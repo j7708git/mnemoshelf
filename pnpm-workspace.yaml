@@ -1,0 +1,6 @@
+packages:
+  - packages/*
+
+# better-sqlite3 是 native 模組，pnpm 10 需要明示允許其安裝腳本（node-gyp 從原始碼編譯）。
+onlyBuiltDependencies:
+  - better-sqlite3

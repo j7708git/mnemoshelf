@@ -1,0 +1,16 @@
+{
+  "name": "mnemoshelf",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mnemoshelf 核心工作區（pnpm workspace）",
+  "engines": {
+    "node": ">=22"
+  },
+  "packageManager": "pnpm@10.34.5",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test"
+  }
+}
