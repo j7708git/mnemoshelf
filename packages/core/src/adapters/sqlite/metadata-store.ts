@@ -217,6 +217,21 @@ export class SqliteMetadataStore implements MetadataStore {
       .filter((chunk): chunk is Chunk => chunk !== undefined);
   }
 
+  async listChunksByPath(rootId: number, relPath: string): Promise<Chunk[]> {
+    return selectRows(
+      this.db,
+      `select ${CHUNK_COLUMNS} from chunks where root_id = ? and rel_path = ? order by seq, id`,
+      rootId,
+      relPath,
+    ).map(rowToChunk);
+  }
+
+  async listRelPaths(rootId: number): Promise<string[]> {
+    return selectRows(this.db, "select distinct rel_path from chunks where root_id = ? order by rel_path", rootId).map(
+      (row) => String(row.rel_path),
+    );
+  }
+
   async addMemory(m: NewMemory): Promise<Memory> {
     const createdAt = new Date().toISOString();
     const insert = this.db.transaction((): number => {

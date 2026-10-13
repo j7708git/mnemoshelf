@@ -115,6 +115,35 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       expect(reversed.map((c) => c.id)).toEqual([ids[1], ids[0]]);
     });
 
+    it("listChunksByPath 依 seq 回傳該路徑的 chunk，其他路徑不受影響", async () => {
+      const root = await store.addRoot(rootInput());
+      await store.replaceChunks(root.id, "notes/a.md", [
+        { seq: 1, kind: "text", text: "第二塊", contentHash: "fa" },
+        { seq: 0, kind: "text", text: "第一塊", contentHash: "fa" },
+      ]);
+      await store.replaceChunks(root.id, "notes/b.md", [{ seq: 0, kind: "text", text: "別檔", contentHash: "fb" }]);
+
+      const chunks = await store.listChunksByPath(root.id, "notes/a.md");
+      expect(chunks.map((c) => c.seq)).toEqual([0, 1]);
+      expect(chunks.map((c) => c.relPath)).toEqual(["notes/a.md", "notes/a.md"]);
+      expect(chunks.map((c) => c.contentHash)).toEqual(["fa", "fa"]);
+
+      expect(await store.listChunksByPath(root.id, "notes/missing.md")).toEqual([]);
+    });
+
+    it("listRelPaths 回傳去重並排序的路徑", async () => {
+      const root = await store.addRoot(rootInput());
+      await store.replaceChunks(root.id, "notes/b.md", [{ seq: 0, kind: "text", text: "b", contentHash: "b" }]);
+      await store.replaceChunks(root.id, "notes/a.md", [
+        { seq: 0, kind: "text", text: "a0", contentHash: "a" },
+        { seq: 1, kind: "text", text: "a1", contentHash: "a" },
+      ]);
+      await store.replaceChunks(root.id, "z.txt", [{ seq: 0, kind: "text", text: "z", contentHash: "z" }]);
+
+      expect(await store.listRelPaths(root.id)).toEqual(["notes/a.md", "notes/b.md", "z.txt"]);
+      expect(await store.listRelPaths(987654)).toEqual([]);
+    });
+
     it("removeRoot(deleteData=true) 刪除該 root 的 chunks 並回傳 id", async () => {
       const root = await store.addRoot(rootInput());
       const chunks = await store.replaceChunks(root.id, "notes/d.md", [

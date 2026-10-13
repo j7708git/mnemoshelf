@@ -42,6 +42,18 @@ export interface MetadataStore {
   /** 依 id 取回 chunks（順序依傳入的 ids，缺漏者略過）。 */
   getChunks(ids: number[]): Promise<Chunk[]>;
 
+  /**
+   * 列出某個檔案（`rootId` + `relPath`）的所有 chunk，依 `seq`（再依 id）排序。
+   * 供 indexer 的內容 hash 增量比對讀取既有 chunk 的 `contentHash`。
+   */
+  listChunksByPath(rootId: number, relPath: string): Promise<Chunk[]>;
+
+  /**
+   * 列出某個 root 底下所有出現過的相對路徑（去重，依字典序排序）。
+   * 供 indexer 找出「磁碟上已消失、但 DB 仍有資料」的檔案並清除。
+   */
+  listRelPaths(rootId: number): Promise<string[]>;
+
   /** 新增記憶；`supersedes` 有值時把被取代者標記 `deletedAt`。 */
   addMemory(m: NewMemory): Promise<Memory>;
   getMemory(id: number): Promise<Memory | null>;

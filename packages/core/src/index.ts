@@ -55,3 +55,44 @@ export {
   SqliteVectorIndex,
   vectorNorm,
 } from "./adapters/sqlite/vector-index.js";
+
+// Indexer 與 root 預覽（M1）
+export {
+  CHUNK_MAX_CHARS,
+  CHUNK_MIN_CHARS,
+  chunkCode,
+  chunkText,
+  type TextChunk,
+} from "./indexer/chunk-text.js";
+export { RootNotIndexableError } from "./indexer/errors.js";
+export {
+  globToRegExp,
+  matchesAnyGlob,
+  matchesGlob,
+} from "./indexer/glob.js";
+export {
+  hashBytes,
+  indexRoot,
+  type IndexProgress,
+  type IndexRootOptions,
+  type IndexRootResult,
+} from "./indexer/indexer.js";
+export {
+  DEFAULT_PREVIEW_MODALITIES,
+  previewRoot,
+  type PreviewKindStat,
+  type PreviewRootInput,
+  type RootPreview,
+} from "./indexer/preview.js";
+export {
+  classifyFile,
+  DEFAULT_MAX_FILE_BYTES,
+  mimeTypeFor,
+  walkRoot,
+  type ScanEntry,
+  type ScanOptions,
+  type ScanResult,
+  type ScanRoot,
+  type SkippedEntry,
+  type SkipReason,
+} from "./indexer/scan.js";
