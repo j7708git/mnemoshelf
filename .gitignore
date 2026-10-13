@@ -1,0 +1,24 @@
+# 機密與本地設定（一律不進版控）
+.env
+.env.*
+!.env.example
+
+# 臨時產物
+.tmp/
+.scratch/
+.local/
+
+# 內部工作紀錄（OpenChamber）
+.openchamber/
+
+# Node
+node_modules/
+dist/
+out/
+*.log
+
+# 本機資料庫與模型
+*.db
+*.db-wal
+*.db-shm
+models/

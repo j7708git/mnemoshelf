@@ -1,0 +1,244 @@
+{
+  "schema_version": 1,
+  "diagram_type": "architecture",
+  "meta": {
+    "title": "Mnemoshelf 架構",
+    "output": "architecture.html",
+    "quality_profile": "showcase"
+  },
+  "components": [
+    {
+      "id": "agents",
+      "type": "external",
+      "label": "AI Agents",
+      "sublabel": "OpenCode / Hermes 等",
+      "pos": [
+        30,
+        60
+      ],
+      "size": [
+        140,
+        64
+      ]
+    },
+    {
+      "id": "mcp",
+      "type": "backend",
+      "label": "MCP 入口",
+      "sublabel": "stdio，不碰資料庫",
+      "pos": [
+        210,
+        60
+      ],
+      "size": [
+        140,
+        64
+      ]
+    },
+    {
+      "id": "ui",
+      "type": "frontend",
+      "label": "桌面 UI",
+      "sublabel": "Electron + React",
+      "pos": [
+        30,
+        260
+      ],
+      "size": [
+        140,
+        64
+      ]
+    },
+    {
+      "id": "core",
+      "type": "backend",
+      "label": "Core 常駐服務",
+      "sublabel": "REST，唯一寫入者",
+      "pos": [
+        420,
+        160
+      ],
+      "size": [
+        150,
+        72
+      ],
+      "tag": "127.0.0.1 + token"
+    },
+    {
+      "id": "roots",
+      "type": "security",
+      "label": "Roots 閘門",
+      "sublabel": "自選目錄 / 黑名單",
+      "pos": [
+        650,
+        60
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "fs",
+      "type": "external",
+      "label": "使用者的資料夾",
+      "sublabel": "預設不掃任何目錄",
+      "pos": [
+        860,
+        60
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "indexer",
+      "type": "backend",
+      "label": "Indexer",
+      "sublabel": "切塊 / 增量 / 限速",
+      "pos": [
+        650,
+        160
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "embedder",
+      "type": "cloud",
+      "label": "Embedder",
+      "sublabel": "僅限多模態",
+      "pos": [
+        860,
+        160
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "meta",
+      "type": "database",
+      "label": "MetadataStore",
+      "sublabel": "SQLite / PostgreSQL",
+      "pos": [
+        420,
+        360
+      ],
+      "size": [
+        150,
+        64
+      ]
+    },
+    {
+      "id": "vec",
+      "type": "database",
+      "label": "VectorIndex",
+      "sublabel": "sqlite-vec / pgvector",
+      "pos": [
+        650,
+        360
+      ],
+      "size": [
+        150,
+        64
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "id": "agents-mcp",
+      "from": "agents",
+      "to": "mcp",
+      "label": "MCP"
+    },
+    {
+      "id": "mcp-core",
+      "from": "mcp",
+      "to": "core",
+      "label": "HTTP 本機"
+    },
+    {
+      "id": "ui-core",
+      "from": "ui",
+      "to": "core",
+      "label": "HTTP 本機"
+    },
+    {
+      "id": "core-roots",
+      "from": "core",
+      "to": "roots",
+      "label": "每次存取先驗證",
+      "fromSide": "top",
+      "toSide": "left"
+    },
+    {
+      "id": "roots-fs",
+      "from": "roots",
+      "to": "fs",
+      "label": "唯讀",
+      "variant": "dashed"
+    },
+    {
+      "id": "core-indexer",
+      "from": "core",
+      "to": "indexer",
+      "label": "索引排程"
+    },
+    {
+      "id": "indexer-embedder",
+      "from": "indexer",
+      "to": "embedder",
+      "label": "文字 / 圖片"
+    },
+    {
+      "id": "indexer-vec",
+      "from": "indexer",
+      "to": "vec",
+      "label": "向量",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDy": 40
+    },
+    {
+      "id": "core-meta",
+      "from": "core",
+      "to": "meta",
+      "label": "查詢 + RRF",
+      "fromSide": "bottom",
+      "toSide": "top",
+      "labelDx": 0,
+      "labelDy": 40
+    }
+  ],
+  "cards": [
+    {
+      "dot": "cyan",
+      "title": "入口",
+      "items": [
+        "agent 走 MCP，不支援者用 REST 或 skill",
+        "UI 與 MCP 都只透過本機 HTTP 連 Core"
+      ]
+    },
+    {
+      "dot": "emerald",
+      "title": "資料",
+      "items": [
+        "MetadataStore 與 VectorIndex 可獨立替換",
+        "混合排序在應用層，後端只回傳各自的排名"
+      ]
+    },
+    {
+      "dot": "rose",
+      "title": "安全",
+      "items": [
+        "預設不掃任何目錄，必須逐一加入 root",
+        "realpath 驗證與黑名單，機密先遮罩再索引"
+      ]
+    }
+  ]
+}
