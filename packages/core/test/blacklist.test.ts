@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { blockedReason, isBlocked } from "../src/roots/blacklist.js";
+import { blockedReason, isBlocked, normalizeSegment } from "../src/roots/blacklist.js";
 
 describe("isBlocked", () => {
   it("擋掉設定與金鑰目錄", () => {
@@ -55,6 +55,56 @@ describe("isBlocked", () => {
     expect(isBlocked("C:\\data\\project\\.env")).toBe(true);
     expect(isBlocked("C:\\data\\project\\.env.example")).toBe(false);
     expect(isBlocked("notes\\sub\\.password-store\\x.gpg")).toBe(true);
+  });
+
+  describe("Windows 路徑變形（注入 platform='win32' 模擬，不需真的在 Windows 跑）", () => {
+    it("尾端的點與空白會被忽略（Windows 語意）", () => {
+      expect(isBlocked(".env.", "win32")).toBe(true);
+      expect(isBlocked(".ssh ", "win32")).toBe(true);
+      expect(isBlocked("notes\\.gnupg. ", "win32")).toBe(true);
+      expect(isBlocked("id_rsa.", "win32")).toBe(true);
+      expect(isBlocked("cert.pem ", "win32")).toBe(true);
+      // 放行清單仍優先：去掉尾點後是 .env.example
+      expect(isBlocked(".env.example.", "win32")).toBe(false);
+      // 去掉尾點後是 .environment.md，仍不誤判
+      expect(isBlocked(".environment.md.", "win32")).toBe(false);
+    });
+
+    it("NTFS ADS（`:stream`）只比對 `:` 之前的部分", () => {
+      expect(isBlocked(".env::$DATA", "win32")).toBe(true);
+      expect(isBlocked(".env::$data", "win32")).toBe(true);
+      expect(isBlocked("notes\\.ssh::$DATA\\x", "win32")).toBe(true);
+      expect(isBlocked("id_rsa:stream", "win32")).toBe(true);
+      expect(isBlocked(".env.example::$DATA", "win32")).toBe(false);
+      expect(isBlocked("readme.md:$DATA", "win32")).toBe(false);
+    });
+
+    it("非 Windows 平台不做這些正規化（行為不變）", () => {
+      for (const platform of ["linux", "darwin"] as const) {
+        expect(isBlocked(".env.", platform)).toBe(false);
+        expect(isBlocked(".ssh ", platform)).toBe(false);
+        expect(isBlocked(".env::$DATA", platform)).toBe(false);
+        // 原本就會命中的仍命中
+        expect(isBlocked(".env", platform)).toBe(true);
+        expect(isBlocked(".ssh/id_rsa", platform)).toBe(true);
+      }
+    });
+
+    it("normalizeSegment 的正規化結果（供除錯與文件）", () => {
+      expect(normalizeSegment(".env.", "win32")).toBe(".env");
+      expect(normalizeSegment(".ssh ", "win32")).toBe(".ssh");
+      expect(normalizeSegment(".env::$DATA", "win32")).toBe(".env");
+      expect(normalizeSegment(".env.::$DATA", "win32")).toBe(".env");
+      expect(normalizeSegment(".ENV.", "win32")).toBe(".env");
+      expect(normalizeSegment(".env.", "linux")).toBe(".env.");
+      expect(normalizeSegment(".ENV", "linux")).toBe(".env");
+    });
+
+    it("Windows 的變形也會反映在 blockedReason", () => {
+      expect(blockedReason(".env.", "win32")).toBe("受保護的檔名樣式");
+      expect(blockedReason(".ssh ", "win32")).toBe("受保護的設定或金鑰目錄");
+      expect(blockedReason(".env.", "linux")).toBeNull();
+    });
   });
 
   it("blockedReason 說明命中的類別", () => {
