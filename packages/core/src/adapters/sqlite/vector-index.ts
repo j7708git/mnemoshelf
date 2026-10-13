@@ -153,6 +153,18 @@ export class SqliteVectorIndex implements VectorIndex {
     return Number(row?.count ?? 0);
   }
 
+  async existingKeys(keys: string[]): Promise<Set<string>> {
+    const found = new Set<string>();
+    if (keys.length === 0) return found;
+
+    // vec0 的 WHERE 只保證支援主鍵（key）等值查詢，因此逐鍵查；每檔的 chunk 數不多。
+    const statement = this.db.prepare<unknown[], { key: unknown }>("select key from vectors where key = ?");
+    for (const key of keys) {
+      if (statement.get(key) !== undefined) found.add(key);
+    }
+    return found;
+  }
+
   async embedderIds(): Promise<string[]> {
     return selectRows(this.db, "select distinct embedder_id as id from vectors order by embedder_id").map((row) =>
       String(row.id),

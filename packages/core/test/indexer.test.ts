@@ -22,6 +22,8 @@ class RecordingEmbedder implements Embedder {
   private readonly inner = new FakeEmbedder();
   readonly documents: { text: string; title: string | undefined }[] = [];
   readonly images: ImageInput[] = [];
+  /** 測試掛鉤：每次 embedDocument 前呼叫（可在掃描與讀取之間製造競態）。 */
+  beforeEmbed: ((text: string) => Promise<void> | void) | undefined;
 
   get info(): EmbedderInfo {
     return this.inner.info;
@@ -32,6 +34,7 @@ class RecordingEmbedder implements Embedder {
   }
 
   async embedDocument(text: string, title?: string): Promise<Float32Array> {
+    await this.beforeEmbed?.(text);
     this.documents.push({ text, title });
     return this.inner.embedDocument(text, title);
   }
@@ -47,6 +50,18 @@ class RecordingEmbedder implements Embedder {
 
   async dispose(): Promise<void> {
     return this.inner.dispose();
+  }
+}
+
+/** 進行嵌入時立即中止的 embedder，用來驗證「embed 中止 → DB 不動」。 */
+class AbortingEmbedder extends RecordingEmbedder {
+  constructor(private readonly controller: AbortController) {
+    super();
+  }
+
+  override async embedDocument(text: string, title?: string): Promise<Float32Array> {
+    this.controller.abort();
+    return super.embedDocument(text, title);
   }
 }
 
@@ -242,6 +257,125 @@ describe("indexRoot", () => {
       expect(media.embedder.images[0]?.mimeType).toBe("image/png");
     } finally {
       await fs.rm(media.dir, { recursive: true, force: true });
+    }
+  });
+
+  // ── 修復輪：資料完整性與安全 ──────────────────────────────────────────────
+
+  it("Blocker 1：改檔後不收留舊向量，count 等於現有 chunk 數", async () => {
+    await indexRoot(harness.root, options(harness));
+    const oldChunks = await harness.store.listChunksByPath(harness.root.id, "a.md");
+    const oldKeys = oldChunks.map((chunk) => `c:${chunk.id}`);
+    expect(oldKeys.length).toBeGreaterThan(0);
+
+    // 改成會切成兩塊的內容（塊數改變，新 chunk 會有新 id）
+    await fs.writeFile(path.join(harness.dir, "a.md"), `# 標題\n\n${"內容".repeat(800)}`);
+
+    await indexRoot(harness.root, options(harness));
+
+    const newChunks = await harness.store.listChunksByPath(harness.root.id, "a.md");
+    expect(newChunks.length).toBe(2);
+    expect(await harness.vec.count()).toBe(newChunks.length + 1); // a.md 兩塊 + b.ts 一塊
+
+    // 舊 key 已被回收，不再出現在索引
+    expect([...(await harness.vec.existingKeys(oldKeys))]).toEqual([]);
+    const hits = await harness.vec.searchVector(await harness.embedder.embedQuery("內容"), {}, 20);
+    for (const hit of hits) {
+      expect(oldKeys).not.toContain(hit.key);
+    }
+  });
+
+  it("Blocker 2：embed 中止時 DB 完全未動，重跑可完成且向量齊", async () => {
+    const controller = new AbortController();
+    const aborting = new AbortingEmbedder(controller);
+
+    await expect(
+      indexRoot(harness.root, {
+        embedder: aborting,
+        store: harness.store,
+        vec: harness.vec,
+        signal: controller.signal,
+        concurrency: 1,
+      }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    // 中止發生在寫入 DB 之前：沒有留下任何 chunk 或向量。
+    expect(await harness.store.listRelPaths(harness.root.id)).toEqual([]);
+    expect(await harness.vec.count()).toBe(0);
+
+    const rerun = await indexRoot(harness.root, options(harness));
+    expect(rerun.processed).toBe(2);
+    expect(await harness.vec.count()).toBe(2);
+  });
+
+  it("Blocker 2(b)：DB 有 hash 但缺向量時，下輪重做補齊", async () => {
+    await indexRoot(harness.root, options(harness));
+    const chunks = await harness.store.listChunksByPath(harness.root.id, "a.md");
+    const missingKey = `c:${chunks[0]!.id}`;
+    await harness.vec.deleteByKeys([missingKey]); // 模擬 replaceChunks→upsert 之間失敗
+
+    const before = harness.embedder.documents.length;
+    const result = await indexRoot(harness.root, options(harness));
+
+    expect(result).toMatchObject({ processed: 1, skippedUnchanged: 1 }); // 只有 a.md 重做
+    expect(harness.embedder.documents.length).toBeGreaterThan(before);
+    expect(await harness.vec.count()).toBe(2);
+
+    const repaired = await harness.store.listChunksByPath(harness.root.id, "a.md");
+    const repairedKey = `c:${repaired[0]!.id}`;
+    expect([...(await harness.vec.existingKeys([repairedKey]))]).toEqual([repairedKey]);
+    expect([...(await harness.vec.existingKeys([missingKey]))]).toEqual([]);
+  });
+
+  it("Non-blocker 3：新近被排除的檔案會從索引清出（chunk 與向量）", async () => {
+    await indexRoot(harness.root, options(harness));
+    const bChunks = await harness.store.listChunksByPath(harness.root.id, "code/b.ts");
+    const bKeys = bChunks.map((chunk) => `c:${chunk.id}`);
+    expect(bKeys.length).toBeGreaterThan(0);
+
+    // 加入 exclude 後重跑（以更新後的 root 設定模擬使用者改了規則）
+    const excludedRoot: Root = { ...harness.root, exclude: ["code/**"] };
+    const result = await indexRoot(excludedRoot, options(harness));
+
+    expect(result).toMatchObject({ processed: 0, skippedUnchanged: 1, removedFiles: 1 });
+    expect(await harness.store.listChunksByPath(harness.root.id, "code/b.ts")).toEqual([]);
+    expect(await harness.store.searchKeyword("answer", {}, 10)).toEqual([]);
+    expect([...(await harness.vec.existingKeys(bKeys))]).toEqual([]);
+    expect(await harness.vec.count()).toBe(1); // 只剩 a.md
+  });
+
+  it("Non-blocker 4：掃描後路徑被換成 root 外 symlink → 該檔 skipped 且整輪不中斷", async (ctx) => {
+    const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "mnemoshelf-outside-"));
+    const outsideFile = path.join(outsideDir, "outside.md");
+    await fs.writeFile(outsideFile, "# 外部檔案");
+
+    const bPath = path.join(harness.dir, "code", "b.ts");
+    try {
+      // 先確認平台支援 symlink
+      const probe = path.join(harness.dir, "probe-link");
+      try {
+        await fs.symlink(outsideFile, probe, "file");
+        await fs.rm(probe);
+      } catch {
+        ctx.skip();
+        return;
+      }
+
+      // 在讀取 b.ts 之前（a.md 嵌入時）把它換成指向 root 外的 symlink。
+      harness.embedder.beforeEmbed = async () => {
+        await fs.rm(bPath);
+        await fs.symlink(outsideFile, bPath, "file");
+      };
+
+      const result = await indexRoot(harness.root, { ...options(harness), concurrency: 1 });
+
+      expect(result.processed).toBe(1);
+      expect(result.skippedFiles).toEqual([{ relPath: "code/b.ts", reason: "unresolved-symlink" }]);
+      expect(await harness.store.listChunksByPath(harness.root.id, "code/b.ts")).toEqual([]);
+      // 整輪沒有中斷，a.md 仍正常索引
+      expect(await harness.store.listChunksByPath(harness.root.id, "a.md")).toHaveLength(1);
+    } finally {
+      await fs.rm(outsideDir, { recursive: true, force: true });
     }
   });
 });

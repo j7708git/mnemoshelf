@@ -190,6 +190,29 @@ export function runVectorIndexContract(name: string, factory: VectorIndexFactory
       expect(await index.embedderIds()).toEqual(["fake@1", "fake@2"]);
     });
 
+    it("existingKeys 回報索引中實際存在的 key", async () => {
+      const index = await fresh();
+      await index.upsert([
+        { key: "c:1", rootId: 1, embedderId: "fake@1", vec: basis(index.dim, 0) },
+        { key: "c:2", rootId: 1, embedderId: "fake@1", vec: basis(index.dim, 1) },
+        { key: "m:1", rootId: null, embedderId: "fake@1", vec: basis(index.dim, 1) },
+      ]);
+
+      const found = await index.existingKeys(["c:1", "c:2", "m:1", "c:missing"]);
+      expect([...found].sort()).toEqual(["c:1", "c:2", "m:1"]);
+    });
+
+    it("existingKeys 空輸入回傳空集合，刪除後不再回報", async () => {
+      const index = await fresh();
+      expect([...(await index.existingKeys([]))]).toEqual([]);
+
+      await index.upsert([{ key: "c:1", rootId: 1, embedderId: "fake@1", vec: basis(index.dim, 0) }]);
+      expect([...(await index.existingKeys(["c:1"]))]).toEqual(["c:1"]);
+
+      await index.deleteByKeys(["c:1"]);
+      expect([...(await index.existingKeys(["c:1"]))]).toEqual([]);
+    });
+
     it("k <= 0 回傳空清單，超過上限時夾住而非報錯", async () => {
       const index = await fresh();
       await index.upsert([{ key: "c:1", rootId: 1, embedderId: "fake@1", vec: basis(index.dim, 0) }]);

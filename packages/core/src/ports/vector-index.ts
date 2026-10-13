@@ -38,6 +38,13 @@ export interface VectorIndex {
 
   count(): Promise<number>;
 
+  /**
+   * 回傳輸入 `keys` 中實際存在於索引者（其餘忽略）。
+   * 供 indexer 的增量判斷確認「DB 有 chunk，但向量是否齊」，缺向量時整檔重做。
+   * 唯讀，不改變索引內容。
+   */
+  existingKeys(keys: string[]): Promise<Set<string>>;
+
   /** 回傳目前索引裡出現過的 embedderId 集合，用於偵測更換 embedder。 */
   embedderIds(): Promise<string[]>;
 }
