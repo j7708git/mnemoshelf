@@ -1,5 +1,9 @@
 import { DuplicateRootError } from "../../errors.js";
-import type { MetadataStore } from "../../ports/metadata-store.js";
+import {
+  normalizeMemoryLimit,
+  type MemoryFilter,
+  type MetadataStore,
+} from "../../ports/metadata-store.js";
 import type {
   Chunk,
   ChunkKind,
@@ -266,6 +270,43 @@ export class SqliteMetadataStore implements MetadataStore {
 
   async forgetMemory(id: number): Promise<void> {
     this.db.prepare("update memories set deleted_at = ? where id = ? and deleted_at is null").run(new Date().toISOString(), id);
+  }
+
+  /**
+   * 列舉未刪除的記憶（見 `MetadataStore.listMemories` 的契約）。
+   *
+   * 排序 `created_at desc, id desc`：`created_at` 是毫秒精度的 ISO 字串，同一毫秒內新增的多筆
+   * 記憶需要 `id` 當決勝鍵，否則順序不確定（不可重現）。欄位條件全部用參數綁定，不做字串拼接。
+   */
+  async listMemories(filter: MemoryFilter = {}): Promise<Memory[]> {
+    const limit = normalizeMemoryLimit(filter.limit);
+    if (limit === 0) return [];
+
+    const conditions = ["deleted_at is null"];
+    const params: unknown[] = [];
+    if (filter.scope !== undefined) {
+      conditions.push("scope = ?");
+      params.push(filter.scope);
+    }
+    if (filter.project !== undefined) {
+      conditions.push("project = ?");
+      params.push(filter.project);
+    }
+    if (filter.agent !== undefined) {
+      conditions.push("agent = ?");
+      params.push(filter.agent);
+    }
+    if (filter.kind !== undefined) {
+      conditions.push("kind = ?");
+      params.push(filter.kind);
+    }
+
+    return selectRows(
+      this.db,
+      `select ${MEMORY_COLUMNS} from memories where ${conditions.join(" and ")} order by created_at desc, id desc limit ?`,
+      ...params,
+      limit,
+    ).map(rowToMemory);
   }
 
   /**

@@ -1,6 +1,8 @@
 import type {
   Chunk,
   Memory,
+  MemoryKind,
+  MemoryScope,
   NewChunk,
   NewMemory,
   NewRoot,
@@ -8,6 +10,40 @@ import type {
   Root,
   SearchFilter,
 } from "./types.js";
+
+/** `listMemories` 未指定 `limit` 時的預設筆數。 */
+export const MEMORY_LIST_DEFAULT_LIMIT = 100;
+/** `listMemories` 的 `limit` 上限（超過者夾到此值）。 */
+export const MEMORY_LIST_MAX_LIMIT = 500;
+
+/**
+ * 列舉記憶的過濾條件。全部可選，未指定（或 `undefined`）＝該欄位不過濾。
+ * `project` 只比對字串：要列出「沒有專案」的記憶請改用其他欄位組合，
+ * 本介面刻意不提供 `project: null` 的語意（避免與「不過濾」混淆）。
+ */
+export interface MemoryFilter {
+  scope?: MemoryScope;
+  project?: string;
+  agent?: string;
+  kind?: MemoryKind;
+  /** 回傳筆數；預設 `MEMORY_LIST_DEFAULT_LIMIT`，上限 `MEMORY_LIST_MAX_LIMIT`。 */
+  limit?: number;
+}
+
+/**
+ * 把 `limit` 正規化成實際要查詢的筆數。
+ *
+ * - 未指定 → `MEMORY_LIST_DEFAULT_LIMIT`；
+ * - 非正整數或 <= 0 → 0（呼叫端據此回傳空清單，與 `searchKeyword(k <= 0)` 的既有慣例一致）；
+ * - 超過 `MEMORY_LIST_MAX_LIMIT` → 夾到上限。
+ *
+ * 放在 port 檔案裡，讓各實作與呼叫端共用同一套邊界語意（不得各自解讀）。
+ */
+export function normalizeMemoryLimit(limit: number | undefined): number {
+  if (limit === undefined) return MEMORY_LIST_DEFAULT_LIMIT;
+  if (!Number.isInteger(limit) || limit <= 0) return 0;
+  return Math.min(limit, MEMORY_LIST_MAX_LIMIT);
+}
 
 /**
  * 中繼資料儲存介面（預設實作為 SQLite）。
@@ -59,6 +95,15 @@ export interface MetadataStore {
   getMemory(id: number): Promise<Memory | null>;
   /** 軟刪除。 */
   forgetMemory(id: number): Promise<void>;
+
+  /**
+   * 列舉**未刪除**的記憶（軟刪除者與被取代者不會出現）。
+   *
+   * - 排序：`createdAt` 由新到舊；同一時間戳（同毫秒）以 `id` 由大到小決定，確保可重現。
+   * - `filter` 全部可選，未指定＝不過濾；各欄位為精確比對（見 `MemoryFilter`）。
+   * - `filter.limit` 的邊界語意見 `normalizeMemoryLimit`（預設 100、上限 500、<= 0 回傳空清單）。
+   */
+  listMemories(filter?: MemoryFilter): Promise<Memory[]>;
 
   /** 關鍵字搜尋 chunk 文字與未刪除的記憶，回傳排名清單。 */
   searchKeyword(query: string, filter: SearchFilter, k: number): Promise<RankedHit[]>;

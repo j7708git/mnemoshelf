@@ -1,0 +1,40 @@
+{
+  "name": "@mnemoshelf/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mnemoshelf 常駐服務：REST API（127.0.0.1＋token）與 MCP stdio 入口（薄轉發）",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./mcp": {
+      "types": "./dist/mcp/stdio.d.ts",
+      "default": "./dist/mcp/stdio.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "e2e": "vitest run test/e2e.test.ts",
+    "serve": "node dist/scripts/serve.js",
+    "mcp": "node dist/scripts/mcp.js"
+  },
+  "dependencies": {
+    "@mnemoshelf/core": "workspace:*",
+    "@mnemoshelf/embedder-transformers": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.32.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}

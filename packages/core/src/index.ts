@@ -22,6 +22,12 @@ export type {
 } from "./ports/types.js";
 
 export type { MetadataStore } from "./ports/metadata-store.js";
+export {
+  MEMORY_LIST_DEFAULT_LIMIT,
+  MEMORY_LIST_MAX_LIMIT,
+  normalizeMemoryLimit,
+} from "./ports/metadata-store.js";
+export type { MemoryFilter } from "./ports/metadata-store.js";
 export type { VectorIndex, VectorItem } from "./ports/vector-index.js";
 export type { Embedder, EmbedderInfo, ImageInput, ProbeResult } from "./ports/embedder.js";
 

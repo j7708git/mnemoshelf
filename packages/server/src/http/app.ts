@@ -1,0 +1,572 @@
+/**
+ * REST 路由（`node:http` 手寫，JSON in／JSON out；不引框架）。
+ *
+ * 契約（任務卡 §REST API）：
+ * - `GET  /health`（免 token）→ `{status:"ok"}`
+ * - `POST /roots`、`GET /roots`、`GET /roots/:id`、`DELETE /roots/:id?deleteData=1`
+ * - `POST /roots/:id/preview`、`POST /roots/:id/index`
+ * - `POST /search`
+ * - `POST /memories`、`GET /memories`、`DELETE /memories/:id`
+ *
+ * 行為規則：
+ * - **單一寫入者**：資料庫只被本行程開啟；本模組是唯一的寫入路徑（MCP 走 HTTP 進來的）。
+ * - **唯讀使用者檔案**：沒有任何端點寫入 root 目錄——只讀檔、只寫自己的資料庫。
+ * - 錯誤一律 `{error:{name,message}}`＋適當狀態碼；錯誤訊息由各錯誤型別決定，不含本機絕對路徑。
+ */
+import { promises as fs } from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
+import { homedir } from "node:os";
+import {
+  assertRootAllowed,
+  blockedReason,
+  DEFAULT_PREVIEW_MODALITIES,
+  DuplicateRootError,
+  indexRoot,
+  isBlocked,
+  type IndexRootResult,
+  type Memory,
+  type MemoryKind,
+  type MemoryScope,
+  type MetadataStore,
+  type Modality,
+  PathBlockedError,
+  PathOutsideRootError,
+  previewRoot,
+  type Root,
+  RootNotIndexableError,
+  RootTooBroadError,
+  type Embedder,
+  type VectorIndex,
+} from "@mnemoshelf/core";
+import { LOOPBACK_HOST } from "../config.js";
+import {
+  IndexInProgressError,
+  MethodNotAllowedError,
+  NotFoundError,
+  NonLoopbackRequestError,
+  PayloadTooLargeError,
+  UnauthorizedError,
+  ValidationError,
+} from "../errors.js";
+import { requireLoopback, requireToken } from "./auth.js";
+import { unifiedSearch, type SearchMode, type UnifiedSearchResult } from "../search.js";
+
+/** JSON 請求主體上限。 */
+export const MAX_JSON_BODY_BYTES = 1024 * 1024;
+/** 單筆記憶內容長度上限（契約未明定，由本實作決定的濫用防護）。 */
+export const MAX_MEMORY_CHARS = 8000;
+
+const MODALITIES: readonly Modality[] = ["text", "code", "image", "audio", "video"];
+const MEMORY_KINDS: readonly MemoryKind[] = ["fact", "decision", "pitfall", "preference"];
+const MEMORY_SCOPES: readonly MemoryScope[] = ["global", "project", "agent"];
+
+/** `POST /roots` 的請求主體。 */
+export interface AddRootRequest {
+  path: string;
+  mode?: "browse" | "index";
+  modalities?: Modality[];
+  include?: string[];
+  exclude?: string[];
+  respectGitignore?: boolean;
+  /** 單檔大小上限；`Root` 契約沒有此欄位，因此只存在行程內（見回報）。 */
+  maxFileBytes?: number;
+}
+
+/** `DELETE /roots/:id` 的回應。 */
+export interface RemoveRootResponse {
+  rootId: number;
+  /** 是否同時刪除 chunk 與向量（`?deleteData=1`）。 */
+  deletedData: boolean;
+  /** 被刪除的 chunk 數（未刪資料時為 0）。 */
+  removedChunks: number;
+}
+
+/** `GET /memories` 的回應（未刪除的記憶，由新到舊）。 */
+export interface ListMemoriesResponse {
+  memories: Memory[];
+}
+
+/** `POST /roots/:id/index` 的回應（`IndexRootResult` 摘要＋量測）。 */
+export interface IndexRootResponse extends IndexRootResult {
+  rootId: number;
+  durationMs: number;
+}
+
+/** 統一的錯誤回應格式。 */
+export interface ErrorResponse {
+  error: { name: string; message: string };
+}
+
+export interface RestAppDeps {
+  store: MetadataStore;
+  vec: VectorIndex;
+  embedder: Embedder;
+  token: string;
+  /** root 加入時的「過寬」判定基準；預設 `os.homedir()`。 */
+  homeDir?: string;
+}
+
+export interface RestApp {
+  /** 交給 `http.createServer` 的請求處理函式。 */
+  handler: (request: IncomingMessage, response: ServerResponse) => void;
+  /** 正在進行的索引（root id → promise）。進行中再呼叫 → 409。 */
+  readonly indexing: ReadonlyMap<number, Promise<IndexRootResult>>;
+  /** 等待中的請求全部結束（測試用：確認沒有殘留的非同步工作）。 */
+  settled(): Promise<void>;
+}
+
+function sendJson(response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
+  const payload = `${JSON.stringify(body)}\n`;
+  response.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "content-length": Buffer.byteLength(payload),
+    ...headers,
+  });
+  response.end(payload);
+}
+
+/**
+ * 把錯誤映射成 HTTP 狀態碼與回應主體。
+ *
+ * 訊息**逐一由各錯誤型別決定**（這些訊息本身不含本機絕對路徑）；
+ * 未預期的錯誤一律回應 500 的固定訊息，細節只寫到 stderr。
+ */
+export function toHttpError(error: unknown): { status: number; body: ErrorResponse; headers: Record<string, string> } {
+  const named = (name: string, message: string): ErrorResponse => ({ error: { name, message } });
+
+  if (error instanceof UnauthorizedError) return { status: 401, body: named(error.name, error.message), headers: {} };
+  if (error instanceof NonLoopbackRequestError) return { status: 403, body: named(error.name, error.message), headers: {} };
+  if (error instanceof RootTooBroadError) return { status: 422, body: named(error.name, error.message), headers: {} };
+  if (error instanceof PathOutsideRootError) return { status: 403, body: named(error.name, error.message), headers: {} };
+  if (error instanceof PathBlockedError) return { status: 403, body: named(error.name, error.message), headers: {} };
+  if (error instanceof DuplicateRootError) {
+    // 刻意不帶路徑：`DuplicateRootError.message` 內含絕對路徑。
+    return { status: 409, body: named(error.name, "此目錄已經加入過"), headers: {} };
+  }
+  if (error instanceof RootNotIndexableError) return { status: 400, body: named(error.name, error.message), headers: {} };
+  if (error instanceof NotFoundError) return { status: 404, body: named(error.name, error.message), headers: {} };
+  if (error instanceof ValidationError) return { status: 400, body: named(error.name, error.message), headers: {} };
+  if (error instanceof IndexInProgressError) return { status: 409, body: named(error.name, error.message), headers: {} };
+  if (error instanceof PayloadTooLargeError) return { status: 413, body: named(error.name, error.message), headers: {} };
+  if (error instanceof MethodNotAllowedError) {
+    return { status: 405, body: named(error.name, error.message), headers: { allow: error.allowed.join(", ") } };
+  }
+
+  return { status: 500, body: named("InternalError", "伺服器內部錯誤"), headers: {} };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** 讀取並解析 JSON 請求主體；空主體視為 `{}`。 */
+async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > MAX_JSON_BODY_BYTES) {
+      request.destroy();
+      throw new PayloadTooLargeError(MAX_JSON_BODY_BYTES);
+    }
+    chunks.push(buffer);
+  }
+  if (total === 0) return {};
+  const text = Buffer.concat(chunks).toString("utf8");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new ValidationError("body", "不是合法的 JSON");
+  }
+  if (!isRecord(parsed)) throw new ValidationError("body", "必須是 JSON 物件");
+  return parsed;
+}
+
+function requireString(value: unknown, field: string, options: { maxLength?: number } = {}): string {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new ValidationError(field, "必須是非空的字串");
+  }
+  if (options.maxLength !== undefined && value.length > options.maxLength) {
+    throw new ValidationError(field, `長度上限 ${options.maxLength} 字元`);
+  }
+  return value;
+}
+
+function optionalString(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "string") throw new ValidationError(field, "必須是字串");
+  return value;
+}
+
+function optionalStringArray(value: unknown, field: string): string[] | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new ValidationError(field, "必須是字串陣列");
+  }
+  return value as string[];
+}
+
+function enumValue<T extends string>(value: unknown, allowed: readonly T[], field: string, fallback: T): T {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== "string" || !(allowed as readonly string[]).includes(value)) {
+    throw new ValidationError(field, `必須是 ${allowed.join(" / ")} 之一`);
+  }
+  return value as T;
+}
+
+/** 解析 `deleteData` 之類的旗標；未提供時回傳 fallback。 */
+function booleanFlag(value: string | null, field: string, fallback: boolean): boolean {
+  if (value === null) return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "" || normalized === "0" || normalized === "false" || normalized === "no") return false;
+  if (normalized === "1" || normalized === "true" || normalized === "yes") return true;
+  throw new ValidationError(field, "必須是 1/0（或 true/false）");
+}
+
+function parseId(raw: string, resource: string): number {
+  const id = Number(raw);
+  if (!Number.isInteger(id) || id <= 0) throw new NotFoundError(resource);
+  return id;
+}
+
+/** 解析查詢字串裡的列舉參數；未提供（或空字串）＝不過濾。 */
+function optionalEnumParam<T extends string>(value: string | null, allowed: readonly T[], field: string): T | undefined {
+  if (value === null || value.trim() === "") return undefined;
+  if (!(allowed as readonly string[]).includes(value)) {
+    throw new ValidationError(field, `必須是 ${allowed.join(" / ")} 之一`);
+  }
+  return value as T;
+}
+
+/** 解析查詢字串裡的文字參數；未提供（或空字串）＝不過濾。 */
+function optionalQueryString(value: string | null, field: string): string | undefined {
+  if (value === null || value.trim() === "") return undefined;
+  return value;
+}
+
+/** 解析查詢字串裡的 limit；未提供＝由儲存層套用預設值。 */
+function queryLimit(value: string | null): number | undefined {
+  if (value === null || value.trim() === "") return undefined;
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new ValidationError("limit", "必須是正整數");
+  }
+  return parsed;
+}
+
+export function createRestApp(deps: RestAppDeps): RestApp {
+  const homeDir = deps.homeDir ?? homedir();
+  /** 行程內的每 root 單檔大小上限（`Root` 契約無此欄位，重啟即失）。 */
+  const maxFileBytesByRoot = new Map<number, number>();
+  const indexing = new Map<number, Promise<IndexRootResult>>();
+  const inflight = new Set<Promise<unknown>>();
+
+  const getRootOr404 = async (id: number): Promise<Root> => {
+    const root = await deps.store.getRoot(id);
+    if (root === null) throw new NotFoundError("root", id);
+    return root;
+  };
+
+  const validateModalities = (value: unknown): Modality[] => {
+    if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+      throw new ValidationError("modalities", "必須是模態名稱陣列");
+    }
+    const list = value as string[];
+    for (const item of list) {
+      if (!MODALITIES.includes(item as Modality)) {
+        throw new ValidationError("modalities", `必須是 ${MODALITIES.join(" / ")} 的子集`);
+      }
+    }
+    return list as Modality[];
+  };
+
+  const createRoot = async (request: IncomingMessage): Promise<{ status: number; body: unknown }> => {
+    const body = (await readJsonBody(request)) as unknown as AddRootRequest;
+    const requestedPath = requireString(body.path, "path");
+
+    let realPath: string;
+    try {
+      realPath = await fs.realpath(requestedPath);
+    } catch {
+      throw new ValidationError("path", "路徑不存在或無法解析");
+    }
+    const stats = await fs.stat(realPath);
+    if (!stats.isDirectory()) throw new ValidationError("path", "必須是目錄");
+
+    // 過寬（檔案系統根／家目錄本身）→ RootTooBroadError（422）；黑名單 → PathBlockedError（403）。
+    assertRootAllowed(realPath, { homeDir });
+    if (isBlocked(realPath)) throw new PathBlockedError(realPath.split(/[\\/]/).pop() ?? realPath, blockedReason(realPath) ?? "黑名單");
+
+    const mode = enumValue(body.mode, ["browse", "index"] as const, "mode", "index");
+    const modalities = body.modalities === undefined
+      ? [...DEFAULT_PREVIEW_MODALITIES]
+      : validateModalities(body.modalities);
+    const include = optionalStringArray(body.include, "include") ?? [];
+    const exclude = optionalStringArray(body.exclude, "exclude") ?? [];
+    if (body.respectGitignore !== undefined && typeof body.respectGitignore !== "boolean") {
+      throw new ValidationError("respectGitignore", "必須是布林值");
+    }
+    let maxFileBytes: number | undefined;
+    if (body.maxFileBytes !== undefined) {
+      if (!Number.isInteger(body.maxFileBytes) || body.maxFileBytes <= 0) {
+        throw new ValidationError("maxFileBytes", "必須是正整數");
+      }
+      maxFileBytes = body.maxFileBytes;
+    }
+
+    const root = await deps.store.addRoot({
+      path: realPath,
+      mode,
+      modalities,
+      include,
+      exclude,
+      respectGitignore: body.respectGitignore ?? true,
+      watch: false,
+    });
+    if (maxFileBytes !== undefined) maxFileBytesByRoot.set(root.id, maxFileBytes);
+    return { status: 201, body: root };
+  };
+
+  const previewFor = async (id: number): Promise<{ status: number; body: unknown }> => {
+    const root = await getRootOr404(id);
+    const maxFileBytes = maxFileBytesByRoot.get(id);
+    const preview = await previewRoot({
+      path: root.path,
+      modalities: root.modalities,
+      include: root.include,
+      exclude: root.exclude,
+      respectGitignore: root.respectGitignore,
+      ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
+    });
+    return { status: 200, body: preview };
+  };
+
+  const startIndex = async (id: number): Promise<{ status: number; body: unknown }> => {
+    const root = await getRootOr404(id);
+    if (root.mode !== "index") throw new RootNotIndexableError(root.id, root.mode);
+    if (indexing.has(id)) throw new IndexInProgressError(id);
+
+    const startedAt = Date.now();
+    const maxFileBytes = maxFileBytesByRoot.get(id);
+    const run = indexRoot(root, {
+      embedder: deps.embedder,
+      store: deps.store,
+      vec: deps.vec,
+      ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
+    });
+    indexing.set(id, run);
+    inflight.add(run);
+    try {
+      const result = await run;
+      return { status: 200, body: { rootId: id, durationMs: Date.now() - startedAt, ...result } };
+    } finally {
+      indexing.delete(id);
+      inflight.delete(run);
+    }
+  };
+
+  const removeRoot = async (id: number, deleteData: boolean): Promise<{ status: number; body: unknown }> => {
+    await getRootOr404(id);
+    if (indexing.has(id)) throw new IndexInProgressError(id);
+    const { removedChunkIds } = await deps.store.removeRoot(id, deleteData);
+    if (deleteData) await deps.vec.deleteByRoot(id);
+    maxFileBytesByRoot.delete(id);
+    const body: RemoveRootResponse = {
+      rootId: id,
+      deletedData: deleteData,
+      removedChunks: removedChunkIds.length,
+    };
+    return { status: 200, body };
+  };
+
+  const addMemory = async (request: IncomingMessage): Promise<{ status: number; body: unknown }> => {
+    const body = await readJsonBody(request);
+    const content = requireString(body.content, "content", { maxLength: MAX_MEMORY_CHARS });
+    const agent = requireString(body.agent, "agent");
+    const kind = enumValue(body.kind, MEMORY_KINDS, "kind", "fact");
+    const scope = enumValue(body.scope, MEMORY_SCOPES, "scope", "global");
+    const project = optionalString(body.project, "project") ?? null;
+
+    const memory: Memory = await deps.store.addMemory({ content, kind, scope, project, agent, supersedes: null });
+    return { status: 201, body: memory };
+  };
+
+  const forgetMemory = async (id: number): Promise<{ status: number; body: unknown }> => {
+    const memory = await deps.store.getMemory(id);
+    if (memory === null) throw new NotFoundError("記憶", id);
+    const alreadyDeleted = memory.deletedAt !== null;
+    if (!alreadyDeleted) await deps.store.forgetMemory(id);
+    return { status: 200, body: { id, deleted: !alreadyDeleted } };
+  };
+
+  const routeRoots = async (
+    request: IncomingMessage,
+    method: string,
+    segments: string[],
+    url: URL,
+  ): Promise<{ status: number; body: unknown }> => {
+    if (segments.length === 1) {
+      if (method === "GET") return { status: 200, body: { roots: await deps.store.listRoots() } };
+      if (method === "POST") return await createRoot(request);
+      throw new MethodNotAllowedError(method, ["GET", "POST"]);
+    }
+
+    const id = parseId(segments[1]!, "root");
+
+    if (segments.length === 2) {
+      if (method === "GET") return { status: 200, body: await getRootOr404(id) };
+      if (method === "DELETE") return await removeRoot(id, booleanFlag(url.searchParams.get("deleteData"), "deleteData", false));
+      throw new MethodNotAllowedError(method, ["GET", "DELETE"]);
+    }
+
+    if (segments.length === 3) {
+      if (segments[2] === "preview") {
+        if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
+        return await previewFor(id);
+      }
+      if (segments[2] === "index") {
+        if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
+        return await startIndex(id);
+      }
+    }
+
+    throw new NotFoundError("路徑");
+  };
+
+  const search = async (request: IncomingMessage): Promise<{ status: number; body: UnifiedSearchResult }> => {
+    const body = await readJsonBody(request);
+    // 型別以外一律由 normalizeSearchOptions 驗證（單一驗證來源）。
+    const result = await unifiedSearch(
+      { store: deps.store, vec: deps.vec, embedder: deps.embedder },
+      {
+        query: body.query as string,
+        mode: body.mode as SearchMode | undefined,
+        rootIds: body.rootIds as number[] | undefined,
+        k: body.k as number | undefined,
+      },
+    );
+    return { status: 200, body: result };
+  };
+
+  /**
+   * `GET /memories`：列出未刪除的記憶（由新到舊）。
+   *
+   * 過濾參數直接對應 `MetadataStore.listMemories` 的 `MemoryFilter`；`limit` 的預設與上限
+   * 由儲存層的 `normalizeMemoryLimit` 決定（預設 100、上限 500），這裡只擋掉非正整數。
+   */
+  const listMemories = async (url: URL): Promise<{ status: number; body: unknown }> => {
+    const params = url.searchParams;
+    const kind = optionalEnumParam(params.get("kind"), MEMORY_KINDS, "kind");
+    const scope = optionalEnumParam(params.get("scope"), MEMORY_SCOPES, "scope");
+    const project = optionalQueryString(params.get("project"), "project");
+    const agent = optionalQueryString(params.get("agent"), "agent");
+    const limit = queryLimit(params.get("limit"));
+
+    const memories = await deps.store.listMemories({
+      ...(kind === undefined ? {} : { kind }),
+      ...(scope === undefined ? {} : { scope }),
+      ...(project === undefined ? {} : { project }),
+      ...(agent === undefined ? {} : { agent }),
+      ...(limit === undefined ? {} : { limit }),
+    });
+    return { status: 200, body: { memories } };
+  };
+
+  const routeMemories = async (
+    request: IncomingMessage,
+    method: string,
+    segments: string[],
+    url: URL,
+  ): Promise<{ status: number; body: unknown }> => {
+    if (segments.length === 1) {
+      if (method === "POST") return await addMemory(request);
+      if (method === "GET") return await listMemories(url);
+      throw new MethodNotAllowedError(method, ["GET", "POST"]);
+    }
+    if (segments.length === 2) {
+      if (method !== "DELETE") throw new MethodNotAllowedError(method, ["DELETE"]);
+      return await forgetMemory(parseId(segments[1]!, "記憶"));
+    }
+    throw new NotFoundError("路徑");
+  };
+
+  const dispatch = async (
+    request: IncomingMessage,
+    response: ServerResponse,
+    url: URL,
+    segments: string[],
+  ): Promise<void> => {
+    const method = (request.method ?? "GET").toUpperCase();
+
+    if (method === "GET" && segments.length === 1 && segments[0] === "health") {
+      sendJson(response, 200, { status: "ok" });
+      return;
+    }
+
+    // 除 /health 外一律要 token。
+    requireToken(request, deps.token);
+
+    let result: { status: number; body: unknown };
+    switch (segments[0]) {
+      case "roots":
+        result = await routeRoots(request, method, segments, url);
+        break;
+      case "search":
+        if (segments.length !== 1) throw new NotFoundError("路徑");
+        if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
+        result = await search(request);
+        break;
+      case "memories":
+        result = await routeMemories(request, method, segments, url);
+        break;
+      default:
+        throw new NotFoundError("路徑");
+    }
+
+    sendJson(response, result.status, result.body);
+  };
+
+  const handler = (request: IncomingMessage, response: ServerResponse): void => {
+    const url = new URL(request.url ?? "/", `http://${LOOPBACK_HOST}`);
+    const segments = url.pathname
+      .split("/")
+      .filter((segment) => segment.length > 0)
+      .map((segment) => {
+        try {
+          return decodeURIComponent(segment);
+        } catch {
+          return segment;
+        }
+      });
+
+    const task = (async (): Promise<void> => {
+      try {
+        requireLoopback(request);
+        await dispatch(request, response, url, segments);
+      } catch (error) {
+        const mapped = toHttpError(error);
+        if (mapped.status === 500) {
+          console.error("[mnemoshelf] 未預期的錯誤：", error);
+        }
+        if (response.destroyed || response.writableEnded) return;
+        if (!response.headersSent) sendJson(response, mapped.status, mapped.body, mapped.headers);
+        else response.end();
+      }
+    })();
+    inflight.add(task);
+    void task.finally(() => inflight.delete(task));
+  };
+
+  return {
+    handler,
+    indexing,
+    async settled(): Promise<void> {
+      // 索引是背景工作（回應會等它），這裡等所有在途請求結束。
+      while (inflight.size > 0) {
+        await Promise.allSettled([...inflight]);
+      }
+    },
+  };
+}

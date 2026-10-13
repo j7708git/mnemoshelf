@@ -1,0 +1,98 @@
+/**
+ * 伺服器層的具名錯誤（沿用 core 的風格：一律 Error 子類別、訊息不含敏感資訊）。
+ *
+ * 這些錯誤是 REST 狀態碼的來源：`http/app.ts` 依型別（或名稱）映射，不做字串比對以外的猜測。
+ * **訊息文字不得包含本機絕對路徑**；需要路徑時只放相對路徑或識別碼。
+ */
+
+/** 啟動時缺少 `MNEMOSHELF_TOKEN`。刻意不自動產生：避免使用者誤以為服務有保護。 */
+export class MissingTokenError extends Error {
+  constructor() {
+    super(
+      "未設定 MNEMOSHELF_TOKEN：服務只綁 127.0.0.1，但仍需要 token 保護。請先產生一組再啟動，例如 `openssl rand -hex 32`（Windows 可用 `node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\"`）",
+    );
+    this.name = "MissingTokenError";
+  }
+}
+
+/** 缺少 MCP stdio 入口所需的連線設定（`MNEMOSHELF_URL` / `MNEMOSHELF_TOKEN`）。 */
+export class MissingMcpConfigError extends Error {
+  /** 缺少的環境變數名稱。 */
+  readonly missing: string[];
+
+  constructor(missing: string[]) {
+    super(`MCP 入口缺少環境變數：${missing.join("、")}`);
+    this.name = "MissingMcpConfigError";
+    this.missing = missing;
+  }
+}
+
+/** token 缺失或不正確（HTTP 401）。訊息不回傳收到的值。 */
+export class UnauthorizedError extends Error {
+  constructor(reason = "缺少或錯誤的 Authorization: Bearer token") {
+    super(reason);
+    this.name = "UnauthorizedError";
+  }
+}
+
+/** 請求來源不是 loopback（HTTP 403）。服務只綁 127.0.0.1，這是縱深防禦。 */
+export class NonLoopbackRequestError extends Error {
+  constructor() {
+    super("只接受來自 loopback 位址的請求");
+    this.name = "NonLoopbackRequestError";
+  }
+}
+
+/** 找不到資源（HTTP 404）。`resource` 是資源種類名稱，`id` 是識別碼。 */
+export class NotFoundError extends Error {
+  readonly resource: string;
+  readonly id: number | null;
+
+  constructor(resource: string, id: number | null = null) {
+    super(id === null ? `找不到${resource}` : `找不到${resource} ${id}`);
+    this.name = "NotFoundError";
+    this.resource = resource;
+    this.id = id;
+  }
+}
+
+/** 請求內容不合法（HTTP 400）。訊息只帶欄位名稱與原因，不回傳使用者資料。 */
+export class ValidationError extends Error {
+  readonly field: string;
+
+  constructor(field: string, reason: string) {
+    super(`請求內容不合法（${field}）：${reason}`);
+    this.name = "ValidationError";
+    this.field = field;
+  }
+}
+
+/** 同一個 root 的索引已在進行中（HTTP 409）。本卡不做索引佇列。 */
+export class IndexInProgressError extends Error {
+  readonly rootId: number;
+
+  constructor(rootId: number) {
+    super(`root ${rootId} 的索引正在進行中，請稍後再試`);
+    this.name = "IndexInProgressError";
+    this.rootId = rootId;
+  }
+}
+
+/** 請求方法不支援（HTTP 405）。 */
+export class MethodNotAllowedError extends Error {
+  readonly allowed: string[];
+
+  constructor(method: string, allowed: string[]) {
+    super(`不支援 ${method}，允許的方法：${allowed.join("、")}`);
+    this.name = "MethodNotAllowedError";
+    this.allowed = allowed;
+  }
+}
+
+/** 請求主體過大（HTTP 413）。 */
+export class PayloadTooLargeError extends Error {
+  constructor(limitBytes: number) {
+    super(`請求主體超過上限（${limitBytes} bytes）`);
+    this.name = "PayloadTooLargeError";
+  }
+}

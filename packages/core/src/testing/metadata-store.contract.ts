@@ -1,7 +1,12 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { DuplicateRootError } from "../errors.js";
-import type { MetadataStore } from "../ports/metadata-store.js";
-import type { NewRoot } from "../ports/types.js";
+import {
+  MEMORY_LIST_DEFAULT_LIMIT,
+  MEMORY_LIST_MAX_LIMIT,
+  type MemoryFilter,
+  type MetadataStore,
+} from "../ports/metadata-store.js";
+import type { NewMemory, NewRoot } from "../ports/types.js";
 
 /** 每個測試都要拿到全新、獨立的實例（暫存目錄或 :memory:）。 */
 export type MetadataStoreFactory = () => MetadataStore | Promise<MetadataStore>;
@@ -16,6 +21,19 @@ function rootInput(overrides: Partial<NewRoot> = {}): NewRoot {
     exclude: ["**/node_modules/**"],
     respectGitignore: true,
     watch: false,
+    ...overrides,
+  };
+}
+
+/** 記憶的測試資料（只覆寫關心的欄位）。 */
+function memoryInput(overrides: Partial<NewMemory> = {}): NewMemory {
+  return {
+    content: "契約測試記憶",
+    kind: "fact",
+    scope: "global",
+    project: null,
+    agent: "contract-agent",
+    supersedes: null,
     ...overrides,
   };
 }
@@ -286,5 +304,102 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       expect(await store.searchKeyword("文字", {}, 0)).toEqual([]);
       expect(await store.searchKeyword("   ", {}, 10)).toEqual([]);
       expect(await store.searchKeyword("，。！", {}, 10)).toEqual([]);
-    });  });
+    });
+
+    it("listMemories 列出未刪除的記憶，createdAt 由新到舊", async () => {
+      const first = await store.addMemory(memoryInput({ content: "第一筆記憶" }));
+      const second = await store.addMemory(memoryInput({ content: "第二筆記憶" }));
+      const third = await store.addMemory(memoryInput({ content: "第三筆記憶" }));
+
+      const listed = await store.listMemories();
+      // 同一毫秒內新增時以 id 由大到小決勝，因此等於反向的插入順序。
+      expect(listed.map((memory) => memory.id)).toEqual([third.id, second.id, first.id]);
+
+      const times = listed.map((memory) => Date.parse(memory.createdAt));
+      for (let index = 1; index < times.length; index += 1) {
+        expect(times[index - 1]!).toBeGreaterThanOrEqual(times[index]!);
+      }
+
+      // 回傳的是完整的 Memory（欄位與 addMemory 的回傳一致）。
+      expect(listed[0]).toEqual(third);
+      expect(listed[0]?.deletedAt).toBeNull();
+    });
+
+    it("listMemories 不列出軟刪除與被取代的記憶", async () => {
+      const kept = await store.addMemory(memoryInput({ content: "保留的記憶" }));
+      const forgotten = await store.addMemory(memoryInput({ content: "要忘掉的記憶" }));
+      const replaced = await store.addMemory(memoryInput({ content: "被取代的舊記憶" }));
+      const replacement = await store.addMemory(
+        memoryInput({ content: "取代後的新記憶", supersedes: replaced.id }),
+      );
+
+      await store.forgetMemory(forgotten.id);
+
+      const listed = await store.listMemories();
+      const ids = listed.map((memory) => memory.id);
+      expect(ids).toEqual([replacement.id, kept.id]);
+      expect(ids).not.toContain(forgotten.id);
+      expect(ids).not.toContain(replaced.id);
+      // 軟刪除的資料仍在（只是不列出）。
+      expect((await store.getMemory(forgotten.id))?.deletedAt).not.toBeNull();
+    });
+
+    it("listMemories 的 filter 各自生效，且可組合", async () => {
+      const m1 = await store.addMemory(
+        memoryInput({ content: "m1", kind: "fact", scope: "global", project: null, agent: "agent-1" }),
+      );
+      const m2 = await store.addMemory(
+        memoryInput({ content: "m2", kind: "decision", scope: "project", project: "proj-1", agent: "agent-1" }),
+      );
+      const m3 = await store.addMemory(
+        memoryInput({ content: "m3", kind: "pitfall", scope: "project", project: "proj-2", agent: "agent-2" }),
+      );
+      const m4 = await store.addMemory(
+        memoryInput({ content: "m4", kind: "fact", scope: "agent", project: null, agent: "agent-2" }),
+      );
+
+      const ids = async (filter: MemoryFilter): Promise<number[]> =>
+        (await store.listMemories(filter)).map((memory) => memory.id);
+
+      expect(await ids({ kind: "fact" })).toEqual([m4.id, m1.id]);
+      expect(await ids({ scope: "project" })).toEqual([m3.id, m2.id]);
+      expect(await ids({ scope: "global" })).toEqual([m1.id]);
+      expect(await ids({ project: "proj-1" })).toEqual([m2.id]);
+      expect(await ids({ project: "proj-none" })).toEqual([]);
+      expect(await ids({ agent: "agent-1" })).toEqual([m2.id, m1.id]);
+      expect(await ids({ agent: "agent-2", kind: "pitfall" })).toEqual([m3.id]);
+      expect(await ids({ agent: "agent-2", kind: "decision" })).toEqual([]);
+      expect(await ids({ project: "proj-2", scope: "global" })).toEqual([]);
+      // 未指定的欄位＝不過濾
+      expect(await ids({})).toHaveLength(4);
+    });
+
+    it("listMemories 的 limit：預設 100、指定生效、上限 500、<= 0 回傳空清單", async () => {
+      const created: number[] = [];
+      for (let index = 0; index < 105; index += 1) {
+        const memory = await store.addMemory(memoryInput({ content: `大量記憶 ${index}` }));
+        created.push(memory.id);
+      }
+
+      // 預設 100
+      expect(await store.listMemories()).toHaveLength(MEMORY_LIST_DEFAULT_LIMIT);
+      // 指定生效，且仍是最新的在前
+      expect((await store.listMemories({ limit: 3 })).map((memory) => memory.id)).toEqual(created.slice(-3).reverse());
+      expect(await store.listMemories({ limit: 105 })).toHaveLength(105);
+      // 超過上限夾到 500（資料只有 105 筆，因此只驗證不會出錯且拿到全部）
+      expect(await store.listMemories({ limit: 10_000 })).toHaveLength(105);
+      // 非正整數 → 空清單
+      expect(await store.listMemories({ limit: 0 })).toEqual([]);
+      expect(await store.listMemories({ limit: -5 })).toEqual([]);
+      expect(await store.listMemories({ limit: 1.5 })).toEqual([]);
+    });
+
+    it("listMemories 的 limit 上限真的夾在 500", async () => {
+      for (let index = 0; index < MEMORY_LIST_MAX_LIMIT + 5; index += 1) {
+        await store.addMemory(memoryInput({ content: `超量記憶 ${index}` }));
+      }
+      expect(await store.listMemories({ limit: MEMORY_LIST_MAX_LIMIT + 1000 })).toHaveLength(MEMORY_LIST_MAX_LIMIT);
+      expect(await store.listMemories()).toHaveLength(MEMORY_LIST_DEFAULT_LIMIT);
+    });
+  });
 }
