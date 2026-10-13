@@ -1,0 +1,27 @@
+{
+  "name": "mnemoshelf-spike-search-storage",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Spike：M1 預設儲存驗證（SQLite 驅動 × sqlite-vec × 中文 FTS × 混合排序 × 規模）",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "drivers": "node scripts/drivers.mjs",
+    "eval": "node scripts/eval.mjs",
+    "scale": "node scripts/scale.mjs",
+    "wal": "node scripts/wal.mjs",
+    "test": "node --test",
+    "all": "node scripts/drivers.mjs && node scripts/eval.mjs && node scripts/scale.mjs && node scripts/wal.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3",
+    "sqlite-vec": "0.1.9"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3"
+    ]
+  }
+}

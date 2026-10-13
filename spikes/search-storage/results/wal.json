@@ -1,0 +1,43 @@
+{
+  "date": "2026-10-13",
+  "versions": {
+    "node": "v22.23.2",
+    "betterSqlite3": "13.0.3",
+    "sqliteVec": "0.1.9",
+    "sqliteVecPlatformBinary": "linux-x64@0.1.9",
+    "sqlite": "3.53.4"
+  },
+  "journalMode": "wal",
+  "writer": {
+    "event": "writer-done",
+    "written": 22400,
+    "busyErrors": 0
+  },
+  "reader": {
+    "event": "reader-done",
+    "queries": 486,
+    "errors": [],
+    "errorCount": 0,
+    "vecQueries": 486,
+    "vecErrors": [],
+    "vecErrorCount": 0,
+    "readLatencyMs": {
+      "p50": 0.3,
+      "p95": 1.7,
+      "max": 2.78
+    },
+    "snapshot": {
+      "before": 21100,
+      "duringAfterWait": 21100,
+      "sameSnapshot": true,
+      "afterCommit": 22500
+    }
+  },
+  "finalRowCount": 22500,
+  "walSizeDuringWrite": 4177712,
+  "conclusion": {
+    "readerQueriesSucceeded": true,
+    "writerBusyErrors": 0,
+    "snapshotIsolated": true
+  }
+}

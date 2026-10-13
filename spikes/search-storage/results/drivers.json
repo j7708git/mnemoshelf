@@ -1,0 +1,99 @@
+{
+  "date": "2026-10-13",
+  "environment": {
+    "node": "v22.23.2",
+    "platform": "linux",
+    "arch": "x64",
+    "cpus": 12,
+    "installed": {
+      "node": "v22.23.2",
+      "betterSqlite3": "13.0.3",
+      "sqliteVec": "0.1.9",
+      "sqliteVecPlatformBinary": "linux-x64@0.1.9"
+    }
+  },
+  "drivers": [
+    {
+      "driver": "better-sqlite3",
+      "sqliteVersion": "3.53.4",
+      "vecVersion": {
+        "call": "v0.1.9"
+      },
+      "loadablePathHasHome": true,
+      "loadablePathKind": "sqlite-vec getLoadablePath()",
+      "vecKnn": [
+        {
+          "id": 2,
+          "distance": 0
+        },
+        {
+          "id": 3,
+          "distance": 1
+        }
+      ],
+      "fts5": {
+        "unicode61": {
+          "available": true,
+          "matches": {
+            "儲存介面": 0,
+            "儲存": 0,
+            "root": 1,
+            "向量": 0
+          }
+        },
+        "trigram": {
+          "available": true,
+          "matches": {
+            "儲存介面": 1,
+            "儲存": 0,
+            "root": 1,
+            "向量": 0
+          }
+        }
+      }
+    },
+    {
+      "driver": "node:sqlite",
+      "sqliteVersion": "3.51.3",
+      "vecVersion": {
+        "call": "v0.1.9"
+      },
+      "loadablePathHasHome": true,
+      "loadablePathKind": "sqlite-vec getLoadablePath()",
+      "vecKnn": [
+        {
+          "id": 2,
+          "distance": 0
+        },
+        {
+          "id": 3,
+          "distance": 1
+        }
+      ],
+      "fts5": {
+        "unicode61": {
+          "available": true,
+          "matches": {
+            "儲存介面": 0,
+            "儲存": 0,
+            "root": 1,
+            "向量": 0
+          }
+        },
+        "trigram": {
+          "available": true,
+          "matches": {
+            "儲存介面": 1,
+            "儲存": 0,
+            "root": 1,
+            "向量": 0
+          }
+        }
+      }
+    }
+  ],
+  "nodeSqliteAllowExtension": {
+    "withoutAllowExtension": "extension loading is not allowed",
+    "withAllowExtension": "/nonexistent.so.so: cannot open shared object file: No such file or directory"
+  }
+}
