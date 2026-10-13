@@ -1,0 +1,33 @@
+{
+  "name": "@mnemoshelf/embedder-transformers",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mnemoshelf embedder：以 @huggingface/transformers（ONNX）實作多模態 Embedder（EmbeddingGemma 2）",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "e2e": "pnpm --filter @mnemoshelf/core run build && tsc -p tsconfig.e2e.json && node out/scripts/e2e.js"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.3.1",
+    "@mnemoshelf/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
