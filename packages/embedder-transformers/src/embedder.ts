@@ -160,6 +160,11 @@ async function runModel(modelId: string, model: GemmaModel, inputs: unknown): Pr
  *
  * lazy 載入：建構子不載模型；第一次 `embed*`／`probe()` 才載。`info` 不依賴模型，建構後即可同步讀取。
  * `dispose()` 後再呼叫 `embed*` 會**自動重新載入**（本實作選擇「自動重新載入」，見測試與註解）。
+ *
+ * 已知限制：`loadModel()` 進行中呼叫 `dispose()` 時，進行中的載入完成後才會實際釋放
+ * （`this.loaded` 在載入完成時設定）。此競態視窗為刻意接受：本專案架構為單一寫入者行程，
+ * 「載入中 dispose」不會發生於正常生命週期；若未來需要嚴格即時釋放，以載入代數（generation
+ * token）在完成時比對後再決定是否保留。
  */
 export class TransformersEmbedder implements Embedder {
   readonly info: EmbedderInfo;

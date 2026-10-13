@@ -6,7 +6,7 @@
  *
  * 兩張圖刻意在形狀與顏色上明顯不同（藍色實心方塊 vs 綠色實心三角形），
  * 對應 M0 spike 驗證過的「低 soft token 預算仍能區分」概念；形狀組合是實測挑出
- * （見 createProbeImages 的註解）：最小邊界 0.156，對 0.132 的門檻有足夠餘裕。
+ * （見 createProbeImages 的註解）：最小邊界 0.155，對 0.132 的門檻有足夠餘裕。
  */
 import { deflateSync } from "node:zlib";
 import type { ImageInput } from "@mnemoshelf/core";
@@ -149,7 +149,7 @@ export interface SyntheticProbeImage {
  *
  * 這組形狀是實測挑出來的：M0 spike 用過的「紅色圓 vs 藍色方塊」在 q4／512 維下
  * 邊界只有 0.131，剛好低於門檻；改成「方塊 vs 三角形」（形狀差異更明顯）後，
- * 實測最小邊界 0.156（見 e2e 報告），對 0.132 的門檻有足夠餘裕。
+ * 實測最小邊界 0.155（見 e2e 報告），對 0.132 的門檻有足夠餘裕。
  */
 export function createProbeImages(size = 256): SyntheticProbeImage[] {
   const square = makeCanvas(size);
