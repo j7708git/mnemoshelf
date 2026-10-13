@@ -22,6 +22,20 @@ test("segmentWords：中文斷詞後以空白連接", () => {
   assert.ok(out.includes("向量"));
 });
 
+test("segmentWords：空字串與全標點回傳空、中英混合兩側都保留", () => {
+  assert.equal(segmentWords(""), "");
+  assert.equal(segmentWords("。。。！！！"), "");
+  const mixed = segmentWords("用 sqlite-vec 做向量檢索");
+  assert.ok(mixed.includes("sqlite-vec") || mixed.includes("sqlite"), `English side missing: ${mixed}`);
+  assert.ok(mixed.includes("向量"), `Chinese side missing: ${mixed}`);
+});
+
+test("bigrams：空字串與單一中文字不產生額外輸出", () => {
+  assert.equal(bigrams(""), "");
+  assert.equal(bigrams("向量"), "向量");
+  assert.equal(bigrams("向量檢索"), "向量 量檢 檢索");
+});
+
 test("queryBucket：依去空白字元數分組", () => {
   assert.equal(queryBucket("儲存"), "<=2");
   assert.equal(queryBucket("向量檢索"), "3-6");
