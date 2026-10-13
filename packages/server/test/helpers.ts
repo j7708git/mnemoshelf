@@ -4,6 +4,7 @@
  * 一律使用 `os.tmpdir()` 下的合成資料，結束後刪除；不讀取任何使用者檔案。
  */
 import { promises as fs } from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { type Embedder, type EmbedderInfo, type ImageInput, type ProbeResult } from "@mnemoshelf/core";
@@ -142,4 +143,45 @@ export async function api(
 export function errorName(body: unknown): string {
   const record = body as { error?: { name?: unknown } } | null;
   return typeof record?.error?.name === "string" ? record.error.name : "";
+}
+
+/**
+ * 直接以 TCP socket 送**原始** HTTP 請求。
+ *
+ * 為什麼不用 `fetch`：畸形 request-target（`//[`、`/%`）在客戶端就會被 `new URL` 或
+ * fetch 自己拒絕，送不出去；要驗證伺服器端行為只能自己寫 bytes。
+ */
+export async function rawHttpRequest(
+  port: number,
+  requestTarget: string,
+  options: { method?: string; host?: string; headers?: Record<string, string> } = {},
+): Promise<{ status: number; statusLine: string; body: string }> {
+  const method = options.method ?? "GET";
+  const host = options.host ?? "127.0.0.1";
+  const extra = Object.entries(options.headers ?? {})
+    .map(([name, value]) => `${name}: ${value}\r\n`)
+    .join("");
+  const head = `${method} ${requestTarget} HTTP/1.1\r\nHost: ${host}\r\n${extra}Connection: close\r\n\r\n`;
+
+  return await new Promise((resolve, reject) => {
+    const socket = net.connect({ host: "127.0.0.1", port }, () => {
+      socket.write(head);
+    });
+    let data = "";
+    socket.setEncoding("utf8");
+    socket.setTimeout(5000);
+    socket.on("data", (chunk: string) => {
+      data += chunk;
+    });
+    socket.on("timeout", () => {
+      socket.destroy();
+      reject(new Error("rawHttpRequest 逾時"));
+    });
+    socket.on("error", reject);
+    socket.on("close", () => {
+      const statusLine = data.split("\r\n")[0] ?? "";
+      const status = Number(statusLine.split(" ")[1]);
+      resolve({ status: Number.isFinite(status) ? status : 0, statusLine, body: data });
+    });
+  });
 }

@@ -13,13 +13,14 @@ import {
   errorName,
   makeFixtureRoot,
   NOTE_TOKEN,
+  rawHttpRequest,
   removeTempDir,
   SlowEmbedder,
   startTestServer,
   TEST_TOKEN,
   type TestServer,
 } from "./helpers.js";
-import type { IndexRootResponse, ListMemoriesResponse } from "../src/index.js";
+import { MAX_REQUEST_URL_LENGTH, type IndexRootResponse, type ListMemoriesResponse } from "../src/index.js";
 import type { RootPreview } from "@mnemoshelf/core";
 
 let server: TestServer | undefined;
@@ -377,6 +378,76 @@ describe("REST：記憶", () => {
     const noToken = await api(server.instance, "GET", "/memories", { token: null });
     expect(noToken.status).toBe(401);
     expect(errorName(noToken.body)).toBe("UnauthorizedError");
+  });
+});
+
+describe("REST：畸形 request-target 不會打掛服務", () => {
+  it("`//[` → 400 InvalidRequestUrlError，服務仍存活", async () => {
+    server = await startTestServer();
+
+    const response = await rawHttpRequest(server.instance.port, "//[");
+    expect(response.status).toBe(400);
+    expect(response.body).toContain("InvalidRequestUrlError");
+    // 訊息不含原始 URL 的不可信內容
+    expect(response.body).not.toContain("//[");
+
+    // 服務仍存活：後續正常請求照常
+    expect((await api(server.instance, "GET", "/health", { token: null })).status).toBe(200);
+    expect((await api(server.instance, "GET", "/roots")).status).toBe(200);
+  });
+
+  it("`/%`（壞掉的百分比編碼）→ 400，服務仍存活", async () => {
+    server = await startTestServer();
+
+    const response = await rawHttpRequest(server.instance.port, "/%");
+    expect(response.status).toBe(400);
+    expect(response.body).toContain("InvalidRequestUrlError");
+
+    expect((await api(server.instance, "GET", "/health", { token: null })).status).toBe(200);
+  });
+
+  it("超長路徑 → 414，服務仍存活；邊界值仍可路由", async () => {
+    server = await startTestServer();
+
+    const tooLong = `/${"a".repeat(10 * 1024)}`;
+    const response = await rawHttpRequest(server.instance.port, tooLong);
+    expect(response.status).toBe(414);
+    expect(response.body).toContain("RequestUriTooLongError");
+
+    // 剛好在限制內：不是 414，而是一般的未知路徑 404（帶 token 才看得到 404）
+    const atLimit = `/${"a".repeat(MAX_REQUEST_URL_LENGTH - 1)}`;
+    const routed = await rawHttpRequest(server.instance.port, atLimit, {
+      headers: { authorization: `Bearer ${TEST_TOKEN}` },
+    });
+    expect(routed.status).toBe(404);
+    // 超過一個 byte：414
+    const overLimit = `/${"a".repeat(MAX_REQUEST_URL_LENGTH)}`;
+    expect((await rawHttpRequest(server.instance.port, overLimit)).status).toBe(414);
+
+    expect((await api(server.instance, "GET", "/health", { token: null })).status).toBe(200);
+  });
+
+  it("畸形請求不影響後續正常請求（含寫入與搜尋）", async () => {
+    server = await startTestServer();
+
+    for (const target of ["//[", "/%", `/${"b".repeat(9000)}`]) {
+      const response = await rawHttpRequest(server.instance.port, target);
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect(response.status).toBeLessThan(500);
+    }
+
+    // 完整流程照常：加 root → index → search
+    const dir = await fixture();
+    const created = await api(server.instance, "POST", "/roots", {
+      body: { path: dir, modalities: ["text", "code", "image"] },
+    });
+    expect(created.status).toBe(201);
+    const root = created.body as { id: number };
+    expect((await api(server.instance, "POST", `/roots/${root.id}/index`)).status).toBe(200);
+
+    const found = await api(server.instance, "POST", "/search", { body: { query: NOTE_TOKEN } });
+    expect(found.status).toBe(200);
+    expect((found.body as { hits: unknown[] }).hits.length).toBeGreaterThan(0);
   });
 });
 

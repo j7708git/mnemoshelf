@@ -96,3 +96,27 @@ export class PayloadTooLargeError extends Error {
     this.name = "PayloadTooLargeError";
   }
 }
+
+/**
+ * 請求目標（request-target）無法解析（HTTP 400）。
+ *
+ * 刻意**不帶原始 URL**：那是不可信的輸入，不該出現在回應裡（也不該進 log 的訊息欄）。
+ * `reason` 只放固定的原因描述。
+ */
+export class InvalidRequestUrlError extends Error {
+  constructor(reason: string) {
+    super(`無法解析請求 URL：${reason}`);
+    this.name = "InvalidRequestUrlError";
+  }
+}
+
+/** 請求 URL 過長（HTTP 414）。 */
+export class RequestUriTooLongError extends Error {
+  readonly limit: number;
+
+  constructor(limit: number) {
+    super(`請求 URL 過長（上限 ${limit} bytes）`);
+    this.name = "RequestUriTooLongError";
+    this.limit = limit;
+  }
+}

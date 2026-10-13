@@ -39,7 +39,7 @@ MNEMOSHELF_TOKEN=<你的-token> pnpm --filter @mnemoshelf/server run serve
 | 方法與路徑 | 說明 |
 |---|---|
 | `GET /health` | 探活（免 token） |
-| `POST /roots` | 加入 root：`{path, mode?, modalities?, include?, exclude?, respectGitignore?, maxFileBytes?}` |
+| `POST /roots` | 加入 root：`{path, mode?, modalities?, include?, exclude?, respectGitignore?, maxFileBytes?}`；`maxFileBytes` **只存活於本次行程**（見下） |
 | `GET /roots`、`GET /roots/:id` | 列出／取得 root |
 | `DELETE /roots/:id?deleteData=1` | 移除 root；`deleteData=1` 時一併刪除 chunk 與向量 |
 | `POST /roots/:id/preview` | 乾跑統計（不寫入任何狀態） |
@@ -50,10 +50,22 @@ MNEMOSHELF_TOKEN=<你的-token> pnpm --filter @mnemoshelf/server run serve
 | `DELETE /memories/:id` | 軟刪除記憶 |
 
 狀態碼：`401` token 錯、`403` 路徑不在 root 內或命中黑名單、`404` 未知資源、`409` 重複 root／索引進行中、
-`422` root 過寬（家目錄或檔案系統根）、`400` 請求內容不合法。
+`422` root 過寬（家目錄或檔案系統根）、`400` 請求內容或請求 URL 不合法、`414` 請求 URL 過長。
 
 搜尋回應的每個命中都帶**來源**（chunk：`rootId`／`relPath`／`seq`／`kind`；memory：`agent`／`scope`），
 文字片段有長度上限並以 `textTruncated` 標記。
+
+### `mode` 預設值的現況（可能改變）
+
+`hybrid` 是**現行預設**，但 M1 整體驗收資料顯示 **`vector` 單獨表現較佳**（樣本小、且為 tester 自評的相關性，
+不是嚴謹的評測結論）。M2 會以更大的查詢集複測並修訂契約，因此**預設值可能改變**；需要固定行為的呼叫端
+請明確帶 `mode`。
+
+### `maxFileBytes` 的生命週期
+
+`POST /roots` 的 `maxFileBytes` **只存活於本次行程**：`Root` 契約沒有這個欄位，因此不會寫進資料庫，
+服務重啟後就回退 indexer 的預設單檔上限（10 MB），**重新索引前需要重新設定**（`POST /roots/:id/index`
+本身不接受此參數，`preview`／`index` 沿用加入時的值）。要持久化需新增 migration 與契約變更，列入未來議題。
 
 ## MCP 入口
 
@@ -75,6 +87,7 @@ MNEMOSHELF_E2E=1 pnpm --filter @mnemoshelf/server run e2e   # 真實 embedder（
 
 ## 目前限制
 
+- `maxFileBytes` 只存活於本次行程，重啟後回退預設 10 MB（見上）。
 - 沒有 watch／檔案監看、沒有 WebSocket／SSE 進度串流、沒有多使用者或角色。
 - root 的 `agentAccess` 欄位本版尚未做內容級過濾。
 - 索引沒有佇列：進行中再呼叫會回 `409`。

@@ -133,16 +133,25 @@ export { LOOPBACK_HOST, loadMcpConfig, loadServerConfig } from "./config.js";
 export type { McpConfig, ServerConfig } from "./config.js";
 export {
   IndexInProgressError,
+  InvalidRequestUrlError,
   MethodNotAllowedError,
   MissingMcpConfigError,
   MissingTokenError,
   NonLoopbackRequestError,
   NotFoundError,
   PayloadTooLargeError,
+  RequestUriTooLongError,
   UnauthorizedError,
   ValidationError,
 } from "./errors.js";
-export { createRestApp, MAX_JSON_BODY_BYTES, MAX_MEMORY_CHARS, toHttpError } from "./http/app.js";
+export {
+  createRestApp,
+  MAX_JSON_BODY_BYTES,
+  MAX_MEMORY_CHARS,
+  MAX_REQUEST_URL_LENGTH,
+  parseRequestTarget,
+  toHttpError,
+} from "./http/app.js";
 export type {
   AddRootRequest,
   ErrorResponse,

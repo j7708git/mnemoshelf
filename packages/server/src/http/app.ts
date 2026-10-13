@@ -41,10 +41,12 @@ import {
 import { LOOPBACK_HOST } from "../config.js";
 import {
   IndexInProgressError,
+  InvalidRequestUrlError,
   MethodNotAllowedError,
   NotFoundError,
   NonLoopbackRequestError,
   PayloadTooLargeError,
+  RequestUriTooLongError,
   UnauthorizedError,
   ValidationError,
 } from "../errors.js";
@@ -55,6 +57,14 @@ import { unifiedSearch, type SearchMode, type UnifiedSearchResult } from "../sea
 export const MAX_JSON_BODY_BYTES = 1024 * 1024;
 /** 單筆記憶內容長度上限（契約未明定，由本實作決定的濫用防護）。 */
 export const MAX_MEMORY_CHARS = 8000;
+/**
+ * 請求 URL（request-target）長度上限。
+ *
+ * 為什麼需要：request-target 會被切成路徑片段並逐段 `decodeURIComponent`，長度不設限就是
+ * 一條免認證的記憶體／CPU 放大路徑（Node 的 HTTP parser 上限約 16 KB，仍遠大於實際需求）。
+ * 超過者回 414，不進路由。
+ */
+export const MAX_REQUEST_URL_LENGTH = 8 * 1024;
 
 const MODALITIES: readonly Modality[] = ["text", "code", "image", "audio", "video"];
 const MEMORY_KINDS: readonly MemoryKind[] = ["fact", "decision", "pitfall", "preference"];
@@ -68,7 +78,7 @@ export interface AddRootRequest {
   include?: string[];
   exclude?: string[];
   respectGitignore?: boolean;
-  /** 單檔大小上限；`Root` 契約沒有此欄位，因此只存在行程內（見回報）。 */
+  /** 單檔大小上限；`Root` 契約沒有此欄位，因此只存在行程內，重啟後回退預設 10 MB（見 README）。 */
   maxFileBytes?: number;
 }
 
@@ -148,6 +158,10 @@ export function toHttpError(error: unknown): { status: number; body: ErrorRespon
   if (error instanceof ValidationError) return { status: 400, body: named(error.name, error.message), headers: {} };
   if (error instanceof IndexInProgressError) return { status: 409, body: named(error.name, error.message), headers: {} };
   if (error instanceof PayloadTooLargeError) return { status: 413, body: named(error.name, error.message), headers: {} };
+  if (error instanceof InvalidRequestUrlError) return { status: 400, body: named(error.name, error.message), headers: {} };
+  if (error instanceof RequestUriTooLongError) {
+    return { status: 414, body: named(error.name, error.message), headers: {} };
+  }
   if (error instanceof MethodNotAllowedError) {
     return { status: 405, body: named(error.name, error.message), headers: { allow: error.allowed.join(", ") } };
   }
@@ -256,9 +270,47 @@ function queryLimit(value: string | null): number | undefined {
   return parsed;
 }
 
+/**
+ * 解析 request-target（`request.url`）成 `URL` 與路徑片段。
+ *
+ * **必須在 `try` 內呼叫**：`new URL()` 對畸形目標（例如 `//[`，Node 的 HTTP parser 會照常
+ * 交給 handler）會丟 `TypeError: Invalid URL`；而 handler 是同步的 request listener，
+ * 未捕捉的例外會直接結束整個行程（單一寫入者服務，等於免認證的 DoS）。
+ * 解析失敗一律轉成具名錯誤（400／414），訊息不含原始 URL 的內容。
+ */
+export function parseRequestTarget(request: IncomingMessage): { url: URL; segments: string[] } {
+  const raw = request.url ?? "/";
+  if (Buffer.byteLength(raw, "utf8") > MAX_REQUEST_URL_LENGTH) {
+    throw new RequestUriTooLongError(MAX_REQUEST_URL_LENGTH);
+  }
+
+  let url: URL;
+  try {
+    url = new URL(raw, `http://${LOOPBACK_HOST}`);
+  } catch {
+    throw new InvalidRequestUrlError("格式不正確");
+  }
+
+  const segments: string[] = [];
+  for (const segment of url.pathname.split("/")) {
+    if (segment.length === 0) continue;
+    try {
+      segments.push(decodeURIComponent(segment));
+    } catch {
+      // 百分比編碼壞掉（例如 `/%`）：這是畸形的 request-target，不當成一般路徑放行。
+      throw new InvalidRequestUrlError("百分比編碼無法解碼");
+    }
+  }
+
+  return { url, segments };
+}
+
 export function createRestApp(deps: RestAppDeps): RestApp {
   const homeDir = deps.homeDir ?? homedir();
-  /** 行程內的每 root 單檔大小上限（`Root` 契約無此欄位，重啟即失）。 */
+  /**
+   * 行程內的每 root 單檔大小上限（`Root` 契約無此欄位，重啟即失、回退 indexer 預設 10 MB）。
+   * 這是刻意的取捨（PM 裁示：文件化，不持久化）；要持久化需 migration 與契約變更。
+   */
   const maxFileBytesByRoot = new Map<number, number>();
   const indexing = new Map<number, Promise<IndexRootResult>>();
   const inflight = new Set<Promise<unknown>>();
@@ -529,34 +581,35 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   };
 
   const handler = (request: IncomingMessage, response: ServerResponse): void => {
-    const url = new URL(request.url ?? "/", `http://${LOOPBACK_HOST}`);
-    const segments = url.pathname
-      .split("/")
-      .filter((segment) => segment.length > 0)
-      .map((segment) => {
-        try {
-          return decodeURIComponent(segment);
-        } catch {
-          return segment;
-        }
-      });
-
+    // 全部解析與路由都在 try 內：handler 是同步的 request listener，任何未捕捉的例外都會
+    // 直接結束行程（見 parseRequestTarget 的說明）。
     const task = (async (): Promise<void> => {
       try {
         requireLoopback(request);
+        const { url, segments } = parseRequestTarget(request);
         await dispatch(request, response, url, segments);
       } catch (error) {
         const mapped = toHttpError(error);
         if (mapped.status === 500) {
           console.error("[mnemoshelf] 未預期的錯誤：", error);
         }
-        if (response.destroyed || response.writableEnded) return;
-        if (!response.headersSent) sendJson(response, mapped.status, mapped.body, mapped.headers);
-        else response.end();
+        try {
+          if (response.destroyed || response.writableEnded) return;
+          if (!response.headersSent) sendJson(response, mapped.status, mapped.body, mapped.headers);
+          else response.end();
+        } catch (sendError) {
+          // 回應已寫不出去（對方斷線等）：吞掉並記錄，不讓它變成未處理的例外。
+          console.error("[mnemoshelf] 回應寫入失敗：", sendError);
+        }
       }
     })();
-    inflight.add(task);
-    void task.finally(() => inflight.delete(task));
+
+    // task 永不 reject：未處理的 rejection 在 Node 22 預設會結束行程，等於同一條崩潰路徑。
+    const settled = task.catch((error: unknown) => {
+      console.error("[mnemoshelf] 請求處理發生未預期的例外：", error);
+    });
+    inflight.add(settled);
+    void settled.finally(() => inflight.delete(settled));
   };
 
   return {
