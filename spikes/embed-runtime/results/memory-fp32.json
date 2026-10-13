@@ -1,0 +1,191 @@
+{
+  "dtype": "fp32",
+  "modalities": "text",
+  "date": "2026-10-13T07:01:06.873Z",
+  "node": "v22.23.2",
+  "platform": "linux 6.8.0-138-generic x64",
+  "loadAvg": [
+    13.72,
+    12.73,
+    11.24
+  ],
+  "perSentence": [
+    {
+      "id": "q_zh_travel",
+      "role": "query",
+      "tokens": 18,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 208.7
+    },
+    {
+      "id": "q_zh_sqlite",
+      "role": "query",
+      "tokens": 20,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 193.1
+    },
+    {
+      "id": "q_zh_park",
+      "role": "query",
+      "tokens": 19,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 214
+    },
+    {
+      "id": "q_zh_coffee",
+      "role": "query",
+      "tokens": 19,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 231.3
+    },
+    {
+      "id": "q_en_renew",
+      "role": "query",
+      "tokens": 21,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 184.5
+    },
+    {
+      "id": "q_code_sql",
+      "role": "query",
+      "tokens": 30,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 234.8
+    },
+    {
+      "id": "d_zh_travel",
+      "role": "document",
+      "tokens": 67,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 396
+    },
+    {
+      "id": "d_zh_sqlite",
+      "role": "document",
+      "tokens": 65,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 262.3
+    },
+    {
+      "id": "d_zh_park",
+      "role": "document",
+      "tokens": 63,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 380.6
+    },
+    {
+      "id": "d_zh_coffee",
+      "role": "document",
+      "tokens": 62,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 409.3
+    },
+    {
+      "id": "d_en_renew",
+      "role": "document",
+      "tokens": 41,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 384.1
+    },
+    {
+      "id": "d_code_typescript",
+      "role": "document",
+      "tokens": 70,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 554.4
+    }
+  ],
+  "sentenceMeanMs": 304.4,
+  "textBatchDims": [
+    12,
+    70
+  ],
+  "textDims": [
+    12,
+    768
+  ],
+  "samples": [
+    {
+      "stage": "start",
+      "ms": null,
+      "rssMiB": 87.6,
+      "heapUsedMiB": 13,
+      "externalMiB": 2.2,
+      "peakRssMiB": 87.6
+    },
+    {
+      "stage": "load (cache 已暖)",
+      "ms": 6406.3,
+      "rssMiB": 935.5,
+      "heapUsedMiB": 267.4,
+      "externalMiB": 13,
+      "peakRssMiB": 936.9
+    },
+    {
+      "stage": "text batch 12 句（max 70 token）",
+      "ms": 3665.3,
+      "rssMiB": 1121.7,
+      "heapUsedMiB": 269.5,
+      "externalMiB": 15.7,
+      "peakRssMiB": 1121.7
+    },
+    {
+      "stage": "12 句逐句平均 304.4 ms",
+      "ms": 304.4,
+      "rssMiB": 1134.1,
+      "heapUsedMiB": 270.6,
+      "externalMiB": 19.2,
+      "peakRssMiB": 1134.1
+    }
+  ],
+  "stages": [
+    {
+      "stage": "load (cache 已暖)",
+      "ms": 6406.3
+    },
+    {
+      "stage": "text batch 12 句（max 70 token）",
+      "ms": 3665.3
+    },
+    {
+      "stage": "12 句逐句平均 304.4 ms",
+      "ms": 304.4
+    }
+  ]
+}

@@ -1,0 +1,287 @@
+{
+  "dtype": "q8",
+  "modalities": "text+image",
+  "date": "2026-10-13T06:58:36.533Z",
+  "node": "v22.23.2",
+  "platform": "linux 6.8.0-138-generic x64",
+  "loadAvg": [
+    13.82,
+    12.04,
+    10.79
+  ],
+  "perSentence": [
+    {
+      "id": "q_zh_travel",
+      "role": "query",
+      "tokens": 18,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 774.6
+    },
+    {
+      "id": "q_zh_sqlite",
+      "role": "query",
+      "tokens": 20,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 622.2
+    },
+    {
+      "id": "q_zh_park",
+      "role": "query",
+      "tokens": 19,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 397.7
+    },
+    {
+      "id": "q_zh_coffee",
+      "role": "query",
+      "tokens": 19,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 497.2
+    },
+    {
+      "id": "q_en_renew",
+      "role": "query",
+      "tokens": 21,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 510.2
+    },
+    {
+      "id": "q_code_sql",
+      "role": "query",
+      "tokens": 30,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 478.8
+    },
+    {
+      "id": "d_zh_travel",
+      "role": "document",
+      "tokens": 67,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 874.6
+    },
+    {
+      "id": "d_zh_sqlite",
+      "role": "document",
+      "tokens": 65,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 1085.9
+    },
+    {
+      "id": "d_zh_park",
+      "role": "document",
+      "tokens": 63,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 859.2
+    },
+    {
+      "id": "d_zh_coffee",
+      "role": "document",
+      "tokens": 62,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 1126.3
+    },
+    {
+      "id": "d_en_renew",
+      "role": "document",
+      "tokens": 41,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 930.3
+    },
+    {
+      "id": "d_code_typescript",
+      "role": "document",
+      "tokens": 70,
+      "embedDims": [
+        1,
+        768
+      ],
+      "latencyMs": 1236.4
+    }
+  ],
+  "sentenceMeanMs": 782.8,
+  "textBatchDims": [
+    12,
+    70
+  ],
+  "textDims": [
+    12,
+    768
+  ],
+  "samples": [
+    {
+      "stage": "start",
+      "ms": null,
+      "rssMiB": 87.7,
+      "heapUsedMiB": 13,
+      "externalMiB": 2.2,
+      "peakRssMiB": 87.7
+    },
+    {
+      "stage": "load (cache 已暖)",
+      "ms": 5253.1,
+      "rssMiB": 423.2,
+      "heapUsedMiB": 267.6,
+      "externalMiB": 15.7,
+      "peakRssMiB": 424.6
+    },
+    {
+      "stage": "text batch 12 句（max 70 token）",
+      "ms": 4970.5,
+      "rssMiB": 790.9,
+      "heapUsedMiB": 269.7,
+      "externalMiB": 18.5,
+      "peakRssMiB": 790.9
+    },
+    {
+      "stage": "12 句逐句平均 782.8 ms",
+      "ms": 782.8,
+      "rssMiB": 888.9,
+      "heapUsedMiB": 270.8,
+      "externalMiB": 23,
+      "peakRssMiB": 888.9
+    },
+    {
+      "stage": "decode 6 images",
+      "ms": null,
+      "rssMiB": 902.7,
+      "heapUsedMiB": 265.5,
+      "externalMiB": 71.2,
+      "peakRssMiB": 902.7
+    },
+    {
+      "stage": "1 image first call (budget 70)",
+      "ms": 6939,
+      "rssMiB": 1036.8,
+      "heapUsedMiB": 140.5,
+      "externalMiB": 55.9,
+      "peakRssMiB": 1036.8
+    },
+    {
+      "stage": "1 image warm (budget 70)",
+      "ms": 4903.5,
+      "rssMiB": 1078.5,
+      "heapUsedMiB": 150.5,
+      "externalMiB": 78.7,
+      "peakRssMiB": 1078.5
+    },
+    {
+      "stage": "batch 4 images (budget 70)",
+      "ms": 15223.5,
+      "rssMiB": 1303.1,
+      "heapUsedMiB": 138.4,
+      "externalMiB": 127.7,
+      "peakRssMiB": 1303.1
+    },
+    {
+      "stage": "peak after budget 70 stage",
+      "ms": null,
+      "rssMiB": 1303.1,
+      "heapUsedMiB": 138.4,
+      "externalMiB": 127.7,
+      "peakRssMiB": 1303.1
+    },
+    {
+      "stage": "1 image first call (budget 280)",
+      "ms": 19380.2,
+      "rssMiB": 1363.5,
+      "heapUsedMiB": 137.3,
+      "externalMiB": 194.9,
+      "peakRssMiB": 1363.5
+    },
+    {
+      "stage": "1 image warm (budget 280)",
+      "ms": 19667.1,
+      "rssMiB": 1406.2,
+      "heapUsedMiB": 137.3,
+      "externalMiB": 233.6,
+      "peakRssMiB": 1406.2
+    },
+    {
+      "stage": "batch 4 images (budget 280)",
+      "ms": 71467.1,
+      "rssMiB": 2151.5,
+      "heapUsedMiB": 138,
+      "externalMiB": 374.1,
+      "peakRssMiB": 2151.5
+    },
+    {
+      "stage": "peak after budget 280 stage",
+      "ms": null,
+      "rssMiB": 2151.5,
+      "heapUsedMiB": 138,
+      "externalMiB": 374.1,
+      "peakRssMiB": 2151.5
+    }
+  ],
+  "stages": [
+    {
+      "stage": "load (cache 已暖)",
+      "ms": 5253.1
+    },
+    {
+      "stage": "text batch 12 句（max 70 token）",
+      "ms": 4970.5
+    },
+    {
+      "stage": "12 句逐句平均 782.8 ms",
+      "ms": 782.8
+    },
+    {
+      "stage": "1 image first call (budget 70)",
+      "ms": 6939
+    },
+    {
+      "stage": "1 image warm (budget 70)",
+      "ms": 4903.5
+    },
+    {
+      "stage": "batch 4 images (budget 70)",
+      "ms": 15223.5
+    },
+    {
+      "stage": "1 image first call (budget 280)",
+      "ms": 19380.2
+    },
+    {
+      "stage": "1 image warm (budget 280)",
+      "ms": 19667.1
+    },
+    {
+      "stage": "batch 4 images (budget 280)",
+      "ms": 71467.1
+    }
+  ]
+}

@@ -1,0 +1,99 @@
+{
+  "baseline": "fp32",
+  "generatedAt": "2026-10-13T07:20:43.424Z",
+  "dtypes": {
+    "q8": {
+      "text768": {
+        "count": 12,
+        "min": 0.9999171866132499,
+        "max": 0.9999670660329152,
+        "mean": 0.9999508161941327,
+        "worstItem": "d_en_renew"
+      },
+      "perDimension": {
+        "dim512": {
+          "count": 12,
+          "min": 0.999923125580265,
+          "max": 0.9999677690296809,
+          "mean": 0.9999525545020834,
+          "worstItem": "d_en_renew"
+        },
+        "dim256": {
+          "count": 12,
+          "min": 0.9999333900244268,
+          "max": 0.9999729063727155,
+          "mean": 0.9999583924089716,
+          "worstItem": "d_en_renew"
+        }
+      },
+      "worstRows": [
+        {
+          "id": "d_en_renew",
+          "cosine": 0.9999171866132499
+        },
+        {
+          "id": "d_zh_coffee",
+          "cosine": 0.9999295281142634
+        },
+        {
+          "id": "d_code_typescript",
+          "cosine": 0.9999468012604296
+        }
+      ],
+      "meta": {
+        "dtype": "q8",
+        "modalities": "text+image",
+        "cacheDir": "../../.tmp/hf-cache-q8",
+        "loadWallMs": 5737.2,
+        "rssAfterLoadMiB": 422.1
+      }
+    },
+    "q4": {
+      "text768": {
+        "count": 12,
+        "min": 0.9831868627010166,
+        "max": 0.9910896319485331,
+        "mean": 0.9865325986195518,
+        "worstItem": "d_code_typescript"
+      },
+      "perDimension": {
+        "dim512": {
+          "count": 12,
+          "min": 0.9844431488933109,
+          "max": 0.9915007000824015,
+          "mean": 0.9872073981773052,
+          "worstItem": "d_code_typescript"
+        },
+        "dim256": {
+          "count": 12,
+          "min": 0.9853401429853127,
+          "max": 0.9928051094544192,
+          "mean": 0.9886612210511511,
+          "worstItem": "d_zh_coffee"
+        }
+      },
+      "worstRows": [
+        {
+          "id": "d_code_typescript",
+          "cosine": 0.9831868627010166
+        },
+        {
+          "id": "d_en_renew",
+          "cosine": 0.9835937121277272
+        },
+        {
+          "id": "d_zh_coffee",
+          "cosine": 0.9838154459854004
+        }
+      ],
+      "meta": {
+        "dtype": "q4",
+        "modalities": "text+image",
+        "cacheDir": "../../.tmp/hf-cache-q4",
+        "loadWallMs": 6662.8,
+        "rssAfterLoadMiB": 556.6
+      }
+    }
+  },
+  "missing": []
+}

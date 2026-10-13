@@ -1,0 +1,27 @@
+{
+  "name": "mnemoshelf-spike-embed-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Spike：驗證 EmbeddingGemma 2（ONNX, transformers.js）在 Node CPU 上的文字+圖片 embedding 可行性與效能（Mnemoshelf M1 關卡）",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "assets": "node scripts/make-assets.mjs",
+    "bench": "node scripts/run-all.mjs",
+    "bench:q8": "node scripts/bench.mjs --dtype q8 --vision --label q8",
+    "bench:q4": "node scripts/bench.mjs --dtype q4 --vision --label q4",
+    "bench:fp32": "node scripts/bench.mjs --dtype fp32 --text-only --label fp32",
+    "compare": "node scripts/compare-dtypes.mjs",
+    "memory": "node scripts/bench-memory.mjs",
+    "bench:electron": "node scripts/bench-electron.mjs",
+    "llama:mmproj": "node scripts/llama-mmproj.mjs"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.3.1"
+  },
+  "devDependencies": {
+    "electron": "44.7.0"
+  }
+}

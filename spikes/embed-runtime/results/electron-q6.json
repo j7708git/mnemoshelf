@@ -1,0 +1,152 @@
+{
+  "generatedAt": "2026-10-13T06:45:58.208Z",
+  "electronBinary": "node_modules/electron/dist/electron",
+  "modes": {
+    "control-run-as-node": {
+      "status": 0,
+      "signal": null,
+      "timedOut": false,
+      "wallMs": 188,
+      "report": {
+        "ok": true,
+        "mode": "run-as-node",
+        "versions": {
+          "node": "24.21.0",
+          "acorn": "8.18.0",
+          "ada": "4.0.0",
+          "amaro": "1.1.11",
+          "ares": "1.34.8",
+          "brotli": "1.2.0",
+          "cldr": "48.0",
+          "icu": "78.2",
+          "llhttp": "9.4.3",
+          "merve": "1.2.2",
+          "modules": "149",
+          "napi": "10",
+          "nbytes": "0.1.4",
+          "ncrypto": "0.0.1",
+          "nghttp2": "1.70.0",
+          "nghttp3": "",
+          "ngtcp2": "",
+          "openssl": "0.0.0",
+          "simdjson": "4.6.7",
+          "simdutf": "7.7.0",
+          "sqlite": "3.53.4",
+          "tz": "2026d",
+          "undici": "7.29.1",
+          "unicode": "17.0",
+          "uv": "1.52.1",
+          "uvwasi": "0.0.23",
+          "v8": "15.2.124.28-electron.0",
+          "zlib": "1.3.2.1-motley",
+          "zstd": "1.6.0",
+          "electron": "44.7.0",
+          "chrome": "152.0.7977.130"
+        }
+      },
+      "stderrTail": "",
+      "stdoutTail": null
+    },
+    "control-main-process": {
+      "status": null,
+      "signal": "SIGTERM",
+      "timedOut": true,
+      "wallMs": 90109,
+      "report": null,
+      "stderrTail": "",
+      "stdoutTail": ""
+    },
+    "run-as-node": {
+      "status": 0,
+      "signal": null,
+      "timedOut": false,
+      "wallMs": 48313,
+      "report": {
+        "runtime": {
+          "electron": "44.7.0",
+          "node": "24.21.0",
+          "modules": "149"
+        },
+        "dtype": "q8",
+        "ok": true,
+        "steps": [
+          "load",
+          "text",
+          "image",
+          "probe"
+        ],
+        "errors": [],
+        "loadMs": 4849.8,
+        "rssAfterLoadMiB": 428.6,
+        "textDims": [
+          1,
+          768
+        ],
+        "textStats": {
+          "dim": 768,
+          "min": -0.2448319047689438,
+          "max": 0.30549758672714233,
+          "nan": 0,
+          "zeros": 0,
+          "l2": 0.9999998853380155
+        },
+        "imageDims": [
+          2,
+          768
+        ],
+        "imageStats": [
+          {
+            "dim": 768,
+            "min": -0.2779010832309723,
+            "max": 0.3311629891395569,
+            "nan": 0,
+            "zeros": 0,
+            "l2": 0.9999998262224407
+          },
+          {
+            "dim": 768,
+            "min": -0.3023264408111572,
+            "max": 0.34037482738494873,
+            "nan": 0,
+            "zeros": 0,
+            "l2": 1.000000440098191
+          }
+        ],
+        "simMatrix": [
+          {
+            "image": "cats.png",
+            "cats": 0.7366069355889291,
+            "circle": 0.5142970203372207
+          },
+          {
+            "image": "red_circle.png",
+            "cats": 0.4941496434082873,
+            "circle": 0.7072674871348663
+          }
+        ],
+        "catsTop1": true,
+        "circleTop1": true
+      },
+      "stderrTail": "\n(process:2626708): GLib-GObject-CRITICAL **: 14:40:17.184: g_object_unref: assertion 'G_IS_OBJECT (object)' failed\n\n(process:2626708): GLib-GObject-CRITICAL **: 14:40:17.184: g_object_unref: assertion 'G_IS_OBJECT (object)' failed\n\n(process:2626708): GLib-GObject-CRITICAL **: 14:40:17.184: g_object_unref: assertion 'G_IS_OBJECT (object)' failed\n\n(process:2626708): GLib-GObject-CRITICAL **: 14:40:17.184: g_object_unref: assertion 'G_IS_OBJECT (object)' failed\n\n(process:2626708): GLib-GObject-CRITICAL **: 14:40:17.184: g_object_ref: assertion 'G_IS_OBJECT (object)' failed\n\n(process:2626708): GLib-GObject-CRITICAL **: 14:40:17.184: g_object_ref: assertion 'G_IS_OBJECT (object)' failed\n\n(process:2626708): GLib-GObject-CRITICAL **: 14:40:17.184: g_object_unref: assertion 'G_IS_OBJECT (object)' failed\n\n(process:2626708): GLib-GObject-CRITICAL **: 14:40:17.184: g_object_unref: assertion 'G_IS_OBJECT (object)' failed\n\n(process:2626708): GLib-GObject-CRITICAL **: 14:40:17.184: g_object_unref: assertion 'G_IS_OBJECT (object)' failed\n\n(process:2626708): GLib-GObject-CRITICAL **: 14:40:17.184: g_object_ref: assertion 'G_IS_OBJECT (object)' failed\n\n(process:2626708): GLib-GObject-CRITICAL **: 14:40:17.184: g_object_unref: assertion 'G_IS_OBJECT (object)' failed\n\n(process:2626708): GLib-GObject-CRITICAL **: 14:40:17.288: g_object_unref: assertion 'G_IS_OBJECT (object)' failed\n",
+      "stdoutTail": null
+    },
+    "main-process": {
+      "status": null,
+      "signal": "SIGTERM",
+      "timedOut": true,
+      "wallMs": 150119,
+      "report": null,
+      "stderrTail": "(node:2627406) [SharpElectronLinux] Warning: Binaries provided by Electron for use on Linux may be incompatible with sharp - see https://sharp.pixelplumbing.com/install#electron-and-linux\n(Use `electron --trace-warnings ...` to show where the warning was created)\n",
+      "stdoutTail": ""
+    },
+    "main-process-display0": {
+      "status": null,
+      "signal": "SIGTERM",
+      "timedOut": true,
+      "wallMs": 150118,
+      "report": null,
+      "stderrTail": "(node:2629409) [SharpElectronLinux] Warning: Binaries provided by Electron for use on Linux may be incompatible with sharp - see https://sharp.pixelplumbing.com/install#electron-and-linux\n(Use `electron --trace-warnings ...` to show where the warning was created)\n",
+      "stdoutTail": ""
+    }
+  }
+}
