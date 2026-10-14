@@ -77,6 +77,23 @@ describe("Host header 驗證", () => {
     }
   });
 
+  it("`*.localhost`（RFC 6761）→ 200；只是含 localhost 字串的外部名稱仍 403", async () => {
+    server = await startTestServer();
+    for (const host of [
+      "openchamber-preview.localhost:57958",
+      "foo.localhost",
+      "OPENCHAMBER-PREVIEW.LOCALHOST:57958",
+    ]) {
+      const response = await get(server.instance, "/health", { host });
+      expect(response.status, `Host: ${host}`).toBe(200);
+    }
+    // 邊界：`.localhost` 本身（沒有標籤）與含 localhost 但不是該後綴的名稱一律 403。
+    for (const host of [".localhost", "notlocalhost", "evil.localhost.evil.example"]) {
+      const response = await get(server.instance, "/health", { host });
+      expect(response.status, `Host: ${host}`).toBe(403);
+    }
+  });
+
   it("Host 驗證在 API 與靜態路徑之前（不因路徑不同而放行）", async () => {
     server = await startTestServer();
     const api403 = await get(server.instance, "/roots", { host: "evil.example", token: TEST_TOKEN });

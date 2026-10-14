@@ -274,6 +274,25 @@ describe("GET /roots/:id/file：文字預覽與圖片位元組", () => {
   });
 });
 
+describe("path 含 NUL 位元組", () => {
+  it("`a%00b` → 400 ValidationError（entries 與 file 皆然，不是 500）", async () => {
+    server = await startTestServer();
+    const dir = await makeExplorerFixture();
+    const rootId = await addRoot(dir);
+
+    const entries = await api(server.instance, "GET", `/roots/${rootId}/entries?path=a%00b`);
+    expect(entries.status).toBe(400);
+    expect(errorName(entries.body)).toBe("ValidationError");
+
+    const file = await api(server.instance, "GET", `/roots/${rootId}/file?path=a%00b`);
+    expect(file.status).toBe(400);
+    expect(errorName(file.body)).toBe("ValidationError");
+
+    // 服務仍存活。
+    expect((await api(server.instance, "GET", "/health", { token: null })).status).toBe(200);
+  });
+});
+
 describe("GET /roots/:id/thumb：縮圖", () => {
   it("成功產生縮圖（PNG，寬度不超過上限）", async () => {
     server = await startTestServer();

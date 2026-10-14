@@ -25,9 +25,15 @@ export interface AddRootFlowProps {
   onCancel: () => void;
   /** 索引完成；帶回新加入的 root。 */
   onDone: (root: Root) => void;
+  /**
+   * `POST /roots` 成功後立即回呼（此時還沒預覽／索引）。
+   *
+   * 讓外層可以刷新側欄的 roots 清單，並把新 root 定入畫面；流程本身**不會**被關閉。
+   */
+  onRootCreated?: (root: Root) => void;
 }
 
-type Step = "input" | "preview" | "indexing" | "done" | "failed";
+type Step = "input" | "preview" | "preview-failed" | "indexing" | "done" | "failed";
 
 /** 被跳過的原因 → 中文標籤。 */
 const SKIP_REASON_LABEL: Record<string, string> = {
@@ -56,7 +62,7 @@ function skipSummary(skipped: RootPreview["skipped"]): { reason: string; count: 
   return [...counts.entries()].map(([reason, count]) => ({ reason, count }));
 }
 
-export function AddRootFlow({ onCancel, onDone }: AddRootFlowProps) {
+export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProps) {
   const [pathInput, setPathInput] = useState("");
   const [step, setStep] = useState<Step>("input");
   const [root, setRoot] = useState<Root | null>(null);
@@ -65,27 +71,49 @@ export function AddRootFlow({ onCancel, onDone }: AddRootFlowProps) {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  // onDone 用 ref 取用，避免它每次 render 改變就重啟輪詢。
+  // onDone／onRootCreated 用 ref 取用，避免它們每次 render 改變就重啟輪詢或重跑流程。
   const onDoneRef = useRef(onDone);
   onDoneRef.current = onDone;
+  const onRootCreatedRef = useRef(onRootCreated);
+  onRootCreatedRef.current = onRootCreated;
+
+  /** 對已加入的 root 做乾跑預覽；失敗時停在可重試的 `preview-failed`，不再回到輸入步驟。 */
+  const loadPreview = async (target: Root): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      const stats = await previewRoot(target.id);
+      setPreview(stats);
+      setStep("preview");
+    } catch (previewError) {
+      setError(previewError instanceof Error ? previewError.message : "讀取預覽統計失敗");
+      setStep("preview-failed");
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const submitPath = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     const target = pathInput.trim();
     if (target === "") return;
-    setBusy(true);
     setError(null);
+    setBusy(true);
+    let created: Root | null = null;
     try {
-      const created = await addRoot({ path: target });
-      const stats = await previewRoot(created.id);
-      setRoot(created);
-      setPreview(stats);
-      setStep("preview");
+      created = await addRoot({ path: target });
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "加入資料夾失敗");
-    } finally {
-      setBusy(false);
     }
+    if (created === null) {
+      setBusy(false);
+      return;
+    }
+    // 加入成功：先定入流程狀態並刷新側欄，之後即使預覽失敗也能正常「取消（移除）」。
+    setRoot(created);
+    onRootCreatedRef.current?.(created);
+    setBusy(false);
+    await loadPreview(created);
   };
 
   const cancel = async (): Promise<void> => {
@@ -237,6 +265,32 @@ export function AddRootFlow({ onCancel, onDone }: AddRootFlowProps) {
               className="rounded-md bg-ink px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
             >
               開始索引
+            </button>
+            <button
+              type="button"
+              onClick={() => void cancel()}
+              className="rounded-md border border-line px-3 py-2 text-sm text-ink"
+            >
+              取消（移除這個資料夾）
+            </button>
+          </div>
+        </div>
+      )}
+
+      {step === "preview-failed" && root !== null && (
+        <div className="space-y-3">
+          <p className="break-all font-mono text-xs text-muted">{root.path}</p>
+          <p role="alert" className="text-sm text-red-600">
+            {error ?? "讀取預覽統計失敗"}
+          </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => void loadPreview(root)}
+              disabled={busy}
+              className="rounded-md bg-ink px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+            >
+              {busy ? "重試中…" : "重試預覽"}
             </button>
             <button
               type="button"

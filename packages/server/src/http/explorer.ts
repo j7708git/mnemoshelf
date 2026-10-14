@@ -93,6 +93,8 @@ const ABSOLUTE_PATH_PATTERN = /^[\\/]|^[A-Za-z]:[\\/]/;
  * 解析並驗證 `path` 查詢參數。
  *
  * - 缺漏（null）→ `ValidationError`（400）；
+ * - 含 NUL 位元組（`\0`，例如查詢字串的 `a%00b`）→ `ValidationError`（400）——這是無效的
+ *   檔案路徑，若不擋會讓 `fs`／`path` 丟出非具名例外而變成 500；
  * - 絕對路徑（POSIX／Windows／UNC）→ `ValidationError`（400）——這是相對路徑參數，
  *   而且 `path.join(root, 絕對路徑)` 會把絕對路徑當成片段接在後面（不會逃脫），
  *   必須先明確拒絕，不能讓它變成「root 內一個奇怪檔名」。
@@ -102,6 +104,9 @@ const ABSOLUTE_PATH_PATTERN = /^[\\/]|^[A-Za-z]:[\\/]/;
  */
 export function parseRelativePath(raw: string | null, options: { allowEmpty: boolean }): string {
   if (raw === null) throw new ValidationError("path", "缺少 path 參數");
+  if (raw.includes("\0")) {
+    throw new ValidationError("path", "不得包含 NUL 位元組");
+  }
   if (ABSOLUTE_PATH_PATTERN.test(raw)) {
     throw new ValidationError("path", "必須是 root 內的相對路徑（不得為絕對路徑）");
   }

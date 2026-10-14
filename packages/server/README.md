@@ -45,9 +45,18 @@ MNEMOSHELF_TOKEN=<你的-token> pnpm --filter @mnemoshelf/server run serve
 - `MNEMOSHELF_WEB_DIR` 不存在時（還沒 build UI）靜態路徑回 404 JSON，**API 不受影響、不 crash**。
 
 **Host header 驗證**：所有請求（含 `/health` 與靜態檔）的 `Host` 必須是
-`127.0.0.1`／`localhost`／`[::1]`（可帶埠號），否則回 `403 InvalidHostError`。
+`127.0.0.1`／`localhost`／`[::1]`（可帶埠號），或以 `.localhost` 結尾的名稱
+（不分大小寫，可帶埠號，例如 `openchamber-preview.localhost:57958`），
+否則回 `403 InvalidHostError`。
 這是 DNS rebinding 的緩解——服務綁在 loopback 仍會被使用者瀏覽到的惡意網頁打進來。
 Vite dev server 用 `server.proxy` ＋ `changeOrigin: true` 對接（見 `packages/web/README.md`）。
+
+放行 `*.localhost` 的理由：RFC 6761 要求解析器把整個 `.localhost` 網域視為 loopback，
+現代瀏覽器也強制把 `*.localhost` 解析到 loopback，因此 DNS rebinding 無法把它導到攻擊者的
+主機。殘餘風險：在**不合規**的解析器環境（自訂了 `*.localhost` 的 DNS 記錄）理論上仍可被
+導向其他位址；此時最後一道防線仍是 `Authorization: Bearer <token>` 認證，以及服務只綁
+loopback、並對連線來源再做 `requireLoopback` 檢查。需要更嚴格的環境可自行縮回只接受
+`127.0.0.1`／`localhost`／`[::1]`。
 
 ## REST API
 

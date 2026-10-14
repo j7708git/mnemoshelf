@@ -1,7 +1,7 @@
 /**
  * TransformersEmbedder：以 `@huggingface/transformers`（ONNX）實作多模態 Embedder。
  *
- * 基線（M0 spike，project-notes/projects/mnemoshelf/research/spike-embed-runtime.md）：
+ * 基線（M0 可行性 spike 的本機實測結論）：
  *   - 模型 `onnx-community/embeddinggemma-2-ONNX`，`device:"cpu"`。
  *   - dtype 逐元件 `{ model:"q4", vision_encoder:"q4" }`（q4 最快、最小；q8／fp32 可設定）。
  *   - 原生 768 維；輸出截斷成 512 維後**重新 L2 正規化**。

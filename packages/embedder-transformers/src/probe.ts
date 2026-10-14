@@ -7,9 +7,8 @@
  *   2. 向量已 L2 正規化。
  *   3. 「圖片 vs 自己的描述」的相似度高於「他人最佳描述」，且差距達門檻。
  *
- * 門檻來源：M0 spike（project-notes/projects/mnemoshelf/research/spike-embed-runtime.md）
- * 在本機 q4／q8、768/512/256 維、圖片 70 token 的所有組合中，實測最小邊界為 0.132
- * （q8、768 維、budget 70）。取此值為最小門檻，低於它視為模型不具可用的跨模態對齊。
+ * 門檻來源：M0 可行性 spike 的本機實測（q4／q8、768/512/256 維、圖片 70 token 的所有組合中，
+ * 實測最小邊界為 0.132（q8、768 維、budget 70）。取此值為最小門檻，低於它視為模型不具可用的跨模態對齊。
  */
 import type { ImageInput, ProbeResult } from "@mnemoshelf/core";
 import { createProbeImages, type SyntheticProbeImage } from "./test-images.js";

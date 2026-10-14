@@ -42,15 +42,16 @@ MNEMOSHELF_DEV_CORE=http://127.0.0.1:8787 pnpm --filter @mnemoshelf/web run dev
 ```
 
 `vite.config.ts` 的 `server.proxy` 用 `changeOrigin: true`：Core 有 Host header 驗證
-（只接受 `127.0.0.1`／`localhost`／`[::1]`），轉發時 `Host` 會被換成 target 的值。
+（只接受 `127.0.0.1`／`localhost`／`[::1]`／`*.localhost`，可帶埠號），轉發時 `Host` 會被換成 target 的值。
 
 ## token 處理
 
 使用者貼上一次 → 存 `sessionStorage`（只活到分頁關閉）→ 每請求帶
-`Authorization: Bearer <token>`；收到 `401` 清除並回到貼 token 畫面。
+`Authorization: Bearer <token>`；收到 `401` 會清除 token，並由 `apiFetch` 派送全域事件
+`mnemoshelf:unauthorized`（`api.ts` 的 `UNAUTHORIZED_EVENT`），`App.tsx` 監聽後切回貼
+token 畫面，各面板不必各自處理 401。
 
 **token 絕不進 URL、絕不經 `VITE_*` 環境變數**（`VITE_*` 會被 build 期內嵌進 bundle）。
-理由與替代方案比較見 `project-notes/projects/mnemoshelf/research/web-ui-stack.md` §Q5。
 M4（Electron）會改用 `webRequest` 注入標頭，讓 token 完全不進 renderer。
 
 ## 測試

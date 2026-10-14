@@ -1,16 +1,20 @@
 /**
  * 對 Core REST API 的存取層：token 保存與帶標頭的請求。
  *
- * token 決策（見 `project-notes/projects/mnemoshelf/research/web-ui-stack.md` §Q5）：
+ * token 決策：
  * - 使用者貼上一次，存 `sessionStorage`（只活到分頁關閉，不落地到磁碟）；
  * - 每請求帶 `Authorization: Bearer <token>`；
  * - **token 絕不進 URL、絕不經 `VITE_*` 環境變數**（`VITE_*` 會被 build 期內嵌進 bundle）。
  *
- * 收到 401 一律清除 token 並讓呼叫端回到貼 token 的畫面。
+ * 收到 401 一律清除 token，並以 `window` 全域事件（`UNAUTHORIZED_EVENT`）通知整個 UI
+ * 回到貼 token 的畫面（各面板不必各自處理 401）。
  */
 
 /** sessionStorage 的 key。 */
 const TOKEN_KEY = "mnemoshelf.token";
+
+/** 401 時派送的全域事件名稱；`App.tsx` 監聽後切回貼 token 畫面。 */
+export const UNAUTHORIZED_EVENT = "mnemoshelf:unauthorized";
 
 /** 讀出目前的 token；沒有時回傳 null。 */
 export function getToken(): string | null {
@@ -64,8 +68,8 @@ export interface Root {
 /**
  * 帶 token 呼叫 API。
  *
- * 401 → 清除 token 並丟 `UnauthorizedApiError`；連線失敗 → 丟 `NetworkError`。
- * 其餘狀態碼原樣回傳，由呼叫端決定訊息。
+ * 401 → 清除 token、派送 `UNAUTHORIZED_EVENT` 並丟 `UnauthorizedApiError`；
+ * 連線失敗 → 丟 `NetworkError`。其餘狀態碼原樣回傳，由呼叫端決定訊息。
  */
 export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const token = getToken();
@@ -81,6 +85,10 @@ export async function apiFetch(path: string, init: RequestInit = {}): Promise<Re
 
   if (response.status === 401) {
     clearToken();
+    // 通知整個 UI 回到貼 token 畫面；呼叫端各自的錯誤處理不需要再管 401。
+    if (typeof window !== "undefined") {
+      window.dispatchEvent(new Event(UNAUTHORIZED_EVENT));
+    }
     throw new UnauthorizedApiError();
   }
   return response;

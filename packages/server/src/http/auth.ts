@@ -54,9 +54,13 @@ export function requireLoopback(request: IncomingMessage): void {
 /**
  * `Host` header 是否是本機位址。
  *
- * 只接受 `127.0.0.1`／`localhost`／`[::1]`，可帶埠號（例如 `127.0.0.1:8787`）。
+ * 接受 `127.0.0.1`／`localhost`／`[::1]`，可帶埠號（例如 `127.0.0.1:8787`）；
+ * 另外接受以 `.localhost` 結尾的名稱（不分大小寫，例如 `openchamber-preview.localhost:57958`）。
  * 為什麼需要：服務綁在 loopback 仍會被使用者瀏覽到的惡意網頁以 **DNS rebinding** 打進來，
  * 標準緩解是驗證 `Host`（`requireLoopback` 只看連線來源 IP，擋不住）。
+ *
+ * `*.localhost` 放行理由：RFC 6761 要求解析器把整個 `.localhost` 網域視為 loopback，
+ * 現代瀏覽器也強制如此，因此 DNS rebinding 利用不到這個後綴（詳見 README 的安全說明）。
  */
 export function isLocalHostHeader(host: string | undefined): boolean {
   if (typeof host !== "string") return false;
@@ -77,7 +81,10 @@ export function isLocalHostHeader(host: string | undefined): boolean {
   const name = colon === -1 ? value : value.slice(0, colon);
   const port = colon === -1 ? "" : value.slice(colon + 1);
   if (port !== "" && !/^\d+$/.test(port)) return false;
-  return name === "127.0.0.1" || name === "localhost";
+  if (name === "127.0.0.1" || name === "localhost") return true;
+  // RFC 6761：`*.localhost` 一律解析到 loopback，DNS rebinding 利用不到。
+  // 需至少一個標籤（`.localhost` 本身不算）；大小寫已由 toLowerCase 正規化。
+  return name.endsWith(".localhost") && name.length > ".localhost".length;
 }
 
 /** 檢查 `Host` header；不是本機位址時丟 `InvalidHostError`（403）。 */

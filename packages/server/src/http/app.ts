@@ -700,6 +700,9 @@ export function createRestApp(deps: RestAppDeps): RestApp {
    *
    * `supersedes`（可選）為被取代的記憶 id：帶了就把該筆標記軟刪除（見 `addMemory` 的契約），
    * UI 的「編輯」流程即以此產生新版本並取代舊版。
+   *
+   * 被取代者原本若已釘選，新版本**繼承**其 `pinned`（`NewMemory` 契約仍無 `pinned`，
+   * 新記憶一律 `false`；這裡是 server 端在建立後補一次 `setMemoryPinned` 的行為細節）。
    */
   const addMemory = async (request: IncomingMessage): Promise<{ status: number; body: unknown }> => {
     const body = await readJsonBody(request);
@@ -710,7 +713,13 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const project = optionalString(body.project, "project") ?? null;
     const supersedes = optionalId(body.supersedes, "supersedes");
 
-    const memory: Memory = await deps.store.addMemory({ content, kind, scope, project, agent, supersedes });
+    // 先讀被取代者（若存在）的 pinned：建立新記憶會把舊版軟刪除，之後仍可讀，但先讀較清楚。
+    const replaced = supersedes === null ? null : await deps.store.getMemory(supersedes);
+    let memory: Memory = await deps.store.addMemory({ content, kind, scope, project, agent, supersedes });
+    if (replaced?.pinned === true) {
+      await deps.store.setMemoryPinned(memory.id, true);
+      memory = (await deps.store.getMemory(memory.id)) ?? memory;
+    }
     return { status: 201, body: memory };
   };
 

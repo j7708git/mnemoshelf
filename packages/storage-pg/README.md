@@ -8,8 +8,8 @@
 這是 Mnemoshelf 的**第二個儲存後端**（預設是 SQLite）。它不修改 core 的任何程式碼或公開
 契約，而是讓同一組契約測試（`@mnemoshelf/core/testing` 的 `runMetadataStoreContract`、
 `runVectorIndexContract`）在 PostgreSQL 上通過，藉此驗證 `docs/storage-ports.md` 的
-「儲存可替換」抽象。選型與實測依據見 `project-notes` 的
-`research/postgres-pgvector-backend.md`。
+「儲存可替換」抽象。實作要點（維度驗證、`hnsw.iterative_scan`、tie 排序、中文全文檢索）
+見下方「實作要點」。
 
 ## 需求
 

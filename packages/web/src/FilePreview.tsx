@@ -9,6 +9,9 @@ import { useEffect, useState } from "react";
 import { fetchImageBlobUrl, readTextPreview, type DirEntry, type TextPreviewBody } from "./api";
 import { formatBytes } from "./format";
 
+/** 計算 UTF-8 位元組數用；模組層共用一個即可。 */
+const utf8Encoder = new TextEncoder();
+
 /** 檔案預覽的容器：依型別分派。`key` 由呼叫端以路徑設定，切換檔案時整個重掛載。 */
 export function FilePreview({ rootId, entry }: { rootId: number; entry: DirEntry }) {
   if (entry.kind === "text" || entry.kind === "code") {
@@ -65,7 +68,7 @@ function TextFilePreview({ rootId, entry }: { rootId: number; entry: DirEntry })
       </div>
       {state.body.truncated && (
         <p className="rounded-md border border-line bg-surface px-3 py-2 text-xs text-muted">
-          檔案過大，只顯示前 {formatBytes(state.body.content.length)}（內容已截斷）。
+          檔案過大，只顯示前 {formatBytes(utf8Encoder.encode(state.body.content).length)}（內容已截斷）。
         </p>
       )}
       <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-line bg-white p-3 text-xs leading-relaxed text-ink">

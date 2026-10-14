@@ -6,6 +6,7 @@ import {
   NetworkError,
   removeRoot,
   setToken,
+  UNAUTHORIZED_EVENT,
   UnauthorizedApiError,
   type Root,
 } from "./api";
@@ -69,6 +70,31 @@ export function App() {
   useEffect(() => {
     if (getToken() !== null) void load();
   }, [load]);
+
+  // 任何請求收到 401（例如 server 換了 token）→ apiFetch 派送全域事件，這裡切回貼 token 畫面。
+  useEffect(() => {
+    const onUnauthorized = (): void => {
+      setSelectedRootId(null);
+      setState({ kind: "need-token", message: "token 不正確或已失效，請重新輸入。" });
+    };
+    window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
+  }, []);
+
+  /**
+   * 只刷新側欄的 roots 清單，**不**切到 `loading` 狀態。
+   *
+   * `load()` 會把畫面切成 loading 而卸載正在進行的「加入資料夾」流程（元件狀態遺失），
+   * 因此流程中途需要刷新側欄時用這個版本；失敗時靜默（不是關鍵路徑，下一次 `load()` 會修正）。
+   */
+  const refreshRoots = useCallback(async (): Promise<void> => {
+    try {
+      const roots = await listRoots();
+      setState((current) => (current.kind === "ready" ? { kind: "ready", roots } : current));
+    } catch {
+      // 靜默失敗（含 401：apiFetch 已派送事件讓 UI 回到貼 token 畫面）。
+    }
+  }, []);
 
   const submitToken = (token: string): void => {
     setToken(token);
@@ -207,7 +233,19 @@ export function App() {
 
               <main className="min-w-0">
                 {mode === "add-root" ? (
-                  <AddRootFlow onCancel={() => setMode("explorer")} onDone={onRootAdded} />
+                  <AddRootFlow
+                    onCancel={() => {
+                      setMode("explorer");
+                      // 取消時可能已移除剛加入的 root：刷新側欄避免留下過期項目。
+                      void refreshRoots();
+                    }}
+                    onDone={onRootAdded}
+                    onRootCreated={(root) => {
+                      // 加入成功後立即把 root 定入流程狀態並刷新側欄（不切 loading，流程不中斷）。
+                      setSelectedRootId(root.id);
+                      void refreshRoots();
+                    }}
+                  />
                 ) : selectedRoot === null ? (
                   <div className="flex h-[60vh] items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center">
                     <p className="text-sm text-muted">請先加入一個資料夾。</p>
