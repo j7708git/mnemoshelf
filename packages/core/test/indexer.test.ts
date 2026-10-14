@@ -8,8 +8,10 @@ import {
   RootNotIndexableError,
   SqliteMetadataStore,
   SqliteVectorIndex,
+  type DocumentInput,
   type Embedder,
   type EmbedderInfo,
+  type EmbedDocumentsOptions,
   type ImageInput,
   type ProbeResult,
   type Root,
@@ -22,7 +24,9 @@ class RecordingEmbedder implements Embedder {
   private readonly inner = new FakeEmbedder();
   readonly documents: { text: string; title: string | undefined }[] = [];
   readonly images: ImageInput[] = [];
-  /** 測試掛鉤：每次 embedDocument 前呼叫（可在掃描與讀取之間製造競態）。 */
+  /** 每次 `embedDocuments` 的輸入筆數（驗證「每檔一次批次呼叫」）。 */
+  readonly batchSizes: number[] = [];
+  /** 測試掛鉤：每次嵌入一批文件前、逐項呼叫（可在掃描與讀取之間製造競態）。 */
   beforeEmbed: ((text: string) => Promise<void> | void) | undefined;
 
   get info(): EmbedderInfo {
@@ -37,6 +41,18 @@ class RecordingEmbedder implements Embedder {
     await this.beforeEmbed?.(text);
     this.documents.push({ text, title });
     return this.inner.embedDocument(text, title);
+  }
+
+  async embedDocuments(
+    inputs: readonly DocumentInput[],
+    opts?: EmbedDocumentsOptions,
+  ): Promise<Float32Array[]> {
+    this.batchSizes.push(inputs.length);
+    for (const input of inputs) {
+      await this.beforeEmbed?.(input.text);
+      this.documents.push({ text: input.text, title: input.title });
+    }
+    return this.inner.embedDocuments(inputs, opts);
   }
 
   async embedImage(image: ImageInput): Promise<Float32Array> {
@@ -59,9 +75,12 @@ class AbortingEmbedder extends RecordingEmbedder {
     super();
   }
 
-  override async embedDocument(text: string, title?: string): Promise<Float32Array> {
+  override async embedDocuments(
+    inputs: readonly DocumentInput[],
+    opts?: EmbedDocumentsOptions,
+  ): Promise<Float32Array[]> {
     this.controller.abort();
-    return super.embedDocument(text, title);
+    return super.embedDocuments(inputs, opts);
   }
 }
 
@@ -141,6 +160,19 @@ describe("indexRoot", () => {
     const titles = new Set(harness.embedder.documents.map((call) => call.title));
     expect(titles.has("a.md")).toBe(true);
     expect(titles.has("code/b.ts")).toBe(true);
+  });
+
+  it("文字檔每檔一次批次呼叫（檔案內不再逐塊 await）", async () => {
+    const multi = await makeHarness({ "big.md": `# 標題\n\n${"內容".repeat(800)}` });
+    try {
+      await indexRoot(multi.root, options(multi));
+      const chunks = await multi.store.listChunksByPath(multi.root.id, "big.md");
+      expect(chunks.length).toBeGreaterThan(1); // 確認真的有多塊
+      // 一次呼叫、涵蓋該檔所有塊（不是逐塊呼叫）。
+      expect(multi.embedder.batchSizes).toEqual([chunks.length]);
+    } finally {
+      await fs.rm(multi.dir, { recursive: true, force: true });
+    }
   });
 
   it("增量：未變更再跑一次不重新嵌入，skippedUnchanged = 全部", async () => {

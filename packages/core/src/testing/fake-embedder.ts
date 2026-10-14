@@ -1,8 +1,31 @@
 import { createHash } from "node:crypto";
-import type { Embedder, EmbedderInfo, ImageInput, ProbeResult } from "../ports/embedder.js";
+import type {
+  DocumentInput,
+  Embedder,
+  EmbedderInfo,
+  EmbedDocumentsOptions,
+  ImageInput,
+  ProbeResult,
+} from "../ports/embedder.js";
 
 /** FakeEmbedder 的固定維度（與預設 embedder 的截斷維度一致）。 */
 export const FAKE_EMBEDDER_DIM = 512;
+
+/** 取消檢查（沿用 indexer 的 `throwIfAborted` 慣例）。 */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal === undefined) return;
+  if (typeof signal.throwIfAborted === "function") {
+    signal.throwIfAborted();
+    return;
+  }
+  if (signal.aborted) {
+    const reason = signal.reason;
+    if (reason instanceof Error) throw reason;
+    const error = new Error("嵌入已取消");
+    error.name = "AbortError";
+    throw error;
+  }
+}
 
 /**
  * FakeEmbedder：**僅供測試，無語意（no semantics）**。
@@ -25,6 +48,22 @@ export class FakeEmbedder implements Embedder {
 
   async embedDocument(text: string, title?: string): Promise<Float32Array> {
     return hashToVector(this.hash(`document:${title ?? "none"}:${text}`));
+  }
+
+  /**
+   * 逐項委派 `embedDocument`，因此批次向量與單筆完全相同（順序對應）。
+   * 只額外支援取消：開始前檢查一次 `signal`。
+   */
+  async embedDocuments(
+    inputs: readonly DocumentInput[],
+    opts?: EmbedDocumentsOptions,
+  ): Promise<Float32Array[]> {
+    throwIfAborted(opts?.signal);
+    const vectors: Float32Array[] = [];
+    for (const input of inputs) {
+      vectors.push(await this.embedDocument(input.text, input.title));
+    }
+    return vectors;
   }
 
   async embedImage(image: ImageInput): Promise<Float32Array> {

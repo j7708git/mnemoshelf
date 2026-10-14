@@ -7,6 +7,7 @@ export {
   DEFAULT_DIM,
   DEFAULT_MAX_SOFT_TOKENS,
   DEFAULT_MODEL_ID,
+  MAX_BATCH_SIZE,
   SUPPORTED_DTYPES,
   TransformersEmbedder,
   defaultModelCacheDir,

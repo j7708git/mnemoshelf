@@ -34,6 +34,23 @@ export interface ProbeResult {
   message?: string;
 }
 
+/**
+ * 批次文件文字的單一輸入項。
+ * 語意與 `embedDocument(text, title)` 完全相同：title 沒有時視為 "none"，實作會套用文件 prefix。
+ */
+export interface DocumentInput {
+  /** 文件文字內容。 */
+  text: string;
+  /** 文件標題（本專案慣例：相對路徑）。省略時視為 "none"。 */
+  title?: string;
+}
+
+/** `embedDocuments` 的呼叫選項。 */
+export interface EmbedDocumentsOptions {
+  /** 取消訊號；實作應在開始推論前檢查（沿用 `throwIfAborted` 慣例）。 */
+  signal?: AbortSignal;
+}
+
 /** 模態 embedding 介面。所有回傳向量必須長度為 info.dim 且已 L2 正規化（容差 1e-3）。 */
 export interface Embedder {
   readonly info: EmbedderInfo;
@@ -41,6 +58,12 @@ export interface Embedder {
   embedQuery(text: string): Promise<Float32Array>;
   /** 文件文字；title 沒有時用 "none"（實作會套用文件 prefix）。 */
   embedDocument(text: string, title?: string): Promise<Float32Array>;
+  /**
+   * 文件文字批次；輸出與 `inputs` **一一對應且順序相同**（`output[i]` 對應 `inputs[i]`）。
+   * 空陣列回傳 `[]`。任一項失敗則整批拋錯，不回傳部分結果。
+   * 語意與逐項呼叫 `embedDocument` 一致（見 docs/embedder-contract.md 的批次方法一節）。
+   */
+  embedDocuments(inputs: readonly DocumentInput[], opts?: EmbedDocumentsOptions): Promise<Float32Array[]>;
   /** 圖片。 */
   embedImage(image: ImageInput): Promise<Float32Array>;
   /** 啟動探測。 */

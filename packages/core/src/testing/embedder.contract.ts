@@ -11,6 +11,14 @@ function norm(vec: Float32Array): number {
   return Math.sqrt(sum);
 }
 
+/** 兩向量的餘弦相似度（兩者皆已 L2 正規化，故等於內積）。 */
+function cosine(a: Float32Array, b: Float32Array): number {
+  let dot = 0;
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i += 1) dot += a[i]! * b[i]!;
+  return dot;
+}
+
 /** 值全部有限（無 NaN／Infinity）。 */
 function isFiniteVector(vec: Float32Array): boolean {
   for (const value of vec) {
@@ -108,6 +116,58 @@ export function runEmbedderContract(name: string, factory: EmbedderFactory): voi
         expect(isFiniteVector(vec)).toBe(true);
         expect(Math.abs(norm(vec) - 1)).toBeLessThan(1e-3);
       }
+    });
+
+    it("embedDocuments：空陣列回傳空陣列", async () => {
+      expect(await embedder.embedDocuments([])).toEqual([]);
+    });
+
+    it("embedDocuments：數量一致、向量性質正確，且與逐筆 embedDocument 語意一致", async () => {
+      const inputs = [
+        { text: "批次文件甲的內容", title: "甲" },
+        { text: "批次文件乙的內容", title: "乙" },
+        { text: "批次文件丙的內容", title: "丙" },
+      ];
+      const batch = await embedder.embedDocuments(inputs);
+      expect(batch).toHaveLength(inputs.length);
+
+      for (let i = 0; i < inputs.length; i += 1) {
+        const vec = batch[i]!;
+        expect(vec).toBeInstanceOf(Float32Array);
+        expect(vec.length).toBe(embedder.info.dim);
+        expect(isFiniteVector(vec)).toBe(true);
+        expect(Math.abs(norm(vec) - 1)).toBeLessThan(1e-3);
+
+        // 同一項文字：批次與單筆呼叫的向量必須一致（容許 pad 造成的微小差異）。
+        const single = await embedder.embedDocument(inputs[i]!.text, inputs[i]!.title);
+        expect(cosine(vec, single)).toBeGreaterThanOrEqual(0.999);
+      }
+    });
+
+    it("embedDocuments：順序對應（反轉輸入則輸出跟著反轉）", async () => {
+      const inputs = [
+        { text: "順序測試文件一", title: "一" },
+        { text: "順序測試文件二", title: "二" },
+        { text: "順序測試文件三", title: "三" },
+      ];
+      const forward = await embedder.embedDocuments(inputs);
+      const reversed = await embedder.embedDocuments([...inputs].reverse());
+
+      expect(forward).toHaveLength(inputs.length);
+      expect(reversed).toHaveLength(inputs.length);
+      for (let i = 0; i < inputs.length; i += 1) {
+        expect(cosine(forward[i]!, reversed[inputs.length - 1 - i]!)).toBeGreaterThanOrEqual(0.999);
+      }
+    });
+
+    it("embedDocuments：同一批次重複呼叫得到相同向量（確定性）", async () => {
+      const inputs = [
+        { text: "確定性測試文件 A", title: "A" },
+        { text: "確定性測試文件 B", title: "B" },
+      ];
+      const first = await embedder.embedDocuments(inputs);
+      const second = await embedder.embedDocuments(inputs);
+      expect(second.map((vec) => Array.from(vec))).toEqual(first.map((vec) => Array.from(vec)));
     });
 
     it("probe() 回傳成功", async () => {

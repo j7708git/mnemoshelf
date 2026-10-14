@@ -67,4 +67,29 @@ describe("FakeEmbedder", () => {
     await embedder.dispose();
     await embedder.dispose();
   });
+
+  it("embedDocuments：空陣列回傳 []，數量一致且與單筆向量相同（順序對應）", async () => {
+    expect(await embedder.embedDocuments([])).toEqual([]);
+
+    const inputs = [
+      { text: "批次文件甲", title: "甲" },
+      { text: "批次文件乙", title: "乙" },
+      { text: "批次文件丙" },
+    ];
+    const batch = await embedder.embedDocuments(inputs);
+    expect(batch).toHaveLength(inputs.length);
+
+    for (let i = 0; i < inputs.length; i += 1) {
+      const single = await embedder.embedDocument(inputs[i]!.text, inputs[i]!.title);
+      expect(Array.from(batch[i]!)).toEqual(Array.from(single));
+    }
+  });
+
+  it("embedDocuments：已取消的 signal 會拋出 AbortError", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      embedder.embedDocuments([{ text: "文件" }], { signal: controller.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+  });
 });

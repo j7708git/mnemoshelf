@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { PathBlockedError, PathOutsideRootError } from "../errors.js";
-import type { Embedder, ImageInput } from "../ports/embedder.js";
+import type { DocumentInput, Embedder, ImageInput } from "../ports/embedder.js";
 import type { MetadataStore } from "../ports/metadata-store.js";
 import type { NewChunk, Root } from "../ports/types.js";
 import type { VectorIndex, VectorItem } from "../ports/vector-index.js";
@@ -88,7 +88,11 @@ function buildChunkInputs(file: ScanEntry, fileHash: string, bytes: Buffer): Chu
 
 /**
  * 對切塊結果產生向量（尚未寫入任何儲存）。
- * `signal` 會在每個 chunk 前檢查：中止時直接拋出，呼叫端因此不會動到 DB。
+ *
+ * 文字／程式碼：**每檔一次批次呼叫** `embedDocuments`（檔案內不再逐塊 await）。
+ * 媒體檔每檔固定一塊，批次化沒有換到任何東西，維持單筆 `embedImage`。
+ * `signal` 在批次前檢查，並一路傳給 embedder（沿用 `throwIfAborted` 慣例）：
+ * 中止時直接拋出，呼叫端因此不會動到 DB。
  */
 async function embedInputs(
   inputs: readonly ChunkInput[],
@@ -97,18 +101,18 @@ async function embedInputs(
   embedder: Embedder,
   signal: AbortSignal | undefined,
 ): Promise<Float32Array[]> {
-  const vectors: Float32Array[] = [];
-  for (const input of inputs) {
+  if (inputs.length === 0) return [];
+
+  if (file.kind !== "text" && file.kind !== "code") {
     throwIfAborted(signal);
-    if (file.kind === "text" || file.kind === "code") {
-      // title 用相對路徑：spike 顯示帶 title 對檢索顯著有利。
-      vectors.push(await embedder.embedDocument(input.text ?? "", file.relPath));
-    } else {
-      const image: ImageInput = file.mimeType === null ? { bytes } : { bytes, mimeType: file.mimeType };
-      vectors.push(await embedder.embedImage(image));
-    }
+    const image: ImageInput = file.mimeType === null ? { bytes } : { bytes, mimeType: file.mimeType };
+    return [await embedder.embedImage(image)];
   }
-  return vectors;
+
+  // title 用相對路徑：spike 顯示帶 title 對檢索顯著有利。
+  const documents: DocumentInput[] = inputs.map((input) => ({ text: input.text ?? "", title: file.relPath }));
+  throwIfAborted(signal);
+  return embedder.embedDocuments(documents, { signal });
 }
 
 interface ProcessDeps {

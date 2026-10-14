@@ -33,6 +33,8 @@ interface Embedder {
   embedQuery(text: string): Promise<Float32Array>;
   /** 文件文字；title 沒有時用 "none"（會套用文件 prefix）。 */
   embedDocument(text: string, title?: string): Promise<Float32Array>;
+  /** 文件文字批次；輸出與 inputs 一一對應且順序相同（見下節）。 */
+  embedDocuments(inputs: readonly DocumentInput[], opts?: EmbedDocumentsOptions): Promise<Float32Array[]>;
   /** 圖片。輸入為已解碼的像素或檔案位元組，由實作決定，但必須明確定義。 */
   embedImage(image: ImageInput): Promise<Float32Array>;
   /** 啟動探測，見下節。 */
@@ -42,6 +44,40 @@ interface Embedder {
 ```
 
 所有回傳的向量：長度為 `info.dim`、**已 L2 正規化**（模長 1，容差 1e-3）。
+
+## 批次方法（`embedDocuments`）
+
+> 本節於 **2026-10-15 經使用者核准新增**。舊的單筆方法（`embedDocument`）保留，語意不變；
+> 批次方法讓實作可以一次 forward 算多塊，改善索引吞吐量。
+
+```ts
+/** 批次中的單一文件輸入項。 */
+interface DocumentInput {
+  /** 文件文字內容。 */
+  text: string;
+  /** 文件標題（本專案慣例：相對路徑）。省略時視為 "none"。 */
+  title?: string;
+}
+
+interface EmbedDocumentsOptions {
+  /** 取消訊號；實作應在開始推論前檢查（沿用 `throwIfAborted` 慣例）。 */
+  signal?: AbortSignal;
+}
+```
+
+保證：
+
+- **順序與數量**：回傳陣列長度等於 `inputs.length`，且 `output[i]` 對應 `inputs[i]`。
+- **語意一致**：同一文字在批次中的向量，與逐筆 `embedDocument(text, title)` 的向量一致
+  （允許 pad 造成的極小差異；實測餘弦 ≥ 0.999）。
+- **空輸入**：`inputs` 為空陣列時回傳 `[]`，且不需要載入模型。
+- **失敗**：任一項失敗（模型輸出形狀不符、取消）即**整批拋錯**，不回傳部分結果。
+- **取消**：`opts.signal` 沿用索引器的 `throwIfAborted` 慣例，實作應在開始推論前檢查。
+
+**批次上限**：一次 forward 的視窗上限由實作決定（預設 embedder 為 16，常數
+`MAX_BATCH_SIZE`）。批次會把同批文字 pad 到同批最長序列，過大的批次會讓 pad 成本與
+記憶體上升，因此需要上限；超過上限的輸入應由實作**內部切成多個視窗**後串接回傳，
+呼叫端不需自行分批。
 
 ## 啟動探測（probe）
 

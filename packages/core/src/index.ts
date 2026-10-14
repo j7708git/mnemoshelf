@@ -29,7 +29,14 @@ export {
 } from "./ports/metadata-store.js";
 export type { MemoryFilter } from "./ports/metadata-store.js";
 export type { VectorIndex, VectorItem } from "./ports/vector-index.js";
-export type { Embedder, EmbedderInfo, ImageInput, ProbeResult } from "./ports/embedder.js";
+export type {
+  DocumentInput,
+  Embedder,
+  EmbedderInfo,
+  EmbedDocumentsOptions,
+  ImageInput,
+  ProbeResult,
+} from "./ports/embedder.js";
 
 export {
   DuplicateRootError,

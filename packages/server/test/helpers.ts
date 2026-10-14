@@ -7,7 +7,7 @@ import { promises as fs } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { type Embedder, type EmbedderInfo, type ImageInput, type ProbeResult } from "@mnemoshelf/core";
+import { type DocumentInput, type Embedder, type EmbedderInfo, type EmbedDocumentsOptions, type ImageInput, type ProbeResult } from "@mnemoshelf/core";
 import { FakeEmbedder } from "@mnemoshelf/core/testing";
 import { createServer, type MnemoshelfServer } from "../src/index.js";
 
@@ -64,6 +64,14 @@ export class SlowEmbedder implements Embedder {
   async embedDocument(text: string, title?: string): Promise<Float32Array> {
     await new Promise((resolve) => setTimeout(resolve, this.delayMs));
     return this.inner.embedDocument(text, title);
+  }
+
+  async embedDocuments(
+    inputs: readonly DocumentInput[],
+    opts?: EmbedDocumentsOptions,
+  ): Promise<Float32Array[]> {
+    await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    return this.inner.embedDocuments(inputs, opts);
   }
 
   async embedImage(image: ImageInput): Promise<Float32Array> {

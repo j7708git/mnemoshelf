@@ -14,7 +14,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { AutoConfig, AutoModel, AutoProcessor, env, load_image } from "@huggingface/transformers";
-import type { Embedder, EmbedderInfo, ImageInput, ProbeResult } from "@mnemoshelf/core";
+import type { DocumentInput, Embedder, EmbedderInfo, EmbedDocumentsOptions, ImageInput, ProbeResult } from "@mnemoshelf/core";
 import {
   EmptyImageInputError,
   InvalidEmbedderOptionError,
@@ -31,6 +31,17 @@ export const DEFAULT_MODEL_ID = "onnx-community/embeddinggemma-2-ONNX";
 export const DEFAULT_DIM = 512;
 /** 預設圖片 soft token 預算。 */
 export const DEFAULT_MAX_SOFT_TOKENS = 70;
+
+/**
+ * 文字批次一次送進模型的視窗上限。
+ *
+ * 取值理由：批次會把同批文字 pad 到同批最長序列；批次愈大，pad 成本與記憶體愈高
+ * （大量圖片批次曾把 RSS 推到數 GiB）。本專案的 chunk 是 600–1200 字元
+ * （約 150–300 token），pad 成本相對小，取 16 作為「一次 forward 吃最多塊、
+ * 又不會讓記憶體失控」的折衷。
+ * 超過上限的輸入由 `embedDocuments` 內部切成多個視窗，呼叫端不需自行分批。
+ */
+export const MAX_BATCH_SIZE = 16;
 
 /** 本套件允許的 dtype（官方模型卡有 fp16，但契約明示不可用 fp16）。 */
 export const SUPPORTED_DTYPES = ["fp32", "q8", "q4", "q4f16"] as const;
@@ -141,6 +152,22 @@ export function defaultModelCacheDir(): string {
   return join(osUserDataDir(homedir()), "mnemoshelf", "models");
 }
 
+/** 取消檢查（沿用 @mnemoshelf/core indexer 的 `throwIfAborted` 慣例）。 */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal === undefined) return;
+  if (typeof signal.throwIfAborted === "function") {
+    signal.throwIfAborted();
+    return;
+  }
+  if (signal.aborted) {
+    const reason = signal.reason;
+    if (reason instanceof Error) throw reason;
+    const error = new Error("嵌入已取消");
+    error.name = "AbortError";
+    throw error;
+  }
+}
+
 /** 非同步取回 `sentence_embedding`，偶發取不到時重試一次（見 M0 spike「實作踩雷」）。 */
 async function runModel(modelId: string, model: GemmaModel, inputs: unknown): Promise<number[][]> {
   let lastMessage = "未取得輸出";
@@ -206,7 +233,46 @@ export class TransformersEmbedder implements Embedder {
   }
 
   async embedDocument(text: string, title?: string): Promise<Float32Array> {
-    return this.embedText(`title: ${title ?? "none"} | text: ${text}`);
+    return this.embedText(this.documentPrefix(text, title));
+  }
+
+  /**
+   * 文字批次：把每項套上文件 prefix 後，一次 `processor([…])`＋一次 `model(inputs)`。
+   *
+   * - 空陣列回傳 `[]`（不載入模型）。
+   * - 輸出與 `inputs` 一一對應且順序相同；每列各自截斷成 `info.dim` 並重新 L2 正規化。
+   * - 超過 `MAX_BATCH_SIZE` 時內部切成多個視窗（順序串接），呼叫端不需自行分批。
+   * - 任一視窗失敗（模型輸出形狀不符、取消）即整批拋錯，不回傳部分結果。
+   */
+  async embedDocuments(
+    inputs: readonly DocumentInput[],
+    opts?: EmbedDocumentsOptions,
+  ): Promise<Float32Array[]> {
+    if (inputs.length === 0) return [];
+
+    // 先檢查取消，避免已取消還去載模型。
+    throwIfAborted(opts?.signal);
+    const { processor, model } = await this.ensureLoaded();
+    const vectors: Float32Array[] = [];
+
+    for (let start = 0; start < inputs.length; start += MAX_BATCH_SIZE) {
+      throwIfAborted(opts?.signal);
+      const window = inputs.slice(start, start + MAX_BATCH_SIZE);
+      const prefixed = window.map((input) => this.documentPrefix(input.text, input.title));
+      const processed = await processor(prefixed);
+      const rows = await runModel(this.modelId, model, processed);
+      if (rows.length !== window.length) {
+        throw new ModelInferenceError(
+          this.modelId,
+          `批次回傳 ${rows.length} 筆向量，預期 ${window.length} 筆`,
+        );
+      }
+      for (const row of rows) {
+        vectors.push(truncateAndNormalize(Float32Array.from(row), this.dim));
+      }
+    }
+
+    return vectors;
   }
 
   async embedImage(image: ImageInput): Promise<Float32Array> {
@@ -242,6 +308,11 @@ export class TransformersEmbedder implements Embedder {
     if (loaded?.model.dispose) {
       await loaded.model.dispose();
     }
+  }
+
+  /** 文件 prefix（查詢 prefix 見 `embedQuery`）。title 沒有時用 "none"。 */
+  private documentPrefix(text: string, title?: string): string {
+    return `title: ${title ?? "none"} | text: ${text}`;
   }
 
   private async embedText(prefixed: string): Promise<Float32Array> {

@@ -68,7 +68,7 @@ async function addRoot(dir: string): Promise<number> {
   return (created.body as { id: number }).id;
 }
 
-/** 失敗的 embedder：`embedDocument` 一律拋錯（驗證進度輪詢的「失敗」狀態）。 */
+/** 失敗的 embedder：`embedDocuments` 一律拋錯（驗證進度輪詢的「失敗」狀態）。 */
 class FailingEmbedder implements Embedder {
   private readonly inner = new FakeEmbedder();
   get info(): EmbedderInfo {
@@ -78,6 +78,11 @@ class FailingEmbedder implements Embedder {
     return this.inner.embedQuery(text);
   }
   async embedDocument(): Promise<Float32Array> {
+    const error = new Error("合成測試：嵌入失敗");
+    error.name = "SyntheticEmbedError";
+    throw error;
+  }
+  async embedDocuments(): Promise<Float32Array[]> {
     const error = new Error("合成測試：嵌入失敗");
     error.name = "SyntheticEmbedError";
     throw error;
