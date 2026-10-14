@@ -136,6 +136,7 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
 export { LOOPBACK_HOST, loadMcpConfig, loadServerConfig } from "./config.js";
 export type { McpConfig, ServerConfig } from "./config.js";
 export {
+  FileTooLargeError,
   IndexInProgressError,
   InvalidHostError,
   InvalidRequestUrlError,
@@ -147,8 +148,33 @@ export {
   PayloadTooLargeError,
   RequestUriTooLongError,
   UnauthorizedError,
+  UnsupportedFileTypeError,
   ValidationError,
 } from "./errors.js";
+export { IndexStatusTracker } from "./index-status.js";
+export type { IndexErrorInfo, IndexState, IndexStatus } from "./index-status.js";
+export {
+  listDirectoryEntries,
+  makeThumbnail,
+  MAX_IMAGE_BYTES,
+  MAX_TEXT_PREVIEW_BYTES,
+  MAX_THUMBNAIL_INPUT_BYTES,
+  parseRelativePath,
+  readFilePreview,
+  resolveTarget,
+  THUMBNAIL_CACHE_LIMIT,
+  THUMBNAIL_MAX_WIDTH,
+  ThumbnailCache,
+} from "./http/explorer.js";
+export type {
+  DirEntry,
+  EntryKind,
+  FilePreview,
+  ImageBytes,
+  ResolvedTarget,
+  TextPreview,
+  ThumbnailResult,
+} from "./http/explorer.js";
 export {
   acceptsHtml,
   API_PATH_PREFIXES,
@@ -164,12 +190,16 @@ export {
 } from "./http/app.js";
 export type {
   AddRootRequest,
+  BytesRouteResult,
   ErrorResponse,
   IndexRootResponse,
+  JsonRouteResult,
+  ListEntriesResponse,
   ListMemoriesResponse,
   RemoveRootResponse,
   RestApp,
   RestAppDeps,
+  RouteResult,
 } from "./http/app.js";
 export { isLocalHostHeader, isLoopbackAddress, parseBearerToken, requireLocalHost, requireToken, tokensMatch } from "./http/auth.js";
 export {

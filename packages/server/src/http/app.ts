@@ -5,6 +5,8 @@
  * - `GET  /health`（免 token）→ `{status:"ok"}`
  * - `POST /roots`、`GET /roots`、`GET /roots/:id`、`DELETE /roots/:id?deleteData=1`
  * - `POST /roots/:id/preview`、`POST /roots/:id/index`
+ * - `GET  /roots/:id/entries?path=`（目錄子項）、`GET /roots/:id/file?path=`（文字預覽／圖片位元組）、
+ *   `GET /roots/:id/thumb?path=`（縮圖）、`GET /roots/:id/index/status`（索引进度輪詢）
  * - `POST /search`
  * - `POST /memories`、`GET /memories`、`DELETE /memories/:id`
  *
@@ -50,6 +52,7 @@ import {
 } from "@mnemoshelf/core";
 import { LOOPBACK_HOST } from "../config.js";
 import {
+  FileTooLargeError,
   IndexInProgressError,
   InvalidHostError,
   InvalidRequestUrlError,
@@ -59,8 +62,20 @@ import {
   PayloadTooLargeError,
   RequestUriTooLongError,
   UnauthorizedError,
+  UnsupportedFileTypeError,
   ValidationError,
 } from "../errors.js";
+import { IndexStatusTracker, type IndexStatus } from "../index-status.js";
+import {
+  listDirectoryEntries,
+  makeThumbnail,
+  parseRelativePath,
+  readFilePreview,
+  ThumbnailCache,
+  type DirEntry,
+  type FilePreview,
+  type TextPreview,
+} from "./explorer.js";
 import { requireLocalHost, requireLoopback, requireToken } from "./auth.js";
 import { unifiedSearch, type SearchMode, type UnifiedSearchResult } from "../search.js";
 
@@ -166,6 +181,35 @@ export interface ErrorResponse {
   error: { name: string; message: string };
 }
 
+/** JSON 路由結果。 */
+export interface JsonRouteResult {
+  status: number;
+  body: unknown;
+}
+
+/** 位元組路由結果（圖片原始位元組、縮圖）：直接以位元組回應，不經 JSON。 */
+export interface BytesRouteResult {
+  status: number;
+  bytes: Buffer;
+  contentType: string;
+  headers?: Record<string, string>;
+}
+
+/** 路由函式的回傳值：JSON 或位元組。 */
+export type RouteResult = JsonRouteResult | BytesRouteResult;
+
+/** 判斷路由結果是否為位元組回應。 */
+function isBytesResult(result: RouteResult): result is BytesRouteResult {
+  return "bytes" in result;
+}
+
+/** `GET /roots/:id/entries` 的回應。 */
+export interface ListEntriesResponse {
+  /** 正規化後的相對 root 路徑（`/` 分隔；root 本身為空字串）。 */
+  path: string;
+  entries: DirEntry[];
+}
+
 export interface RestAppDeps {
   store: MetadataStore;
   vec: VectorIndex;
@@ -200,6 +244,22 @@ function sendJson(response: ServerResponse, status: number, body: unknown, heade
   response.end(payload);
 }
 
+/** 直接以位元組回應（圖片原始位元組、縮圖）；`content-type` 由呼叫端指定。 */
+function sendBytes(
+  response: ServerResponse,
+  status: number,
+  contentType: string,
+  body: Buffer,
+  headers: Record<string, string> = {},
+): void {
+  response.writeHead(status, {
+    "content-type": contentType,
+    "content-length": body.byteLength,
+    ...headers,
+  });
+  response.end(body);
+}
+
 /**
  * 把錯誤映射成 HTTP 狀態碼與回應主體。
  *
@@ -224,6 +284,8 @@ export function toHttpError(error: unknown): { status: number; body: ErrorRespon
   if (error instanceof ValidationError) return { status: 400, body: named(error.name, error.message), headers: {} };
   if (error instanceof IndexInProgressError) return { status: 409, body: named(error.name, error.message), headers: {} };
   if (error instanceof PayloadTooLargeError) return { status: 413, body: named(error.name, error.message), headers: {} };
+  if (error instanceof FileTooLargeError) return { status: 413, body: named(error.name, error.message), headers: {} };
+  if (error instanceof UnsupportedFileTypeError) return { status: 415, body: named(error.name, error.message), headers: {} };
   if (error instanceof InvalidRequestUrlError) return { status: 400, body: named(error.name, error.message), headers: {} };
   if (error instanceof RequestUriTooLongError) {
     return { status: 414, body: named(error.name, error.message), headers: {} };
@@ -380,6 +442,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   const maxFileBytesByRoot = new Map<number, number>();
   const indexing = new Map<number, Promise<IndexRootResult>>();
   const inflight = new Set<Promise<unknown>>();
+  /** 索引工作狀態（行程內記憶體；供 `GET /roots/:id/index/status` 輪詢）。 */
+  const indexStatus = new IndexStatusTracker();
+  /** 縮圖快取（行程內記憶體；不寫磁碟）。 */
+  const thumbnailCache = new ThumbnailCache();
 
   // 靜態檔根目錄：不存在時（還沒 build UI）不建立 sirv handler，靜態路徑一律 404。
   const webDir = path.resolve(deps.webDir);
@@ -521,21 +587,81 @@ export function createRestApp(deps: RestAppDeps): RestApp {
 
     const startedAt = Date.now();
     const maxFileBytes = maxFileBytesByRoot.get(id);
+    indexStatus.begin(id);
     const run = indexRoot(root, {
       embedder: deps.embedder,
       store: deps.store,
       vec: deps.vec,
+      onProgress: (progress) => indexStatus.report(id, progress),
       ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
     });
     indexing.set(id, run);
     inflight.add(run);
     try {
       const result = await run;
+      indexStatus.finish(id, result);
       return { status: 200, body: { rootId: id, durationMs: Date.now() - startedAt, ...result } };
+    } catch (error) {
+      indexStatus.fail(id, error);
+      throw error;
     } finally {
       indexing.delete(id);
       inflight.delete(run);
     }
+  };
+
+  /**
+   * `GET /roots/:id/entries?path=`：列出相對路徑下的目錄子項。
+   *
+   * `path` 缺漏或為絕對路徑 → 400；逃出 root（含 `..`、symlink）或命中黑名單 → 403；
+   * 目標不是目錄 → 400；不存在 → 404。所有存取都經 `resolveInsideRoot`。
+   */
+  const listEntries = async (id: number, url: URL): Promise<RouteResult> => {
+    const root = await getRootOr404(id);
+    const relPath = parseRelativePath(url.searchParams.get("path"), { allowEmpty: true });
+    const body: ListEntriesResponse = await listDirectoryEntries(root, relPath);
+    return { status: 200, body };
+  };
+
+  /**
+   * `GET /roots/:id/file?path=`：文字預覽（JSON）或圖片原始位元組（帶 Content-Type）。
+   *
+   * 二進位與媒體檔 → 415；超過大小上限 → 413。
+   */
+  const readFile = async (id: number, url: URL): Promise<RouteResult> => {
+    const root = await getRootOr404(id);
+    const relPath = parseRelativePath(url.searchParams.get("path"), { allowEmpty: false });
+    const preview: FilePreview = await readFilePreview(root, relPath);
+    if (preview.kind === "text") {
+      const body: TextPreview = preview;
+      return { status: 200, body };
+    }
+    return {
+      status: 200,
+      bytes: preview.bytes,
+      contentType: preview.contentType,
+      headers: { "cache-control": "private, max-age=60" },
+    };
+  };
+
+  /** `GET /roots/:id/thumb?path=`：用 `sharp` 產生縮圖（記憶體快取）。 */
+  const readThumbnail = async (id: number, url: URL): Promise<RouteResult> => {
+    const root = await getRootOr404(id);
+    const relPath = parseRelativePath(url.searchParams.get("path"), { allowEmpty: false });
+    const thumbnail = await makeThumbnail(root, relPath, thumbnailCache);
+    return {
+      status: 200,
+      bytes: thumbnail.bytes,
+      contentType: thumbnail.contentType,
+      headers: { "cache-control": "private, max-age=300" },
+    };
+  };
+
+  /** `GET /roots/:id/index/status`：輪詢索引进度（行程內記憶體狀態）。 */
+  const getIndexStatus = async (id: number): Promise<RouteResult> => {
+    await getRootOr404(id);
+    const status: IndexStatus = indexStatus.status(id);
+    return { status: 200, body: status };
   };
 
   const removeRoot = async (id: number, deleteData: boolean): Promise<{ status: number; body: unknown }> => {
@@ -544,6 +670,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const { removedChunkIds } = await deps.store.removeRoot(id, deleteData);
     if (deleteData) await deps.vec.deleteByRoot(id);
     maxFileBytesByRoot.delete(id);
+    indexStatus.clear(id);
     const body: RemoveRootResponse = {
       rootId: id,
       deletedData: deleteData,
@@ -577,7 +704,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     method: string,
     segments: string[],
     url: URL,
-  ): Promise<{ status: number; body: unknown }> => {
+  ): Promise<RouteResult> => {
     if (segments.length === 1) {
       if (method === "GET") return { status: 200, body: { roots: await deps.store.listRoots() } };
       if (method === "POST") return await createRoot(request);
@@ -601,6 +728,24 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
         return await startIndex(id);
       }
+      if (segments[2] === "entries") {
+        if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
+        return await listEntries(id, url);
+      }
+      if (segments[2] === "file") {
+        if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
+        return await readFile(id, url);
+      }
+      if (segments[2] === "thumb") {
+        if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
+        return await readThumbnail(id, url);
+      }
+    }
+
+    // `GET /roots/:id/index/status`（索引进度輪詢）。
+    if (segments.length === 4 && segments[2] === "index" && segments[3] === "status") {
+      if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
+      return await getIndexStatus(id);
     }
 
     throw new NotFoundError("路徑");
@@ -679,7 +824,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     // 除 /health 外一律要 token。
     requireToken(request, deps.token);
 
-    let result: { status: number; body: unknown };
+    let result: RouteResult;
     switch (segments[0]) {
       case "roots":
         result = await routeRoots(request, method, segments, url);
@@ -696,7 +841,11 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         throw new NotFoundError("路徑");
     }
 
-    sendJson(response, result.status, result.body);
+    if (isBytesResult(result)) {
+      sendBytes(response, result.status, result.contentType, result.bytes, result.headers ?? {});
+    } else {
+      sendJson(response, result.status, result.body);
+    }
   };
 
   const handler = (request: IncomingMessage, response: ServerResponse): void => {

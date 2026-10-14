@@ -11,6 +11,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@tanstack/react-virtual": "^3.14.19",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },

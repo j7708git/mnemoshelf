@@ -91,6 +91,36 @@ export class IndexInProgressError extends Error {
   }
 }
 
+/**
+ * 這個型別的檔案不支援此操作（HTTP 415）。
+ *
+ * 用於「文字預覽遇到二進位／媒體檔」與「縮圖遇到非圖片」等情形。
+ * 訊息只帶**相對路徑**（或檔名），不含本機絕對路徑；呼叫端不得據此洩漏 root 外的資訊。
+ */
+export class UnsupportedFileTypeError extends Error {
+  /** 相對 root 的路徑（POSIX 分隔）；未知時為空字串。 */
+  readonly relPath: string;
+
+  constructor(relPath: string, reason: string) {
+    super(`不支援這個檔案的預覽（${relPath === "" ? "檔案" : relPath}）：${reason}`);
+    this.name = "UnsupportedFileTypeError";
+    this.relPath = relPath;
+  }
+}
+
+/** 檔案過大，超過此操作的上限（HTTP 413）。訊息只帶相對路徑與上限值。 */
+export class FileTooLargeError extends Error {
+  readonly relPath: string;
+  readonly limitBytes: number;
+
+  constructor(relPath: string, limitBytes: number) {
+    super(`檔案過大，無法處理（${relPath === "" ? "檔案" : relPath}；上限 ${limitBytes} bytes）`);
+    this.name = "FileTooLargeError";
+    this.relPath = relPath;
+    this.limitBytes = limitBytes;
+  }
+}
+
 /** 請求方法不支援（HTTP 405）。 */
 export class MethodNotAllowedError extends Error {
   readonly allowed: string[];

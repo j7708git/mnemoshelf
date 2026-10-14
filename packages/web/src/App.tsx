@@ -4,10 +4,13 @@ import {
   getToken,
   listRoots,
   NetworkError,
+  removeRoot,
   setToken,
   UnauthorizedApiError,
   type Root,
 } from "./api";
+import { AddRootFlow } from "./AddRootFlow";
+import { ExplorerPanel } from "./ExplorerPanel";
 import { RootsList } from "./RootsList";
 import { TokenForm } from "./TokenForm";
 
@@ -19,14 +22,18 @@ type ViewState =
   | { kind: "error"; message: string };
 
 /**
- * 應用根元件：先確認 token，再顯示 roots 清單。
+ * 應用根元件：token → 資料夾清單 → 檔案總管（目錄樹、預覽、索引进度）。
  *
- * 本卡範圍只有：token 輸入、連線狀態、roots 列表。其餘畫面留白，不做假的按鈕。
+ * 本卡範圍：加入資料夾引導、虛擬化目錄樹、檔案預覽（文字／圖片）。搜尋與記憶留待後續卡。
  */
 export function App() {
   const [state, setState] = useState<ViewState>(() =>
     getToken() === null ? { kind: "need-token", message: null } : { kind: "loading" },
   );
+  const [selectedRootId, setSelectedRootId] = useState<number | null>(null);
+  const [mode, setMode] = useState<"explorer" | "add-root">("explorer");
+  /** 遞增以強制目錄樹與狀態重新載入。 */
+  const [refreshKey, setRefreshKey] = useState(0);
 
   const load = useCallback(async (): Promise<void> => {
     setState({ kind: "loading" });
@@ -58,8 +65,35 @@ export function App() {
 
   const forgetToken = (): void => {
     clearToken();
+    setSelectedRootId(null);
     setState({ kind: "need-token", message: null });
   };
+
+  const onRootAdded = (root: Root): void => {
+    setSelectedRootId(root.id);
+    setMode("explorer");
+    setRefreshKey((current) => current + 1);
+    void load();
+  };
+
+  const onRemoveRoot = async (root: Root): Promise<void> => {
+    const confirmed = window.confirm(
+      `要移除資料夾「${root.path}」嗎？\n移除後索引資料會一併刪除，但磁碟上的檔案不會被更動。`,
+    );
+    if (!confirmed) return;
+    try {
+      await removeRoot(root.id, true);
+      if (selectedRootId === root.id) setSelectedRootId(null);
+      await load();
+    } catch (error) {
+      setState({ kind: "error", message: error instanceof Error ? error.message : "移除資料夾失敗" });
+    }
+  };
+
+  const selectedRoot =
+    state.kind === "ready"
+      ? (state.roots.find((root) => root.id === selectedRootId) ?? state.roots[0] ?? null)
+      : null;
 
   return (
     <div className="flex min-h-full flex-col bg-surface text-ink">
@@ -94,7 +128,7 @@ export function App() {
       )}
 
       {state.kind === "ready" && (
-        <div className="mx-auto flex max-w-3xl flex-col gap-6 px-6 py-8">
+        <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-8">
           <header className="flex items-center justify-between gap-3">
             <div>
               <h1 className="text-xl font-semibold text-ink">Mnemoshelf</h1>
@@ -109,13 +143,43 @@ export function App() {
             </button>
           </header>
 
-          <section className="space-y-3">
-            <div className="flex items-baseline justify-between">
-              <h2 className="text-base font-medium text-ink">已加入的資料夾</h2>
-              <span className="text-xs text-muted">共 {state.roots.length} 個</span>
-            </div>
-            <RootsList roots={state.roots} />
-          </section>
+          <div className="grid gap-6 lg:grid-cols-[300px_minmax(0,1fr)]">
+            <aside className="space-y-3">
+              <div className="flex items-center justify-between">
+                <h2 className="text-base font-medium text-ink">
+                  資料夾<span className="ml-1 text-xs text-muted">（{state.roots.length}）</span>
+                </h2>
+                <button
+                  type="button"
+                  onClick={() => setMode("add-root")}
+                  className="rounded-md bg-ink px-2.5 py-1 text-xs font-medium text-white"
+                >
+                  加入
+                </button>
+              </div>
+              <RootsList
+                roots={state.roots}
+                selectedRootId={selectedRoot?.id ?? null}
+                onSelect={(root) => {
+                  setSelectedRootId(root.id);
+                  setMode("explorer");
+                }}
+                onRemove={(root) => void onRemoveRoot(root)}
+              />
+            </aside>
+
+            <main className="min-w-0">
+              {mode === "add-root" ? (
+                <AddRootFlow onCancel={() => setMode("explorer")} onDone={onRootAdded} />
+              ) : selectedRoot === null ? (
+                <div className="flex h-[60vh] items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center">
+                  <p className="text-sm text-muted">請先加入一個資料夾。</p>
+                </div>
+              ) : (
+                <ExplorerPanel key={selectedRoot.id} root={selectedRoot} refreshKey={refreshKey} />
+              )}
+            </main>
+          </div>
         </div>
       )}
     </div>

@@ -61,15 +61,31 @@ Vite dev server 用 `server.proxy` ＋ `changeOrigin: true` 對接（見 `packag
 | `GET /roots`、`GET /roots/:id` | 列出／取得 root |
 | `DELETE /roots/:id?deleteData=1` | 移除 root；`deleteData=1` 時一併刪除 chunk 與向量 |
 | `POST /roots/:id/preview` | 乾跑統計（不寫入任何狀態） |
-| `POST /roots/:id/index` | 觸發索引；同一 root 索引進行中再呼叫 → `409` |
+| `POST /roots/:id/index` | 觸發索引；同一 root 索引進行中再呼叫 → `409`。**會等整個索引跑完才回應** |
+| `GET /roots/:id/index/status` | 輪詢索引进度：`{state: idle\|running\|completed\|failed, progress, startedAt, finishedAt, durationMs, error, result}`（行程內記憶體；**重啟後回 `idle`**，不引入 SSE／WebSocket） |
+| `GET /roots/:id/entries?path=<相對路徑>` | 列出該相對路徑（目錄）下的直接子項：`{path, entries:[{name,path,kind,size,mimeType}]}`。`kind` 為 `dir`／`text`／`code`／`image`／`audio`／`video`／`binary`；目錄的 `size` 為 `null` |
+| `GET /roots/:id/file?path=<相對路徑>` | 文字預覽（JSON：`{kind:"text",path,size,truncated,content}`，上限 256 KB、超過截斷並以 `truncated` 標明）或圖片原始位元組（帶正確 `Content-Type`） |
+| `GET /roots/:id/thumb?path=<相對路徑>` | 圖片縮圖（`sharp` 產生、寬度上限 320px、輸出 PNG；**記憶體內快取**，不寫磁碟） |
 | `POST /search` | `{query, mode?, rootIds?, k?}`；`mode` 為 `keyword`／`hybrid`／`vector`（預設），`k` 上限 100 |
 | `POST /memories` | `{content, kind?, scope?, project?, agent}`（`agent` 必填＝寫入者標識） |
 | `GET /memories` | 列出未刪除的記憶（由新到舊）；query：`kind`、`scope`、`project`、`agent`、`limit`（預設 100、上限 500） |
 | `DELETE /memories/:id` | 軟刪除記憶 |
 
 狀態碼：`401` token 錯、`403` 路徑不在 root 內或命中黑名單、或 `Host` 非本機、`404` 未知資源、
-`409` 重複 root／索引進行中、`422` root 過寬（家目錄或檔案系統根）、`400` 請求內容或請求 URL 不合法、
-`414` 請求 URL 過長。
+`409` 重複 root／索引進行中、`413` 檔案過大（超過端點上限）、`415` 型別不支援預覽（二進位／非圖片縮圖）、
+`422` root 過寬（家目錄或檔案系統根）、`400` 請求內容或請求 URL 不合法、`414` 請求 URL 過長。
+
+### 檔案存取的守衛與上限（M3）
+
+`entries`／`file`／`thumb` 三個端點的 `path` 一律是**相對 root 的路徑**，且**全部經
+`resolveInsideRoot`**（`docs/roots-and-privacy.md` §路徑安全）：realpath 解析（跟隨 symlink）、
+必須落在 root 內、並檢查黑名單（相對與絕對路徑都檢查）。
+
+- `path` 缺漏或為絕對路徑 → `400`；`..` 逃出 root、指向 root 外的 symlink → `403`；黑名單 → `403`。
+- 目錄樹的每個子項也會再過一次守衛：指向 root 外或命中黑名單的項目**不列出**。
+- 文字預覽上限 256 KB（`MAX_TEXT_PREVIEW_BYTES`，超過截斷並標明）；原始圖片上限 25 MB；
+  縮圖輸入上限 25 MB。超過上限回 `413`。
+- 縮圖快取為**行程內記憶體**（上限 200 張，key 含 mtime 與大小），不寫磁碟。
 
 搜尋回應的每個命中都帶**來源**（chunk：`rootId`／`relPath`／`seq`／`kind`；memory：`agent`／`scope`），
 文字片段有長度上限並以 `textTruncated` 標記。
@@ -115,7 +131,9 @@ MNEMOSHELF_E2E=1 pnpm --filter @mnemoshelf/server run e2e   # 真實 embedder（
 ## 目前限制
 
 - `maxFileBytes` 只存活於本次行程，重啟後回退預設 10 MB（見上）。
-- 沒有 watch／檔案監看、沒有 WebSocket／SSE 進度串流、沒有多使用者或角色。
+- 沒有 watch／檔案監看、沒有 WebSocket／SSE 進度串流、沒有多使用者或角色。索引进度以輪詢
+  `GET /roots/:id/index/status` 取得（行程內記憶體；重啟後回 `idle`）。
 - root 的 `agentAccess` 欄位本版尚未做內容級過濾。
-- 索引沒有佇列：進行中再呼叫會回 `409`。
-- Web UI 只有骨架（token 輸入＋roots 清單）；加入資料夾、目錄樹、預覽、搜尋、記憶尚未提供。
+- 索引沒有佇列：進行中再呼叫會回 `409`。索引取消端點尚未提供。
+- Web UI 提供 token 輸入、roots 清單、加入資料夾引導（加入→預覽→索引→進度）、虛擬化目錄樹與
+  檔案預覽（文字與圖片縮圖）；搜尋與記憶管理尚未提供（下一張卡）。

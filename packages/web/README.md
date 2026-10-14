@@ -1,13 +1,20 @@
 # @mnemoshelf/web
 
-Mnemoshelf 的 Web UI（M3 第一塊骨架）：**Vite + React + Tailwind CSS v4**。
+Mnemoshelf 的 Web UI：**Vite + React + Tailwind CSS v4**（＋ `@tanstack/react-virtual`）。
 build 產物（`dist/`）由 `@mnemoshelf/server` 同源提供，因此 UI 與 API 共用同一個
 `127.0.0.1` 入口，不需要 CORS。
 
-## 本卡範圍
+## 本卡範圍（M3 檔案總管）
 
-- token 輸入頁、連線狀態、roots 清單（`GET /roots`）。
-- 尚未提供：加入／移除資料夾、目錄樹、檔案預覽、搜尋、記憶（後續卡）。
+- token 輸入頁、連線狀態、roots 清單（可選取與移除）。
+- **加入資料夾引導**：輸入路徑 → `POST /roots` → 預覽統計（`POST /roots/:id/preview`）→
+  「開始索引」→ 背景索引 ＋ 輪詢 `GET /roots/:id/index/status` 顯示進度 → 完成。
+- **虛擬化目錄樹**：展開時才載入子項（`GET /roots/:id/entries`，lazy），以
+  `@tanstack/react-virtual` 虛擬化（節點多時不爆 DOM）。
+- **檔案預覽**：文字（`GET /roots/:id/file`，截斷會標明）與圖片（`GET /roots/:id/thumb` 縮圖，
+  可切換原圖）。圖片一律 `fetch`＋blob URL（`<img src>` 帶不了 `Authorization`），
+  不再使用時 `URL.revokeObjectURL`。
+- 尚未提供：搜尋、記憶管理（下一張卡）。
 
 ## 開發
 
@@ -38,5 +45,6 @@ M4（Electron）會改用 `webRequest` 注入標頭，讓 token 完全不進 ren
 
 ## 測試
 
-本卡未為 web 加測試工具鏈（未核准 `vitest`／`jsdom` 等依賴）；行為以
-`@mnemoshelf/server` 的靜態服務／Host 驗證測試與瀏覽器實測涵蓋。
+web 套件沒有單元測試工具鏈（未核准 `vitest`／`jsdom` 等依賴）；行為以
+`@mnemoshelf/server` 的端點整合測試與瀏覽器實測涵蓋。目錄樹的純邏輯
+（`flattenTree.ts`）刻意抽成與 React 無關的純函式，未來若引入測試工具鏈可直接測。

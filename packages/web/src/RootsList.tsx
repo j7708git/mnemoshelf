@@ -2,6 +2,9 @@ import type { Root } from "./api";
 
 export interface RootsListProps {
   roots: Root[];
+  selectedRootId: number | null;
+  onSelect: (root: Root) => void;
+  onRemove: (root: Root) => void;
 }
 
 const MODE_LABEL: Record<Root["mode"], string> = {
@@ -20,37 +23,55 @@ function formatDate(iso: string): string {
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString("zh-TW");
 }
 
-/** 已加入的資料夾清單（本卡只讀 `GET /roots`；加入／移除與目錄樹留待後續卡）。 */
-export function RootsList({ roots }: RootsListProps) {
+/** 已加入的資料夾清單：可選取（右側顯示目錄樹）與移除。 */
+export function RootsList({ roots, selectedRootId, onSelect, onRemove }: RootsListProps) {
   if (roots.length === 0) {
     return (
-      <div className="rounded-lg border border-dashed border-line bg-white/60 px-6 py-12 text-center">
-        <p className="text-base font-medium text-ink">尚未加入任何資料夾</p>
-        <p className="mt-2 text-sm text-muted">
-          加入資料夾、目錄樹與搜尋功能會在後續版本提供；本版本只顯示已加入的資料夾清單。
-        </p>
+      <div className="rounded-lg border border-dashed border-line bg-white/60 px-4 py-8 text-center">
+        <p className="text-sm font-medium text-ink">尚未加入任何資料夾</p>
+        <p className="mt-2 text-xs text-muted">按「加入」選擇一個資料夾，加入後會先顯示統計。</p>
       </div>
     );
   }
 
   return (
     <ul className="space-y-2">
-      {roots.map((root) => (
-        <li key={root.id} className="rounded-lg border border-line bg-white px-4 py-3">
-          <div className="flex items-baseline justify-between gap-3">
-            <span className="truncate font-medium text-ink" title={root.path}>
-              {basename(root.path)}
-            </span>
-            <span className="shrink-0 rounded-full border border-line px-2 py-0.5 text-xs text-muted">
-              {MODE_LABEL[root.mode]}
-            </span>
-          </div>
-          <p className="mt-1 break-all font-mono text-xs text-muted">{root.path}</p>
-          <p className="mt-1 text-xs text-muted">
-            模態：{root.modalities.join("、") || "（無）"}　加入時間：{formatDate(root.createdAt)}
-          </p>
-        </li>
-      ))}
+      {roots.map((root) => {
+        const selected = root.id === selectedRootId;
+        return (
+          <li key={root.id}>
+            <div
+              className={`rounded-lg border px-3 py-2 ${
+                selected ? "border-ink bg-white" : "border-line bg-white/70"
+              }`}
+            >
+              <div className="flex items-baseline justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() => onSelect(root)}
+                  aria-current={selected ? "true" : undefined}
+                  className="min-w-0 flex-1 text-left"
+                  title={root.path}
+                >
+                  <span className="block truncate text-sm font-medium text-ink">{basename(root.path)}</span>
+                  <span className="mt-0.5 block break-all font-mono text-xs text-muted">{root.path}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onRemove(root)}
+                  className="shrink-0 rounded-md border border-line px-2 py-0.5 text-xs text-muted hover:text-red-600"
+                >
+                  移除
+                </button>
+              </div>
+              <p className="mt-1 text-xs text-muted">
+                {MODE_LABEL[root.mode]}　模態：{root.modalities.join("、") || "（無）"}
+              </p>
+              <p className="text-xs text-muted">加入時間：{formatDate(root.createdAt)}</p>
+            </div>
+          </li>
+        );
+      })}
     </ul>
   );
 }
