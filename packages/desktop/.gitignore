@@ -1,0 +1,2 @@
+# electron-builder 的 --dir 產物（本機建置用，不進版控）
+dist-app/

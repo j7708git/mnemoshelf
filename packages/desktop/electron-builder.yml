@@ -1,0 +1,56 @@
+# electron-builder 設定（spike；決策依 M4 打包研究，2026-10 查證）
+#
+# 用法：`pnpm --filter @mnemoshelf/desktop dist`（等於 `tsc` + `electron-builder --dir`）
+# 產物：`packages/desktop/dist-app/linux-unpacked/`（未封裝目錄，供本輪實跑驗收）
+#
+# 注意：electron-builder 的 npm `latest` tag 落後（26.15.3），最新 26.x 在 `v26` tag
+# （26.17.0）。版本在 package.json 明確釘住，不要改成浮動版本。
+appId: dev.mnemoshelf.app
+productName: Mnemoshelf
+
+directories:
+  output: dist-app
+
+# 執行檔名（預設會用 package.json 的 scoped name 變成 `@mnemoshelfdesktop`）。
+executableName: mnemoshelf
+
+asar: true
+
+# 應用程式檔（相對 app 目錄＝packages/desktop）。有 include pattern 時 electron-builder
+# 不會自動補 `**/*`；`package.json` 與 production `node_modules/**` 一律會加進來。
+files:
+  - dist/**
+  - package.json
+  - "!**/*.map"
+
+# 必須從 asar 解包的原生二進位（解開後落在 app.asar.unpacked，Electron 會透明導向）：
+asarUnpack:
+  # sharp 官方指定的寫法：libvips 的側載檔在 @img/* 內，不是 .node，自動偵測抓不到。
+  - "**/node_modules/sharp/**"
+  - "**/node_modules/@img/**"
+  # sqlite-vec 的 loadExtension() 需要真實檔案路徑（.so／.dylib／.dll）。
+  - "**/node_modules/sqlite-vec*/**"
+  # onnxruntime-node：onnxruntime_binding.node 與 libonnxruntime.so／.dll。
+  - "**/*.node"
+  - "**/node_modules/onnxruntime-node/bin/**"
+
+# Web UI 靜態檔放在 asar 之外（resources/web），由 Core 服務以 MNEMOSHELF_WEB_DIR 讀取。
+# 放在 asar 內也可以（Electron 會導向），但靜態檔沒有必要進 asar，也讓「UI 是不是打包進去」
+# 一眼可驗。
+extraResources:
+  - from: ../web/dist
+    to: web
+    filter:
+      - "**/*"
+      # 不要把 sourcemap 一起送進產物（asar 那邊也排除了 `*.map`）。
+      - "!**/*.map"
+
+# 四個原生模組都是 N-API／Node-API，不需 @electron/rebuild（研究中已確認）。
+npmRebuild: false
+
+# Electron 預設帶全套 locale；只留會用到的，縮小體積。
+electronLanguages:
+  - en-US
+  - zh-TW
+  - zh-CN
+  - ja

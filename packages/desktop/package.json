@@ -1,0 +1,25 @@
+{
+  "name": "@mnemoshelf/desktop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mnemoshelf 桌面殼（Electron）：main process 內啟動 Core 服務、載入 Web UI，並以 electron-builder 打包",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "vitest run",
+    "dist": "pnpm run build && electron-builder --dir",
+    "start": "electron ."
+  },
+  "dependencies": {
+    "@mnemoshelf/server": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "electron": "44.7.0",
+    "electron-builder": "26.17.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
