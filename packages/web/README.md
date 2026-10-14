@@ -46,13 +46,22 @@ MNEMOSHELF_DEV_CORE=http://127.0.0.1:8787 pnpm --filter @mnemoshelf/web run dev
 
 ## token 處理
 
-使用者貼上一次 → 存 `sessionStorage`（只活到分頁關閉）→ 每請求帶
-`Authorization: Bearer <token>`；收到 `401` 會清除 token，並由 `apiFetch` 派送全域事件
+**瀏覽器模式**（直接開服務的網址）：使用者貼上一次 → 存 `sessionStorage`（只活到分頁關閉）→
+每請求帶 `Authorization: Bearer <token>`；收到 `401` 會清除 token，並由 `apiFetch` 派送全域事件
 `mnemoshelf:unauthorized`（`api.ts` 的 `UNAUTHORIZED_EVENT`），`App.tsx` 監聽後切回貼
 token 畫面，各面板不必各自處理 401。
 
-**token 絕不進 URL、絕不經 `VITE_*` 環境變數**（`VITE_*` 會被 build 期內嵌進 bundle）。
-M4（Electron）會改用 `webRequest` 注入標頭，讓 token 完全不進 renderer。
+**桌面模式**（Electron 殼）：preload 掛了 `window.mnemoshelfDesktop` 時，token 由應用程式自己管
+（`safeStorage` 加密保存，main process 以 `webRequest` 注入標頭），UI 不出現 token 表單、
+也沒有「登出」；401 會顯示可重試的錯誤（而不是回頭要求貼 token）。見 `desktop.ts`。
+
+**token 絕不進 URL、絕不經 `VITE_*` 環境變數**（`VITE_*` 會被 build 期內嵌進 bundle），
+也**不會**經過 desktop bridge（bridge 只回傳保存狀態）。
+
+## 桌面模式專屬畫面
+
+`BootstrapScreen.tsx`（首次啟動的模型下載進度／重試）與 `SettingsPanel.tsx`（開機自啟開關、
+token 保存狀態、版本）只在桌面模式顯示；瀏覽器模式完全不受影響（同一個 build 支援兩種環境）。
 
 ## 測試
 

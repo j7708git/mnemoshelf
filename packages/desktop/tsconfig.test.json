@@ -5,5 +5,10 @@
     "outDir": "dist",
     "noEmit": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "vitest.config.ts"]
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.cts",
+    "test/**/*.ts",
+    "vitest.config.ts"
+  ]
 }

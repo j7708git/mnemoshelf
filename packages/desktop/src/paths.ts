@@ -19,7 +19,7 @@ export interface DesktopPaths {
   modelDir: string;
   /** Web UI 靜態檔目錄（`MNEMOSHELF_WEB_DIR`）。 */
   webDir: string;
-  /** 自動產生的 token 落地位置（spike 限定；正式的 safeStorage 管理見後續卡片）。 */
+  /** token 密文檔位置（由 `safeStorage` 加密後落地，見 `token-store.ts`）。 */
   tokenFile: string;
 }
 
@@ -36,34 +36,35 @@ export function resolveDesktopPaths(input: {
     dataDir: path.join(userData, "data"),
     modelDir: path.join(userData, "models"),
     webDir: input.webDir === undefined ? path.join(path.resolve(input.resourcesPath), "web") : path.resolve(input.webDir),
-    tokenFile: path.join(userData, "spike-token.txt"),
+    tokenFile: path.join(userData, "token.bin"),
   };
 }
 
-/** token 的來源。 */
-export type TokenSource = "env" | "generated";
+/** token 的來源（由 `token-store.ts` 決定；這裡只保留型別給其他模組使用）。 */
+export type TokenSource = "env" | "stored" | "generated" | "session";
 
-/** token 決策結果。 */
-export interface TokenDecision {
-  token: string;
-  source: TokenSource;
+/** 桌面殼的命令列選項。 */
+export interface CliOptions {
+  /** `--headless`：不開視窗、不建系統匣，只跑 Core 服務。 */
+  headless: boolean;
+  /** `--hidden`：建立視窗但不主動顯示（開機自啟時用，從系統匣叫回來）。 */
+  hidden: boolean;
+}
+
+/** 解析命令列選項（純函式，可單獨測試）。 */
+export function parseCliArgs(argv: readonly string[]): CliOptions {
+  return {
+    headless: argv.includes("--headless"),
+    hidden: argv.includes("--hidden"),
+  };
 }
 
 /**
- * 決定這次啟動要用的 token。
+ * 交給 `createServer()` 的環境變數（覆寫值走 server 的同一條驗證路徑）。
  *
- * spike 階段：`MNEMOSHELF_TOKEN` 有值就沿用（與 `pnpm serve` 的用法一致），
- * 否則產生一組隨機 token 並落地到 userData（正式的 safeStorage 管理是下一張卡）。
+ * `MNEMOSHELF_PORT` 預設 0（由 OS 指派隨機埠，只綁 127.0.0.1）；外部若明確指定
+ * （例如 headless 驗收要用固定埠 curl）則沿用該值。
  */
-export function decideToken(env: NodeJS.ProcessEnv, generate: () => string): TokenDecision {
-  const fromEnv = env.MNEMOSHELF_TOKEN;
-  if (fromEnv !== undefined && fromEnv.trim() !== "") {
-    return { token: fromEnv.trim(), source: "env" };
-  }
-  return { token: generate(), source: "generated" };
-}
-
-/** 交給 `createServer()` 的環境變數（覆寫值走 server 的同一條驗證路徑）。 */
 export function buildServerEnv(input: {
   base: NodeJS.ProcessEnv;
   token: string;
@@ -71,13 +72,13 @@ export function buildServerEnv(input: {
   modelDir: string;
   webDir: string;
 }): NodeJS.ProcessEnv {
+  const port = input.base.MNEMOSHELF_PORT;
   return {
     ...input.base,
     MNEMOSHELF_TOKEN: input.token,
     MNEMOSHELF_DATA_DIR: input.dataDir,
     MNEMOSHELF_MODEL_DIR: input.modelDir,
     MNEMOSHELF_WEB_DIR: input.webDir,
-    // 0（預設）＝由 OS 指派隨機埠；只綁 127.0.0.1（契約）。
-    MNEMOSHELF_PORT: "0",
+    MNEMOSHELF_PORT: port === undefined || port.trim() === "" ? "0" : port,
   };
 }

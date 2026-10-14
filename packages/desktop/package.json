@@ -13,6 +13,8 @@
     "start": "electron ."
   },
   "dependencies": {
+    "@huggingface/transformers": "4.3.1",
+    "@mnemoshelf/embedder-transformers": "workspace:*",
     "@mnemoshelf/server": "workspace:*"
   },
   "devDependencies": {

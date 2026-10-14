@@ -11,11 +11,14 @@ import {
   type Root,
 } from "./api";
 import { AddRootFlow } from "./AddRootFlow";
+import { BootstrapScreen } from "./BootstrapScreen";
 import { ExplorerPanel } from "./ExplorerPanel";
 import { MemoriesPanel } from "./MemoriesPanel";
 import { RootsList } from "./RootsList";
 import { SearchPanel } from "./SearchPanel";
+import { SettingsPanel } from "./SettingsPanel";
 import { TokenForm } from "./TokenForm";
+import { useDesktopBridge, type DesktopBootstrapState, type DesktopSettingsState } from "./desktop";
 
 /** 畫面的四種狀態。 */
 type ViewState =
@@ -36,17 +39,32 @@ const NAV_LABEL: Record<View, string> = {
 /**
  * 應用根元件：token → 資料夾清單 → 三個主要檢視（檔案總管／搜尋／記憶管理）。
  *
- * 本卡範圍：統一搜尋畫面（模式選擇器，預設 hybrid）與記憶管理（列表、釘選、編輯、刪除、來源）。
+ * 兩種執行環境共用同一份 UI：
+ * - **桌面模式**（Electron 殼）：preload 掛上 `window.mnemoshelfDesktop`，token 由應用自己管
+ *   （main process 以 `webRequest` 注入標頭），因此不出現手動貼 token 的畫面；
+ *   模型下載進度也由殼推過來（`BootstrapScreen`），下載完成前先顯示進度。
+ * - **瀏覽器模式**：直接開服務的網址，token 由使用者貼上（`TokenForm`），行為與 M3 相同。
  */
 export function App() {
+  const desktop = useDesktopBridge();
   const [state, setState] = useState<ViewState>(() =>
-    getToken() === null ? { kind: "need-token", message: null } : { kind: "loading" },
+    desktop !== null ? { kind: "loading" } : getToken() === null ? { kind: "need-token", message: null } : { kind: "loading" },
   );
   const [selectedRootId, setSelectedRootId] = useState<number | null>(null);
   const [view, setView] = useState<View>("explorer");
   const [mode, setMode] = useState<"explorer" | "add-root">("explorer");
   /** 遞增以強制目錄樹與狀態重新載入。 */
   const [refreshKey, setRefreshKey] = useState(0);
+
+  /** 桌面殼的模型下載狀態（瀏覽器模式永遠是 null）。 */
+  const [bootstrap, setBootstrap] = useState<DesktopBootstrapState | null>(null);
+  const [bootstrapBusy, setBootstrapBusy] = useState(false);
+  /** 使用者在下載失敗時選擇「先進入應用」。 */
+  const [bootstrapSkipped, setBootstrapSkipped] = useState(false);
+  const [settings, setSettings] = useState<DesktopSettingsState | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [settingsBusy, setSettingsBusy] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   const load = useCallback(async (): Promise<void> => {
     setState({ kind: "loading" });
@@ -55,6 +73,14 @@ export function App() {
       setState({ kind: "ready", roots });
     } catch (error) {
       if (error instanceof UnauthorizedApiError) {
+        if (desktop !== null) {
+          // 桌面模式的 token 由殼自己注入，401 代表殼與服務對不上（不該發生）：給可重試的錯誤。
+          setState({
+            kind: "error",
+            message: "本機服務拒絕了這次請求（401）。請按「重試」；若持續失敗，請重新啟動應用程式。",
+          });
+          return;
+        }
         setState({ kind: "need-token", message: "token 不正確或已失效，請重新輸入。" });
         return;
       }
@@ -64,22 +90,81 @@ export function App() {
       }
       setState({ kind: "error", message: error instanceof Error ? error.message : "發生未知的錯誤。" });
     }
-  }, []);
+  }, [desktop]);
+
+  /** 桌面模式：訂閱模型下載狀態（掛載時先問一次目前狀態，之後收推播）。 */
+  useEffect(() => {
+    if (desktop === null) return;
+    let alive = true;
+    void desktop.bootstrap
+      .getState()
+      .then((current) => {
+        if (alive && current !== null) setBootstrap(current);
+      })
+      .catch(() => undefined);
+    const unsubscribe = desktop.bootstrap.onUpdate((current) => {
+      if (alive) setBootstrap(current);
+    });
+    return () => {
+      alive = false;
+      unsubscribe();
+    };
+  }, [desktop]);
+
+  /** 桌面模式：取得設定（token 保存狀態、開機自啟）。 */
+  useEffect(() => {
+    if (desktop === null) return;
+    let alive = true;
+    void desktop.settings
+      .get()
+      .then((value) => {
+        if (alive) setSettings(value);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [desktop]);
+
+  /**
+   * 只有「真的在下載（或下載失敗）」才擋住介面。
+   *
+   * `checking`／`idle` 也擋的話，模型本來就在磁碟上的使用者每次啟動都會閃一下下載畫面；
+   * 模型不在磁碟時，狀態會在幾毫秒內變成 `downloading`，那時才擋（下載要幾分鐘，擋住是合理的）。
+   */
+  const bootstrapBlocking =
+    desktop !== null &&
+    bootstrap !== null &&
+    (bootstrap.phase === "downloading" || bootstrap.phase === "verifying" || bootstrap.phase === "failed");
+  const bootstrapReady = !bootstrapBlocking || bootstrapSkipped;
 
   // 掛載時若已有 token（同一分頁內重整）就直接載入，否則顯示 token 輸入。
+  // 桌面模式則等模型就緒（UI 不需要 token）。
   useEffect(() => {
+    if (!bootstrapReady) return;
+    if (desktop !== null) {
+      void load();
+      return;
+    }
     if (getToken() !== null) void load();
-  }, [load]);
+  }, [bootstrapReady, desktop, load]);
 
   // 任何請求收到 401（例如 server 換了 token）→ apiFetch 派送全域事件，這裡切回貼 token 畫面。
   useEffect(() => {
     const onUnauthorized = (): void => {
       setSelectedRootId(null);
+      if (desktop !== null) {
+        setState({
+          kind: "error",
+          message: "本機服務拒絕了這次請求（401）。請按「重試」；若持續失敗，請重新啟動應用程式。",
+        });
+        return;
+      }
       setState({ kind: "need-token", message: "token 不正確或已失效，請重新輸入。" });
     };
     window.addEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
     return () => window.removeEventListener(UNAUTHORIZED_EVENT, onUnauthorized);
-  }, []);
+  }, [desktop]);
 
   /**
    * 只刷新側欄的 roots 清單，**不**切到 `loading` 狀態。
@@ -106,6 +191,35 @@ export function App() {
     setSelectedRootId(null);
     setState({ kind: "need-token", message: null });
   };
+
+  const retryBootstrap = useCallback(async (): Promise<void> => {
+    if (desktop === null) return;
+    setBootstrapBusy(true);
+    try {
+      const current = await desktop.bootstrap.retry();
+      if (current !== null) setBootstrap(current);
+    } catch {
+      // 失敗狀態本身就會由推播更新；這裡吞掉例外即可。
+    } finally {
+      setBootstrapBusy(false);
+    }
+  }, [desktop]);
+
+  const toggleAutostart = useCallback(
+    async (enabled: boolean): Promise<void> => {
+      if (desktop === null) return;
+      setSettingsBusy(true);
+      setSettingsError(null);
+      try {
+        setSettings(await desktop.settings.setAutostart(enabled));
+      } catch (error) {
+        setSettingsError(error instanceof Error ? error.message : "設定開機自啟失敗");
+      } finally {
+        setSettingsBusy(false);
+      }
+    },
+    [desktop],
+  );
 
   const onRootAdded = (root: Root): void => {
     setSelectedRootId(root.id);
@@ -134,15 +248,28 @@ export function App() {
       ? (state.roots.find((root) => root.id === selectedRootId) ?? state.roots[0] ?? null)
       : null;
 
+  /** 模型下載失敗且使用者選擇先進入應用時，在主畫面提醒（可重試）。 */
+  const bootstrapFailed = desktop !== null && bootstrap !== null && bootstrap.phase === "failed";
+
   return (
     <div className="flex min-h-full flex-col bg-surface text-ink">
-      {state.kind === "need-token" && <TokenForm message={state.message} onSubmit={submitToken} />}
+      {desktop !== null && !bootstrapReady && (
+        <BootstrapScreen
+          state={bootstrap}
+          token={settings?.token ?? null}
+          busy={bootstrapBusy}
+          onRetry={() => void retryBootstrap()}
+          onSkip={() => setBootstrapSkipped(true)}
+        />
+      )}
 
-      {state.kind === "loading" && (
+      {bootstrapReady && state.kind === "need-token" && <TokenForm message={state.message} onSubmit={submitToken} />}
+
+      {bootstrapReady && state.kind === "loading" && (
         <div className="flex flex-1 items-center justify-center text-sm text-muted">正在連線到本機服務…</div>
       )}
 
-      {state.kind === "error" && (
+      {bootstrapReady && state.kind === "error" && (
         <div className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center gap-4 px-6 text-center">
           <p role="alert" className="text-sm text-red-600">
             {state.message}
@@ -155,18 +282,20 @@ export function App() {
             >
               重試
             </button>
-            <button
-              type="button"
-              onClick={forgetToken}
-              className="rounded-md border border-line px-3 py-2 text-sm font-medium text-ink"
-            >
-              重新輸入 token
-            </button>
+            {desktop === null && (
+              <button
+                type="button"
+                onClick={forgetToken}
+                className="rounded-md border border-line px-3 py-2 text-sm font-medium text-ink"
+              >
+                重新輸入 token
+              </button>
+            )}
           </div>
         </div>
       )}
 
-      {state.kind === "ready" && (
+      {bootstrapReady && state.kind === "ready" && (
         <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-8">
           <header className="flex flex-wrap items-center justify-between gap-3">
             <div>
@@ -195,15 +324,52 @@ export function App() {
                   </button>
                 ))}
               </nav>
-              <button
-                type="button"
-                onClick={forgetToken}
-                className="rounded-md border border-line px-3 py-1.5 text-sm text-ink"
-              >
-                登出
-              </button>
+              {desktop !== null && (
+                <button
+                  type="button"
+                  onClick={() => setShowSettings((current) => !current)}
+                  className="rounded-md border border-line px-3 py-1.5 text-sm text-ink"
+                >
+                  設定
+                </button>
+              )}
+              {desktop === null && (
+                <button
+                  type="button"
+                  onClick={forgetToken}
+                  className="rounded-md border border-line px-3 py-1.5 text-sm text-ink"
+                >
+                  登出
+                </button>
+              )}
             </div>
           </header>
+
+          {bootstrapFailed && (
+            <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-line bg-white px-3 py-2">
+              <p className="text-xs text-muted">
+                模型尚未下載完成：建立索引時會再試一次。{bootstrap?.lastError !== null && bootstrap?.lastError !== undefined ? `（${bootstrap.lastError.message}）` : ""}
+              </p>
+              <button
+                type="button"
+                onClick={() => void retryBootstrap()}
+                disabled={bootstrapBusy}
+                className="rounded-md border border-line px-2.5 py-1 text-xs text-ink disabled:opacity-40"
+              >
+                {bootstrapBusy ? "重試中…" : "重試下載"}
+              </button>
+            </div>
+          )}
+
+          {desktop !== null && showSettings && (
+            <SettingsPanel
+              settings={settings}
+              error={settingsError}
+              busy={settingsBusy}
+              onToggleAutostart={(enabled) => void toggleAutostart(enabled)}
+              onClose={() => setShowSettings(false)}
+            />
+          )}
 
           {view === "explorer" && (
             <div className="grid gap-6 lg:grid-cols-[300px_minmax(0,1fr)]">
