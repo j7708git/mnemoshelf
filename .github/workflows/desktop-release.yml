@@ -158,10 +158,15 @@ jobs:
 
       # 授權清單：以 desktop 為主的 production 相依閉包（含 @img/sharp-libvips-*／sqlite-vec-*），
       # 各平台各產生一份（內容反映該平台實際隨附的套件）。
+      #
+      # 必須產生在 `packages/desktop/dist-app/` 內（與安裝檔同層）：upload-artifact v4 以
+      # 「所有搜尋路徑的最小共同祖先（LCA）」為 artifact 根，若授權清單放在 repo 根，
+      # LCA 會變成 repo 根，安裝檔在 artifact 內就多了 `packages/desktop/dist-app/` 這層；
+      # 之後 release job 的 `find`／`gh release create` 就會拿到目錄而失敗。
       - name: 產生授權清單
         shell: bash
         run: |
-          pnpm --filter "@mnemoshelf/desktop..." licenses list --prod --long > "third-party-licenses-${{ matrix.platform }}.txt"
+          pnpm --filter "@mnemoshelf/desktop..." licenses list --prod --long > "packages/desktop/dist-app/third-party-licenses-${{ matrix.platform }}.txt"
 
       - name: 上傳安裝檔與授權清單
         uses: actions/upload-artifact@v4
@@ -171,7 +176,7 @@ jobs:
           if-no-files-found: error
           path: |
             ${{ matrix.artifacts }}
-            third-party-licenses-${{ matrix.platform }}.txt
+            packages/desktop/dist-app/third-party-licenses-${{ matrix.platform }}.txt
 
   # 只有推送 v* tag 才發布；workflow_dispatch 不會走到這裡。
   release:
@@ -266,8 +271,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # 只收檔案（`find -type f`）：`dist/*` 會連目錄一起展開（例如萬一 artifact 內
+          # 多了一層目錄），而 `gh release` 對目錄不會跳過、直接讀取失敗。
+          mapfile -t dist_assets < <(find dist -type f | sort)
+          if [ "${#dist_assets[@]}" -eq 0 ]; then
+            echo "錯誤：dist/ 底下沒有任何附件（download-artifact 沒有抓到 artifact？）" >&2
+            exit 1
+          fi
+          echo "Release 附件（${#dist_assets[@]} 個來自 dist/）："
+          printf '  %s\n' "${dist_assets[@]}"
           assets=(
-            dist/*
+            "${dist_assets[@]}"
             docs/licenses/LGPL-3.0.txt
             docs/licenses/GPL-3.0.txt
             docs/licenses/THIRD-PARTY-NOTICES.md

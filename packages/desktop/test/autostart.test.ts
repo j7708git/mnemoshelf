@@ -7,6 +7,7 @@ import {
   autostartFilePath,
   configHome,
   desktopEntryContent,
+  openedAtLogin,
   quoteExecArgument,
   readAutostartState,
   setAutostart,
@@ -110,10 +111,57 @@ describe("macOS／Windows 的開機自啟", () => {
     expect(api.calls).toEqual([{ openAtLogin: true, args: ["--hidden"] }]);
   });
 
+  it("讀回狀態時帶同一組 path／args（Windows 逐字比對登錄值，只帶 path 會永遠讀成未啟用）", async () => {
+    // 模擬 Windows 的行為：只有 path 與 args 都與註冊值相同才回報已啟用。
+    const registered = { path: options().execPath, args: ["--hidden"] };
+    const seen: { path?: string; args?: string[] }[] = [];
+    const api: LoginItemApi = {
+      getLoginItemSettings: (settings) => {
+        seen.push({ ...(settings ?? {}) });
+        return {
+          openAtLogin:
+            settings?.path === registered.path && JSON.stringify(settings.args) === JSON.stringify(registered.args),
+        };
+      },
+      setLoginItemSettings: () => undefined,
+    };
+
+    const state = await readAutostartState(options({ platform: "win32", loginItems: api }));
+
+    expect(seen).toEqual([{ path: registered.path, args: ["--hidden"] }]);
+    expect(state).toMatchObject({ enabled: true, supported: true, location: null });
+  });
+
   it("沒有系統 API 時回報不支援", async () => {
     const state = await readAutostartState(options({ platform: "win32", loginItems: null }));
     expect(state.supported).toBe(false);
     await expect(setAutostart(options({ platform: "win32", loginItems: null }), true)).rejects.toThrow();
+  });
+});
+
+describe("登入時啟動的推導（macOS）", () => {
+  function loginItems(settings: { openAtLogin: boolean; wasOpenedAtLogin?: boolean }): LoginItemApi {
+    return {
+      getLoginItemSettings: () => settings,
+      setLoginItemSettings: () => undefined,
+    };
+  }
+
+  it("darwin 以 wasOpenedAtLogin 推導（SMAppService 不吃 --hidden）", () => {
+    const opened = loginItems({ openAtLogin: true, wasOpenedAtLogin: true });
+    expect(openedAtLogin(options({ platform: "darwin", loginItems: opened }))).toBe(true);
+    const notOpened = loginItems({ openAtLogin: true, wasOpenedAtLogin: false });
+    expect(openedAtLogin(options({ platform: "darwin", loginItems: notOpened }))).toBe(false);
+  });
+
+  it("其他平台一律 false（Windows 的 --hidden 由參數傳遞）", () => {
+    const opened = loginItems({ openAtLogin: true, wasOpenedAtLogin: true });
+    expect(openedAtLogin(options({ platform: "win32", loginItems: opened }))).toBe(false);
+    expect(openedAtLogin(options({ platform: "linux", loginItems: opened }))).toBe(false);
+  });
+
+  it("沒有登入項目 API 時為 false", () => {
+    expect(openedAtLogin(options({ platform: "darwin", loginItems: null }))).toBe(false);
   });
 });
 

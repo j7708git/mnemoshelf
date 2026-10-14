@@ -24,7 +24,7 @@
  * 產物：`<out>/report/`（截圖與 report.json）、`<out>/*.log`、`<out>/summary.json`（未進版控）。
  */
 import { spawn } from "node:child_process";
-import { createWriteStream, existsSync, promises as fs } from "node:fs";
+import { createWriteStream, existsSync, promises as fs, realpathSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -36,6 +36,12 @@ const repoRoot = path.resolve(packageDir, "..", "..");
 
 /** Electron 產物裡的其他執行檔（不是應用程式本體），列出來避免誤選。 */
 const NON_APP_EXECUTABLES = new Set(["chrome-sandbox", "chrome_crashpad_handler"]);
+
+/** electron-builder 的 `--dir` 產物目錄後綴。 */
+const UNPACKED_DIR_SUFFIX = "-unpacked";
+
+/** 目錄名裡可能出現的架構標記（用來判斷某個候選是不是別的架構的產物）。 */
+const ARCH_TOKENS = ["x86_64", "x64", "arm64", "armv7l", "ia32"];
 
 function parseArgs(argv) {
   const args = { command: "all", out: null, userData: null, sampleRoot: null, skipBuild: false, only: null };
@@ -61,7 +67,36 @@ function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** 找到 `--dir` 產物裡的應用程式執行檔（linux-unpacked 下的頂層執行檔）。 */
+/**
+ * 挑出 `dist-app/` 底下的未封裝產物目錄。
+ *
+ * **不要寫死目錄名**：electron-builder 的 `--dir` 輸出目錄會隨架構變動——x64 是
+ * `linux-unpacked`，非 x64 會多一段架構後綴（arm64 runner 上是 `linux-arm64-unpacked`）。
+ * 寫死 `linux-unpacked` 會讓 arm64 的 CI leg 找不到產物而必紅。
+ *
+ * 同時存在多個候選時（例如同一個輸出目錄建過兩種架構）：優先取目錄名含 `arch` 的，
+ * 其次是「沒有標明架構」的那個（＝建置機器預設架構），最後才退回第一個。
+ */
+async function findUnpackedDir(distApp, arch = process.arch) {
+  const entries = await fs.readdir(distApp, { withFileTypes: true }).catch(() => []);
+  const candidates = entries
+    .filter((entry) => entry.isDirectory() && entry.name.endsWith(UNPACKED_DIR_SUFFIX))
+    .map((entry) => path.join(distApp, entry.name))
+    .sort((a, b) => a.localeCompare(b));
+  if (candidates.length === 0) {
+    throw new Error(
+      `在 ${distApp} 找不到未封裝產物目錄（*-unpacked），請先跑 \`pnpm --filter @mnemoshelf/desktop dist\``,
+    );
+  }
+  const matchesArch = (dir) => {
+    const name = path.basename(dir);
+    const tokens = ARCH_TOKENS.filter((token) => name.includes(token));
+    return tokens.length === 0 || tokens.includes(arch);
+  };
+  return candidates.find((dir) => path.basename(dir).includes(arch)) ?? candidates.find(matchesArch) ?? candidates[0];
+}
+
+/** 找到未封裝產物目錄裡的應用程式執行檔（頂層那個）。 */
 async function findExecutable(dir) {
   const entries = await fs.readdir(dir, { withFileTypes: true });
   const candidates = [];
@@ -331,10 +366,12 @@ async function main() {
   const outRoot = path.resolve(args.out ?? path.join(repoRoot, ".tmp", "desktop-shell"));
   await fs.mkdir(outRoot, { recursive: true });
 
-  const unpacked = path.join(packageDir, "dist-app", "linux-unpacked");
-  if (!args.skipBuild && !existsSync(path.join(unpacked, "mnemoshelf"))) {
+  const distApp = path.join(packageDir, "dist-app");
+  if (!args.skipBuild && !existsSync(distApp)) {
     console.log("[smoke] 找不到打包產物：先跑 `pnpm --filter @mnemoshelf/desktop dist`");
   }
+  const unpacked = await findUnpackedDir(distApp);
+  console.log(`[smoke] 未封裝產物目錄：${path.relative(repoRoot, unpacked)}`);
   const executable = await findExecutable(unpacked);
   // 上一次沒收乾淨的行程會佔住單一實例鎖（同一 userData）：先清掉再跑，避免誤判成失敗。
   await cleanupInstances(executable);
@@ -605,7 +642,25 @@ async function main() {
   process.exitCode = summary.ok ? 0 : 1;
 }
 
-main().catch((error) => {
-  console.error(`[smoke] 失敗：${error instanceof Error ? error.message : error}`);
-  process.exitCode = 1;
-});
+/**
+ * 只有「直接執行這支腳本」時才跑主流程：被 `import` 時只匯出純函式，讓單元測試可以
+ * 呼叫目錄／執行檔解析（見 `test/smoke-unpacked.test.ts`）。用 realpath 比對，避免
+ * 以符號連結呼叫時誤判成 import。
+ */
+function isDirectRun() {
+  if (process.argv[1] === undefined) return false;
+  try {
+    return realpathSync(path.resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isDirectRun()) {
+  main().catch((error) => {
+    console.error(`[smoke] 失敗：${error instanceof Error ? error.message : error}`);
+    process.exitCode = 1;
+  });
+}
+
+export { findExecutable, findUnpackedDir };

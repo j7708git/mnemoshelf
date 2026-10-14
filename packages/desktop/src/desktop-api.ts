@@ -53,9 +53,14 @@ export interface DesktopBridge {
   apiVersion: number;
   platform: string;
   bootstrap: {
-    getState(): Promise<BootstrapState>;
-    /** 重新檢查並（必要時）重試下載；回傳最新狀態。 */
-    retry(): Promise<BootstrapState>;
+    /**
+     * 目前的模型下載狀態；**可能為 null**（`--headless` 沒有下載流程、或啟動流程尚未建好
+     * `ModelBootstrap` 時）。main 端的實作就是 `bootstrap?.getState() ?? null`，web 端的
+     * 鏡像（`packages/web/src/desktop.ts`）也早已宣告 `| null`；這裡以實際行為為準對齊。
+     */
+    getState(): Promise<BootstrapState | null>;
+    /** 重新檢查並（必要時）重試下載；回傳最新狀態（同上，可能為 null）。 */
+    retry(): Promise<BootstrapState | null>;
     /** 訂閱狀態變化；回傳取消訂閱函式。 */
     onUpdate(listener: (state: BootstrapState) => void): () => void;
   };

@@ -27,7 +27,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type MnemoshelfServer } from "@mnemoshelf/server";
 import { installLoadExtensionAsarShim } from "./asar-paths.js";
-import { autostartFilePath, readAutostartState, setAutostart, type AutostartOptions, type AutostartState } from "./autostart.js";
+import { autostartFilePath, openedAtLogin, readAutostartState, setAutostart, type AutostartOptions, type AutostartState } from "./autostart.js";
 import {
   DESKTOP_API_VERSION,
   DESKTOP_BRIDGE_NAME,
@@ -58,7 +58,7 @@ let bootstrap: ModelBootstrap | null = null;
 let tokenInfo: TokenInfo | null = null;
 let quitting = false;
 let allowWindowClose = false;
-/** `--hidden`（登入時自啟）時不要主動顯示視窗。 */
+/** `--hidden`（登入時自啟）時不要主動顯示視窗；macOS 另由 `wasOpenedAtLogin` 推導（見 main()）。 */
 let startHidden = cli.hidden;
 
 /**
@@ -380,7 +380,15 @@ async function main(): Promise<void> {
   });
   const webDir = await resolveWebDir(paths.webDir, appPath);
 
-  log(`模式：headless=${String(cli.headless)}；hidden=${String(cli.hidden)}`);
+  // macOS 的自啟走 SMAppService，`path`／`args` 是 Windows-only，登入時收不到 `--hidden`：
+  // 改由 `wasOpenedAtLogin` 推導「這次是登入時啟動」，視同 `--hidden`（不彈視窗）並隱藏 Dock 圖示。
+  if (openedAtLogin(autostartOptions())) {
+    startHidden = true;
+    app.dock?.hide();
+    log("偵測到由登入項目啟動（wasOpenedAtLogin）：不主動顯示視窗");
+  }
+
+  log(`模式：headless=${String(cli.headless)}；hidden=${String(startHidden)}`);
   log(`Electron ${process.versions.electron}／Chromium ${process.versions.chrome}／Node ${process.versions.node}`);
   log(`isPackaged=${String(app.isPackaged)}；appPath=${appPath}；resourcesPath=${process.resourcesPath}`);
   log(`userData=${paths.userData}`);

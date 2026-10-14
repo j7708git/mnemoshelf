@@ -68,7 +68,8 @@ pnpm --filter @mnemoshelf/desktop dist    # = tsc + electron-builder --dir
 ./packages/desktop/dist-app/linux-unpacked/mnemoshelf
 ```
 
-`dist` 產出未封裝目錄（`dist-app/linux-unpacked/`）。開發模式可以直接
+`dist` 產出未封裝目錄，**目錄名含架構後綴**（x64 為 `dist-app/linux-unpacked/`，
+arm64 為 `dist-app/linux-arm64-unpacked/`）。開發模式可以直接
 `pnpm --filter @mnemoshelf/desktop start`（會退回 repo 內的 `packages/web/dist`）。
 
 要產出**安裝檔**（發版用）改用：
@@ -112,14 +113,15 @@ pnpm --filter @mnemoshelf/desktop run dist:win     # NSIS 安裝檔（x64）
 ## 驗收用的自動流程
 
 `scripts/smoke.mjs` 會在 xvfb 下啟動 `--dir` 產物，用真實視窗跑完桌面殼的行為，每步截圖並寫出
-`report.json`。三個子命令：
+`report.json`。四個子命令：
 
 ```bash
 # 需要 xvfb-run（Electron 沒有 display 起不來）
 node packages/desktop/scripts/smoke.mjs gui        # 模型狀態→桌面模式→單一實例→瀏覽器模式→索引／搜尋→自啟→系統匣
 node packages/desktop/scripts/smoke.mjs interrupt  # 下載中斷（SIGKILL）→ 重啟沿用已下載檔案並完成
 node packages/desktop/scripts/smoke.mjs headless   # --headless：沒有視窗，curl 帶 token 打服務
-node packages/desktop/scripts/smoke.mjs all        # 以上三個依序跑
+node packages/desktop/scripts/smoke.mjs hidden     # --hidden：視窗已建立且 UI 已載入，但不主動顯示
+node packages/desktop/scripts/smoke.mjs all        # 以上四個依序跑
 ```
 
 選項：`--out <dir>`、`--user-data <dir>`、`--sample-root <dir>`、`--only <情境>`、`--skip-build`。
@@ -154,6 +156,10 @@ node packages/desktop/scripts/smoke.mjs all        # 以上三個依序跑
   headless 請用 `xvfb-run`（或不使用桌面殼，直接跑 `packages/server`）。
 - **macOS／Windows 未實測**：本卡只在 Linux 實跑；macOS／Windows 的自啟與系統匣（`...Template`
   圖示、Windows `guid`）只做了文件審查與程式碼層的處理，尚未實機驗證。
+- **macOS 自啟的已知限制**：自啟走 SMAppService，**未簽署的版本可能不生效**（系統會擋下未簽章的
+  登入項目）；而且 `setLoginItemSettings` 的 `--hidden` 是經由 `path`／`args` 傳遞，那兩個參數是
+  **Windows-only**，macOS 的登入啟動拿不到它們。桌面殼因此改用 `app.getLoginItemSettings().wasOpenedAtLogin`
+  推導「這次是登入時啟動」，據此不顯示視窗並隱藏 Dock 圖示（與 Linux／Windows 的 `--hidden` 等效）。
 - **本機環境沒有桌面環境變數時**（例如從 tty／systemd 啟動），Chromium 認不出桌面環境會退到
   `basic_text` 後端、`safeStorage` 不可用；桌面殼偵測到這種情況會明確指定 libsecret 後端，
   仍失敗時才降級成「本次執行有效的 token」。
