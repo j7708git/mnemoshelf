@@ -4,12 +4,16 @@
   "private": true,
   "type": "module",
   "description": "Mnemoshelf 桌面殼（Electron）：main process 內啟動 Core 服務、載入 Web UI，並以 electron-builder 打包",
+  "author": "Mnemoshelf contributors",
   "main": "dist/main.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "vitest run",
     "dist": "pnpm run build && electron-builder --dir",
+    "dist:linux": "pnpm run build && electron-builder --linux --publish never",
+    "dist:mac": "pnpm run build && electron-builder --mac --publish never",
+    "dist:win": "pnpm run build && electron-builder --win --publish never",
     "start": "electron ."
   },
   "dependencies": {

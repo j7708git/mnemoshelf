@@ -71,6 +71,18 @@ pnpm --filter @mnemoshelf/desktop dist    # = tsc + electron-builder --dir
 `dist` 產出未封裝目錄（`dist-app/linux-unpacked/`）。開發模式可以直接
 `pnpm --filter @mnemoshelf/desktop start`（會退回 repo 內的 `packages/web/dist`）。
 
+要產出**安裝檔**（發版用）改用：
+
+```bash
+pnpm --filter @mnemoshelf/desktop run dist:linux   # AppImage + tar.gz
+pnpm --filter @mnemoshelf/desktop run dist:mac     # dmg（Apple Silicon）
+pnpm --filter @mnemoshelf/desktop run dist:win     # NSIS 安裝檔（x64）
+```
+
+三平台各自在原生環境建置（不要從 Linux 交叉建 macOS）；發版由 GitHub Actions 的
+`desktop-release.yml` 負責（推送 `v*` tag 時建置並建立 Release）。完整的建置說明、
+未簽署安裝檔的開啟方式與授權（LGPL-3.0 的 libvips）見 **`docs/building.md`**。
+
 命令列選項：
 
 | 選項 | 效果 |

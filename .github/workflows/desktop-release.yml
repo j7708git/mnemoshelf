@@ -1,0 +1,285 @@
+# 桌面版建置與發布管線
+#
+# 觸發：
+# - push `v*` tag：三平台各建安裝檔，並建立 GitHub Release（tag 名即版本），附件含安裝檔與授權資料。
+# - workflow_dispatch：同樣建三平台安裝檔並上傳 artifacts，但**不**建立 Release（測試用）。
+#   不在非 tag 的 push 上自動建置（避免每次 commit 都跑三平台）。
+#
+# 三平台（各平台用原生 runner 各建各的；不從 Linux 交叉建 macOS）：
+# - Linux x64：  ubuntu-latest      → AppImage、tar.gz
+# - Linux arm64：ubuntu-24.04-arm   → AppImage、tar.gz
+# - macOS（Apple Silicon）：macos-latest（現行即 arm64）→ dmg
+# - Windows x64：windows-latest     → NSIS 安裝檔（.exe）
+#
+# 注意：
+# - electron-builder **必須從 pnpm 環境呼叫**：直接跑 `node_modules/.bin/electron-builder`
+#   會被判定成 npm，pnpm 沒有攤平的平台套件（`@img/sharp-*`、`sqlite-vec-*`）不會被收進產物。
+#   因此一律走 `pnpm --filter @mnemoshelf/desktop run dist:*`（見 packages/desktop/package.json）。
+# - 不簽章：macOS 在 electron-builder.yml 設 `identity: null`、Windows 沒有憑證，
+#   安裝檔會有系統警告；繞過方式見 docs/building.md，Release 說明也會附上。
+# - 不用 secrets：發布只用 Actions 內建的 GITHUB_TOKEN（`contents: write`）。
+
+name: desktop-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # 測試基準：型別檢查、建置、測試全綠才允許發布。輸出測試摘要供 Release 說明引用。
+  verify:
+    name: 測試基準
+    runs-on: ubuntu-latest
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: 安裝 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: 安裝依賴
+        run: pnpm install --frozen-lockfile
+
+      - name: 型別檢查
+        run: pnpm typecheck
+
+      - name: 建置
+        run: pnpm build
+
+      - name: 測試
+        shell: bash
+        run: |
+          set -o pipefail
+          pnpm test 2>&1 | tee test-output.txt
+
+      - name: 整理測試摘要
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "pnpm install --frozen-lockfile / pnpm typecheck / pnpm build：完成"
+            echo "pnpm test 摘要（Test Files／Tests 行）："
+            grep -E "Test Files|Tests " test-output.txt || echo "(沒有擷取到摘要，請見本次 run 的 verify job 記錄)"
+          } > test-summary.txt
+
+      - name: 上傳測試基準
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-baseline
+          path: |
+            test-summary.txt
+            test-output.txt
+          if-no-files-found: warn
+
+  # 三平台建置。打包後在 Linux runner 上跑 headless smoke（xvfb 內啟動、驗 /health 與 token 驗證）。
+  build:
+    name: 建置（${{ matrix.platform }}）
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            os: ubuntu-latest
+            script: dist:linux
+            smoke: true
+            artifacts: |
+              packages/desktop/dist-app/*.AppImage
+              packages/desktop/dist-app/*.tar.gz
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+            script: dist:linux
+            smoke: true
+            artifacts: |
+              packages/desktop/dist-app/*.AppImage
+              packages/desktop/dist-app/*.tar.gz
+          - platform: macos-arm64
+            os: macos-latest
+            script: dist:mac
+            smoke: false
+            artifacts: |
+              packages/desktop/dist-app/*.dmg
+          - platform: windows-x64
+            os: windows-latest
+            script: dist:win
+            smoke: false
+            artifacts: |
+              packages/desktop/dist-app/*.exe
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v4
+
+      - name: 安裝 pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: 安裝 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # 讓安裝檔版本與 tag 一致（tag `v0.1.0` → app 版本 `0.1.0`）。
+      # 只在跑在 runner 上的工作區生效，不會回寫 repo。
+      - name: 同步版本號（tag → app 版本）
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          node -e "const fs=require('node:fs');const p='packages/desktop/package.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));j.version=process.argv[1];fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n');" "$VERSION"
+          echo "app 版本設為 $VERSION"
+
+      - name: 安裝依賴
+        run: pnpm install --frozen-lockfile
+
+      - name: 建置
+        run: pnpm build
+
+      - name: 建置安裝檔（electron-builder）
+        run: pnpm --filter @mnemoshelf/desktop run ${{ matrix.script }}
+
+      # 打包後 smoke：在 xvfb 內啟動打包產物（--headless），驗 /health 與 token 驗證
+      # （帶 token 200／不帶 401）與優雅結束。需要 xvfb-run（GitHub 的 ubuntu runner 已內建）。
+      - name: 打包後 smoke（headless）
+        if: matrix.smoke
+        run: node packages/desktop/scripts/smoke.mjs headless --out .tmp/desktop-ci
+
+      # 授權清單：以 desktop 為主的 production 相依閉包（含 @img/sharp-libvips-*／sqlite-vec-*），
+      # 各平台各產生一份（內容反映該平台實際隨附的套件）。
+      - name: 產生授權清單
+        shell: bash
+        run: |
+          pnpm --filter "@mnemoshelf/desktop..." licenses list --prod --long > "third-party-licenses-${{ matrix.platform }}.txt"
+
+      - name: 上傳安裝檔與授權清單
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          # 找不到安裝檔就直接失敗（避免「看似成功但沒有附件」的無聲故障）。
+          if-no-files-found: error
+          path: |
+            ${{ matrix.artifacts }}
+            third-party-licenses-${{ matrix.platform }}.txt
+
+  # 只有推送 v* tag 才發布；workflow_dispatch 不會走到這裡。
+  release:
+    name: 發布 GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs:
+      - verify
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 取出原始碼（含歷史，供產生變更清單）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安裝 pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: 安裝 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: 下載安裝檔與授權清單
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: |
+            linux-*
+            macos-*
+            windows-*
+          merge-multiple: true
+
+      - name: 下載測試基準
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: test-baseline
+          path: test-baseline
+
+      - name: 產生 Release 說明
+        env:
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          RANGE="${TAG}"
+          if [ -n "${PREV}" ]; then RANGE="${PREV}..${TAG}"; fi
+          {
+            echo "Mnemoshelf 桌面版 ${TAG}。"
+            echo
+            echo "## 本次變更"
+            git log --no-merges --pretty='- %s (%h)' "${RANGE}" || true
+            echo
+            echo "## 建置與測試基準"
+            echo "- commit：${GITHUB_SHA}"
+            echo "- 工作流程記錄：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- 建置：四條管線（Linux x64／Linux arm64／macOS Apple Silicon／Windows x64）各以原生 runner 建置。"
+            echo "- 測試：pnpm install --frozen-lockfile、pnpm typecheck、pnpm build、pnpm test 全綠（verify job）。"
+            echo
+            echo '```'
+            cat test-baseline/test-summary.txt 2>/dev/null || echo "(測試摘要請見本次 run 的 verify job 記錄)"
+            echo '```'
+            echo
+            echo "## 附件"
+            echo "- Linux x64／arm64：AppImage 與 tar.gz（檔名含平台與架構）"
+            echo "- macOS Apple Silicon：dmg"
+            echo "- Windows x64：NSIS 安裝檔（.exe）"
+            echo "- 各平台另附 third-party-licenses-<平台>.txt（pnpm licenses list --prod 產出）"
+            echo "- LGPL-3.0.txt、GPL-3.0.txt、THIRD-PARTY-NOTICES.md（授權全文與 libvips 原始碼取得方式）"
+            echo
+            echo "## 授權（LGPL-3.0 平台套件）"
+            echo "- 本 App 隨附 @img/sharp-libvips-*（LGPL-3.0-or-later）平台套件，即 sharp 使用的預編 libvips。"
+            echo "- 授權全文見附件 LGPL-3.0.txt 與 GPL-3.0.txt（LGPL-3.0 以 GPL-3.0 為基礎）。"
+            echo "- 對應原始碼取得方式與 shared library 替換說明見附件 THIRD-PARTY-NOTICES.md。"
+            echo
+            echo "## 安裝（未簽署）"
+            echo "- 這些安裝檔未經程式碼簽署，首次開啟會有系統警告："
+            echo "  Windows：SmartScreen 視窗點「更多資訊」再點「仍要執行」；"
+            echo "  macOS：在 Finder 對 App 按右鍵選「打開」，再確認一次。"
+            echo "- 詳細說明（含從原始碼建置）見 repo 的 docs/building.md。"
+          } > RELEASE_NOTES.md
+          echo "----- RELEASE_NOTES.md -----"
+          cat RELEASE_NOTES.md
+
+      - name: 建立 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          assets=(
+            dist/*
+            docs/licenses/LGPL-3.0.txt
+            docs/licenses/GPL-3.0.txt
+            docs/licenses/THIRD-PARTY-NOTICES.md
+          )
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            # 同一個 tag 重跑時（例如修正後重試）：更新說明並覆蓋附件，不重建 Release。
+            gh release edit "${GITHUB_REF_NAME}" --notes-file RELEASE_NOTES.md
+            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file RELEASE_NOTES.md \
+              "${assets[@]}"
+          fi

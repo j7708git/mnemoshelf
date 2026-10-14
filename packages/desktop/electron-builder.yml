@@ -1,7 +1,10 @@
-# electron-builder 設定（spike；決策依 M4 打包研究，2026-10 查證）
+# electron-builder 設定（決策依 M4 打包研究，2026-10 查證）
 #
-# 用法：`pnpm --filter @mnemoshelf/desktop dist`（等於 `tsc` + `electron-builder --dir`）
-# 產物：`packages/desktop/dist-app/linux-unpacked/`（未封裝目錄，供本輪實跑驗收）
+# 用法：
+# - `pnpm --filter @mnemoshelf/desktop dist`：`tsc` + `electron-builder --dir`，產出未封裝目錄
+#   `dist-app/linux-unpacked/`（本機實跑驗收用）。
+# - `pnpm --filter @mnemoshelf/desktop run dist:linux|dist:mac|dist:win`：產出安裝檔
+#   （Linux：AppImage／tar.gz；macOS：dmg；Windows：NSIS）。CI 發版走這一條。
 #
 # 注意：electron-builder 的 npm `latest` tag 落後（26.15.3），最新 26.x 在 `v26` tag
 # （26.17.0）。版本在 package.json 明確釘住，不要改成浮動版本。
@@ -13,6 +16,40 @@ directories:
 
 # 執行檔名（預設會用 package.json 的 scoped name 變成 `@mnemoshelfdesktop`）。
 executableName: mnemoshelf
+
+# 安裝檔命名一律帶平台與架構：`${os}` 是目標平台（linux／mac／win）、`${arch}` 是目標架構
+# （electron-builder 會依 target 正規化，例如 x64 的 AppImage 是 `x86_64`）。
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+
+# --- 三平台安裝檔 target ---
+#
+# Linux 的 arch 不寫死：CI 用兩個 runner（x64／arm64）各建各的，預設就是「目前機器」的架構。
+linux:
+  target:
+    - AppImage
+    - tar.gz
+  category: Utility
+
+# macOS 只支援 Apple Silicon（arm64）。
+mac:
+  target:
+    - target: dmg
+      arch:
+        - arm64
+  category: public.app-category.productivity
+  # identity: null = 完全不簽章（個人使用，接受 Gatekeeper 警告；繞過方式見 docs/building.md）。
+  # v26 的語意：「未設定」會去 keychain 找憑證、找不到才跳過；設 null 則明確跳過簽章。
+  identity: null
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
 
 asar: true
 
