@@ -38,6 +38,11 @@ await index.migrate();                          // 建立擴充＋向量表＋HN
   識別字會先驗證再以雙引號包裹，不會拼接未經驗證的字串。
 - 維度由 `PgVectorIndex` 的 `dim` 決定（預設 512，對應 core 的 `DEFAULT_DIM`），
   並寫死進 `vector(N)` 型別；寫入／查詢的向量長度不符時拋 `VectorDimensionError`。
+- `migrate()` 冪等，但**不**只靠 `CREATE TABLE IF NOT EXISTS`：它會先驗證既有 `vectors.embedding`
+  欄位的維度，若與本次 `dim` 不同就拋 `VectorColumnDimensionError`（訊息含 schema、表名與期望／實際
+  維度），**不**靜默通過、**不**自動 drop 表或改欄位型別。未帶維度的 `vector` 欄位也算不符
+  （它什麼長度都收，放行會讓不同維度的向量混進同一欄）。維度真的改變時，請自行遷移資料
+  （例如改欄位型別或重建表）後再啟動。
 - 連線池由呼叫端擁有與關閉；本套件不讀環境變數，也不管理服務設定。
 
 ## 實作要點

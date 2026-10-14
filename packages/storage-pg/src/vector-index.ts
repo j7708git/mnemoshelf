@@ -11,6 +11,7 @@ import type { VectorIndex, VectorItem } from "@mnemoshelf/core";
 import type { Pool } from "pg";
 import { qualified } from "./schema.js";
 import { withTransaction } from "./connection.js";
+import { VectorColumnDimensionError } from "./errors.js";
 
 /** `PgVectorIndex` 的選項。 */
 export interface PgVectorIndexOptions {
@@ -36,6 +37,17 @@ export function toVectorLiteral(vec: Float32Array): string {
 }
 
 /**
+ * pgvector 欄位型別字串的維度（`vector(512)` → 512）；非「帶維度的 vector」型別回傳 `null`。
+ *
+ * `format_type` 在型別不在 `search_path` 時會加 schema 前綴（例如 `public.vector(512)`），
+ * 因此允許一個選用的 schema 限定詞。
+ */
+function parseVectorColumnDim(typeName: string): number | null {
+  const match = /^(?:[A-Za-z_][A-Za-z0-9_]*\.)?vector\((\d+)\)$/.exec(typeName.trim());
+  return match === null ? null : Number(match[1]);
+}
+
+/**
  * 建表 DDL（冪等）。
  *
  * - `embedding vector(N)`：維度寫死在型別，`dim` 由建構子決定。
@@ -43,6 +55,9 @@ export function toVectorLiteral(vec: Float32Array): string {
  *   的 tie 排序（見 `upsert` 的說明）。
  * - HNSW ＋ `vector_cosine_ops`：可在空表建立（migrate 友善），查詢時另開 iterative scan。
  * - `root_id` 是一般整數欄（沒有 vec0 的 partition key 概念）；`NULL` 代表全域物件（記憶）。
+ *
+ * 冪等只代表「重複呼叫不出錯」：表已存在時**不會**改既有結構。因此維度變更不會被這段 DDL
+ * 反映，`migrate()` 會先檢查既有欄位維度並在不符時拋 `VectorColumnDimensionError`。
  */
 function vectorSchemaSql(schema: string, dim: number): string {
   const vectors = qualified(schema, "vectors");
@@ -94,7 +109,41 @@ export class PgVectorIndex implements VectorIndex {
   async migrate(): Promise<void> {
     // 先單獨建立擴充：`vector` 型別要在後續 DDL 的型別解析時就存在。
     await this.pool.query("create extension if not exists vector");
+    // 維度檢查必須在 DDL 之前：`create table if not exists` 不會驗證、也不會改既有欄位型別。
+    await this.assertExistingEmbeddingDim();
     await this.pool.query(vectorSchemaSql(this.schema, this.dim));
+  }
+
+  /**
+   * 檢查既有的 `vectors.embedding` 欄位維度；與本次 `dim` 不符就拋 `VectorColumnDimensionError`。
+   *
+   * 表或欄位不存在時直接返回，交給 `migrate()` 的 DDL 建立（表不存在是正常首跑情境）。
+   * 用 `format_type(atttypid, atttypmod)` 取得**帶維度的型別名**（如 `vector(512)`）再解析數字，
+   * 不直接解讀 `atttypmod`：pgvector 的 typmod 編碼不保證等於維度。
+   * 維度不符時只拋錯，**不**靜默 drop 表或改欄位型別。
+   */
+  private async assertExistingEmbeddingDim(): Promise<void> {
+    const result = await this.pool.query(
+      `select format_type(a.atttypid, a.atttypmod) as type
+         from pg_attribute a
+         join pg_class c on c.oid = a.attrelid
+         join pg_namespace n on n.oid = c.relnamespace
+        where n.nspname = $1
+          and c.relname = 'vectors'
+          and a.attname = 'embedding'
+          and a.attnum > 0
+          and not a.attisdropped`,
+      [this.schema],
+    );
+
+    const row = result.rows[0];
+    if (row === undefined) return;
+
+    const actualType = String(row.type);
+    const actual = parseVectorColumnDim(actualType);
+    if (actual !== this.dim) {
+      throw new VectorColumnDimensionError(this.dim, actual, actualType, this.schema, "vectors");
+    }
   }
 
   /**

@@ -12,5 +12,6 @@ export {
   toVectorLiteral,
   type PgVectorIndexOptions,
 } from "./vector-index.js";
+export { VectorColumnDimensionError } from "./errors.js";
 export { createPgPool, withTransaction, type CreatePgPoolOptions } from "./connection.js";
 export { segmentText } from "./segment.js";
