@@ -1,0 +1,34 @@
+{
+  "name": "@mnemoshelf/storage-pg",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Mnemoshelf 第二儲存後端：以 PostgreSQL＋pgvector 實作 MetadataStore 與 VectorIndex 兩個 port",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@mnemoshelf/core": "workspace:*",
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@testcontainers/postgresql": "12.2.1",
+    "@types/node": "^22.18.0",
+    "@types/pg": "8.23.1",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
