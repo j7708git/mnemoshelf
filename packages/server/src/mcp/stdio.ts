@@ -34,13 +34,14 @@ export const MCP_TOOLS: Tool[] = [
   {
     name: "search",
     description:
-      `搜尋已索引的檔案片段與記憶。mode：keyword（全文）、vector（語意）、hybrid（預設，RRF 合併）；k 上限 100。` +
+      `搜尋已索引的檔案片段與記憶。mode：vector（預設，語意）、keyword（全文）、hybrid（RRF 合併兩路）；k 上限 100。` +
+      `記憶只在 keyword／hybrid 模式命中（預設 vector 只回檔案片段）。` +
       `每個命中都帶來源（rootId/relPath 或 agent）。${UNTRUSTED_DATA_WARNING}`,
     inputSchema: {
       type: "object",
       properties: {
         query: { type: "string", description: "查詢字串（必填）" },
-        mode: { type: "string", enum: ["keyword", "vector", "hybrid"], description: "預設 hybrid" },
+        mode: { type: "string", enum: ["keyword", "vector", "hybrid"], description: "預設 vector" },
         rootIds: { type: "array", items: { type: "integer" }, description: "只搜尋這些 root（選填）" },
         k: { type: "integer", description: "回傳筆數，預設 10、上限 100" },
       },

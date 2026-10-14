@@ -112,7 +112,7 @@ describe.skipIf(!ENABLED)("e2e（MNEMOSHELF_E2E=1 才執行）：真實 embedder
     expect(remembered.status).toBe(201);
     const memory = remembered.body as { id: number };
 
-    const memorySearch = await api(server, "POST", "/search", { body: { query: "blue square", k: 10 } });
+    const memorySearch = await api(server, "POST", "/search", { body: { query: "blue square", mode: "keyword", k: 10 } });
     const memoryHit = (memorySearch.body as UnifiedSearchResult).hits.find((hit) => hit.type === "memory");
     expect(memoryHit).toBeDefined();
     if (memoryHit?.type === "memory") {

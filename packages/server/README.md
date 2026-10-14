@@ -44,7 +44,7 @@ MNEMOSHELF_TOKEN=<你的-token> pnpm --filter @mnemoshelf/server run serve
 | `DELETE /roots/:id?deleteData=1` | 移除 root；`deleteData=1` 時一併刪除 chunk 與向量 |
 | `POST /roots/:id/preview` | 乾跑統計（不寫入任何狀態） |
 | `POST /roots/:id/index` | 觸發索引；同一 root 索引進行中再呼叫 → `409` |
-| `POST /search` | `{query, mode?, rootIds?, k?}`；`mode` 為 `keyword`／`vector`／`hybrid`（預設），`k` 上限 100 |
+| `POST /search` | `{query, mode?, rootIds?, k?}`；`mode` 為 `keyword`／`hybrid`／`vector`（預設），`k` 上限 100 |
 | `POST /memories` | `{content, kind?, scope?, project?, agent}`（`agent` 必填＝寫入者標識） |
 | `GET /memories` | 列出未刪除的記憶（由新到舊）；query：`kind`、`scope`、`project`、`agent`、`limit`（預設 100、上限 500） |
 | `DELETE /memories/:id` | 軟刪除記憶 |
@@ -55,11 +55,16 @@ MNEMOSHELF_TOKEN=<你的-token> pnpm --filter @mnemoshelf/server run serve
 搜尋回應的每個命中都帶**來源**（chunk：`rootId`／`relPath`／`seq`／`kind`；memory：`agent`／`scope`），
 文字片段有長度上限並以 `textTruncated` 標記。
 
-### `mode` 預設值的現況（可能改變）
+### `mode` 預設值：`vector`（M2 已修訂）
 
-`hybrid` 是**現行預設**，但 M1 整體驗收資料顯示 **`vector` 單獨表現較佳**（樣本小、且為 tester 自評的相關性，
-不是嚴謹的評測結論）。M2 會以更大的查詢集複測並修訂契約，因此**預設值可能改變**；需要固定行為的呼叫端
-請明確帶 `mode`。
+**`vector` 是現行預設**（2026-10-14，M2 契約修訂）。M1 整體驗收以 8 個自然語句查詢複測，三模式 Top-1
+相關次數為 **`vector` 8/8 ＞ `hybrid` 7/8 ＞ `keyword` 5/8**，且有反例（中文查詢找圖時，`hybrid` 的
+keyword 路壓過 vector 路的正確命中），因此預設由 `hybrid` 改為 `vector`。樣本小、且為 tester 自評的
+相關性，不是嚴謹的評測結論。
+
+`hybrid`（RRF 合併）與 `keyword` **保留為選用**，需要固定行為的呼叫端請明確帶 `mode`。注意：**記憶只進
+keyword 那一路**，因此預設 `vector` 不含記憶命中；要搜尋記憶請帶 `mode: "keyword"` 或 `"hybrid"`。
+（完整契約見 `docs/storage-ports.md` §搜尋模式與預設。）
 
 ### `maxFileBytes` 的生命週期
 

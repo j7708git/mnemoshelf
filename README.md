@@ -17,6 +17,8 @@ Mnemoshelf 是一個本機桌面應用程式，目標有兩個：
   詳見 [docs/embedder-contract.md](docs/embedder-contract.md)。
 - **儲存可替換。** 預設 SQLite，資料量大時可換成其他後端。
   詳見 [docs/storage-ports.md](docs/storage-ports.md)。
+- **搜尋預設向量優先。** `/search` 不帶 `mode` 時只跑向量那一路（M1 實測優於混合與關鍵字）；
+  `hybrid`（RRF 合併）與 `keyword` 為選用。詳見 [docs/storage-ports.md](docs/storage-ports.md)。
 - **本機優先。** 服務只綁 `127.0.0.1`，並以 token 保護；資料不離開本機，
   除非使用者明確選用雲端 embedding。
 

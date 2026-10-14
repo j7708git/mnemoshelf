@@ -146,9 +146,10 @@ describe("REST：roots 生命週期", () => {
       expect(body.hits.map((hit) => hit.rank)).toEqual(body.hits.map((_hit, index) => index + 1));
     }
 
-    // 命中帶來源
-    const hybrid = await api(server.instance, "POST", "/search", { body: { query: NOTE_TOKEN } });
-    const hits = (hybrid.body as { hits: { type: string; rootId?: number; relPath?: string; seq?: number; kind?: string }[] }).hits;
+    // 命中帶來源（不帶 mode 的預設已於 M2 改為 vector，見 docs/storage-ports.md）
+    const defaultSearch = await api(server.instance, "POST", "/search", { body: { query: NOTE_TOKEN } });
+    expect((defaultSearch.body as { mode: string }).mode).toBe("vector");
+    const hits = (defaultSearch.body as { hits: { type: string; rootId?: number; relPath?: string; seq?: number; kind?: string }[] }).hits;
     const chunkHit = hits.find((hit) => hit.type === "chunk");
     expect(chunkHit).toBeDefined();
     expect(chunkHit!.rootId).toBe(root.id);
@@ -286,7 +287,8 @@ describe("REST：記憶", () => {
     expect(memory.project).toBe("mnemoshelf");
     expect(memory.deletedAt).toBeNull();
 
-    const found = await api(server.instance, "POST", "/search", { body: { query: "mnemoshelf" } });
+    // 記憶只進關鍵字那一路，因此這裡明確帶 mode（M2 起不帶 mode 的預設是 vector）。
+    const found = await api(server.instance, "POST", "/search", { body: { query: "mnemoshelf", mode: "keyword" } });
     const hits = (found.body as { hits: { type: string; id?: number; agent?: string; kind?: string; scope?: string }[] }).hits;
     const memoryHit = hits.find((hit) => hit.type === "memory");
     expect(memoryHit).toBeDefined();
@@ -298,7 +300,7 @@ describe("REST：記憶", () => {
     expect(forgotten.status).toBe(200);
     expect(forgotten.body).toEqual({ id: memory.id, deleted: true });
 
-    const afterForget = await api(server.instance, "POST", "/search", { body: { query: "mnemoshelf" } });
+    const afterForget = await api(server.instance, "POST", "/search", { body: { query: "mnemoshelf", mode: "keyword" } });
     const remaining = (afterForget.body as { hits: { type: string }[] }).hits.filter((hit) => hit.type === "memory");
     expect(remaining).toHaveLength(0);
 

@@ -3,10 +3,11 @@
  * 兩路，依 `mode` 決定跑哪幾路，多路時以 Reciprocal Rank Fusion 合併
  * （storage-ports.md §設計規則 1；RRF 在應用層，不由後端負責）。
  *
- * 為什麼預設 `hybrid`：M0 spike 顯示向量單獨可能更好，但當時尚未以真實查詢複測。
- * **現況（M1 整體驗收後）**：`hybrid` 仍是預設，但 M1 資料顯示 `vector` 單獨表現較佳
- * （樣本小、且為 tester 自評相關性，非嚴謹評測）；M2 會複測並修訂契約，**預設值可能改變**，
- * 需要固定行為的呼叫端請明確帶 `mode`。三種模式同時暴露，就是為了讓整體驗收能用同一組查詢實測。
+ * 為什麼預設 `vector`（M2 契約修訂，2026-10-14）：M0 spike 顯示向量單獨可能更好；M1 整體驗收以
+ * 8 個自然語句查詢複測，三模式 Top-1 相關次數為 **vector 8/8 ＞ hybrid 7/8 ＞ keyword 5/8**，
+ * 且有反例（中文查詢找圖時，`hybrid` 的 keyword 路壓過 vector 路的正確命中）。因此預設由 `hybrid`
+ * 改為 `vector`；`hybrid`（RRF）與 `keyword` **保留為選用**，需要時明確帶 `mode`。
+ * 樣本小、且為 tester 自評相關性，非嚴謹評測（見 docs/storage-ports.md §搜尋模式與預設）。
  *
  * 來源標註（docs/roots-and-privacy.md §Agent 存取）：每個命中都帶足以回溯的來源欄位
  * （chunk：`rootId`＋`relPath`＋`seq`；memory：`agent`）。回傳的文字一律視為不受信任資料。
@@ -29,7 +30,7 @@ import { ValidationError } from "./errors.js";
 export const SEARCH_MODES = ["keyword", "vector", "hybrid"] as const;
 export type SearchMode = (typeof SEARCH_MODES)[number];
 
-export const DEFAULT_SEARCH_MODE: SearchMode = "hybrid";
+export const DEFAULT_SEARCH_MODE: SearchMode = "vector";
 export const DEFAULT_SEARCH_K = 10;
 /** `k` 的上限（任務卡明定）。超過者會被夾到上限，不視為錯誤。 */
 export const MAX_SEARCH_K = 100;
@@ -86,7 +87,7 @@ export interface UnifiedSearchDeps {
 
 export interface UnifiedSearchOptions {
   query: string;
-  /** 預設 `hybrid`。 */
+  /** 預設 `vector`（M2 起）；`hybrid`（RRF）與 `keyword` 為選用。 */
   mode?: SearchMode;
   /** 未指定（或空陣列以外的清單）時不過濾；指定時只搜尋這些 root（記憶因此不納入）。 */
   rootIds?: number[];
@@ -192,8 +193,9 @@ export function normalizeSearchOptions(options: UnifiedSearchOptions): {
 /**
  * 統一搜尋。回傳的命中都帶來源欄位（見檔頭）。
  *
- * 註：記憶目前只進關鍵字那一路（`remember` 不嵌入內容），因此 `vector` 模式不會有記憶命中；
- * `rootIds` 有指定時記憶一律不納入（storage-ports.md 對 `searchKeyword` 的既有規則）。
+ * 註：記憶目前只進關鍵字那一路（`remember` 不嵌入內容），因此 `vector` 模式（含預設）不會有記憶命中；
+ * 需要搜尋記憶時明確帶 `mode: "keyword"` 或 `"hybrid"`。`rootIds` 有指定時記憶一律不納入
+ * （storage-ports.md 對 `searchKeyword` 的既有規則）。
  */
 export async function unifiedSearch(
   deps: UnifiedSearchDeps,

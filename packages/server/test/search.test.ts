@@ -20,6 +20,7 @@ import {
 } from "@mnemoshelf/core";
 import { FakeEmbedder } from "@mnemoshelf/core/testing";
 import {
+  DEFAULT_SEARCH_MODE,
   fuseRanked,
   MAX_SEARCH_K,
   TEXT_SNIPPET_MAX_CHARS,
@@ -131,6 +132,18 @@ describe("unifiedSearch", () => {
 
     const result = await unifiedSearch({ store, vec, embedder }, { query: "zorblat", mode: "vector" });
     expect(result.hits.length).toBeGreaterThan(0);
+    expect(result.hits.every((hit) => hit.type === "chunk")).toBe(true);
+  });
+
+  it("不帶 mode 時走 vector（M2 契約修訂：預設由 hybrid 改為 vector）", async () => {
+    // 放一筆關鍵字會命中的記憶：預設若仍是 keyword／hybrid，就會回傳這筆記憶。
+    await store.addMemory({ content: "zorblat 的記憶（預設模式不該命中）", kind: "fact", scope: "global", project: null, agent: "tester", supersedes: null });
+
+    const result = await unifiedSearch({ store, vec, embedder }, { query: "zorblat" });
+
+    expect(DEFAULT_SEARCH_MODE).toBe("vector");
+    expect(result.mode).toBe("vector");
+    // 預設只跑向量那一路，因此不含記憶命中。
     expect(result.hits.every((hit) => hit.type === "chunk")).toBe(true);
   });
 

@@ -159,7 +159,8 @@ describe("MCP stdio 入口", () => {
     expect(memory.content).toBe(content);
     expect(memory.agent).toBe("test-client");
 
-    const found = await mcp.client.callTool({ name: "search", arguments: { query: "unique-marker-77" } });
+    // 記憶只在 keyword／hybrid 命中（M2 起不帶 mode 的預設是 vector）。
+    const found = await mcp.client.callTool({ name: "search", arguments: { query: "unique-marker-77", mode: "keyword" } });
     const hits = jsonOf<{ hits: { type: string; id?: number; agent?: string }[] }>(found);
     const memoryHit = hits.hits.find((hit) => hit.type === "memory");
     expect(memoryHit).toBeDefined();
@@ -169,7 +170,7 @@ describe("MCP stdio 入口", () => {
     const forgotten = await mcp.client.callTool({ name: "forget", arguments: { id: memory.id } });
     expect(forgotten.isError).toBeFalsy();
 
-    const afterForget = await mcp.client.callTool({ name: "search", arguments: { query: "unique-marker-77" } });
+    const afterForget = await mcp.client.callTool({ name: "search", arguments: { query: "unique-marker-77", mode: "keyword" } });
     const remaining = jsonOf<{ hits: { type: string }[] }>(afterForget).hits.filter((hit) => hit.type === "memory");
     expect(remaining).toHaveLength(0);
   });
