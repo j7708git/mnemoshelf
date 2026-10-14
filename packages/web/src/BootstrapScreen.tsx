@@ -58,7 +58,15 @@ export function BootstrapScreen({ state, token, busy, onRetry, onSkip }: Bootstr
           {failed && (state?.lastError === null || state?.lastError === undefined ? "模型下載失敗。" : `${state.lastError.name}：${state.lastError.message}`)}
         </p>
 
-        <div className="h-2 w-full overflow-hidden rounded-full bg-line">
+        <div
+          className="h-2 w-full overflow-hidden rounded-full bg-line"
+          role="progressbar"
+          aria-label="模型下載進度"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={percent}
+          aria-valuetext={`${percent}%`}
+        >
           <div className="h-full bg-ink transition-[width]" style={{ width: `${percent}%` }} />
         </div>
 

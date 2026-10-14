@@ -19,7 +19,8 @@ pnpm build                                    # core / embedder / server / web /
 pnpm --filter @mnemoshelf/desktop dist        # 未封裝目錄（electron-builder --dir），開發與驗收用
 ```
 
-`dist` 產出 `packages/desktop/dist-app/linux-unpacked/`（依平台目錄名不同），可直接執行裡面的
+`dist` 產出 `packages/desktop/dist-app/` 底下的未封裝目錄，**目錄名含架構後綴**
+（x64 為 `linux-unpacked`、arm64 為 `linux-arm64-unpacked`；其他平台同理），可直接執行裡面的
 `mnemoshelf` 執行檔。開發模式另可用 `pnpm --filter @mnemoshelf/desktop start`。
 
 要產出**安裝檔**：
@@ -108,6 +109,10 @@ pnpm --filter "@mnemoshelf/desktop..." licenses list --prod --long
 
 - **未簽章 / 未公證**：安裝時需依上面「下載安裝檔」一節繞過系統警告；沒有 auto-update。
 - **macOS 只支援 Apple Silicon（arm64）**。
+- **macOS 的自啟可能不生效**：自啟走 SMAppService（由系統管理登入項目），**未簽署的版本可能
+  被系統擋下而靜默無效**；而且 macOS 的登入啟動**不會**收到 `--hidden` 之類的自啟參數
+  （`setLoginItemSettings` 的 `path`／`args` 是 Windows-only），桌面殼改以
+  `wasOpenedAtLogin` 推導「登入時啟動」來避免彈出視窗。
 - **Linux 的縮圖**使用 sharp 時會在行程 stderr 印出 glib 相關訊息（功能正常，是 Electron 與
   sharp 在 Linux 的已知問題）。
 - 執行時需要網路才能**首次下載 embedding 模型**（約 300 MB，存在使用者資料目錄）；安裝檔本身
