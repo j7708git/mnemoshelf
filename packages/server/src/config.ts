@@ -7,12 +7,14 @@
  * | `MNEMOSHELF_TOKEN` | REST 的 Bearer token | **無預設，未設即啟動失敗** |
  * | `MNEMOSHELF_MODEL_DIR` | 模型快取目錄（交給 embedder） | embedder 自己的預設（OS 使用者資料目錄） |
  * | `MNEMOSHELF_PORT` | 監聽埠 | `0`（隨機埠） |
+ * | `MNEMOSHELF_WEB_DIR` | Web UI 靜態檔目錄 | 本 repo 的 `packages/web/dist` |
  *
  * token 刻意不自動產生：自動生成會讓使用者誤以為已經有保護，實際上 token 沒人知道、
  * 也沒人能通過驗證。未設時直接失敗並提示產生方式（`MissingTokenError`）。
  */
 import { homedir } from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { MissingMcpConfigError, MissingTokenError, ValidationError } from "./errors.js";
 
 /** 服務綁定的位址：只綁 loopback，永遠不可設定成 0.0.0.0。 */
@@ -28,6 +30,18 @@ export interface ServerConfig {
   modelDir: string | undefined;
   /** 監聽埠；0 表示由 OS 指派。 */
   port: number;
+  /** Web UI 靜態檔目錄（已解析為絕對路徑；不存在時 API 仍正常，靜態路徑回 404）。 */
+  webDir: string;
+}
+
+/**
+ * Web UI build 產物的預設位置：本檔所在的套件目錄往上兩層再進 `web/dist`。
+ *
+ * `src/config.ts` 與 build 後的 `dist/config.js` 都位於 `packages/server/` 底下，
+ * 因此兩種情況下 `../../web/dist` 都指向 `packages/web/dist`（不硬寫分隔符）。
+ */
+function defaultWebDir(): string {
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "web", "dist");
 }
 
 /** OS 使用者資料目錄（跨平台，不硬寫分隔符；與 embedder 的預設邏輯一致）。 */
@@ -67,7 +81,11 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     port = parsed;
   }
 
-  return { dataDir, dbPath: path.join(dataDir, "mnemoshelf.db"), token, modelDir, port };
+  const webDirSetting = env.MNEMOSHELF_WEB_DIR;
+  const webDir =
+    webDirSetting !== undefined && webDirSetting.trim() !== "" ? path.resolve(webDirSetting) : defaultWebDir();
+
+  return { dataDir, dbPath: path.join(dataDir, "mnemoshelf.db"), token, modelDir, port, webDir };
 }
 
 /** MCP stdio 入口的連線設定（`MNEMOSHELF_URL` + `MNEMOSHELF_TOKEN`）。 */

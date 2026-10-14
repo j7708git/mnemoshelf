@@ -70,9 +70,11 @@ describe("REST：health 與授權", () => {
     expect(JSON.stringify(response.body)).not.toContain(TEST_TOKEN);
   });
 
-  it("未知路徑 → 404；方法不支援 → 405", async () => {
+  it("未知 API 路徑 → 404；方法不支援 → 405", async () => {
     server = await startTestServer();
-    const notFound = await api(server.instance, "GET", "/nope");
+    // 非 API 路徑可能由 Web UI 的 SPA fallback 服務（見 static.test.ts）；
+    // 這裡驗證的是 API 命名空間內的未知路徑仍是 JSON 404。
+    const notFound = await api(server.instance, "GET", "/roots/1/nope");
     expect(notFound.status).toBe(404);
     expect(errorName(notFound.body)).toBe("NotFoundError");
 

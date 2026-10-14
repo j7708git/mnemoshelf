@@ -43,6 +43,19 @@ export class NonLoopbackRequestError extends Error {
   }
 }
 
+/**
+ * `Host` header 不是本機位址（HTTP 403）。
+ *
+ * 服務綁在 loopback 仍會被惡意網頁以 DNS rebinding 打進來，因此只接受
+ * `127.0.0.1`／`localhost`／`[::1]`（可帶埠號）。訊息不回傳收到的值。
+ */
+export class InvalidHostError extends Error {
+  constructor() {
+    super("Host header 不是本機位址（只接受 127.0.0.1、localhost 或 [::1]）");
+    this.name = "InvalidHostError";
+  }
+}
+
 /** 找不到資源（HTTP 404）。`resource` 是資源種類名稱，`id` 是識別碼。 */
 export class NotFoundError extends Error {
   readonly resource: string;

@@ -1,10 +1,12 @@
 # @mnemoshelf/server
 
 Mnemoshelf Core 常駐服務的**組裝層**：把既有的 SQLite `MetadataStore`／`VectorIndex`、indexer 與
-`TransformersEmbedder` 接成一個行程，對外提供兩種介面：
+`TransformersEmbedder` 接成一個行程，對外提供三種介面：
 
 1. **REST API**（本機 HTTP，`127.0.0.1` ＋ Bearer token）：roots 管理、預覽、索引、統一搜尋、記憶讀寫。
-2. **MCP 入口**（stdio，薄轉發）：約 5 個工具，經本機 HTTP 打 REST。
+2. **Web UI 靜態檔**（同源）：服務 `packages/web/dist`，找不到的非 API 路徑在瀏覽器導航時回 `index.html`
+   （SPA fallback）。**靜態檔不需要 token**（`<script src>`／`<link>` 帶不了自訂標頭）。
+3. **MCP 入口**（stdio，薄轉發）：約 5 個工具，經本機 HTTP 打 REST。
 
 **MCP 行程不碰資料庫**：只有本服務行程開啟資料庫（單一寫入者，見 `docs/storage-ports.md`）。
 本服務對使用者檔案**只讀不寫**。
@@ -27,9 +29,25 @@ MNEMOSHELF_TOKEN=<你的-token> pnpm --filter @mnemoshelf/server run serve
 | `MNEMOSHELF_TOKEN` | REST 的 Bearer token | **無預設；未設即啟動失敗** |
 | `MNEMOSHELF_DATA_DIR` | 資料目錄（SQLite 檔 `mnemoshelf.db` 所在） | OS 使用者資料目錄下的 `mnemoshelf` |
 | `MNEMOSHELF_PORT` | 監聽埠（只綁 `127.0.0.1`） | `0`（隨機埠） |
+| `MNEMOSHELF_WEB_DIR` | Web UI 靜態檔目錄 | 本 repo 的 `packages/web/dist` |
 | `MNEMOSHELF_MODEL_DIR` | 模型快取目錄（交給 embedder） | embedder 的預設（OS 使用者資料目錄） |
 | `MNEMOSHELF_URL` | **MCP 入口用**：REST 基底網址 | — |
 | `MNEMOSHELF_TOKEN` | **MCP 入口用**：與 REST 相同 | — |
+
+## Web UI（靜態檔與 SPA fallback）
+
+路由順序是「**先 API（要 token）→ 再靜態檔 → 最後 SPA fallback**」：
+
+- `GET /` 與其他存在的檔案由 `sirv` 服務（免 token），回應帶 CSP。
+- 找不到的非 API 路徑：**GET／HEAD 且 `Accept` 接受 HTML**（含 `text/html` 或 `*/*`）、
+  且路徑「不像檔案」（最後一段沒有副檔名）時回 `index.html`；其餘回 JSON 404。
+  這讓 API 用戶端的未知路徑維持 JSON 404，不會被吃成 HTML。
+- `MNEMOSHELF_WEB_DIR` 不存在時（還沒 build UI）靜態路徑回 404 JSON，**API 不受影響、不 crash**。
+
+**Host header 驗證**：所有請求（含 `/health` 與靜態檔）的 `Host` 必須是
+`127.0.0.1`／`localhost`／`[::1]`（可帶埠號），否則回 `403 InvalidHostError`。
+這是 DNS rebinding 的緩解——服務綁在 loopback 仍會被使用者瀏覽到的惡意網頁打進來。
+Vite dev server 用 `server.proxy` ＋ `changeOrigin: true` 對接（見 `packages/web/README.md`）。
 
 ## REST API
 
@@ -49,8 +67,9 @@ MNEMOSHELF_TOKEN=<你的-token> pnpm --filter @mnemoshelf/server run serve
 | `GET /memories` | 列出未刪除的記憶（由新到舊）；query：`kind`、`scope`、`project`、`agent`、`limit`（預設 100、上限 500） |
 | `DELETE /memories/:id` | 軟刪除記憶 |
 
-狀態碼：`401` token 錯、`403` 路徑不在 root 內或命中黑名單、`404` 未知資源、`409` 重複 root／索引進行中、
-`422` root 過寬（家目錄或檔案系統根）、`400` 請求內容或請求 URL 不合法、`414` 請求 URL 過長。
+狀態碼：`401` token 錯、`403` 路徑不在 root 內或命中黑名單、或 `Host` 非本機、`404` 未知資源、
+`409` 重複 root／索引進行中、`422` root 過寬（家目錄或檔案系統根）、`400` 請求內容或請求 URL 不合法、
+`414` 請求 URL 過長。
 
 搜尋回應的每個命中都帶**來源**（chunk：`rootId`／`relPath`／`seq`／`kind`；memory：`agent`／`scope`），
 文字片段有長度上限並以 `textTruncated` 標記。
@@ -90,9 +109,13 @@ pnpm --filter @mnemoshelf/server test        # 單元／整合（FakeEmbedder，
 MNEMOSHELF_E2E=1 pnpm --filter @mnemoshelf/server run e2e   # 真實 embedder（模型快取在 repo 的 .tmp/）
 ```
 
+靜態服務／SPA fallback／Host 驗證的測試在 `test/static.test.ts`，用合成的 dist 目錄，
+不依賴真的 build 產物。
+
 ## 目前限制
 
 - `maxFileBytes` 只存活於本次行程，重啟後回退預設 10 MB（見上）。
 - 沒有 watch／檔案監看、沒有 WebSocket／SSE 進度串流、沒有多使用者或角色。
 - root 的 `agentAccess` 欄位本版尚未做內容級過濾。
 - 索引沒有佇列：進行中再呼叫會回 `409`。
+- Web UI 只有骨架（token 輸入＋roots 清單）；加入資料夾、目錄樹、預覽、搜尋、記憶尚未提供。

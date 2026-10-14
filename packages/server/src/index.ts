@@ -31,6 +31,8 @@ export interface CreateServerOptions {
   dataDir?: string;
   /** 覆寫 `MNEMOSHELF_PORT`；0（預設）表示由 OS 指派隨機埠。 */
   port?: number;
+  /** 覆寫 `MNEMOSHELF_WEB_DIR`（Web UI 靜態檔目錄）。 */
+  webDir?: string;
   /** 覆寫 embedder（測試注入 `FakeEmbedder`；預設 `TransformersEmbedder`，lazy 載入）。 */
   embedder?: Embedder;
   /** 「過寬 root」判定的家目錄基準；預設 `os.homedir()`。 */
@@ -80,6 +82,7 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
   if (options.token !== undefined) env.MNEMOSHELF_TOKEN = options.token;
   if (options.dataDir !== undefined) env.MNEMOSHELF_DATA_DIR = options.dataDir;
   if (options.port !== undefined) env.MNEMOSHELF_PORT = String(options.port);
+  if (options.webDir !== undefined) env.MNEMOSHELF_WEB_DIR = options.webDir;
   // 設定只有一處驗證來源（loadServerConfig）；覆寫值也走同一條路徑。
   const config: ServerConfig = loadServerConfig(env);
 
@@ -98,6 +101,7 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     vec,
     embedder,
     token: config.token,
+    webDir: config.webDir,
     ...(options.homeDir === undefined ? {} : { homeDir: options.homeDir }),
   });
 
@@ -133,6 +137,7 @@ export { LOOPBACK_HOST, loadMcpConfig, loadServerConfig } from "./config.js";
 export type { McpConfig, ServerConfig } from "./config.js";
 export {
   IndexInProgressError,
+  InvalidHostError,
   InvalidRequestUrlError,
   MethodNotAllowedError,
   MissingMcpConfigError,
@@ -145,11 +150,16 @@ export {
   ValidationError,
 } from "./errors.js";
 export {
+  acceptsHtml,
+  API_PATH_PREFIXES,
   createRestApp,
+  isApiPath,
+  looksLikeFile,
   MAX_JSON_BODY_BYTES,
   MAX_MEMORY_CHARS,
   MAX_REQUEST_URL_LENGTH,
   parseRequestTarget,
+  STATIC_CSP,
   toHttpError,
 } from "./http/app.js";
 export type {
@@ -161,7 +171,7 @@ export type {
   RestApp,
   RestAppDeps,
 } from "./http/app.js";
-export { isLoopbackAddress, parseBearerToken, requireToken, tokensMatch } from "./http/auth.js";
+export { isLocalHostHeader, isLoopbackAddress, parseBearerToken, requireLocalHost, requireToken, tokensMatch } from "./http/auth.js";
 export {
   DEFAULT_SEARCH_K,
   DEFAULT_SEARCH_MODE,

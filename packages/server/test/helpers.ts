@@ -88,7 +88,9 @@ export interface TestServer {
 }
 
 /** 啟動測試伺服器（FakeEmbedder＋port 0＋暫存資料目錄）。 */
-export async function startTestServer(options: { embedder?: Embedder; homeDir?: string } = {}): Promise<TestServer> {
+export async function startTestServer(
+  options: { embedder?: Embedder; homeDir?: string; webDir?: string } = {},
+): Promise<TestServer> {
   const dataDir = await makeTempDir("mnemoshelf-data-");
   const instance = await createServer({
     env: {},
@@ -97,6 +99,7 @@ export async function startTestServer(options: { embedder?: Embedder; homeDir?: 
     port: 0,
     embedder: options.embedder ?? new FakeEmbedder(),
     homeDir: options.homeDir ?? os.homedir(),
+    ...(options.webDir === undefined ? {} : { webDir: options.webDir }),
   });
   return {
     instance,

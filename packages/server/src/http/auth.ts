@@ -4,10 +4,11 @@
  * - 服務只綁 `127.0.0.1`（`config.LOOPBACK_HOST`；不接受設定成外部位址）。
  * - 所有寫入與讀取端點（`/health` 除外）都要帶 `Authorization: Bearer <MNEMOSHELF_TOKEN>`。
  * - token 比對用 `crypto.timingSafeEqual` 比對 SHA-256 摘要，長度不固定也不會洩漏長度。
+ * - `Host` header 只接受本機位址（DNS rebinding 的緩解；見 `docs/roots-and-privacy.md`）。
  */
 import { createHash, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage } from "node:http";
-import { NonLoopbackRequestError, UnauthorizedError } from "../errors.js";
+import { InvalidHostError, NonLoopbackRequestError, UnauthorizedError } from "../errors.js";
 
 /** 不需要 token 的端點（探活用）。 */
 export const PUBLIC_PATHS = ["/health"] as const;
@@ -48,4 +49,38 @@ export function isLoopbackAddress(address: string | undefined): boolean {
  */
 export function requireLoopback(request: IncomingMessage): void {
   if (!isLoopbackAddress(request.socket.remoteAddress)) throw new NonLoopbackRequestError();
+}
+
+/**
+ * `Host` header 是否是本機位址。
+ *
+ * 只接受 `127.0.0.1`／`localhost`／`[::1]`，可帶埠號（例如 `127.0.0.1:8787`）。
+ * 為什麼需要：服務綁在 loopback 仍會被使用者瀏覽到的惡意網頁以 **DNS rebinding** 打進來，
+ * 標準緩解是驗證 `Host`（`requireLoopback` 只看連線來源 IP，擋不住）。
+ */
+export function isLocalHostHeader(host: string | undefined): boolean {
+  if (typeof host !== "string") return false;
+  const value = host.trim().toLowerCase();
+  if (value === "") return false;
+
+  // IPv6 字面值：`[::1]` 或 `[::1]:port`。
+  if (value.startsWith("[")) {
+    const end = value.indexOf("]");
+    if (end === -1) return false;
+    if (value.slice(1, end) !== "::1") return false;
+    const rest = value.slice(end + 1);
+    return rest === "" || /^:\d+$/.test(rest);
+  }
+
+  // 主機名稱或 IPv4：`host` 或 `host:port`。
+  const colon = value.indexOf(":");
+  const name = colon === -1 ? value : value.slice(0, colon);
+  const port = colon === -1 ? "" : value.slice(colon + 1);
+  if (port !== "" && !/^\d+$/.test(port)) return false;
+  return name === "127.0.0.1" || name === "localhost";
+}
+
+/** 檢查 `Host` header；不是本機位址時丟 `InvalidHostError`（403）。 */
+export function requireLocalHost(request: IncomingMessage): void {
+  if (!isLocalHostHeader(request.headers.host)) throw new InvalidHostError();
 }

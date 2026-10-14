@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+/* design tokens：Tailwind v4 的 CSS-first 設定（此卡只做骨架，尚未做 dark/light 雙主題）。 */
+@theme {
+  --color-surface: oklch(98% 0.004 250);
+  --color-ink: oklch(24% 0.02 260);
+  --color-muted: oklch(52% 0.02 260);
+  --color-line: oklch(88% 0.01 260);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+}

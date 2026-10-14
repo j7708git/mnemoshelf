@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Mnemoshelf 核心工作區（pnpm workspace）",
   "engines": {
-    "node": ">=22"
+    "node": ">=22.12.0"
   },
   "packageManager": "pnpm@10.34.5",
   "scripts": {

@@ -12,10 +12,20 @@
  * - **單一寫入者**：資料庫只被本行程開啟；本模組是唯一的寫入路徑（MCP 走 HTTP 進來的）。
  * - **唯讀使用者檔案**：沒有任何端點寫入 root 目錄——只讀檔、只寫自己的資料庫。
  * - 錯誤一律 `{error:{name,message}}`＋適當狀態碼；錯誤訊息由各錯誤型別決定，不含本機絕對路徑。
+ *
+ * 靜態檔服務（Web UI）：
+ * - 路由順序是「**先 API（要 token）→ 再靜態檔 → 最後 SPA fallback**」，否則未知 API 路徑會被
+ *   fallback 吃成 `index.html` 而不是 404 JSON。
+ * - 靜態檔**不要 token**（`<script src>`／`<link>` 帶不了自訂標頭；`index.html` 與 bundle 不含機密）。
+ * - SPA fallback 自己寫（不用 sirv 的 `single`）：只有 GET／HEAD、`Accept` 接受 HTML、
+ *   且路徑「不像檔案」時才回 `index.html`；路徑解析不得超出靜態根目錄。
+ * - 靜態根目錄不存在時（還沒 build）API 仍正常，靜態路徑回 404 JSON，不 crash。
  */
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { homedir } from "node:os";
+import path from "node:path";
+import sirv from "sirv";
 import {
   assertRootAllowed,
   blockedReason,
@@ -41,6 +51,7 @@ import {
 import { LOOPBACK_HOST } from "../config.js";
 import {
   IndexInProgressError,
+  InvalidHostError,
   InvalidRequestUrlError,
   MethodNotAllowedError,
   NotFoundError,
@@ -50,7 +61,7 @@ import {
   UnauthorizedError,
   ValidationError,
 } from "../errors.js";
-import { requireLoopback, requireToken } from "./auth.js";
+import { requireLocalHost, requireLoopback, requireToken } from "./auth.js";
 import { unifiedSearch, type SearchMode, type UnifiedSearchResult } from "../search.js";
 
 /** JSON 請求主體上限。 */
@@ -69,6 +80,54 @@ export const MAX_REQUEST_URL_LENGTH = 8 * 1024;
 const MODALITIES: readonly Modality[] = ["text", "code", "image", "audio", "video"];
 const MEMORY_KINDS: readonly MemoryKind[] = ["fact", "decision", "pitfall", "preference"];
 const MEMORY_SCOPES: readonly MemoryScope[] = ["global", "project", "agent"];
+
+/**
+ * API 的第一段路徑前綴。
+ *
+ * 只有這些前綴會進 API 路由（要 token）；其餘路徑才可能由靜態檔／SPA fallback 服務。
+ * 這個分界必須與 `dispatch` 的 `switch (segments[0])` 一致。
+ */
+export const API_PATH_PREFIXES: readonly string[] = ["health", "roots", "search", "memories"];
+
+/** 靜態檔回應的 CSP（UI 與 API 同源；`<img>` 走 blob/data，故放行 blob: 與 data:）。 */
+export const STATIC_CSP = [
+  "default-src 'self'",
+  "script-src 'self'",
+  "style-src 'self'",
+  "img-src 'self' blob: data:",
+  "connect-src 'self'",
+  "base-uri 'none'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join("; ");
+
+/** 請求是否指向 API（`/health`、`/roots`、`/search`、`/memories` 及其子路徑）。 */
+export function isApiPath(segments: readonly string[]): boolean {
+  return segments.length > 0 && API_PATH_PREFIXES.includes(segments[0]!);
+}
+
+/**
+ * 用戶端是否接受 HTML。
+ *
+ * `Accept` 缺席視為不接受（API 用戶端通常會帶 `Accept: application/json`）；
+ * `text/html` 或萬用字元型別（`curl` 預設送的那種）都算，瀏覽器則送 `text/html,...`。
+ */
+export function acceptsHtml(accept: string | undefined): boolean {
+  if (typeof accept !== "string") return false;
+  return accept.includes("text/html") || accept.includes("*/*");
+}
+
+/**
+ * 路徑是否「看起來像檔案」（最後一段含副檔名）。
+ *
+ * 這種路徑在找不到檔案時**不**做 SPA fallback（回 404），避免把缺失的 asset
+ * 或 `/foo.json` 之類的回成 `index.html`（與 sirv 預設 `ignores` 的行為一致）。
+ */
+export function looksLikeFile(pathname: string): boolean {
+  const segments = pathname.split("/").filter((segment) => segment !== "");
+  const last = segments.length > 0 ? segments[segments.length - 1]! : "";
+  return /\.[A-Za-z0-9]+$/.test(last);
+}
 
 /** `POST /roots` 的請求主體。 */
 export interface AddRootRequest {
@@ -114,6 +173,12 @@ export interface RestAppDeps {
   token: string;
   /** root 加入時的「過寬」判定基準；預設 `os.homedir()`。 */
   homeDir?: string;
+  /**
+   * Web UI 靜態檔根目錄（絕對路徑）。
+   *
+   * 不存在時靜態路徑一律回 404 JSON（API 不受影響）——讓「還沒 build UI」不是啟動錯誤。
+   */
+  webDir: string;
 }
 
 export interface RestApp {
@@ -146,6 +211,7 @@ export function toHttpError(error: unknown): { status: number; body: ErrorRespon
 
   if (error instanceof UnauthorizedError) return { status: 401, body: named(error.name, error.message), headers: {} };
   if (error instanceof NonLoopbackRequestError) return { status: 403, body: named(error.name, error.message), headers: {} };
+  if (error instanceof InvalidHostError) return { status: 403, body: named(error.name, error.message), headers: {} };
   if (error instanceof RootTooBroadError) return { status: 422, body: named(error.name, error.message), headers: {} };
   if (error instanceof PathOutsideRootError) return { status: 403, body: named(error.name, error.message), headers: {} };
   if (error instanceof PathBlockedError) return { status: 403, body: named(error.name, error.message), headers: {} };
@@ -314,6 +380,59 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   const maxFileBytesByRoot = new Map<number, number>();
   const indexing = new Map<number, Promise<IndexRootResult>>();
   const inflight = new Set<Promise<unknown>>();
+
+  // 靜態檔根目錄：不存在時（還沒 build UI）不建立 sirv handler，靜態路徑一律 404。
+  const webDir = path.resolve(deps.webDir);
+  const webIndexPath = path.join(webDir, "index.html");
+  const staticFiles = existsSync(webDir)
+    ? sirv(webDir, {
+        dev: process.env.NODE_ENV !== "production",
+        etag: true,
+        setHeaders: (response) => {
+          response.setHeader("Content-Security-Policy", STATIC_CSP);
+        },
+      })
+    : null;
+
+  /**
+   * 先嘗試靜態檔；sirv 沒命中時回傳 false。
+   *
+   * sirv 的 `next` 是同步呼叫的，命中時也在同步階段就 `writeHead`（檔案內容之後才 stream），
+   * 因此呼叫後即可判斷是否已接手。
+   */
+  const tryStaticFile = (request: IncomingMessage, response: ServerResponse): boolean => {
+    if (staticFiles === null) return false;
+    let fellThrough = false;
+    staticFiles(request, response, () => {
+      fellThrough = true;
+    });
+    return !fellThrough;
+  };
+
+  /**
+   * 服務靜態檔與 SPA fallback（不含 API；API 由 `dispatch` 處理）。
+   *
+   * 順序：真實檔案 → 找不到時，GET／HEAD＋接受 HTML＋路徑不像檔案 → `index.html` → 否則 404 JSON。
+   */
+  const serveWeb = async (request: IncomingMessage, response: ServerResponse, url: URL): Promise<void> => {
+    const method = (request.method ?? "GET").toUpperCase();
+    if (method !== "GET" && method !== "HEAD") throw new MethodNotAllowedError(method, ["GET", "HEAD"]);
+
+    if (tryStaticFile(request, response)) return;
+
+    // SPA fallback：只有「接受 HTML」的瀏覽器導航才回 index.html；其餘（含 API 用戶端）維持 404 JSON。
+    if (!acceptsHtml(request.headers.accept) || looksLikeFile(url.pathname)) throw new NotFoundError("路徑");
+    if (!existsSync(webIndexPath)) throw new NotFoundError("路徑");
+
+    const html = await fs.readFile(webIndexPath);
+    response.writeHead(200, {
+      "content-type": "text/html; charset=utf-8",
+      "content-length": html.byteLength,
+      "cache-control": "no-cache",
+      "content-security-policy": STATIC_CSP,
+    });
+    response.end(method === "HEAD" ? undefined : html);
+  };
 
   const getRootOr404 = async (id: number): Promise<Root> => {
     const root = await deps.store.getRoot(id);
@@ -586,8 +705,13 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const task = (async (): Promise<void> => {
       try {
         requireLoopback(request);
+        requireLocalHost(request);
         const { url, segments } = parseRequestTarget(request);
-        await dispatch(request, response, url, segments);
+        if (isApiPath(segments)) {
+          await dispatch(request, response, url, segments);
+        } else {
+          await serveWeb(request, response, url);
+        }
       } catch (error) {
         const mapped = toHttpError(error);
         if (mapped.status === 500) {
