@@ -4,7 +4,7 @@ Mnemoshelf 的 Web UI：**Vite + React + Tailwind CSS v4**（＋ `@tanstack/reac
 build 產物（`dist/`）由 `@mnemoshelf/server` 同源提供，因此 UI 與 API 共用同一個
 `127.0.0.1` 入口，不需要 CORS。
 
-## 本卡範圍（M3 檔案總管）
+## 本卡範圍（M3：檔案總管、搜尋與記憶管理）
 
 - token 輸入頁、連線狀態、roots 清單（可選取與移除）。
 - **加入資料夾引導**：輸入路徑 → `POST /roots` → 預覽統計（`POST /roots/:id/preview`）→
@@ -14,7 +14,17 @@ build 產物（`dist/`）由 `@mnemoshelf/server` 同源提供，因此 UI 與 A
 - **檔案預覽**：文字（`GET /roots/:id/file`，截斷會標明）與圖片（`GET /roots/:id/thumb` 縮圖，
   可切換原圖）。圖片一律 `fetch`＋blob URL（`<img src>` 帶不了 `Authorization`），
   不再使用時 `URL.revokeObjectURL`。
-- 尚未提供：搜尋、記憶管理（下一張卡）。
+- **統一搜尋**：模式選擇器（`vector`／`hybrid`／`keyword`，**UI 預設 `hybrid`**，含記憶命中；
+  server 的 `/search` 預設仍是 `vector`）；結果區分檔案塊與記憶，並顯示來源（root／路徑／分數、
+  記憶的 agent／範圍）；點檔案結果在右側以既有 `FilePreview` 開預覽。
+- **記憶管理**：列表（`pinned` 標示、釘選優先排序）、釘選／取消（`POST /memories/:id/pin`）、
+  編輯（走 supersedes：`POST /memories` 帶 `supersedes` 產生新版本並取代舊版）、
+  刪除（確認步驟；軟刪除）、看來源（寫入者／種類／範圍／取代關係／建立時間）。
+
+## 導覽
+
+連線後有三個主要檢視（`App.tsx` 的頂部分頁）：**檔案總管**、**搜尋**、**記憶管理**。
+搜尋畫面在上方切換模式；記憶管理以 `pinned` 優先、其次 `createdAt` 由新到舊排序。
 
 ## 開發
 

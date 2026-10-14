@@ -237,3 +237,137 @@ export async function fetchImageBlobUrl(
   if (!response.ok) throw new Error(await readErrorMessage(response, "讀取圖片失敗"));
   return URL.createObjectURL(await response.blob());
 }
+
+// ---------------------------------------------------------------------------
+// M3 收尾：統一搜尋、記憶管理（列表／釘選／編輯／刪除／來源）
+// ---------------------------------------------------------------------------
+
+/** 記憶的種類（與 Core 契約一致）。 */
+export type MemoryKind = "fact" | "decision" | "pitfall" | "preference";
+
+/** 記憶的作用範圍（與 Core 契約一致）。 */
+export type MemoryScope = "global" | "project" | "agent";
+
+/** `GET /memories` 回傳的記憶（欄位以 Core 契約為準）。 */
+export interface Memory {
+  id: number;
+  content: string;
+  kind: MemoryKind;
+  scope: MemoryScope;
+  project: string | null;
+  /** 寫入這筆記憶的 agent 標識（來源）。 */
+  agent: string;
+  /** 取代了哪一筆記憶（編輯流程會產生新版本並標記取代舊版）。 */
+  supersedes: number | null;
+  /** 是否釘選（釘選者在清單優先顯示）。 */
+  pinned: boolean;
+  createdAt: string;
+  deletedAt: string | null;
+}
+
+/** 搜尋模式（與 Core 契約一致）；UI 預設 `hybrid`（含記憶命中）。 */
+export const SEARCH_MODES = ["vector", "hybrid", "keyword"] as const;
+export type SearchMode = (typeof SEARCH_MODES)[number];
+
+/** 檔案片段命中。 */
+export interface ChunkSearchHit {
+  type: "chunk";
+  key: string;
+  rank: number;
+  score: number;
+  rootId: number;
+  relPath: string;
+  seq: number;
+  kind: EntryKind;
+  text: string | null;
+  textTruncated: boolean;
+}
+
+/** 記憶命中。 */
+export interface MemorySearchHit {
+  type: "memory";
+  key: string;
+  rank: number;
+  score: number;
+  id: number;
+  kind: MemoryKind;
+  scope: MemoryScope;
+  project: string | null;
+  agent: string;
+  text: string;
+  textTruncated: boolean;
+}
+
+export type SearchHit = ChunkSearchHit | MemorySearchHit;
+
+/** `POST /search` 的回應。 */
+export interface SearchResult {
+  mode: SearchMode;
+  k: number;
+  hits: SearchHit[];
+}
+
+/** 統一搜尋；`mode` 由呼叫端明確帶入（UI 預設 hybrid）。 */
+export async function search(input: {
+  query: string;
+  mode: SearchMode;
+  rootIds?: number[];
+  k?: number;
+}): Promise<SearchResult> {
+  const response = await apiFetch("/search", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await readErrorMessage(response, "搜尋失敗"));
+  return (await response.json()) as SearchResult;
+}
+
+/** 列出未刪除的記憶（由新到舊；pinned 由呼叫端另行排序）。 */
+export async function listMemories(): Promise<Memory[]> {
+  const response = await apiFetch("/memories");
+  if (!response.ok) throw new Error(await readErrorMessage(response, "讀取記憶清單失敗"));
+  const body = (await response.json()) as { memories?: unknown };
+  if (!Array.isArray(body.memories)) throw new Error("伺服器回應格式不正確");
+  return body.memories as Memory[];
+}
+
+/**
+ * 新增記憶。
+ *
+ * `supersedes` 帶入被編輯記憶的 id 時，會建立新版本並把舊版標記軟刪除
+ * （Core 的 supersedes 語意），這就是 UI 的「編輯」流程。
+ */
+export async function addMemory(input: {
+  content: string;
+  agent: string;
+  kind?: MemoryKind;
+  scope?: MemoryScope;
+  project?: string | null;
+  supersedes?: number | null;
+}): Promise<Memory> {
+  const response = await apiFetch("/memories", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await readErrorMessage(response, "儲存記憶失敗"));
+  return (await response.json()) as Memory;
+}
+
+/** 設定／取消釘選（冪等）；回傳更新後的記憶。 */
+export async function pinMemory(id: number, pinned: boolean): Promise<Memory> {
+  const response = await apiFetch(`/memories/${id}/pin`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ pinned }),
+  });
+  if (!response.ok) throw new Error(await readErrorMessage(response, "更新釘選狀態失敗"));
+  return (await response.json()) as Memory;
+}
+
+/** 軟刪除記憶。 */
+export async function deleteMemory(id: number): Promise<void> {
+  const response = await apiFetch(`/memories/${id}`, { method: "DELETE" });
+  if (!response.ok) throw new Error(await readErrorMessage(response, "刪除記憶失敗"));
+}

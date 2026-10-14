@@ -90,11 +90,19 @@ export interface MetadataStore {
    */
   listRelPaths(rootId: number): Promise<string[]>;
 
-  /** 新增記憶；`supersedes` 有值時把被取代者標記 `deletedAt`。 */
+  /** 新增記憶；`supersedes` 有值時把被取代者標記 `deletedAt`。新增的記憶一律 `pinned=false`。 */
   addMemory(m: NewMemory): Promise<Memory>;
   getMemory(id: number): Promise<Memory | null>;
   /** 軟刪除。 */
   forgetMemory(id: number): Promise<void>;
+
+  /**
+   * 設定記憶的釘選狀態（冪等；M3 擴充）。
+   *
+   * 不存在的 id 是**無操作**（不拋錯），與 `forgetMemory` 的既有風格一致；
+   * 需要判斷存在與否的呼叫端（例如 REST 端點要回 404）請先 `getMemory`。
+   */
+  setMemoryPinned(id: number, pinned: boolean): Promise<void>;
 
   /**
    * 列舉**未刪除**的記憶（軟刪除者與被取代者不會出現）。

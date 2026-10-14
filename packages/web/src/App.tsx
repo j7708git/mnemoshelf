@@ -11,7 +11,9 @@ import {
 } from "./api";
 import { AddRootFlow } from "./AddRootFlow";
 import { ExplorerPanel } from "./ExplorerPanel";
+import { MemoriesPanel } from "./MemoriesPanel";
 import { RootsList } from "./RootsList";
+import { SearchPanel } from "./SearchPanel";
 import { TokenForm } from "./TokenForm";
 
 /** 畫面的四種狀態。 */
@@ -21,16 +23,26 @@ type ViewState =
   | { kind: "ready"; roots: Root[] }
   | { kind: "error"; message: string };
 
+/** 連線後的主要檢視。 */
+type View = "explorer" | "search" | "memories";
+
+const NAV_LABEL: Record<View, string> = {
+  explorer: "檔案總管",
+  search: "搜尋",
+  memories: "記憶管理",
+};
+
 /**
- * 應用根元件：token → 資料夾清單 → 檔案總管（目錄樹、預覽、索引进度）。
+ * 應用根元件：token → 資料夾清單 → 三個主要檢視（檔案總管／搜尋／記憶管理）。
  *
- * 本卡範圍：加入資料夾引導、虛擬化目錄樹、檔案預覽（文字／圖片）。搜尋與記憶留待後續卡。
+ * 本卡範圍：統一搜尋畫面（模式選擇器，預設 hybrid）與記憶管理（列表、釘選、編輯、刪除、來源）。
  */
 export function App() {
   const [state, setState] = useState<ViewState>(() =>
     getToken() === null ? { kind: "need-token", message: null } : { kind: "loading" },
   );
   const [selectedRootId, setSelectedRootId] = useState<number | null>(null);
+  const [view, setView] = useState<View>("explorer");
   const [mode, setMode] = useState<"explorer" | "add-root">("explorer");
   /** 遞增以強制目錄樹與狀態重新載入。 */
   const [refreshKey, setRefreshKey] = useState(0);
@@ -71,6 +83,7 @@ export function App() {
 
   const onRootAdded = (root: Root): void => {
     setSelectedRootId(root.id);
+    setView("explorer");
     setMode("explorer");
     setRefreshKey((current) => current + 1);
     void load();
@@ -129,57 +142,86 @@ export function App() {
 
       {state.kind === "ready" && (
         <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-8">
-          <header className="flex items-center justify-between gap-3">
+          <header className="flex flex-wrap items-center justify-between gap-3">
             <div>
               <h1 className="text-xl font-semibold text-ink">Mnemoshelf</h1>
               <p className="text-xs text-muted">已連線到本機服務（127.0.0.1）</p>
             </div>
-            <button
-              type="button"
-              onClick={forgetToken}
-              className="rounded-md border border-line px-3 py-1.5 text-sm text-ink"
-            >
-              登出
-            </button>
+            <div className="flex flex-wrap items-center gap-3">
+              <nav
+                aria-label="主要檢視"
+                className="inline-flex overflow-hidden rounded-md border border-line"
+              >
+                {(["explorer", "search", "memories"] as const).map((item) => (
+                  <button
+                    key={item}
+                    type="button"
+                    aria-current={view === item ? "page" : undefined}
+                    onClick={() => {
+                      setView(item);
+                      if (item === "explorer") setMode("explorer");
+                    }}
+                    className={`px-3 py-1.5 text-sm font-medium ${
+                      view === item ? "bg-ink text-white" : "bg-white text-ink"
+                    }`}
+                  >
+                    {NAV_LABEL[item]}
+                  </button>
+                ))}
+              </nav>
+              <button
+                type="button"
+                onClick={forgetToken}
+                className="rounded-md border border-line px-3 py-1.5 text-sm text-ink"
+              >
+                登出
+              </button>
+            </div>
           </header>
 
-          <div className="grid gap-6 lg:grid-cols-[300px_minmax(0,1fr)]">
-            <aside className="space-y-3">
-              <div className="flex items-center justify-between">
-                <h2 className="text-base font-medium text-ink">
-                  資料夾<span className="ml-1 text-xs text-muted">（{state.roots.length}）</span>
-                </h2>
-                <button
-                  type="button"
-                  onClick={() => setMode("add-root")}
-                  className="rounded-md bg-ink px-2.5 py-1 text-xs font-medium text-white"
-                >
-                  加入
-                </button>
-              </div>
-              <RootsList
-                roots={state.roots}
-                selectedRootId={selectedRoot?.id ?? null}
-                onSelect={(root) => {
-                  setSelectedRootId(root.id);
-                  setMode("explorer");
-                }}
-                onRemove={(root) => void onRemoveRoot(root)}
-              />
-            </aside>
-
-            <main className="min-w-0">
-              {mode === "add-root" ? (
-                <AddRootFlow onCancel={() => setMode("explorer")} onDone={onRootAdded} />
-              ) : selectedRoot === null ? (
-                <div className="flex h-[60vh] items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center">
-                  <p className="text-sm text-muted">請先加入一個資料夾。</p>
+          {view === "explorer" && (
+            <div className="grid gap-6 lg:grid-cols-[300px_minmax(0,1fr)]">
+              <aside className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-base font-medium text-ink">
+                    資料夾<span className="ml-1 text-xs text-muted">（{state.roots.length}）</span>
+                  </h2>
+                  <button
+                    type="button"
+                    onClick={() => setMode("add-root")}
+                    className="rounded-md bg-ink px-2.5 py-1 text-xs font-medium text-white"
+                  >
+                    加入
+                  </button>
                 </div>
-              ) : (
-                <ExplorerPanel key={selectedRoot.id} root={selectedRoot} refreshKey={refreshKey} />
-              )}
-            </main>
-          </div>
+                <RootsList
+                  roots={state.roots}
+                  selectedRootId={selectedRoot?.id ?? null}
+                  onSelect={(root) => {
+                    setSelectedRootId(root.id);
+                    setMode("explorer");
+                  }}
+                  onRemove={(root) => void onRemoveRoot(root)}
+                />
+              </aside>
+
+              <main className="min-w-0">
+                {mode === "add-root" ? (
+                  <AddRootFlow onCancel={() => setMode("explorer")} onDone={onRootAdded} />
+                ) : selectedRoot === null ? (
+                  <div className="flex h-[60vh] items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center">
+                    <p className="text-sm text-muted">請先加入一個資料夾。</p>
+                  </div>
+                ) : (
+                  <ExplorerPanel key={selectedRoot.id} root={selectedRoot} refreshKey={refreshKey} />
+                )}
+              </main>
+            </div>
+          )}
+
+          {view === "search" && <SearchPanel roots={state.roots} onOpenMemories={() => setView("memories")} />}
+
+          {view === "memories" && <MemoriesPanel />}
         </div>
       )}
     </div>

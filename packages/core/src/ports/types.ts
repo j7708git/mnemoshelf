@@ -63,14 +63,26 @@ export interface Memory {
   agent: string;
   /** 取代了哪一筆記憶（有的話，被取代者會被軟刪除）。 */
   supersedes: number | null;
+  /**
+   * 是否釘選（M3 擴充）。
+   *
+   * 由 `MetadataStore.setMemoryPinned` 設定；既有資料與新增的記憶一律預設 `false`。
+   * 這是管理面的標記，**不影響**搜尋排名或 `listMemories` 的排序（UI 自行把釘選者排前面）。
+   */
+  pinned: boolean;
   /** ISO 8601 時間字串。 */
   createdAt: string;
   /** ISO 8601 時間字串；未刪除時為 null。 */
   deletedAt: string | null;
 }
 
-/** 新增記憶時的輸入（id／createdAt／deletedAt 由儲存層產生）。 */
-export type NewMemory = Omit<Memory, "id" | "createdAt" | "deletedAt">;
+/**
+ * 新增記憶時的輸入（id／createdAt／deletedAt 由儲存層產生）。
+ *
+ * `pinned` 刻意**不在**輸入內：新增的記憶一律 `false`，要釘選請用
+ * `MetadataStore.setMemoryPinned`（見 `Memory.pinned`）。
+ */
+export type NewMemory = Omit<Memory, "id" | "createdAt" | "deletedAt" | "pinned">;
 
 /** 查詢過濾條件。未指定 rootIds 表示不過濾。 */
 export interface SearchFilter {

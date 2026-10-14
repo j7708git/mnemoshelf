@@ -259,6 +259,33 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       expect(hits.map((h) => h.key)).toEqual([`m:${second.id}`]);
     });
 
+    it("setMemoryPinned 設定與取消釘選（冪等），pinned 反映在 getMemory 與 listMemories", async () => {
+      const memory = await store.addMemory(memoryInput({ content: "要被釘選的記憶" }));
+      // 新增的記憶預設不釘選。
+      expect(memory.pinned).toBe(false);
+      expect((await store.getMemory(memory.id))?.pinned).toBe(false);
+
+      await store.setMemoryPinned(memory.id, true);
+      expect((await store.getMemory(memory.id))?.pinned).toBe(true);
+      // 冪等：重複設定同樣的值不會出錯，狀態不變。
+      await store.setMemoryPinned(memory.id, true);
+      expect((await store.getMemory(memory.id))?.pinned).toBe(true);
+
+      // 列表回傳的完整 Memory 也帶正確的 pinned。
+      expect((await store.listMemories()).find((item) => item.id === memory.id)?.pinned).toBe(true);
+
+      await store.setMemoryPinned(memory.id, false);
+      expect((await store.getMemory(memory.id))?.pinned).toBe(false);
+      expect((await store.listMemories()).find((item) => item.id === memory.id)?.pinned).toBe(false);
+    });
+
+    it("setMemoryPinned 對不存在的 id 是無操作（比照 forgetMemory 的風格，不拋錯）", async () => {
+      await expect(store.setMemoryPinned(987654, true)).resolves.toBeUndefined();
+      expect(await store.getMemory(987654)).toBeNull();
+      // 不存在的 id 不會被憑空建立。
+      expect(await store.listMemories()).toEqual([]);
+    });
+
     it("forgetMemory 軟刪除後搜尋不到，但資料仍在", async () => {
       const memory = await store.addMemory({
         content: "踩坑：WAL 下不要開多個寫入者",

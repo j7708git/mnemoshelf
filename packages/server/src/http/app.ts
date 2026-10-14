@@ -8,7 +8,7 @@
  * - `GET  /roots/:id/entries?path=`（目錄子項）、`GET /roots/:id/file?path=`（文字預覽／圖片位元組）、
  *   `GET /roots/:id/thumb?path=`（縮圖）、`GET /roots/:id/index/status`（索引进度輪詢）
  * - `POST /search`
- * - `POST /memories`、`GET /memories`、`DELETE /memories/:id`
+ * - `POST /memories`、`GET /memories`、`POST /memories/:id/pin`、`DELETE /memories/:id`
  *
  * 行為規則：
  * - **單一寫入者**：資料庫只被本行程開啟；本模組是唯一的寫入路徑（MCP 走 HTTP 進來的）。
@@ -339,6 +339,22 @@ function requireString(value: unknown, field: string, options: { maxLength?: num
 function optionalString(value: unknown, field: string): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "string") throw new ValidationError(field, "必須是字串");
+  return value;
+}
+
+/** 解析可選的布林欄位；未提供（`undefined`／`null`）時回傳 `undefined`。 */
+function optionalBoolean(value: unknown, field: string): boolean | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "boolean") throw new ValidationError(field, "必須是布林值");
+  return value;
+}
+
+/** 解析可選的正整數 id（例如 `supersedes`）；未提供時回傳 `null`。 */
+function optionalId(value: unknown, field: string): number | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new ValidationError(field, "必須是正整數");
+  }
   return value;
 }
 
@@ -679,6 +695,12 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     return { status: 200, body };
   };
 
+  /**
+   * `POST /memories`：新增記憶。
+   *
+   * `supersedes`（可選）為被取代的記憶 id：帶了就把該筆標記軟刪除（見 `addMemory` 的契約），
+   * UI 的「編輯」流程即以此產生新版本並取代舊版。
+   */
   const addMemory = async (request: IncomingMessage): Promise<{ status: number; body: unknown }> => {
     const body = await readJsonBody(request);
     const content = requireString(body.content, "content", { maxLength: MAX_MEMORY_CHARS });
@@ -686,9 +708,24 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const kind = enumValue(body.kind, MEMORY_KINDS, "kind", "fact");
     const scope = enumValue(body.scope, MEMORY_SCOPES, "scope", "global");
     const project = optionalString(body.project, "project") ?? null;
+    const supersedes = optionalId(body.supersedes, "supersedes");
 
-    const memory: Memory = await deps.store.addMemory({ content, kind, scope, project, agent, supersedes: null });
+    const memory: Memory = await deps.store.addMemory({ content, kind, scope, project, agent, supersedes });
     return { status: 201, body: memory };
+  };
+
+  /**
+   * `POST /memories/:id/pin`：設定／取消釘選（冪等）。
+   *
+   * 主體 `{pinned?: boolean}`，省略時預設 `true`（只送空主體即為釘選）。
+   * 未知的 id → 404（先 `getMemory` 判斷存在與否）；回傳更新後的記憶。
+   */
+  const pinMemory = async (request: IncomingMessage, id: number): Promise<{ status: number; body: unknown }> => {
+    const body = await readJsonBody(request);
+    const pinned = optionalBoolean(body.pinned, "pinned") ?? true;
+    if ((await deps.store.getMemory(id)) === null) throw new NotFoundError("記憶", id);
+    await deps.store.setMemoryPinned(id, pinned);
+    return { status: 200, body: await deps.store.getMemory(id) };
   };
 
   const forgetMemory = async (id: number): Promise<{ status: number; body: unknown }> => {
@@ -804,6 +841,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     if (segments.length === 2) {
       if (method !== "DELETE") throw new MethodNotAllowedError(method, ["DELETE"]);
       return await forgetMemory(parseId(segments[1]!, "記憶"));
+    }
+    if (segments.length === 3 && segments[2] === "pin") {
+      if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
+      return await pinMemory(request, parseId(segments[1]!, "記憶"));
     }
     throw new NotFoundError("路徑");
   };

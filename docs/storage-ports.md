@@ -5,6 +5,9 @@
 > **修訂紀錄**：2026-10-14（M2）修訂「搜尋排序」——`/search` 預設由 `hybrid`（RRF 合併）改為
 > `vector`（向量優先），`hybrid` 與 `keyword` 保留為選用；並新增 §搜尋模式與預設、§PostgreSQL 後端。
 > 舊語意以註記保留在 §設計規則 1，方便讀舊文件的人。
+>
+> 2026-10-14（M3）新增 §記憶的釘選：`Memory.pinned` 欄位與 `MetadataStore.setMemoryPinned`
+> 方法（兩後端皆實作、通過同一組契約測試）；`listMemories` 的排序語意不變。
 
 | 介面 | 職責 | 預設實作 | 預計的替代實作 |
 |---|---|---|---|
@@ -51,6 +54,33 @@ keyword 路把 vector 路原本正確的命中壓了下去（RRF 讓兩路等權
 **`hybrid` 與 `keyword` 保留不刪**：兩者仍是正式模式，明確帶 `mode` 即照舊可用；RRF 實作保留在應用層
 （見 §設計規則 1）。需要固定行為的呼叫端請一律明確帶 `mode`。**記憶只進 keyword 那一路**，因此預設
 `vector` 不含記憶命中；要搜尋記憶請帶 `mode: "keyword"` 或 `"hybrid"`。
+
+## 記憶的釘選（M3 擴充）
+
+管理面的標記：`Memory.pinned: boolean`（型別見 `ports/types.ts`）。既有資料與新增的記憶一律
+預設 `false`；`NewMemory` 刻意**不含** `pinned`，要釘選請用下列方法。
+
+| 方法 | 語意 |
+|---|---|
+| `MetadataStore.setMemoryPinned(id, pinned)` | 設定／取消釘選，**冪等** |
+
+- **不存在的 id 是無操作**（不拋錯），與 `forgetMemory` 的既有風格一致；需要回 404 的
+  呼叫端（REST）請先 `getMemory` 判斷存在與否。
+- `pinned` **不影響** `listMemories` 的排序（仍是 `createdAt` 由新到舊、同毫秒以 `id` 決勝）；
+  「釘選優先」的排序由呼叫端（UI）自行處理，後端契約因此不必變動既有排序語意。
+- `getMemory` 與 `listMemories` 回傳的 `Memory` 都帶正確的 `pinned`。
+
+**兩個後端的實作**：
+
+- **SQLite（預設）**：欄位 `memories.pinned integer not null default 0`；以版本化遷移
+  `0002_memory_pinned` 補欄位（先查 `pragma table_info` 再 `alter table add column`，維持冪等），
+  既有資料庫的既有資料自動為 `0`。
+- **PostgreSQL**：欄位 `pinned boolean not null default false`；`migrate()` 除了 `create table`，
+  另以 `alter table … add column if not exists pinned …` 補既有資料庫的欄位（冪等）。
+
+契約測試（`@mnemoshelf/core/testing` 的 `runMetadataStoreContract`）新增兩例：釘選／取消
+（含冪等，且 `getMemory` 與 `listMemories` 都反映），以及不存在 id 的無操作。SQLite 與
+PostgreSQL 兩個後端都必須通過同一組測試。
 
 ## 全文檢索與中文
 

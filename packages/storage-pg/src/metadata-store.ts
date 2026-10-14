@@ -31,7 +31,7 @@ export interface PgMetadataStoreOptions {
 const ROOT_COLUMNS =
   "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at";
 const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash";
-const MEMORY_COLUMNS = "id, content, kind, scope, project, agent, supersedes, created_at, deleted_at";
+const MEMORY_COLUMNS = "id, content, kind, scope, project, agent, supersedes, pinned, created_at, deleted_at";
 
 /** `pg` 的 unique violation 錯誤碼（SQLite 是字串比對，PostgreSQL 是 SQLSTATE）。 */
 const UNIQUE_VIOLATION = "23505";
@@ -81,6 +81,7 @@ function rowToMemory(row: Record<string, unknown>): Memory {
     project: row.project === null || row.project === undefined ? null : String(row.project),
     agent: String(row.agent),
     supersedes: row.supersedes === null || row.supersedes === undefined ? null : Number(row.supersedes),
+    pinned: row.pinned === true,
     createdAt: String(row.created_at),
     deletedAt: row.deleted_at === null || row.deleted_at === undefined ? null : String(row.deleted_at),
   };
@@ -141,12 +142,16 @@ function metadataSchemaSql(schema: string): string {
       project text,
       agent text not null,
       supersedes integer,
+      pinned boolean not null default false,
       created_at text not null,
       deleted_at text,
       seg text,
       tsv tsvector generated always as (to_tsvector('simple', seg)) stored
     );
     create index if not exists memories_tsv_gin on ${memories} using gin (tsv);
+
+    -- 既有資料庫（本卡之前建立的表）補上 pinned；冪等，重複執行無害。
+    alter table ${memories} add column if not exists pinned boolean not null default false;
   `;
 }
 
@@ -324,6 +329,11 @@ export class PgMetadataStore implements MetadataStore {
       new Date().toISOString(),
       id,
     ]);
+  }
+
+  /** 設定釘選（冪等）；不存在的 id 更新不到任何列，等同無操作。 */
+  async setMemoryPinned(id: number, pinned: boolean): Promise<void> {
+    await this.pool.query(`update ${this.memories} set pinned = $1 where id = $2`, [pinned, id]);
   }
 
   async listMemories(filter: MemoryFilter = {}): Promise<Memory[]> {

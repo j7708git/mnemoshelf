@@ -383,6 +383,101 @@ describe("REST：記憶", () => {
     expect(noToken.status).toBe(401);
     expect(errorName(noToken.body)).toBe("UnauthorizedError");
   });
+
+  it("新增的記憶 pinned=false，且 pinned 欄位出現在 POST 與 GET /memories 的回應", async () => {
+    server = await startTestServer();
+    const created = await api(server.instance, "POST", "/memories", {
+      body: { content: "釘選欄位測試", agent: "agent-pin" },
+    });
+    expect(created.status).toBe(201);
+    expect((created.body as { pinned: boolean }).pinned).toBe(false);
+
+    const listed = await api(server.instance, "GET", "/memories");
+    const memories = (listed.body as ListMemoriesResponse).memories;
+    expect(memories).toHaveLength(1);
+    expect(memories[0]?.pinned).toBe(false);
+  });
+
+  it("POST /memories/:id/pin 釘選與取消（冪等），回應帶更新後的記憶", async () => {
+    server = await startTestServer();
+    const memory = (await api(server.instance, "POST", "/memories", {
+      body: { content: "要被釘選的記憶", agent: "agent-pin" },
+    })).body as { id: number };
+
+    // 只送空主體＝釘選（pinned 預設 true）。
+    const pinned = await api(server.instance, "POST", `/memories/${memory.id}/pin`, { body: {} });
+    expect(pinned.status).toBe(200);
+    expect((pinned.body as { id: number; pinned: boolean }).id).toBe(memory.id);
+    expect((pinned.body as { pinned: boolean }).pinned).toBe(true);
+
+    // 冪等：再釘一次結果相同。
+    const pinnedAgain = await api(server.instance, "POST", `/memories/${memory.id}/pin`, { body: { pinned: true } });
+    expect(pinnedAgain.status).toBe(200);
+    expect((pinnedAgain.body as { pinned: boolean }).pinned).toBe(true);
+
+    // 列表也反映 pinned。
+    const listed = await api(server.instance, "GET", "/memories");
+    expect((listed.body as ListMemoriesResponse).memories[0]?.pinned).toBe(true);
+
+    // 取消釘選。
+    const unpinned = await api(server.instance, "POST", `/memories/${memory.id}/pin`, { body: { pinned: false } });
+    expect(unpinned.status).toBe(200);
+    expect((unpinned.body as { pinned: boolean }).pinned).toBe(false);
+    expect((await api(server.instance, "GET", "/memories")).body).toMatchObject({
+      memories: [{ id: memory.id, pinned: false }],
+    });
+  });
+
+  it("POST /memories/:id/pin 未知 id → 404；無 token → 401；pinned 非布林 → 400", async () => {
+    server = await startTestServer();
+
+    const unknown = await api(server.instance, "POST", "/memories/987654/pin", { body: { pinned: true } });
+    expect(unknown.status).toBe(404);
+    expect(errorName(unknown.body)).toBe("NotFoundError");
+
+    const noToken = await api(server.instance, "POST", "/memories/1/pin", { body: {}, token: null });
+    expect(noToken.status).toBe(401);
+    expect(errorName(noToken.body)).toBe("UnauthorizedError");
+
+    const memory = (await api(server.instance, "POST", "/memories", {
+      body: { content: "驗證 pinned 型別", agent: "agent-pin" },
+    })).body as { id: number };
+    const badType = await api(server.instance, "POST", `/memories/${memory.id}/pin`, { body: { pinned: "yes" } });
+    expect(badType.status).toBe(400);
+    expect(errorName(badType.body)).toBe("ValidationError");
+  });
+
+  it("POST /memories 帶 supersedes：新版本建立、舊版本不再列出、關係可回溯", async () => {
+    server = await startTestServer();
+    const original = (await api(server.instance, "POST", "/memories", {
+      body: { content: "舊版本：用四個空白縮排", agent: "editor-agent", kind: "preference", scope: "global" },
+    })).body as { id: number };
+
+    const updated = await api(server.instance, "POST", "/memories", {
+      body: {
+        content: "新版本：用兩個空白縮排",
+        agent: "editor-agent",
+        kind: "preference",
+        scope: "global",
+        supersedes: original.id,
+      },
+    });
+    expect(updated.status).toBe(201);
+    const replacement = updated.body as { id: number; supersedes: number | null; pinned: boolean };
+    expect(replacement.supersedes).toBe(original.id);
+    expect(replacement.pinned).toBe(false);
+
+    const listed = (await api(server.instance, "GET", "/memories")).body as ListMemoriesResponse;
+    expect(listed.memories.map((memory) => memory.id)).toEqual([replacement.id]);
+    expect(listed.memories.map((memory) => memory.id)).not.toContain(original.id);
+
+    // supersedes 非正整數 → 400
+    const bad = await api(server.instance, "POST", "/memories", {
+      body: { content: "x", agent: "editor-agent", supersedes: 0 },
+    });
+    expect(bad.status).toBe(400);
+    expect(errorName(bad.body)).toBe("ValidationError");
+  });
 });
 
 describe("REST：畸形 request-target 不會打掛服務", () => {

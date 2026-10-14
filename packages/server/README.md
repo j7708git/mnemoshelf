@@ -67,8 +67,9 @@ Vite dev server 用 `server.proxy` ＋ `changeOrigin: true` 對接（見 `packag
 | `GET /roots/:id/file?path=<相對路徑>` | 文字預覽（JSON：`{kind:"text",path,size,truncated,content}`，上限 256 KB、超過截斷並以 `truncated` 標明）或圖片原始位元組（帶正確 `Content-Type`） |
 | `GET /roots/:id/thumb?path=<相對路徑>` | 圖片縮圖（`sharp` 產生、寬度上限 320px、輸出 PNG；**記憶體內快取**，不寫磁碟） |
 | `POST /search` | `{query, mode?, rootIds?, k?}`；`mode` 為 `keyword`／`hybrid`／`vector`（預設），`k` 上限 100 |
-| `POST /memories` | `{content, kind?, scope?, project?, agent}`（`agent` 必填＝寫入者標識） |
-| `GET /memories` | 列出未刪除的記憶（由新到舊）；query：`kind`、`scope`、`project`、`agent`、`limit`（預設 100、上限 500） |
+| `POST /memories` | `{content, kind?, scope?, project?, agent, supersedes?}`（`agent` 必填＝寫入者標識；`supersedes` 為被取代的記憶 id，帶了會把舊版軟刪除＝編輯流程） |
+| `GET /memories` | 列出未刪除的記憶（由新到舊）；每筆帶 `pinned`；query：`kind`、`scope`、`project`、`agent`、`limit`（預設 100、上限 500） |
+| `POST /memories/:id/pin` | 設定／取消釘選：`{pinned?: boolean}`（省略＝`true`）；冪等；未知 id → `404`；回傳更新後的記憶 |
 | `DELETE /memories/:id` | 軟刪除記憶 |
 
 狀態碼：`401` token 錯、`403` 路徑不在 root 內或命中黑名單、或 `Host` 非本機、`404` 未知資源、
@@ -89,6 +90,15 @@ Vite dev server 用 `server.proxy` ＋ `changeOrigin: true` 對接（見 `packag
 
 搜尋回應的每個命中都帶**來源**（chunk：`rootId`／`relPath`／`seq`／`kind`；memory：`agent`／`scope`），
 文字片段有長度上限並以 `textTruncated` 標記。
+
+### 記憶的編輯與釘選（M3）
+
+- **編輯＝supersedes**：`POST /memories` 帶 `supersedes: <舊記憶 id>` 會建立新版本，並把舊版標記
+  軟刪除（`deletedAt`）。`GET /memories` 只列未刪除者，因此編輯後只看到新版本；新版本的回應帶
+  `supersedes` 指回舊版，UI 即以此呈現新舊關係。**不直接改寫既有記憶列**。
+- **釘選**：`POST /memories/:id/pin` 設定／取消 `pinned`（冪等）；`GET /memories` 的每筆記憶都帶
+  `pinned`。後端契約（`docs/storage-ports.md` §記憶的釘選）刻意**不**把釘選併入排序——釘選優先的
+  排序由 UI 自行處理。
 
 ### `mode` 預設值：`vector`（M2 已修訂）
 
@@ -135,5 +145,6 @@ MNEMOSHELF_E2E=1 pnpm --filter @mnemoshelf/server run e2e   # 真實 embedder（
   `GET /roots/:id/index/status` 取得（行程內記憶體；重啟後回 `idle`）。
 - root 的 `agentAccess` 欄位本版尚未做內容級過濾。
 - 索引沒有佇列：進行中再呼叫會回 `409`。索引取消端點尚未提供。
-- Web UI 提供 token 輸入、roots 清單、加入資料夾引導（加入→預覽→索引→進度）、虛擬化目錄樹與
-  檔案預覽（文字與圖片縮圖）；搜尋與記憶管理尚未提供（下一張卡）。
+- Web UI 提供 token 輸入、roots 清單、加入資料夾引導（加入→預覽→索引→進度）、虛擬化目錄樹、
+  檔案預覽（文字與圖片縮圖）、統一搜尋（模式選擇器，UI 預設 `hybrid`）與記憶管理
+  （列表、釘選、編輯、刪除、看來源）。

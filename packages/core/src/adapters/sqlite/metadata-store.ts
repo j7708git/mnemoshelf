@@ -25,7 +25,7 @@ import { buildMatchExpression, segmentText } from "./segment.js";
 
 const ROOT_COLUMNS = "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at";
 const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash";
-const MEMORY_COLUMNS = "id, content, kind, scope, project, agent, supersedes, created_at, deleted_at";
+const MEMORY_COLUMNS = "id, content, kind, scope, project, agent, supersedes, pinned, created_at, deleted_at";
 
 function parseStringArray(value: unknown): string[] {
   if (typeof value !== "string") return [];
@@ -68,6 +68,7 @@ function rowToMemory(row: Record<string, unknown>): Memory {
     project: row.project === null || row.project === undefined ? null : String(row.project),
     agent: String(row.agent),
     supersedes: row.supersedes === null || row.supersedes === undefined ? null : Number(row.supersedes),
+    pinned: Number(row.pinned) !== 0,
     createdAt: String(row.created_at),
     deletedAt: row.deleted_at === null || row.deleted_at === undefined ? null : String(row.deleted_at),
   };
@@ -270,6 +271,11 @@ export class SqliteMetadataStore implements MetadataStore {
 
   async forgetMemory(id: number): Promise<void> {
     this.db.prepare("update memories set deleted_at = ? where id = ? and deleted_at is null").run(new Date().toISOString(), id);
+  }
+
+  /** 設定釘選（冪等）；不存在的 id 更新不到任何列，等同無操作。 */
+  async setMemoryPinned(id: number, pinned: boolean): Promise<void> {
+    this.db.prepare("update memories set pinned = ? where id = ?").run(pinned ? 1 : 0, id);
   }
 
   /**
