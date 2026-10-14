@@ -2,7 +2,8 @@
 #
 # 用法：
 # - `pnpm --filter @mnemoshelf/desktop dist`：`tsc` + `electron-builder --dir`，產出未封裝目錄
-#   `dist-app/linux-unpacked/`（本機實跑驗收用）。
+#   在 `dist-app/` 底下；目錄名含架構後綴：x64 為 `linux-unpacked`，arm64 為
+#   `linux-arm64-unpacked`（非 x64 才有後綴）（本機實跑驗收用）。
 # - `pnpm --filter @mnemoshelf/desktop run dist:linux|dist:mac|dist:win`：產出安裝檔
 #   （Linux：AppImage／tar.gz；macOS：dmg；Windows：NSIS）。CI 發版走這一條。
 #

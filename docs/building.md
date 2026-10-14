@@ -19,9 +19,11 @@ pnpm build                                    # core / embedder / server / web /
 pnpm --filter @mnemoshelf/desktop dist        # 未封裝目錄（electron-builder --dir），開發與驗收用
 ```
 
-`dist` 產出 `packages/desktop/dist-app/` 底下的未封裝目錄，**目錄名含架構後綴**
-（x64 為 `linux-unpacked`、arm64 為 `linux-arm64-unpacked`；其他平台同理），可直接執行裡面的
-`mnemoshelf` 執行檔。開發模式另可用 `pnpm --filter @mnemoshelf/desktop start`。
+`dist` 產出 `packages/desktop/dist-app/` 底下的未封裝目錄，**目錄名含架構後綴**：
+Linux x64 為 `linux-unpacked`、Linux arm64 為 `linux-arm64-unpacked`（非 x64 才有架構後綴）。
+（解析未封裝目錄的 `findUnpackedDir` 是**打包後 smoke 的 Linux 專用**工具，macOS／Windows 的
+未封裝目錄名不在它的涵蓋範圍。）可直接執行裡面的 `mnemoshelf` 執行檔。開發模式另可用
+`pnpm --filter @mnemoshelf/desktop start`。
 
 要產出**安裝檔**：
 

@@ -278,6 +278,27 @@ jobs:
             echo "錯誤：dist/ 底下沒有任何附件（download-artifact 沒有抓到 artifact？）" >&2
             exit 1
           fi
+          # 「有檔案」不等於「有安裝檔」：授權清單下載成功時 dist/ 也有檔案。
+          # tag 發布會建四個平台，安裝檔以副檔名分四類——Linux 有 AppImage 與 tar.gz 兩種、
+          # macOS 是 dmg、Windows 是 NSIS 產出的 exe，四類必須各至少一個才放行。
+          missing_types=()
+          for ext in "*.AppImage" "*.tar.gz" "*.dmg" "*.exe"; do
+            found=false
+            for asset in "${dist_assets[@]}"; do
+              # 未加引號的 ${ext}：這裡要的是 glob 展開，不是字面比對。
+              # shellcheck disable=SC2254
+              case "${asset}" in ${ext}) found=true; break ;; esac
+            done
+            if [ "${found}" = false ]; then
+              missing_types+=("${ext}")
+            fi
+          done
+          if [ "${#missing_types[@]}" -ne 0 ]; then
+            echo "錯誤：dist/ 缺少安裝檔類型：${missing_types[*]}（四平台各以副檔名計數，缺一即不發布）" >&2
+            echo "實際從 dist/ 找到的檔案（${#dist_assets[@]} 個）：" >&2
+            printf '  %s\n' "${dist_assets[@]}" >&2
+            exit 1
+          fi
           echo "Release 附件（${#dist_assets[@]} 個來自 dist/）："
           printf '  %s\n' "${dist_assets[@]}"
           assets=(
