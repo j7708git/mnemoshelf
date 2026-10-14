@@ -62,10 +62,17 @@ pnpm --filter @mnemoshelf/desktop run dist:win     # Windows x64：NSIS 安裝�
 系統會出現警告——這是預期行為。請確認安裝檔來自本專案的 GitHub Release，再用下列方式開啟：
 
 - **Windows**：SmartScreen 視窗 →「**更多資訊**」→「**仍要執行**」。
-- **macOS**：在 Finder 對 App 按**右鍵** → 選「**打開**」→ 在跳出的視窗再按一次「**打開**」。
-  （直接雙擊會被 Gatekeeper 擋下；右鍵開啟只需要做一次。）
-  也可以在終端機移除隔離屬性：
-  `xattr -dr com.apple.quarantine /Applications/Mnemoshelf.app`。
+- **macOS**：安裝檔未簽署也未公證，在 Apple Silicon 上**右鍵 → 打開不一定可用**（常見是直接
+  顯示「**已損毀，無法打開**」，此時右鍵選單裡不會有「打開」選項）。請依序嘗試：
+  1. **系統設定 → 隱私權與安全性** → 捲到「安全性」區塊：若出現「**仍要打開**」按鈕
+     （會列出被擋下的 App 名稱），按它並輸入密碼後即可開啟。
+  2. 若沒有該按鈕、或顯示「已損毀」：在**終端機**移除隔離屬性後再開（這對未簽署的
+     App 通常是最後有效的一招）：
+     ```bash
+     xattr -dr com.apple.quarantine /Applications/Mnemoshelf.app
+     ```
+     （路徑依你實際放置的位置調整；`-r` 連同 App 內所有檔案一起處理。）
+  3. 若以上都不行，請回報當時看到的**完整錯誤訊息**，再對症處理。
 - **Linux AppImage**：下載後 `chmod +x <檔名>` 再執行（需要 FUSE；沒有 FUSE 時可用
   `--appimage-extract` 解開後執行）。
 
