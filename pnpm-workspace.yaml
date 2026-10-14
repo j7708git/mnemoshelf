@@ -1,6 +1,13 @@
 packages:
   - packages/*
 
-# better-sqlite3 是 native 模組，pnpm 10 需要明示允許其安裝腳本（node-gyp 從原始碼編譯）。
-onlyBuiltDependencies:
-  - better-sqlite3
+# 注意：不要把 better-sqlite3 加進 onlyBuiltDependencies。
+#
+# better-sqlite3 13.x 以 N-API（NAPI_VERSION=10）發布，tarball 內含各平台預編譯
+# （prebuilds/*.node，含 win32-x64），執行期由 lib/binding.js 依 platform／arch 直接載入，
+# 不需要 node-gyp 產物；套件本身也已宣告 gypfile: false 且沒有 install script。
+#
+# 一旦列入 onlyBuiltDependencies，pnpm 10 會替它執行 `node-gyp rebuild`（pnpm 不看
+# gypfile: false）。node-gyp 在 Windows 的 configure 階段就會偵測 Visual Studio，
+# 而且早於 binding.gyp 的 prebuild 短路判斷，因此機器上沒有可用 VS 時會讓
+# `pnpm install` 直接失敗——即使最後什麼都不必編譯。
