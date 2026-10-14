@@ -58,6 +58,20 @@ describe("previewRoot", () => {
     expect(preview.estimatedSeconds).toBe(Math.ceil(preview.estimatedChunks / 8));
   });
 
+  it("root 內的 `.gitignore` 是目錄時，視為沒有可讀的 .gitignore（不拋 EISDIR）", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mnemoshelf-preview-eisdir-"));
+    try {
+      await fs.mkdir(path.join(dir, ".gitignore"));
+      await fs.writeFile(path.join(dir, "note.md"), "# 標題\n\n內容");
+
+      const preview = await previewRoot({ path: dir, modalities: ["text", "code"] });
+      expect(preview.totalFiles).toBe(1);
+      expect(preview.byKind.text.count).toBe(1);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it("預覽不寫入任何 DB", async () => {
     const db: SqliteDatabase = openDatabase(":memory:");
     try {

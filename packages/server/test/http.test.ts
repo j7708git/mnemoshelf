@@ -170,6 +170,25 @@ describe("REST：roots 生命週期", () => {
     expect((await api(server.instance, "GET", "/roots")).body).toEqual({ roots: [] });
   });
 
+  it("root 內的 `.gitignore` 是目錄 → preview 仍回 200（不 500）", async () => {
+    server = await startTestServer();
+    const dir = await fixture();
+    // 同名項目是目錄而非檔案：loadGitignore 讀取時會拿到 EISDIR。
+    await fs.mkdir(path.join(dir, ".gitignore"));
+
+    const created = await api(server.instance, "POST", "/roots", {
+      body: { path: dir, modalities: ["text", "code", "image"] },
+    });
+    expect(created.status).toBe(201);
+    const root = created.body as { id: number };
+
+    const preview = await api(server.instance, "POST", `/roots/${root.id}/preview`);
+    expect(preview.status).toBe(200);
+    const stats = preview.body as RootPreview;
+    // 沒有可讀的 .gitignore → 空規則集，三個 fixture 檔案仍全部納入。
+    expect(stats.totalFiles).toBe(3);
+  });
+
   it("browse 模式的 root 不可索引 → 400 RootNotIndexableError", async () => {
     server = await startTestServer();
     const dir = await fixture();
@@ -477,6 +496,38 @@ describe("REST：記憶", () => {
     });
     expect(bad.status).toBe(400);
     expect(errorName(bad.body)).toBe("ValidationError");
+  });
+
+  it("POST /memories 帶 supersedes 時新版本繼承被取代者的 pinned", async () => {
+    server = await startTestServer();
+
+    // 已釘選的舊版本 → 新版本也釘選。
+    const pinnedOriginal = (await api(server.instance, "POST", "/memories", {
+      body: { content: "已釘選的舊版本", agent: "editor-agent", kind: "preference" },
+    })).body as { id: number; pinned: boolean };
+    expect(pinnedOriginal.pinned).toBe(false);
+    await api(server.instance, "POST", `/memories/${pinnedOriginal.id}/pin`, { body: { pinned: true } });
+
+    const pinnedReplacement = (await api(server.instance, "POST", "/memories", {
+      body: { content: "取代已釘選版本", agent: "editor-agent", kind: "preference", supersedes: pinnedOriginal.id },
+    })).body as { id: number; supersedes: number | null; pinned: boolean };
+    expect(pinnedReplacement.supersedes).toBe(pinnedOriginal.id);
+    expect(pinnedReplacement.pinned).toBe(true);
+
+    // 未釘選的舊版本 → 新版本維持未釘選（契約：新記憶預設 false）。
+    const plainOriginal = (await api(server.instance, "POST", "/memories", {
+      body: { content: "未釘選的舊版本", agent: "editor-agent" },
+    })).body as { id: number };
+    const plainReplacement = (await api(server.instance, "POST", "/memories", {
+      body: { content: "取代未釘選版本", agent: "editor-agent", supersedes: plainOriginal.id },
+    })).body as { pinned: boolean };
+    expect(plainReplacement.pinned).toBe(false);
+
+    // 列表反映：只有新版本在列，且 pinned 正確。
+    const listed = (await api(server.instance, "GET", "/memories")).body as ListMemoriesResponse;
+    const byId = new Map(listed.memories.map((memory) => [memory.id, memory]));
+    expect(byId.get(pinnedReplacement.id)?.pinned).toBe(true);
+    expect(byId.has(pinnedOriginal.id)).toBe(false);
   });
 });
 

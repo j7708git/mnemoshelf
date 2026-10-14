@@ -257,13 +257,27 @@ function isUnreadable(error: unknown): boolean {
   return code === "EACCES" || code === "EPERM";
 }
 
-/** 讀取 root 內的 `.gitignore`；不存在或不可讀時回傳 null。 */
+/**
+ * `.gitignore` 路徑存在、但本身是目錄時，`fs.readFile` 會回 `EISDIR`。
+ * 與 `isUnreadable`（權限問題）語意不同，故獨立判斷。
+ */
+function isEisdir(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { code?: unknown }).code === "EISDIR";
+}
+
+/**
+ * 讀取 root 內的 `.gitignore`；不存在、不可讀，或本身是目錄時回傳 null。
+ *
+ * `.gitignore` 只是輔助檔，讀不到不該讓整個預覽失敗，因此下列情況一律視為
+ * 「沒有可讀的 .gitignore」（空規則集）：不存在（`ENOENT`）、權限不足
+ * （`EACCES`／`EPERM`）、同名項目是目錄（`EISDIR`）。其他錯誤維持拋出。
+ */
 async function loadGitignore(rootAbs: string): Promise<ReturnType<typeof ignore> | null> {
   try {
     const content = await fs.readFile(path.join(rootAbs, ".gitignore"), "utf8");
     return ignore().add(content);
   } catch (error) {
-    if (isEnoent(error) || isUnreadable(error)) return null;
+    if (isEnoent(error) || isUnreadable(error) || isEisdir(error)) return null;
     throw error;
   }
 }
