@@ -3,7 +3,7 @@
  * 桌面殼的驗收驅動：在 xvfb 下啟動 `--dir` 打包產物，跑完桌面殼的每一個行為並留下證據。
  *
  * 用法（於 repo 根目錄或 `packages/desktop/` 皆可）：
- *   node packages/desktop/scripts/smoke.mjs [all|gui|interrupt|headless] [選項]
+ *   node packages/desktop/scripts/smoke.mjs [all|gui|interrupt|headless|hidden] [選項]
  *
  * 子命令：
  * - `gui`（預設）：一次啟動跑 `bootstrap,app,single,browser,index,autostart,tray` 七個情境——
@@ -11,6 +11,10 @@
  *   加入資料夾／索引／搜尋、開機自啟開關、關窗縮到系統匣與系統匣離開。
  * - `interrupt`：模擬「下載中斷」——第一次跑到有進度就 SIGKILL，第二次重啟確認沿用已下載的檔案並完成。
  * - `headless`：以 `--headless` 啟動，確認沒有視窗、服務可以用 curl 帶 token 打到。
+ * - `hidden`（M2 的回歸驗收）：以 `--hidden` 啟動（開機自啟那條路徑）跑 `hidden` 情境，確認視窗
+ *   建好、UI 載入、第一次 `ready-to-show` 之後仍不可見；接著**不帶** `--hidden` 跑同一個情境，
+ *   確認它會明確失敗（前提不成立時不能靜靜通過）。
+ * - `all`：依序跑 `gui`、`interrupt`、`headless`、`hidden`。
  *
  * 選項：`--out <dir>`、`--user-data <dir>`、`--sample-root <dir>`、`--skip-build`、`--only <情境>`。
  *
@@ -47,8 +51,8 @@ function parseArgs(argv) {
     else if (!key.startsWith("--")) positionals.push(key);
   }
   if (positionals.length > 0) args.command = positionals[0];
-  if (!["all", "gui", "interrupt", "headless"].includes(args.command)) {
-    throw new Error(`不認得的子命令：${args.command}（可用：all／gui／interrupt／headless）`);
+  if (!["all", "gui", "interrupt", "headless", "hidden"].includes(args.command)) {
+    throw new Error(`不認得的子命令：${args.command}（可用：all／gui／interrupt／headless／hidden）`);
   }
   return args;
 }
@@ -216,6 +220,54 @@ async function findBrowserProcess(executable) {
 }
 
 /**
+ * 清掉上一次沒收乾淨的行程（同一 userData 會佔住單一實例鎖）：先清掉再跑，避免誤判成失敗。
+ */
+async function cleanupInstances(executable) {
+  await new Promise((resolve) => {
+    const cleanup = spawn("pkill", ["-f", executable], { stdio: "ignore" });
+    cleanup.on("close", () => resolve());
+    cleanup.on("error", () => resolve());
+  });
+  await delay(500);
+}
+
+/**
+ * 跑一次「以 `--hidden` 啟動（或不帶）＋ `hidden` 情境」並回收結果。
+ *
+ * 情境本身不需模型，沿用 gui 的 userData（模型快取若已在磁碟上就不會重新下載）；
+ * 若該 userData 還沒有模型，背景的下載會在驗收結束時中斷——留下的暫存檔由下一次啟動清掉。
+ */
+async function runHiddenCheck({ executable, baseEnv, userData, outRoot, withHidden }) {
+  const label = withHidden ? "hidden" : "hidden-control";
+  const out = path.join(outRoot, `report-${label}`);
+  await fs.rm(out, { recursive: true, force: true });
+  await cleanupInstances(executable);
+  const result = await runApp({
+    executable,
+    args: withHidden ? ["--hidden"] : [],
+    logFile: path.join(outRoot, `${label}.log`),
+    env: {
+      ...baseEnv,
+      MNEMOSHELF_DESKTOP_USER_DATA: userData,
+      MNEMOSHELF_AUTOTEST: "hidden",
+      MNEMOSHELF_AUTOTEST_OUT: out,
+    },
+  });
+  const report = await fs
+    .readFile(path.join(out, "report.json"), "utf8")
+    .then((text) => JSON.parse(text))
+    .catch(() => null);
+  return {
+    exitCode: result.code,
+    signal: result.signal,
+    modeLine: result.lines.find((line) => line.includes("模式：")) ?? null,
+    reportOk: report?.ok ?? null,
+    failure: report?.failure ?? null,
+    steps: report?.steps?.map((step) => `${step.ok ? "✓" : "✗"} [${step.scenario}] ${step.name}：${step.detail}`) ?? [],
+  };
+}
+
+/**
  * 跑一次打包產物。
  *
  * @returns {{ code: number|null, signal: string|null, log: string, lines: string[] }}
@@ -285,12 +337,7 @@ async function main() {
   }
   const executable = await findExecutable(unpacked);
   // 上一次沒收乾淨的行程會佔住單一實例鎖（同一 userData）：先清掉再跑，避免誤判成失敗。
-  await new Promise((resolve) => {
-    const cleanup = spawn("pkill", ["-f", executable], { stdio: "ignore" });
-    cleanup.on("close", () => resolve());
-    cleanup.on("error", () => resolve());
-  });
-  await delay(500);
+  await cleanupInstances(executable);
 
   const sampleRoot = await ensureSampleRoot(
     path.resolve(args.sampleRoot ?? path.join(repoRoot, ".tmp", "desktop-spike", "sample-root")),
@@ -310,7 +357,7 @@ async function main() {
   };
 
   const summary = { command: args.command, executable, sampleRoot, xdgConfigHome, results: {}, ok: true };
-  const commands = args.command === "all" ? ["gui", "interrupt", "headless"] : [args.command];
+  const commands = args.command === "all" ? ["gui", "interrupt", "headless", "hidden"] : [args.command];
 
   for (const command of commands) {
     if (command === "gui") {
@@ -519,6 +566,34 @@ async function main() {
       if (unauthorized === null || unauthorized.status !== 401) summary.ok = false;
       if (summary.results.headless.trayLine !== null) summary.ok = false;
       if (summary.results.headless.gracefulLine === null) summary.ok = false;
+    }
+
+    if (command === "hidden") {
+      // M2 的回歸驗收（開機自啟那條路徑）：帶 `--hidden` 啟動時視窗必須不可見。
+      // 情境本身不需要模型；沿用 gui 的 userData（快取在磁碟上時不會重新下載）。
+      const userData = path.resolve(args.userData ?? path.join(outRoot, "userData-gui"));
+      console.log(`[smoke] hidden：以 --hidden 啟動並斷言視窗不可見；userData=${userData}`);
+
+      const withHidden = await runHiddenCheck({ executable, baseEnv, userData, outRoot, withHidden: true });
+      console.log(`[smoke] hidden（帶 --hidden）→ 退出碼 ${withHidden.exitCode}；報告 ok=${withHidden.reportOk}`);
+      for (const step of withHidden.steps) console.log(`[smoke]   ${step}`);
+
+      // 對照組：不帶 `--hidden` 時情境的前提不成立，必須明確失敗（不能靜靜通過）。
+      console.log("[smoke] hidden：不帶 --hidden 重跑同一個情境（預期：失敗）");
+      const control = await runHiddenCheck({ executable, baseEnv, userData, outRoot, withHidden: false });
+      console.log(`[smoke] hidden（不帶 --hidden）→ 退出碼 ${control.exitCode}；報告 ok=${control.reportOk}；failure=${control.failure}`);
+
+      summary.results.hidden = {
+        withHidden,
+        control,
+      };
+      // 帶 `--hidden`：退出碼 0、報告通過、log 確認真的走 hidden 模式、且那一步是 ✓。
+      if (withHidden.exitCode !== 0 || withHidden.reportOk !== true) summary.ok = false;
+      if (withHidden.modeLine === null || !withHidden.modeLine.includes("hidden=true")) summary.ok = false;
+      if (!withHidden.steps.some((step) => step.startsWith("✓ [hidden] 以 --hidden 啟動時視窗不顯示"))) summary.ok = false;
+      // 對照組：非 0 退出、報告失敗、訊息要指出前提是 `--hidden`。
+      if (control.exitCode === 0 || control.reportOk !== false) summary.ok = false;
+      if (control.failure === null || !control.failure.includes("--hidden")) summary.ok = false;
     }
   }
 

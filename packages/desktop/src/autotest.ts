@@ -12,6 +12,8 @@
  * - `index`：加入測試資料夾 → 索引 → 文字預覽 → 搜尋（沿用 M4 打包 spike 的流程）。
  *   不含圖片縮圖：樣本圖片的模態預設未開，不會被索引，縮圖端點由 spike 卡單獨驗過。
  * - `autostart`：設定介面的開機自啟開關（開啟／關閉，並檢查落地檔案）。
+ * - `hidden`：以 `--hidden` 啟動時，視窗建好、UI 載入完、第一次 `ready-to-show` 之後
+ *   仍不可見（開機自啟不彈出視窗）。**必須**以 `--hidden` 啟動才會通過，因此不在 `all` 裡。
  * - `tray`：關窗縮到系統匣（程序存活、視窗隱藏）→ 從系統匣選單「離開」整個結束。
  */
 import { promises as fs } from "node:fs";
@@ -52,6 +54,10 @@ export interface AutotestOptions {
   bootstrapTimeoutMs: number;
   /** 只確認進度出現就停住（等外部砍掉行程）。 */
   killAfterProgress: boolean;
+  /** 這次啟動是不是帶了 `--hidden`（`hidden` 情境的斷言前提）。 */
+  startHidden: boolean;
+  /** 主視窗第一次 `ready-to-show` 的訊號（`hidden` 情境要等它之後才斷言）。 */
+  windowReadyToShow: Promise<void>;
   environment?: Record<string, unknown>;
   rendererMessages?: readonly string[];
   /** 系統匣的「開啟主視窗」（產品程式碼匯出的同一個函式）。 */
@@ -76,10 +82,42 @@ export interface AutotestResult {
 /** 全部情境（`all` 展開後的順序；`tray` 一定最後，因為它會結束行程）。 */
 export const ALL_SCENARIOS = ["bootstrap", "app", "single", "browser", "index", "autostart", "tray"] as const;
 
+/**
+ * 只在特定啟動方式下才成立的情境，**不**含在 `all` 裡（跑 `all` 的啟動方式不一定符合前提）：
+ *
+ * - `hidden`：必須以 `--hidden` 啟動，驗「開機自啟的登入啟動不會彈出視窗」。
+ */
+export const OPT_IN_SCENARIOS = ["hidden"] as const;
+
+/** 情境的執行順序：opt-in 情境插在 `tray` 之前（`tray` 會結束行程，必須最後）。 */
+function executionOrder(): string[] {
+  const order: string[] = [...ALL_SCENARIOS];
+  order.splice(order.length - 1, 0, ...OPT_IN_SCENARIOS);
+  return order;
+}
+
 const POLL_MS = 250;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** 等一個已經在跑的 promise；逾時丟錯（等主行程的訊號用，不讓驗收無限卡住）。 */
+async function waitForPromise(promise: Promise<void>, timeoutMs: number, description: string): Promise<void> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`等待逾時（${description}，已等 ${Math.round(timeoutMs / 1000)} 秒）`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }
 
 /** 在 renderer 內求值（`executeJavaScript` 不受 `script-src 'self'` 的 CSP 影響，已實測）。 */
@@ -214,18 +252,19 @@ async function listDir(dir: string): Promise<{ files: { relPath: string; bytes: 
 
 /** 解析情境清單。 */
 export function parseScenarios(value: string): string[] {
+  const order = executionOrder();
   const trimmed = value.trim();
   if (trimmed === "" || trimmed === "all") return [...ALL_SCENARIOS];
   const requested = trimmed
     .split(",")
     .map((item) => item.trim())
     .filter((item) => item !== "");
-  const unknown = requested.filter((item) => !(ALL_SCENARIOS as readonly string[]).includes(item));
+  const unknown = requested.filter((item) => !order.includes(item));
   if (unknown.length > 0) {
-    throw new Error(`不認得的情境：${unknown.join("、")}（可用：${ALL_SCENARIOS.join("、")}）`);
+    throw new Error(`不認得的情境：${unknown.join("、")}（可用：${order.join("、")}）`);
   }
-  // 一律照 ALL_SCENARIOS 的順序跑（tray 會結束行程，必須最後）。
-  return [...ALL_SCENARIOS].filter((item) => requested.includes(item));
+  // 一律照 executionOrder 的順序跑（tray 會結束行程，必須最後）。
+  return order.filter((item) => requested.includes(item));
 }
 
 /** 跑指定的情境；不論成敗都寫出報告，最後以結果回報。 */
@@ -575,6 +614,28 @@ export async function runAutotest(options: AutotestOptions): Promise<AutotestRes
       const stillThere = await fs.stat(file).then(() => true).catch(() => false);
       if (stillThere) throw new Error(`關閉後 ${file} 仍然存在`);
       return `開關已關閉；${file} 已刪除`;
+    });
+  }
+
+  if (scenarios.includes("hidden")) {
+    await run("hidden", "以 --hidden 啟動時視窗不顯示", async () => {
+      const win = requireWindow();
+      if (!options.startHidden) {
+        // 情境前提不成立就當失敗，不能靜靜通過（否則回歸會藏在這一步後面）。
+        throw new Error("這個情境要以 --hidden 啟動才會成立（啟動命令要帶 --hidden）");
+      }
+      // 等「顯示」的那兩條路徑都走過（ready-to-show ＋ loadURL 之後）再斷言，
+      // 否則可能只是還沒走到顯示那一步而誤判成通過。
+      await waitForPromise(options.windowReadyToShow, options.stepTimeoutMs, "主視窗第一次 ready-to-show");
+      if (win.isDestroyed()) throw new Error("主視窗被銷毀：--hidden 只該「不顯示」，不該關掉視窗");
+      if (win.isVisible()) {
+        throw new Error("以 --hidden 啟動後主視窗仍然可見：顯示路徑沒有守住 startHidden（開機自啟會彈出視窗）");
+      }
+      const url = win.webContents.getURL();
+      if (!url.startsWith(options.serverUrl)) {
+        throw new Error(`主視窗沒有載入本機服務的 UI（目前網址：${url}）`);
+      }
+      return `視窗已建立、UI 已載入、第一次 ready-to-show 已發生，但視窗仍不可見（${url}）`;
     });
   }
 

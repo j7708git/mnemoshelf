@@ -202,10 +202,9 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: |
-            linux-*
-            macos-*
-            windows-*
+          # 單行花括號 glob：download-artifact v4 把整個 `pattern` 當成**單一** glob
+          # 丟進 Minimatch，多行字串不匹配任何 artifact 名稱（會安靜地一個附件都不下載）。
+          pattern: "{linux-*,macos-*,windows-*}"
           merge-multiple: true
 
       - name: 下載測試基準

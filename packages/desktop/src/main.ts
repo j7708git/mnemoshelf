@@ -61,6 +61,17 @@ let allowWindowClose = false;
 /** `--hidden`（登入時自啟）時不要主動顯示視窗。 */
 let startHidden = cli.hidden;
 
+/**
+ * 主視窗第一次 `ready-to-show` 的訊號。
+ *
+ * 自動驗收的 `hidden` 情境要等這個訊號之後才斷言「視窗仍不可見」：否則可能只是
+ * 「還沒走到顯示那一步」而被誤判成通過（真正的 bug 是顯示路徑把 `startHidden` 蓋掉）。
+ */
+let notifyWindowReadyToShow: () => void = () => undefined;
+const windowReadyToShow = new Promise<void>((resolve) => {
+  notifyWindowReadyToShow = resolve;
+});
+
 /** 這一輪的授權統計（驗收證據：注入幾次、有沒有 401）。 */
 const authCounters = { injected: 0, requests: 0, unauthorized: 0 };
 
@@ -162,6 +173,7 @@ function createWindow(): BrowserWindow {
   });
   window.once("ready-to-show", () => {
     if (!startHidden) window.show();
+    notifyWindowReadyToShow();
   });
   window.on("close", (event) => {
     // 「關窗縮到系統匣」：服務繼續跑，之後可從匣選單把視窗叫回來。
@@ -435,7 +447,8 @@ async function main(): Promise<void> {
     await showFatal("載入介面失敗", `${detail}\n\n服務網址：${server.url}`, "請關閉這個視窗後重新啟動應用程式。");
     return;
   }
-  window.show();
+  // 載入完成後只有在「不是 --hidden 啟動」時才顯示：開機自啟（登入時）不該彈出視窗。
+  if (!startHidden) window.show();
 
   tray = createTray();
 
@@ -490,6 +503,9 @@ async function runAutotestIfRequested(context: {
     indexTimeoutMs: Number(process.env.MNEMOSHELF_AUTOTEST_INDEX_TIMEOUT_MS ?? 1_800_000),
     bootstrapTimeoutMs: Number(process.env.MNEMOSHELF_AUTOTEST_BOOTSTRAP_TIMEOUT_MS ?? 1_800_000),
     killAfterProgress: process.env.MNEMOSHELF_AUTOTEST_KILL_AFTER_PROGRESS === "1",
+    /** `hidden` 情境要在「第一次 ready-to-show 之後」斷言視窗仍不可見。 */
+    startHidden,
+    windowReadyToShow,
     environment: {
       electron: process.versions.electron,
       chrome: process.versions.chrome,
