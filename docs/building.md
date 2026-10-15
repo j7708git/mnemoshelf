@@ -1,7 +1,7 @@
 # 建置與安裝（桌面版）
 
 Mnemoshelf 是可離線使用的桌面應用程式（Electron），原始碼在 `packages/desktop`。
-本頁說明如何**從原始碼建置**、**各平台的產物**、**下載安裝檔時的未簽署警告怎麼處理**，
+本頁說明如何**從原始碼建置**、**各平台的產物**、**下載安裝檔時的簽章與公證警告怎麼處理**，
 以及**第三方授權（含 LGPL-3.0 的 libvips）**的合規資訊。
 
 ## 環境需求
@@ -56,17 +56,19 @@ pnpm --filter @mnemoshelf/desktop run dist:win     # Windows x64：NSIS 安裝�
 > （electron-builder 對不同 target 的架構正規化不同）。上表的 Linux 名稱是實測結果；
 > macOS／Windows 的產物名稱依同一套命名規則（尚未在實機產出）。
 
-## 下載安裝檔（未簽署）
+## 下載安裝檔（ad-hoc 簽章、未公證）
 
-本專案的安裝檔**未經程式碼簽署，也沒有 macOS 公證**（沒有購買簽署憑證）。因此第一次開啟時，
+本專案的 macOS 安裝檔使用 **ad-hoc 簽章**（無身份證明的自我簽章，`identity: "-"`）——
+它讓 macOS 接受執行檔，但**沒有開發者憑證、也未經公證**（沒有購買簽署憑證）；
+Windows 安裝檔則**未簽章**。因此第一次開啟時，
 系統會出現警告——這是預期行為。請確認安裝檔來自本專案的 GitHub Release，再用下列方式開啟：
 
 - **Windows**：SmartScreen 視窗 →「**更多資訊**」→「**仍要執行**」。
-- **macOS**：安裝檔未簽署也未公證，在 Apple Silicon 上**右鍵 → 打開不一定可用**（常見是直接
+- **macOS**：安裝檔只有 ad-hoc 簽章、未公證，在 Apple Silicon 上**右鍵 → 打開不一定可用**（常見是直接
   顯示「**已損毀，無法打開**」，此時右鍵選單裡不會有「打開」選項）。請依序嘗試：
   1. **系統設定 → 隱私權與安全性** → 捲到「安全性」區塊：若出現「**仍要打開**」按鈕
      （會列出被擋下的 App 名稱），按它並輸入密碼後即可開啟。
-  2. 若沒有該按鈕、或顯示「已損毀」：在**終端機**移除隔離屬性後再開（這對未簽署的
+  2. 若沒有該按鈕、或顯示「已損毀」：在**終端機**移除隔離屬性後再開（這對未公證的
      App 通常是最後有效的一招）：
      ```bash
      xattr -dr com.apple.quarantine /Applications/Mnemoshelf.app
@@ -76,7 +78,7 @@ pnpm --filter @mnemoshelf/desktop run dist:win     # Windows x64：NSIS 安裝�
 - **Linux AppImage**：下載後 `chmod +x <檔名>` 再執行（需要 FUSE；沒有 FUSE 時可用
   `--appimage-extract` 解開後執行）。
 
-因為沒有簽章，本專案也**沒有 auto-update**：要更新請重新下載新版本安裝檔。
+因為沒有開發者簽章與公證，本專案也**沒有 auto-update**：要更新請重新下載新版本安裝檔。
 
 ## 授權清單與 LGPL 合規
 
@@ -116,10 +118,10 @@ pnpm --filter "@mnemoshelf/desktop..." licenses list --prod --long
 
 ## 已知限制
 
-- **未簽章 / 未公證**：安裝時需依上面「下載安裝檔」一節繞過系統警告；沒有 auto-update。
+- **ad-hoc 簽章、未公證**：安裝時需依上面「下載安裝檔」一節繞過系統警告；沒有 auto-update。
 - **macOS 只支援 Apple Silicon（arm64）**。
-- **macOS 的自啟可能不生效**：自啟走 SMAppService（由系統管理登入項目），**未簽署的版本可能
-  被系統擋下而靜默無效**；而且 macOS 的登入啟動**不會**收到 `--hidden` 之類的自啟參數
+- **macOS 的自啟可能不生效**：自啟走 SMAppService（由系統管理登入項目），**ad-hoc 簽章
+  （未公證）的版本可能被系統擋下而靜默無效**；而且 macOS 的登入啟動**不會**收到 `--hidden` 之類的自啟參數
   （`setLoginItemSettings` 的 `path`／`args` 是 Windows-only），桌面殼改以
   `wasOpenedAtLogin` 推導「登入時啟動」來避免彈出視窗。
 - **Linux 的縮圖**使用 sharp 時會在行程 stderr 印出 glib 相關訊息（功能正常，是 Electron 與

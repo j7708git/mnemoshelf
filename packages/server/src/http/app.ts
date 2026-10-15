@@ -468,6 +468,8 @@ function countByReason(entries: readonly { reason: string }[]): Record<string, n
 /**
  * 服務版本：讀 `@mnemoshelf/server` 自己的 package.json。
  *
+ * 版本來源＝server 套件版本，與 release 對準（發版時 server 與 desktop 的版本
+ * 同步為 release 版本；desktop 端的 tag → app 版本同步見 CI 的 desktop-release.yml）。
  * 為什麼不是桌面殼的版本：服務是獨立可跑的元件，不該相依 desktop 套件；
  * 桌面殼若要報自己的版本，需另外提供（目前未接）。讀不到時回 `"0.0.0"`，不讓診斷失敗。
  */

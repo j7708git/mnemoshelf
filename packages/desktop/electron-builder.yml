@@ -38,9 +38,10 @@ mac:
       arch:
         - arm64
   category: public.app-category.productivity
-  # identity: null = 完全不簽章（個人使用，接受 Gatekeeper 警告；繞過方式見 docs/building.md）。
-  # v26 的語意：「未設定」會去 keychain 找憑證、找不到才跳過；設 null 則明確跳過簽章。
-  identity: null
+  # identity: "-" = ad-hoc 簽章（無身份證明的自我簽章）：不是完全不簽，而是以無憑證的
+  # 臨時簽章讓 macOS 接受執行檔；Gatekeeper 首次執行仍會提示（未公證），繞過方式見 docs/building.md。
+  # v26 的語意：「未設定」會去 keychain 找憑證、找不到才跳過；設 "-" 則明確走 ad-hoc。
+  identity: "-"
 
 win:
   target:

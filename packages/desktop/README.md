@@ -82,7 +82,8 @@ pnpm --filter @mnemoshelf/desktop run dist:win     # NSIS 安裝檔（x64）
 
 三平台各自在原生環境建置（不要從 Linux 交叉建 macOS）；發版由 GitHub Actions 的
 `desktop-release.yml` 負責（推送 `v*` tag 時建置並建立 Release）。完整的建置說明、
-未簽署安裝檔的開啟方式與授權（LGPL-3.0 的 libvips）見 **`docs/building.md`**。
+安裝檔的簽章狀態（macOS 為 ad-hoc 簽章、未公證；Windows 未簽章）與開啟方式、授權
+（LGPL-3.0 的 libvips）見 **`docs/building.md`**。
 
 命令列選項：
 
@@ -156,8 +157,8 @@ node packages/desktop/scripts/smoke.mjs all        # 以上四個依序跑
   headless 請用 `xvfb-run`（或不使用桌面殼，直接跑 `packages/server`）。
 - **macOS／Windows 未實測**：本卡只在 Linux 實跑；macOS／Windows 的自啟與系統匣（`...Template`
   圖示、Windows `guid`）只做了文件審查與程式碼層的處理，尚未實機驗證。
-- **macOS 自啟的已知限制**：自啟走 SMAppService，**未簽署的版本可能不生效**（系統會擋下未簽章的
-  登入項目）；而且 `setLoginItemSettings` 的 `--hidden` 是經由 `path`／`args` 傳遞，那兩個參數是
+- **macOS 自啟的已知限制**：自啟走 SMAppService，**ad-hoc 簽章（未公證）的版本可能不生效**
+  （系統會擋下沒有有效簽章的登入項目）；而且 `setLoginItemSettings` 的 `--hidden` 是經由 `path`／`args` 傳遞，那兩個參數是
   **Windows-only**，macOS 的登入啟動拿不到它們。桌面殼因此改用 `app.getLoginItemSettings().wasOpenedAtLogin`
   推導「這次是登入時啟動」，據此不顯示視窗並隱藏 Dock 圖示（與 Linux／Windows 的 `--hidden` 等效）。
 - **本機環境沒有桌面環境變數時**（例如從 tty／systemd 啟動），Chromium 認不出桌面環境會退到

@@ -15,8 +15,9 @@
 # - electron-builder **必須從 pnpm 環境呼叫**：直接跑 `node_modules/.bin/electron-builder`
 #   會被判定成 npm，pnpm 沒有攤平的平台套件（`@img/sharp-*`、`sqlite-vec-*`）不會被收進產物。
 #   因此一律走 `pnpm --filter @mnemoshelf/desktop run dist:*`（見 packages/desktop/package.json）。
-# - 不簽章：macOS 在 electron-builder.yml 設 `identity: null`、Windows 沒有憑證，
-#   安裝檔會有系統警告；繞過方式見 docs/building.md，Release 說明也會附上。
+# - 不簽章（沒有開發者憑證）：macOS 在 electron-builder.yml 設 `identity: "-"` 走 ad-hoc 簽章
+#   （無身份證明的自我簽章，仍未公證）、Windows 沒有憑證，安裝檔首次開啟會有系統警告；
+#   繞過方式見 docs/building.md，Release 說明也會附上。
 # - 不用 secrets：發布只用 Actions 內建的 GITHUB_TOKEN（`contents: write`）。
 
 name: desktop-release
@@ -259,8 +260,8 @@ jobs:
             echo "- 授權全文見附件 LGPL-3.0.txt 與 GPL-3.0.txt（LGPL-3.0 以 GPL-3.0 為基礎）。"
             echo "- 對應原始碼取得方式與 shared library 替換說明見附件 THIRD-PARTY-NOTICES.md。"
             echo
-            echo "## 安裝（未簽署）"
-            echo "- 這些安裝檔未經程式碼簽署，首次開啟會有系統警告："
+            echo "## 安裝（macOS 為 ad-hoc 簽章、未公證；Windows 未簽章）"
+            echo "- macOS 安裝檔使用 ad-hoc 簽章（無開發者憑證、未公證），Windows 安裝檔未簽章；首次開啟會有系統警告："
             echo "  Windows：SmartScreen 視窗點「更多資訊」再點「仍要執行」；"
             echo "  macOS：在 Finder 對 App 按右鍵選「打開」，再確認一次。"
             echo "- 詳細說明（含從原始碼建置）見 repo 的 docs/building.md。"
