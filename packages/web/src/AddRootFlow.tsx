@@ -10,6 +10,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   addRoot,
+  cancelIndex,
   getIndexStatus,
   previewRoot,
   removeRoot,
@@ -33,7 +34,7 @@ export interface AddRootFlowProps {
   onRootCreated?: (root: Root) => void;
 }
 
-type Step = "input" | "preview" | "preview-failed" | "indexing" | "done" | "failed";
+type Step = "input" | "preview" | "preview-failed" | "indexing" | "cancelled" | "done" | "failed";
 
 /** 被跳過的原因 → 中文標籤。 */
 const SKIP_REASON_LABEL: Record<string, string> = {
@@ -70,6 +71,11 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
   const [status, setStatus] = useState<IndexStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+
+  // 使用者是否按過「取消索引」。`POST /index` 會在中止後才回應，這個旗標讓它的
+  // rejection／回應不被誤判成「索引失敗」。
+  const cancelRequestedRef = useRef(false);
 
   // onDone／onRootCreated 用 ref 取用，避免它們每次 render 改變就重啟輪詢或重跑流程。
   const onDoneRef = useRef(onDone);
@@ -130,15 +136,35 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
   const beginIndex = (): void => {
     if (root === null) return;
     setError(null);
+    cancelRequestedRef.current = false;
+    setCancelling(false);
     setStep("indexing");
     // 不 await：POST /index 會等索引跑完才回應，進度靠輪詢。
     void startIndex(root.id).catch((indexError: unknown) => {
+      // 使用者主動取消時 POST /index 也會結束（伺服器回 200），不該顯示成失敗。
+      if (cancelRequestedRef.current) return;
       setError(indexError instanceof Error ? indexError.message : "索引失敗");
       setStep("failed");
     });
   };
 
-  // 索引中：每 800ms 輪詢一次狀態，直到 completed／failed。
+  /** 要求取消進行中的索引；狀態改由輪詢接手（`state: "cancelled"`）。 */
+  const requestCancel = async (): Promise<void> => {
+    if (root === null || cancelling) return;
+    cancelRequestedRef.current = true;
+    setCancelling(true);
+    try {
+      await cancelIndex(root.id);
+    } catch (cancelError) {
+      // 取消失敗（例如連線中斷）：回到可重試的索引中畫面，讓輪詢繼續。
+      cancelRequestedRef.current = false;
+      setError(cancelError instanceof Error ? cancelError.message : "取消索引失敗");
+    } finally {
+      setCancelling(false);
+    }
+  };
+
+  // 索引中：每 800ms 輪詢一次狀態，直到 completed／failed／cancelled。
   useEffect(() => {
     if (step !== "indexing" || root === null) return;
     let cancelled = false;
@@ -151,6 +177,8 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
         if (current.state === "completed") {
           setStep("done");
           onDoneRef.current(root);
+        } else if (current.state === "cancelled") {
+          setStep("cancelled");
         } else if (current.state === "failed") {
           setError(current.error?.message ?? "索引失敗");
           setStep("failed");
@@ -307,6 +335,44 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
         <div className="space-y-3">
           <p className="text-sm text-ink">正在建立索引…（可以放著，完成後會自動顯示）</p>
           <ProgressBar status={status} />
+          {error !== null && (
+            <p role="alert" className="text-sm text-red-600">
+              {error}
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={() => void requestCancel()}
+            disabled={cancelling}
+            className="rounded-md border border-line px-3 py-2 text-sm text-ink disabled:opacity-40"
+          >
+            {cancelling ? "取消中…" : "取消索引"}
+          </button>
+        </div>
+      )}
+
+      {step === "cancelled" && (
+        <div className="space-y-3">
+          <p className="text-sm text-ink">已取消索引。已完成的檔案仍保留在索引中，可隨時重新索引。</p>
+          <ProgressBar status={status} />
+          <div className="flex gap-2">
+            {root !== null && (
+              <button
+                type="button"
+                onClick={beginIndex}
+                className="rounded-md bg-ink px-3 py-2 text-sm font-medium text-white"
+              >
+                重新索引
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onCancel}
+              className="rounded-md border border-line px-3 py-2 text-sm text-ink"
+            >
+              關閉
+            </button>
+          </div>
         </div>
       )}
 
@@ -343,11 +409,23 @@ function Stat({ label, value }: { label: string; value: string }) {
   );
 }
 
+/**
+ * 索引进度：長條圖以**檔案**為單位（單調不倒退），文字另外顯示 chunk 級資訊。
+ *
+ * 為什麼長條圖不用 chunk 數：`estimatedChunks` 是逐檔切塊後累加的**下界**，大檔開始時
+ * 會先跳高，用 chunk 比例畫長條圖會讓百分比倒退。chunk 數放在文字裡，讓使用者在大檔
+ * 進行中看到規模（例如「已嵌入 0／預估 8,800 塊」），而不是只有不動的檔案數。
+ */
 function ProgressBar({ status }: { status: IndexStatus | null }) {
   const progress = status?.progress ?? null;
   const total = progress?.total ?? 0;
-  const processed = progress?.processed ?? 0;
-  const percent = total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
+  const done = (progress?.processed ?? 0) + (progress?.skippedUnchanged ?? 0) + (progress?.skipped ?? 0) + (progress?.failed ?? 0);
+  const percent = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+
+  const chunkLine =
+    progress !== null && progress.estimatedChunks > 0
+      ? `；已嵌入 ${progress.processedChunks}／預估 ${progress.estimatedChunks} 塊`
+      : "";
 
   return (
     <div className="space-y-1">
@@ -356,9 +434,12 @@ function ProgressBar({ status }: { status: IndexStatus | null }) {
       </div>
       <p className="text-xs text-muted">
         {total > 0
-          ? `已處理 ${processed}／${total} 個檔案（${percent}%），跳過未變更 ${progress?.skippedUnchanged ?? 0} 個`
+          ? `已處理 ${progress?.processed ?? 0}／${total} 個檔案（${percent}%），跳過未變更 ${progress?.skippedUnchanged ?? 0} 個${chunkLine}`
           : "正在掃描檔案…"}
       </p>
+      {progress !== null && progress.failed > 0 && (
+        <p className="text-xs text-amber-700">有 {progress.failed} 個檔案處理失敗，其餘仍會繼續。</p>
+      )}
     </div>
   );
 }

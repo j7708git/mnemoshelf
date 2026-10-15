@@ -146,13 +146,27 @@ export interface TextPreviewBody {
 /** 索引进度輪詢的狀態。 */
 export interface IndexStatus {
   rootId: number;
-  state: "idle" | "running" | "completed" | "failed";
-  progress: { processed: number; total: number; skippedUnchanged: number } | null;
+  state: "idle" | "running" | "completed" | "failed" | "cancelled";
+  progress: {
+    processed: number;
+    total: number;
+    skippedUnchanged: number;
+    skipped: number;
+    failed: number;
+    processedChunks: number;
+    estimatedChunks: number;
+  } | null;
   startedAt: string | null;
   finishedAt: string | null;
   durationMs: number | null;
   error: { name: string; message: string } | null;
-  result: { total: number; processed: number; skippedUnchanged: number; removedFiles: number } | null;
+  result: {
+    total: number;
+    processed: number;
+    skippedUnchanged: number;
+    removedFiles: number;
+    failedFiles: { relPath: string; reason: string }[];
+  } | null;
 }
 
 /** 讀出伺服器錯誤回應的中文訊息；格式不符時回退成帶狀態碼的訊息。 */
@@ -196,6 +210,18 @@ export async function previewRoot(rootId: number): Promise<RootPreview> {
 export async function startIndex(rootId: number): Promise<void> {
   const response = await apiFetch(`/roots/${rootId}/index`, { method: "POST" });
   if (!response.ok) throw new Error(await readErrorMessage(response, "索引失敗"));
+}
+
+/**
+ * 取消進行中的索引（`POST /roots/:id/index/cancel`）。
+ *
+ * 沒有進行中的索引時伺服器回 404，這裡不視為錯誤（冪等：目的已達成）；
+ * 其餘失敗照常丟錯。實際狀態仍以 `getIndexStatus` 為準。
+ */
+export async function cancelIndex(rootId: number): Promise<void> {
+  const response = await apiFetch(`/roots/${rootId}/index/cancel`, { method: "POST" });
+  if (response.ok || response.status === 404) return;
+  throw new Error(await readErrorMessage(response, "取消索引失敗"));
 }
 
 /** 輪詢索引进度。 */

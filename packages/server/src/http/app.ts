@@ -4,7 +4,7 @@
  * 契約（任務卡 §REST API）：
  * - `GET  /health`（免 token）→ `{status:"ok"}`
  * - `POST /roots`、`GET /roots`、`GET /roots/:id`、`DELETE /roots/:id?deleteData=1`
- * - `POST /roots/:id/preview`、`POST /roots/:id/index`
+ * - `POST /roots/:id/preview`、`POST /roots/:id/index`、`POST /roots/:id/index/cancel`
  * - `GET  /roots/:id/entries?path=`（目錄子項）、`GET /roots/:id/file?path=`（文字預覽／圖片位元組）、
  *   `GET /roots/:id/thumb?path=`（縮圖）、`GET /roots/:id/index/status`（索引进度輪詢）
  * - `POST /search`
@@ -174,6 +174,26 @@ export interface ListMemoriesResponse {
 export interface IndexRootResponse extends IndexRootResult {
   rootId: number;
   durationMs: number;
+}
+
+/**
+ * `POST /roots/:id/index` 在**索引被取消**時的回應。
+ *
+ * 取消是正常的使用者操作，不是伺服器錯誤，因此仍回 200；`cancelled` 讓呼叫端能區分
+ * 「這一輪跑完」與「被中止」。真正的狀態以 `GET /roots/:id/index/status` 為準
+ * （此時為 `cancelled`）。
+ */
+export interface IndexCancelledResponse {
+  rootId: number;
+  durationMs: number;
+  cancelled: true;
+}
+
+/** `POST /roots/:id/index/cancel` 的回應。 */
+export interface CancelIndexResponse {
+  rootId: number;
+  /** 一律為 true；沒有進行中的索引時回 404 而非此主體。 */
+  cancelled: boolean;
 }
 
 /** 統一的錯誤回應格式。 */
@@ -457,6 +477,13 @@ export function createRestApp(deps: RestAppDeps): RestApp {
    */
   const maxFileBytesByRoot = new Map<number, number>();
   const indexing = new Map<number, Promise<IndexRootResult>>();
+  /**
+   * 進行中索引的 `AbortController`（每個 root 一個，與 `indexing` 同生命週期）。
+   *
+   * `indexRoot` 本來就支援 `signal`；這裡只是把「誰能觸發 abort」暴露給 REST。
+   * 只放進行中的任務：`finally` 移除，因此取消已結束的任務會找不到 controller（回 404）。
+   */
+  const indexControllers = new Map<number, AbortController>();
   const inflight = new Set<Promise<unknown>>();
   /** 索引工作狀態（行程內記憶體；供 `GET /roots/:id/index/status` 輪詢）。 */
   const indexStatus = new IndexStatusTracker();
@@ -603,27 +630,55 @@ export function createRestApp(deps: RestAppDeps): RestApp {
 
     const startedAt = Date.now();
     const maxFileBytes = maxFileBytesByRoot.get(id);
+    const controller = new AbortController();
     indexStatus.begin(id);
     const run = indexRoot(root, {
       embedder: deps.embedder,
       store: deps.store,
       vec: deps.vec,
+      signal: controller.signal,
       onProgress: (progress) => indexStatus.report(id, progress),
       ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
     });
     indexing.set(id, run);
+    indexControllers.set(id, controller);
     inflight.add(run);
     try {
       const result = await run;
       indexStatus.finish(id, result);
       return { status: 200, body: { rootId: id, durationMs: Date.now() - startedAt, ...result } };
     } catch (error) {
+      // 取消是使用者要求（不是錯誤）：標記 `cancelled`，並以 200＋`cancelled` 回應，
+      // 呼叫端才不會把正常取消當成伺服器錯誤。
+      if (controller.signal.aborted) {
+        indexStatus.cancel(id);
+        const body: IndexCancelledResponse = { rootId: id, durationMs: Date.now() - startedAt, cancelled: true };
+        return { status: 200, body };
+      }
       indexStatus.fail(id, error);
       throw error;
     } finally {
       indexing.delete(id);
+      indexControllers.delete(id);
       inflight.delete(run);
     }
+  };
+
+  /**
+   * `POST /roots/:id/index/cancel`：中止該 root **自己的**進行中索引。
+   *
+   * - 只中止這個 root 的任務（controller 以 root id 存放），不影響其他 root。
+   * - root 不存在 → 404；root 存在但沒有進行中的索引 → 404（沒有可取消的任務）。
+   * - 中止後 `indexRoot` 拋 `AbortError`，`startIndex` 會把狀態標成 `cancelled`；
+   *   已寫入的資料按檔交易，維持一致，之後可再索引（失敗／被中止的檔案下一輪重做）。
+   */
+  const cancelIndex = async (id: number): Promise<{ status: number; body: unknown }> => {
+    await getRootOr404(id);
+    const controller = indexControllers.get(id);
+    if (controller === undefined) throw new NotFoundError("進行中的索引", id);
+    controller.abort();
+    const body: CancelIndexResponse = { rootId: id, cancelled: true };
+    return { status: 200, body };
   };
 
   /**
@@ -788,10 +843,14 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       }
     }
 
-    // `GET /roots/:id/index/status`（索引进度輪詢）。
+    // `GET /roots/:id/index/status`（索引进度輪詢）與 `POST /roots/:id/index/cancel`（取消）。
     if (segments.length === 4 && segments[2] === "index" && segments[3] === "status") {
       if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
       return await getIndexStatus(id);
+    }
+    if (segments.length === 4 && segments[2] === "index" && segments[3] === "cancel") {
+      if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
+      return await cancelIndex(id);
     }
 
     throw new NotFoundError("路徑");

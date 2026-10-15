@@ -4,8 +4,8 @@
  * 目錄樹資料來自 `GET /roots/:id/entries`（檔案系統，與索引狀態無關）；
  * 索引进度來自 `GET /roots/:id/index/status` 輪詢。
  */
-import { useCallback, useEffect, useState } from "react";
-import { getIndexStatus, startIndex, type DirEntry, type IndexStatus, type Root } from "./api";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { cancelIndex, getIndexStatus, startIndex, type DirEntry, type IndexStatus, type Root } from "./api";
 import { DirectoryTree } from "./DirectoryTree";
 import { FilePreview } from "./FilePreview";
 import { formatBytes } from "./format";
@@ -14,6 +14,13 @@ export interface ExplorerPanelProps {
   root: Root;
   /** 由外部遞增以強制重新載入目錄樹（例如索引完成後）。 */
   refreshKey: number;
+}
+
+/** chunk 級進度的補充說明；掃描階段（預估 0 塊）為空字串。 */
+function chunkNote(status: IndexStatus | null): string {
+  const progress = status?.progress ?? null;
+  if (progress === null || progress.estimatedChunks === 0) return "";
+  return `；已嵌入 ${progress.processedChunks}／預估 ${progress.estimatedChunks} 塊`;
 }
 
 /** 索引进度狀態 → 中文說明。 */
@@ -25,12 +32,16 @@ function describeStatus(status: IndexStatus | null): string {
     case "running": {
       const progress = status.progress;
       if (progress === null || progress.total === 0) return "索引中：正在掃描檔案…";
-      return `索引中：已處理 ${progress.processed}／${progress.total} 個檔案`;
+      return `索引中：已處理 ${progress.processed}／${progress.total} 個檔案${chunkNote(status)}`;
     }
     case "completed":
       return status.result === null
         ? "索引完成"
-        : `索引完成：處理 ${status.result.processed} 個、跳過未變更 ${status.result.skippedUnchanged} 個`;
+        : `索引完成：處理 ${status.result.processed} 個、跳過未變更 ${status.result.skippedUnchanged} 個${
+            status.result.failedFiles.length > 0 ? `、失敗 ${status.result.failedFiles.length} 個` : ""
+          }`;
+    case "cancelled":
+      return "索引已取消（已完成的檔案仍保留在索引中）";
     case "failed":
       return `索引失敗：${status.error?.message ?? "未知錯誤"}`;
   }
@@ -41,8 +52,13 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
   const [status, setStatus] = useState<IndexStatus | null>(null);
   const [treeKey, setTreeKey] = useState(refreshKey);
   const [busy, setBusy] = useState(false);
+  /**
+   * 使用者剛按下「重新索引」：即使第一次輪詢還看到 `idle`（請求還在路上），也要持續輪詢，
+   * 否則進度與「取消索引」按鈕不會出現（`startIndex` 要等整輪跑完才回應）。
+   */
+  const pollingRef = useRef(false);
 
-  // 讀取／輪詢索引狀態：running 時每 1.5 秒更新一次，其餘只讀一次。
+  // 讀取／輪詢索引狀態：running（或剛啟動索引）時每 1.5 秒更新一次，其餘只讀一次。
   useEffect(() => {
     let cancelled = false;
     let timer: ReturnType<typeof setInterval> | undefined;
@@ -52,7 +68,10 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
         const current = await getIndexStatus(root.id);
         if (cancelled) return;
         setStatus(current);
-        if (current.state === "running") {
+        if (current.state === "completed" || current.state === "failed" || current.state === "cancelled") {
+          pollingRef.current = false;
+        }
+        if (current.state === "running" || pollingRef.current) {
           if (timer === undefined) timer = setInterval(() => void tick(), 1500);
         } else if (timer !== undefined) {
           clearInterval(timer);
@@ -72,6 +91,9 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
 
   const reindex = useCallback(async (): Promise<void> => {
     setBusy(true);
+    pollingRef.current = true;
+    // 遞增 treeKey 讓輪詢立刻重跑一次，不必等 startIndex 回應。
+    setTreeKey((current) => current + 1);
     try {
       await startIndex(root.id);
       setTreeKey((current) => current + 1);
@@ -83,6 +105,20 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
     }
   }, [root.id]);
 
+  /** 取消進行中的索引；`startIndex` 的 promise 會隨後結束（伺服器回 200），由輪詢接手顯示。 */
+  const stopIndex = useCallback(async (): Promise<void> => {
+    setBusy(true);
+    try {
+      await cancelIndex(root.id);
+    } catch {
+      // 取消失敗（例如連線中斷）：輪詢會在下一次 tick 反映實際狀態。
+    } finally {
+      setBusy(false);
+    }
+  }, [root.id]);
+
+  const running = status?.state === "running";
+
   return (
     <section className="flex min-h-0 flex-col gap-3">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
@@ -93,14 +129,26 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
           <p className="text-xs text-muted">{describeStatus(status)}</p>
         </div>
         {root.mode === "index" && (
-          <button
-            type="button"
-            onClick={() => void reindex()}
-            disabled={busy || status?.state === "running"}
-            className="rounded-md border border-line px-3 py-1.5 text-sm text-ink disabled:opacity-40"
-          >
-            {busy || status?.state === "running" ? "索引中…" : "重新索引"}
-          </button>
+          <div className="flex gap-2">
+            {running && (
+              <button
+                type="button"
+                onClick={() => void stopIndex()}
+                disabled={busy}
+                className="rounded-md border border-line px-3 py-1.5 text-sm text-ink disabled:opacity-40"
+              >
+                取消索引
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => void reindex()}
+              disabled={busy || running}
+              className="rounded-md border border-line px-3 py-1.5 text-sm text-ink disabled:opacity-40"
+            >
+              {running ? "索引中…" : "重新索引"}
+            </button>
+          </div>
         )}
       </div>
 
@@ -127,6 +175,12 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
 
       {status?.state === "completed" && status.result !== null && status.result.removedFiles > 0 && (
         <p className="text-xs text-muted">本次索引清除了 {status.result.removedFiles} 個已不存在檔案的索引資料。</p>
+      )}
+      {status?.state === "completed" && status.result !== null && status.result.failedFiles.length > 0 && (
+        <p className="text-xs text-amber-700">
+          有 {status.result.failedFiles.length} 個檔案處理失敗（其餘檔案已完成）：
+          {status.result.failedFiles.map((file) => file.relPath).join("、")}
+        </p>
       )}
       {selectedEntry !== null && selectedEntry.size !== null && (
         <p className="text-xs text-muted">

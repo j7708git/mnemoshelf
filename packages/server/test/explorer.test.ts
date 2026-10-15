@@ -392,19 +392,32 @@ describe("GET /roots/:id/index/status：進度輪詢", () => {
     expect(completed.finishedAt).not.toBeNull();
   });
 
-  it("索引失敗 → failed（含錯誤訊息）", async () => {
+  it("嵌入失敗不再是整輪失敗：逐檔記入 failedFiles、整輪仍完成", async () => {
     server = await startTestServer({ embedder: new FailingEmbedder() });
     const dir = await makeExplorerFixture();
     const rootId = await addRoot(dir);
 
     const response = await api(server.instance, "POST", `/roots/${rootId}/index`);
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(200);
+
+    const result = response.body as IndexRootResponse;
+    // 文字檔全部失敗，但整輪沒有失敗（圖片仍走 embedImage 成功）。
+    expect(result.failedFiles.length).toBeGreaterThan(0);
+    expect(result.processed).toBeGreaterThan(0);
+    // 對帳：失敗檔也算「處理完」，四類相加等於 total。
+    expect(
+      result.processed + result.skippedUnchanged + result.skippedFiles.length + result.failedFiles.length,
+    ).toBe(result.total);
+    // 失敗原因只留短標籤（原始錯誤訊息被丟棄）。
+    for (const file of result.failedFiles) {
+      expect(file.reason).toBe("SyntheticEmbedError");
+    }
 
     const status = (await api(server.instance, "GET", `/roots/${rootId}/index/status`)).body as IndexStatus;
-    expect(status.state).toBe("failed");
-    expect(status.error).not.toBeNull();
-    expect(status.error!.name).toBe("SyntheticEmbedError");
-    expect(status.result).toBeNull();
+    expect(status.state).toBe("completed");
+    expect(status.error).toBeNull();
+    expect(status.result).not.toBeNull();
+    expect(status.result!.failedFiles.length).toBe(result.failedFiles.length);
   });
 
   it("未知 root → 404", async () => {

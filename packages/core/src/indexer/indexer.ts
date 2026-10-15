@@ -26,9 +26,44 @@ export interface IndexProgress {
    *
    * 來源有兩類：讀取前守衛再檢查失敗（`unresolved-symlink`／`blocked`），
    * 以及內容層二進位偵測（`binary-content`）。
-   * 對帳語意：整輪跑完時 `processed + skippedUnchanged + skipped === total`。
    */
   skipped: number;
+  /**
+   * 本次處理失敗、但**沒有中斷整輪**的檔案數，對應結果的 `failedFiles.length`。
+   *
+   * 對帳語意：整輪跑完時 `processed + skippedUnchanged + skipped + failed === total`。
+   * 失敗檔的既有索引資料**刻意保留**（不 purge）：下一輪索引會重試它，成功即自癒。
+   */
+  failed: number;
+  /**
+   * 本次已完成嵌入並寫入的 chunk 數（逐檔累加，`processFile` 成功才增加）。
+   *
+   * 為什麼不是「檔內即時進度」：`embedDocuments` 契約明定**呼叫端不需自行分批**
+   * （超過批次上限由實作內部切視窗），所以一個檔案從進入嵌入到寫入完成之間，
+   * 這裡不會有中間值。它提供的是「實際完成量」與跨檔的細粒度。
+   */
+  processedChunks: number;
+  /**
+   * 目前為止已切塊、預期會嵌入的 chunk 數（每個檔案讀取並切塊後累加）。
+   *
+   * 掃描階段無從得知內容，因此這是**下界**且只增不減；`estimatedChunks - processedChunks`
+   * 是「已排入但尚未嵌入」的量。它讓 UI 在大檔開始時就能顯示規模
+   * （例如「已嵌入 0／預估 8,800 塊」），而不是只看到檔案數不動。
+   */
+  estimatedChunks: number;
+}
+
+/**
+ * 一個處理失敗、但沒有中斷整輪的檔案。
+ *
+ * `reason` 只放**短標籤**，不放原始錯誤訊息：`fs` 的錯誤訊息含本機絕對路徑，
+ * 會經 REST 回應與 UI 外洩（見 repo 的隱私規範）。
+ */
+export interface FailedFileEntry {
+  /** 相對 root 的路徑（`/` 分隔）。 */
+  relPath: string;
+  /** 失敗原因標籤：優先取錯誤的 `code`（如 `EACCES`），其次取錯誤名稱，都沒有時為 `error`。 */
+  reason: string;
 }
 
 export interface IndexRootOptions {
@@ -55,6 +90,12 @@ export interface IndexRootResult {
    * 正常情況為空；計數上 `processed + skippedUnchanged + skippedFiles.length === total`。
    */
   skippedFiles: SkippedEntry[];
+  /**
+   * 本次處理失敗（讀取、嵌入或寫入拋錯）的檔案；這些檔案**不中斷整輪**，其餘檔案照常完成。
+   *
+   * 對帳語意：`processed + skippedUnchanged + skippedFiles.length + failedFiles.length === total`。
+   */
+  failedFiles: FailedFileEntry[];
 }
 
 /** 內容層二進位偵測只看檔案前段這麼多 bytes（成本固定、與檔案大小無關）。 */
@@ -177,9 +218,33 @@ interface ProcessDeps {
 }
 
 type FileOutcome =
-  | { status: "processed" }
+  | { status: "processed"; chunks: number }
   | { status: "unchanged" }
   | { status: "skipped"; reason: SkipReason };
+
+/** `processFile` 的呼叫端掛鉤（只用於進度回報，不影響資料寫入）。 */
+interface ProcessHooks {
+  /**
+   * 檔案切塊完成、**即將開始嵌入**時呼叫，帶該檔的 chunk 數。
+   *
+   * 時機刻意放在嵌入之前：大檔的嵌入是一次批次呼叫、中間不會有回報，
+   * 先把預估塊數加進去，UI 才能立刻顯示這個檔案的規模。
+   */
+  onChunked?: (chunkCount: number) => void;
+}
+
+/**
+ * 錯誤 → 可安全外洩的短標籤（見 `FailedFileEntry.reason`）。
+ *
+ * 不用 `error.message`：`fs` 的訊息（例如 `ENOENT: no such file or directory, open '<絕對路徑>'`）
+ * 含本機絕對路徑。這裡只取結構化的 `code` 或錯誤名稱，並限制字元集與長度。
+ */
+function failureReason(error: unknown): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(code)) return code;
+  if (error instanceof Error && /^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(error.name)) return error.name;
+  return "error";
+}
 
 /**
  * 讀取前對「掃描時解析好的路徑」再過一次守衛（TOCTOU 防護）。
@@ -238,6 +303,7 @@ async function processFile(
   file: ScanEntry,
   deps: ProcessDeps,
   signal: AbortSignal | undefined,
+  hooks: ProcessHooks = {},
 ): Promise<FileOutcome> {
   const target = await revalidateReadPath(root, file);
   if (!target.ok) return { status: "skipped", reason: target.reason };
@@ -262,6 +328,7 @@ async function processFile(
   }
 
   const inputs = buildChunkInputs(file, fileHash, bytes);
+  hooks.onChunked?.(inputs.length);
   const vectors = await embedInputs(inputs, file, bytes, deps.embedder, signal);
   throwIfAborted(signal);
 
@@ -278,7 +345,7 @@ async function processFile(
     vec: vectors[index]!,
   }));
   await deps.vec.upsert(items);
-  return { status: "processed" };
+  return { status: "processed", chunks: inputs.length };
 }
 
 /**
@@ -292,6 +359,11 @@ async function processFile(
  *   內容層跳過（`binary-content`）的檔案仍在 `files` 內（掃描不讀內容，無法事先知道），
  *   因此由 `processFile` 自己清除（見 `purgeChunks`），結果同樣不保留索引。
  * - 可取消（`signal`，於每個檔案開始前與嵌入前檢查）與限併發（`concurrency`，預設 2）。
+ * - **單檔失敗不中斷整輪**：`processFile` 的錯誤被記入 `failedFiles`（原因只留短標籤），
+ *   其餘檔案照常處理；失敗檔的既有索引資料保留，下一輪重試（成功即自癒）。
+ * - 進度：檔案級計數（`processed`／`skippedUnchanged`／`skipped`／`failed`）整輪可對帳
+ *   （四者相加 === `total`）；另有 chunk 級資訊（`processedChunks`／`estimatedChunks`），
+ *   後者是逐檔切塊後累加的下界，只增不減（單一大檔的嵌入是單次批次呼叫，檔內不會有中間值）。
  * - 全程唯讀使用者檔案。
  */
 export async function indexRoot(root: Root, options: IndexRootOptions): Promise<IndexRootResult> {
@@ -323,9 +395,21 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
 
   let processed = 0;
   let skippedUnchanged = 0;
+  let failed = 0;
+  let processedChunks = 0;
+  let estimatedChunks = 0;
   const skippedFiles: SkippedEntry[] = [];
+  const failedFiles: FailedFileEntry[] = [];
   const report = (): void =>
-    options.onProgress?.({ processed, total, skippedUnchanged, skipped: skippedFiles.length });
+    options.onProgress?.({
+      processed,
+      total,
+      skippedUnchanged,
+      skipped: skippedFiles.length,
+      failed,
+      processedChunks,
+      estimatedChunks,
+    });
 
   let cursor = 0;
   const worker = async (): Promise<void> => {
@@ -335,9 +419,27 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
       if (index >= files.length) return;
       throwIfAborted(signal);
       const file = files[index]!;
-      const outcome = await processFile(root, file, { embedder, store, vec }, signal);
-      if (outcome.status === "processed") processed += 1;
-      else if (outcome.status === "unchanged") skippedUnchanged += 1;
+      let outcome: FileOutcome;
+      try {
+        outcome = await processFile(root, file, { embedder, store, vec }, signal, {
+          onChunked: (chunkCount) => {
+            estimatedChunks += chunkCount;
+            report();
+          },
+        });
+      } catch (error) {
+        // 中止優先於「壞檔」：取消不是檔案失敗，整輪就此結束（見 throwIfAborted）。
+        throwIfAborted(signal);
+        // 壞檔（讀取／嵌入／寫入拋錯）只記下來，不讓整輪失敗。
+        failed += 1;
+        failedFiles.push({ relPath: file.relPath, reason: failureReason(error) });
+        report();
+        continue;
+      }
+      if (outcome.status === "processed") {
+        processed += 1;
+        processedChunks += outcome.chunks;
+      } else if (outcome.status === "unchanged") skippedUnchanged += 1;
       else skippedFiles.push({ relPath: file.relPath, reason: outcome.reason });
       report();
     }
@@ -346,5 +448,5 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
   const workerCount = Math.min(concurrency, files.length);
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
-  return { total, processed, skippedUnchanged, removedFiles, skippedFiles };
+  return { total, processed, skippedUnchanged, removedFiles, skippedFiles, failedFiles };
 }

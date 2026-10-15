@@ -88,6 +88,7 @@ export {
   indexRoot,
   looksBinary,
   BINARY_SNIFF_BYTES,
+  type FailedFileEntry,
   type IndexProgress,
   type IndexRootOptions,
   type IndexRootResult,

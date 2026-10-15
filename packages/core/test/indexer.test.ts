@@ -15,6 +15,7 @@ import {
   type EmbedderInfo,
   type EmbedDocumentsOptions,
   type ImageInput,
+  type IndexProgress,
   type ProbeResult,
   type Root,
   type SqliteDatabase,
@@ -82,6 +83,27 @@ class AbortingEmbedder extends RecordingEmbedder {
     opts?: EmbedDocumentsOptions,
   ): Promise<Float32Array[]> {
     this.controller.abort();
+    return super.embedDocuments(inputs, opts);
+  }
+}
+
+/**
+ * 對含特定標記的文字整批拋錯的 embedder，用來驗證「單檔失敗不中斷整輪」。
+ *
+ * 錯誤帶 `code`（模擬 Node 檔案系統錯誤的形狀），驗證 `failedFiles.reason` 會取用 `code`。
+ */
+class FailingEmbedder extends RecordingEmbedder {
+  constructor(private readonly marker: string) {
+    super();
+  }
+
+  override async embedDocuments(
+    inputs: readonly DocumentInput[],
+    opts?: EmbedDocumentsOptions,
+  ): Promise<Float32Array[]> {
+    if (inputs.some((input) => input.text.includes(this.marker))) {
+      throw Object.assign(new Error("模擬嵌入失敗（訊息含 /絕對/路徑 也必須被丟棄）"), { code: "EMODELFAIL" });
+    }
     return super.embedDocuments(inputs, opts);
   }
 }
@@ -263,12 +285,13 @@ describe("indexRoot", () => {
   });
 
   it("進度數字可對帳：processed + skippedUnchanged === total", async () => {
-    const progress: { processed: number; total: number; skippedUnchanged: number }[] = [];
+    const progress: IndexProgress[] = [];
     const result = await indexRoot(harness.root, {
       ...options(harness),
       onProgress: (p) => progress.push({ ...p }),
     });
-    expect(progress.length).toBe(2);
+    // 每個檔案至少一次回報（切塊完成時與完成時各一次；見逐塊進度一節）。
+    expect(progress.length).toBeGreaterThanOrEqual(2);
     for (const entry of progress) {
       expect(entry.processed + entry.skippedUnchanged).toBeLessThanOrEqual(entry.total);
     }
@@ -472,13 +495,13 @@ describe("內容層二進位偵測（binary-content）", () => {
   it("進度對帳：processed + skippedUnchanged + skipped === total", async () => {
     const h = await makeHarness({ "ok.md": "# 標題\n\n正常", "fake.md": nulBytes() });
     try {
-      const progress: { processed: number; total: number; skippedUnchanged: number; skipped: number }[] = [];
+      const progress: IndexProgress[] = [];
       const result = await indexRoot(h.root, {
         ...options(h),
         concurrency: 1,
         onProgress: (p) => progress.push({ ...p }),
       });
-      expect(progress).toHaveLength(2);
+      expect(progress.length).toBeGreaterThanOrEqual(2);
       const last = progress.at(-1)!;
       expect(last.skipped).toBe(1);
       expect(last.processed + last.skippedUnchanged + last.skipped).toBe(last.total);
@@ -524,6 +547,149 @@ describe("內容層二進位偵測（binary-content）", () => {
       const result = await indexRoot(h.root, options(h));
       expect(result).toMatchObject({ total: 2, processed: 2 });
       expect(result.skippedFiles).toEqual([]);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("單檔失敗不中斷整輪（failedFiles）", () => {
+  it("壞檔記入 failedFiles，其餘檔案照常索引；重跑即自癒", async () => {
+    const h = await makeHarness({
+      "good.md": "# 標題\n\n正常內容",
+      "bad.md": "# 標題\n\nBADMARK 內容",
+    });
+    try {
+      const result = await indexRoot(h.root, {
+        embedder: new FailingEmbedder("BADMARK"),
+        store: h.store,
+        vec: h.vec,
+      });
+
+      expect(result).toMatchObject({ total: 2, processed: 1, skippedUnchanged: 0 });
+      // reason 取錯誤的 `code`，**不含**原始訊息（訊息裡有假的路徑字串）。
+      expect(result.failedFiles).toEqual([{ relPath: "bad.md", reason: "EMODELFAIL" }]);
+      expect(JSON.stringify(result.failedFiles)).not.toContain("絕對");
+
+      // 好檔不受影響；壞檔沒有任何 chunk 或向量。
+      expect(await h.store.listChunksByPath(h.root.id, "good.md")).toHaveLength(1);
+      expect(await h.store.listChunksByPath(h.root.id, "bad.md")).toEqual([]);
+      expect(await h.vec.count()).toBe(1);
+
+      // 下一輪用正常 embedder：壞檔被重做，整輪無失敗。
+      const rerun = await indexRoot(h.root, options(h));
+      expect(rerun).toMatchObject({ processed: 1, skippedUnchanged: 1 });
+      expect(rerun.failedFiles).toEqual([]);
+      expect(await h.vec.count()).toBe(2);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("失敗檔的既有索引資料保留（不 purge），下一輪重試才替換", async () => {
+    const h = await makeHarness({ "a.md": "# 標題\n\n第一版內容" });
+    try {
+      await indexRoot(h.root, options(h));
+      const before = (await h.store.listChunksByPath(h.root.id, "a.md")).map((chunk) => `c:${chunk.id}`);
+      expect(before).toHaveLength(1);
+
+      await fs.writeFile(path.join(h.dir, "a.md"), "# 標題\n\n第二版 BADMARK 內容");
+      const failed = await indexRoot(h.root, {
+        embedder: new FailingEmbedder("BADMARK"),
+        store: h.store,
+        vec: h.vec,
+      });
+      expect(failed.failedFiles).toEqual([{ relPath: "a.md", reason: "EMODELFAIL" }]);
+      expect([...(await h.vec.existingKeys(before))]).toEqual(before);
+
+      const rerun = await indexRoot(h.root, options(h));
+      expect(rerun).toMatchObject({ processed: 1, failedFiles: [] });
+      const after = await h.store.listChunksByPath(h.root.id, "a.md");
+      expect(after[0]?.text).toContain("第二版");
+      expect([...(await h.vec.existingKeys(before))]).toEqual([]);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("進度對帳：processed + skippedUnchanged + skipped + failed === total", async () => {
+    const nulBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0xff]);
+    const h = await makeHarness({
+      "ok.md": "# 標題\n\n正常內容",
+      "fake.md": nulBytes,
+      "bad.md": "# 標題\n\nBADMARK 內容",
+    });
+    try {
+      const progress: IndexProgress[] = [];
+      const result = await indexRoot(h.root, {
+        embedder: new FailingEmbedder("BADMARK"),
+        store: h.store,
+        vec: h.vec,
+        concurrency: 1,
+        onProgress: (p) => progress.push({ ...p }),
+      });
+
+      const last = progress.at(-1)!;
+      expect(last.processed).toBe(1);
+      expect(last.skipped).toBe(1);
+      expect(last.failed).toBe(1);
+      expect(last.skippedUnchanged).toBe(0);
+      expect(last.processed + last.skippedUnchanged + last.skipped + last.failed).toBe(last.total);
+      expect(
+        last.processed + last.skippedUnchanged + result.skippedFiles.length + result.failedFiles.length,
+      ).toBe(result.total);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("逐塊進度（processedChunks／estimatedChunks）", () => {
+  it("預估塊數在嵌入前先累加，完成後 processedChunks 等於實際塊數", async () => {
+    const h = await makeHarness({ "big.md": `# 標題\n\n${"內容".repeat(800)}` });
+    try {
+      const progress: IndexProgress[] = [];
+      await indexRoot(h.root, { ...options(h), onProgress: (p) => progress.push({ ...p }) });
+      const chunks = (await h.store.listChunksByPath(h.root.id, "big.md")).length;
+      expect(chunks).toBeGreaterThan(1);
+
+      // 第一次回報來自「切塊完成、即將嵌入」：預估已加上，但還沒有任何塊完成。
+      expect(progress[0]).toMatchObject({ processed: 0, processedChunks: 0, estimatedChunks: chunks });
+      // 檔案完成後：實際完成量等於該檔塊數。
+      expect(progress.at(-1)).toMatchObject({ processed: 1, processedChunks: chunks, estimatedChunks: chunks });
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("進度數字只增不減（UI 輪詢不會倒退），且 estimatedChunks 是下界", async () => {
+    const h = await makeHarness({
+      "a.md": "# 標題\n\n第一份文件",
+      "b.md": `# 標題\n\n${"內容".repeat(400)}`,
+      "c.md": "# 標題\n\n第三份文件",
+    });
+    try {
+      const progress: IndexProgress[] = [];
+      await indexRoot(h.root, {
+        ...options(h),
+        concurrency: 2,
+        onProgress: (p) => progress.push({ ...p }),
+      });
+      expect(progress.length).toBeGreaterThanOrEqual(3);
+
+      const keys = ["processed", "skippedUnchanged", "skipped", "failed", "processedChunks", "estimatedChunks"] as const;
+      for (let index = 1; index < progress.length; index += 1) {
+        const previous = progress[index - 1]!;
+        const current = progress[index]!;
+        for (const key of keys) {
+          expect(current[key]).toBeGreaterThanOrEqual(previous[key]);
+        }
+        expect(current.total).toBe(previous.total);
+      }
+
+      const last = progress.at(-1)!;
+      expect(last.processedChunks).toBeLessThanOrEqual(last.estimatedChunks);
+      expect(last.processedChunks).toBeGreaterThan(0);
     } finally {
       await fs.rm(h.dir, { recursive: true, force: true });
     }

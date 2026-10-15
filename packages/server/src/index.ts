@@ -191,7 +191,9 @@ export {
 export type {
   AddRootRequest,
   BytesRouteResult,
+  CancelIndexResponse,
   ErrorResponse,
+  IndexCancelledResponse,
   IndexRootResponse,
   JsonRouteResult,
   ListEntriesResponse,

@@ -88,6 +88,51 @@ export class SlowEmbedder implements Embedder {
   }
 }
 
+/**
+ * 對含特定標記的文字整批拋錯的 embedder（驗證「壞檔不讓整輪索引失敗」）。
+ * 錯誤帶 `code`，對應 `failedFiles.reason` 的來源。
+ */
+export class FailingEmbedder implements Embedder {
+  private readonly inner = new FakeEmbedder();
+
+  constructor(private readonly marker: string) {}
+
+  get info(): EmbedderInfo {
+    return this.inner.info;
+  }
+
+  async embedQuery(text: string): Promise<Float32Array> {
+    return this.inner.embedQuery(text);
+  }
+
+  async embedDocument(text: string, title?: string): Promise<Float32Array> {
+    if (text.includes(this.marker)) throw Object.assign(new Error("模擬嵌入失敗"), { code: "EMODELFAIL" });
+    return this.inner.embedDocument(text, title);
+  }
+
+  async embedDocuments(
+    inputs: readonly DocumentInput[],
+    opts?: EmbedDocumentsOptions,
+  ): Promise<Float32Array[]> {
+    if (inputs.some((input) => input.text.includes(this.marker))) {
+      throw Object.assign(new Error("模擬嵌入失敗"), { code: "EMODELFAIL" });
+    }
+    return this.inner.embedDocuments(inputs, opts);
+  }
+
+  async embedImage(image: ImageInput): Promise<Float32Array> {
+    return this.inner.embedImage(image);
+  }
+
+  async probe(): Promise<ProbeResult> {
+    return this.inner.probe();
+  }
+
+  async dispose(): Promise<void> {
+    return this.inner.dispose();
+  }
+}
+
 export interface TestServer {
   instance: MnemoshelfServer;
   dataDir: string;

@@ -70,8 +70,9 @@ loopback、並對連線來源再做 `requireLoopback` 檢查。需要更嚴格�
 | `GET /roots`、`GET /roots/:id` | 列出／取得 root |
 | `DELETE /roots/:id?deleteData=1` | 移除 root；`deleteData=1` 時一併刪除 chunk 與向量 |
 | `POST /roots/:id/preview` | 乾跑統計（不寫入任何狀態） |
-| `POST /roots/:id/index` | 觸發索引；同一 root 索引進行中再呼叫 → `409`。**會等整個索引跑完才回應** |
-| `GET /roots/:id/index/status` | 輪詢索引进度：`{state: idle\|running\|completed\|failed, progress, startedAt, finishedAt, durationMs, error, result}`（行程內記憶體；**重啟後回 `idle`**，不引入 SSE／WebSocket） |
+| `POST /roots/:id/index` | 觸發索引；同一 root 索引進行中再呼叫 → `409`。**會等整個索引跑完才回應**；被取消時回 `200`＋`{rootId, durationMs, cancelled:true}`（不是錯誤） |
+| `POST /roots/:id/index/cancel` | 取消**該 root 自己**進行中的索引：`{rootId, cancelled:true}`。沒有進行中的索引（或 root 不存在）→ `404`。取消後可再次索引（失敗／被中止的檔案下一輪重做） |
+| `GET /roots/:id/index/status` | 輪詢索引进度：`{state: idle\|running\|completed\|failed\|cancelled, progress, startedAt, finishedAt, durationMs, error, result}`（行程內記憶體；**重啟後回 `idle`**，不引入 SSE／WebSocket）。`progress` 為檔案級計數（`processed`／`total`／`skippedUnchanged`／`skipped`／`failed`，四者相加 === `total`）＋ chunk 級資訊（`processedChunks`／`estimatedChunks`）；`result` 另帶 `skippedFiles`／`failedFiles` |
 | `GET /roots/:id/entries?path=<相對路徑>` | 列出該相對路徑（目錄）下的直接子項：`{path, entries:[{name,path,kind,size,mimeType}]}`。`kind` 為 `dir`／`text`／`code`／`image`／`audio`／`video`／`binary`；目錄的 `size` 為 `null` |
 | `GET /roots/:id/file?path=<相對路徑>` | 文字預覽（JSON：`{kind:"text",path,size,truncated,content}`，上限 256 KB、超過截斷並以 `truncated` 標明）或圖片原始位元組（帶正確 `Content-Type`） |
 | `GET /roots/:id/thumb?path=<相對路徑>` | 圖片縮圖（`sharp` 產生、寬度上限 320px、輸出 PNG；**記憶體內快取**，不寫磁碟） |
@@ -126,6 +127,19 @@ keyword 那一路**，因此預設 `vector` 不含記憶命中；要搜尋記憶
 服務重啟後就回退 indexer 的預設單檔上限（10 MB），**重新索引前需要重新設定**（`POST /roots/:id/index`
 本身不接受此參數，`preview`／`index` 沿用加入時的值）。要持久化需新增 migration 與契約變更，列入未來議題。
 
+### 索引的取消、失敗與進度語意（2026-10-15）
+
+- **單檔失敗不中斷整輪**：讀取／嵌入／寫入拋錯只記入 `result.failedFiles`（`{relPath, reason}`，
+  `reason` 是短標籤如 `EACCES`，**不含絕對路徑**），其餘檔案照常完成。失敗檔的既有索引資料保留，
+  下一輪索引會重試它（成功即自癒）。
+- **取消**：`POST /roots/:id/index/cancel` 觸發該 root 的 `AbortSignal`。中止時整輪結束、
+  狀態為 `cancelled`（不是 `failed`，`error` 為 null）；進行中的檔案**不寫入任何資料**，
+  因此下一輪會重做，已完成的檔案則維持一致。取消後可立刻再索引。
+- **進度對帳**：整輪完成時 `processed + skippedUnchanged + skipped + failed === total`。
+  另有 chunk 級資訊 `processedChunks`／`estimatedChunks`：後者是逐檔切塊後累加的**下界**，
+  只增不減；因為 `embedDocuments` 契約要求呼叫端不自行分批，單一大檔的嵌入是**一次批次呼叫**，
+  檔內不會有中間值——UI 的長條圖因此仍以檔案為單位（單調不倒退），chunk 數以文字呈現規模。
+
 ## MCP 入口
 
 ```bash
@@ -153,7 +167,7 @@ MNEMOSHELF_E2E=1 pnpm --filter @mnemoshelf/server run e2e   # 真實 embedder（
 - 沒有 watch／檔案監看、沒有 WebSocket／SSE 進度串流、沒有多使用者或角色。索引进度以輪詢
   `GET /roots/:id/index/status` 取得（行程內記憶體；重啟後回 `idle`）。
 - root 的 `agentAccess` 欄位本版尚未做內容級過濾。
-- 索引沒有佇列：進行中再呼叫會回 `409`。索引取消端點尚未提供。
+- 索引沒有佇列：進行中再呼叫會回 `409`。取消走 `POST /roots/:id/index/cancel`（只中止該 root 自己的任務）。
 - Web UI 提供 token 輸入、roots 清單、加入資料夾引導（加入→預覽→索引→進度）、虛擬化目錄樹、
   檔案預覽（文字與圖片縮圖）、統一搜尋（模式選擇器，UI 預設 `hybrid`）與記憶管理
   （列表、釘選、編輯、刪除、看來源）。

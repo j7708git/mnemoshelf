@@ -10,7 +10,7 @@
 import type { IndexProgress, IndexRootResult } from "@mnemoshelf/core";
 
 /** 一個 root 的索引工作狀態。 */
-export type IndexState = "idle" | "running" | "completed" | "failed";
+export type IndexState = "idle" | "running" | "completed" | "failed" | "cancelled";
 
 /** 失敗時的錯誤摘要（只放名稱與訊息，不含堆疊與路徑）。 */
 export interface IndexErrorInfo {
@@ -102,6 +102,23 @@ export class IndexStatusTracker {
     entry.durationMs = entry.startedAtMs === null ? null : now - entry.startedAtMs;
     entry.result = result;
     entry.error = null;
+  }
+
+  /**
+   * 索引被取消（`POST /roots/:id/index/cancel`）。
+   *
+   * 語意與 `failed` 不同：取消是**使用者要求**的結果，不是錯誤，因此 `error` 保持 null。
+   * 已寫入的資料本來就按檔交易，維持一致；`result` 也保持 null（這一輪沒有完成）。
+   */
+  cancel(rootId: number): void {
+    const entry = this.entries.get(rootId);
+    if (entry === undefined) return;
+    const now = Date.now();
+    entry.state = "cancelled";
+    entry.finishedAt = new Date(now).toISOString();
+    entry.durationMs = entry.startedAtMs === null ? null : now - entry.startedAtMs;
+    entry.error = null;
+    entry.result = null;
   }
 
   /** 索引失敗：記下錯誤名稱與訊息（不含堆疊）。 */

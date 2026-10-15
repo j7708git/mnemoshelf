@@ -11,7 +11,9 @@ import { RootNotIndexableError } from "@mnemoshelf/core";
 import {
   api,
   errorName,
+  FailingEmbedder,
   makeFixtureRoot,
+  makeTempDir,
   NOTE_TOKEN,
   rawHttpRequest,
   removeTempDir,
@@ -598,6 +600,100 @@ describe("REST：畸形 request-target 不會打掛服務", () => {
     const found = await api(server.instance, "POST", "/search", { body: { query: NOTE_TOKEN } });
     expect(found.status).toBe(200);
     expect((found.body as { hits: unknown[] }).hits.length).toBeGreaterThan(0);
+  });
+});
+
+describe("REST：索引取消與壞檔", () => {
+  it("取消進行中的索引 → 200，狀態為 cancelled，之後可再索引完成", async () => {
+    server = await startTestServer({ embedder: new SlowEmbedder(100) });
+    const dir = await fixture();
+    const created = await api(server.instance, "POST", "/roots", {
+      body: { path: dir, modalities: ["text", "code", "image"] },
+    });
+    const root = created.body as { id: number };
+
+    const started = api(server.instance, "POST", `/roots/${root.id}/index`);
+    // 等索引真的開始（狀態 running）再取消，避免與請求處理競態。
+    let running = false;
+    for (let attempt = 0; attempt < 100 && !running; attempt += 1) {
+      const current = await api(server.instance, "GET", `/roots/${root.id}/index/status`);
+      running = (current.body as { state: string }).state === "running";
+      if (!running) await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(running).toBe(true);
+
+    const cancelled = await api(server.instance, "POST", `/roots/${root.id}/index/cancel`);
+    expect(cancelled.status).toBe(200);
+    expect(cancelled.body).toMatchObject({ rootId: root.id, cancelled: true });
+
+    // 被取消的那一輪以 200＋cancelled 結束（不是 500，也不是失敗）。
+    const finished = await started;
+    expect(finished.status).toBe(200);
+    expect(finished.body).toMatchObject({ rootId: root.id, cancelled: true });
+
+    const status = await api(server.instance, "GET", `/roots/${root.id}/index/status`);
+    const body = status.body as { state: string; error: unknown };
+    expect(body.state).toBe("cancelled");
+    expect(body.error).toBeNull();
+
+    // 取消後可再索引，且能跑完（已完成的檔案維持一致，未完成的下一輪重做）。
+    const again = await api(server.instance, "POST", `/roots/${root.id}/index`);
+    expect(again.status).toBe(200);
+    const result = again.body as IndexRootResponse;
+    expect(result.processed + result.skippedUnchanged).toBe(result.total);
+    expect((await api(server.instance, "GET", `/roots/${root.id}/index/status`)).body).toMatchObject({
+      state: "completed",
+    });
+  });
+
+  it("沒有進行中的索引時取消 → 404；未知 root → 404；方法不支援 → 405", async () => {
+    server = await startTestServer();
+    const dir = await fixture();
+    const created = await api(server.instance, "POST", "/roots", { body: { path: dir } });
+    const root = created.body as { id: number };
+
+    const idle = await api(server.instance, "POST", `/roots/${root.id}/index/cancel`);
+    expect(idle.status).toBe(404);
+    expect(errorName(idle.body)).toBe("NotFoundError");
+
+    const unknown = await api(server.instance, "POST", "/roots/987654/index/cancel");
+    expect(unknown.status).toBe(404);
+    expect(errorName(unknown.body)).toBe("NotFoundError");
+
+    const wrongMethod = await api(server.instance, "GET", `/roots/${root.id}/index/cancel`);
+    expect(wrongMethod.status).toBe(405);
+    expect(wrongMethod.headers.get("allow")).toBe("POST");
+  });
+
+  it("壞檔不讓整輪索引失敗：failedFiles 有紀錄、好檔仍可搜尋、狀態為 completed", async () => {
+    server = await startTestServer({ embedder: new FailingEmbedder("BADTOKEN") });
+    const dir = await makeTempDir();
+    fixtureDirs.push(dir);
+    await fs.writeFile(path.join(dir, "bad.md"), "# 標題\n\nBADTOKEN 的內容\n", "utf8");
+    await fs.writeFile(path.join(dir, "good.md"), `# 標題\n\n${NOTE_TOKEN} 的內容\n`, "utf8");
+
+    const created = await api(server.instance, "POST", "/roots", { body: { path: dir } });
+    const root = created.body as { id: number };
+
+    const indexed = await api(server.instance, "POST", `/roots/${root.id}/index`);
+    expect(indexed.status).toBe(200);
+    const result = indexed.body as IndexRootResponse;
+    expect(result.processed).toBe(1);
+    expect(result.failedFiles).toEqual([{ relPath: "bad.md", reason: "EMODELFAIL" }]);
+    // 失敗原因不含任何路徑（原始錯誤訊息被丟棄）。
+    expect(JSON.stringify(result.failedFiles)).not.toContain(dir);
+
+    // 好檔照常寫入索引並可搜尋。
+    const found = await api(server.instance, "POST", "/search", { body: { query: NOTE_TOKEN } });
+    expect((found.body as { hits: unknown[] }).hits.length).toBeGreaterThan(0);
+
+    const status = await api(server.instance, "GET", `/roots/${root.id}/index/status`);
+    expect(status.body).toMatchObject({ state: "completed" });
+    const progress = (status.body as { progress: { failed: number; processedChunks: number; estimatedChunks: number } })
+      .progress;
+    expect(progress.failed).toBe(1);
+    expect(progress.processedChunks).toBeGreaterThan(0);
+    expect(progress.estimatedChunks).toBeGreaterThanOrEqual(progress.processedChunks);
   });
 });
 
