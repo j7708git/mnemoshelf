@@ -9,9 +9,11 @@ import {
   cancelIndexWithRetry,
   getIndexStatus,
   IndexPollGate,
+  isIndexAlreadyRunningError,
   startIndex,
   type DirEntry,
   type IndexStatus,
+  type PollBaseline,
   type Root,
 } from "./api";
 import { DirectoryTree } from "./DirectoryTree";
@@ -83,8 +85,21 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
    * 為什麼需要：按下「重新索引」後立刻輪詢時，`POST /index` 可能還沒到伺服器，第一次輪詢會
    * 看到**上一輪**的 `completed`／`failed`／`cancelled`；若據此停止輪詢，新一輪的進度與取消鈕
    * 就會整輪隱藏。`reindex` 以「舊輪的 runSeq」重建這個 gate，只有終態且 runSeq 改變才算本輪結束。
+   *
+   * 初值為 `null` 只用在「沒有要發起新一輪」的讀取（初次載入／外部 `refreshKey`）：此時任何
+   * 終態都直接視為結束、單純顯示一次即可，不需要分辨新舊輪。`reindex` 會在發起新一輪時先換成
+   * `"unknown"`（見 `PollBaseline`：preflight 尚未定案也不誤停），定案後再換成正確 baseline。
+   * 每次 tick 都讀 `pollGateRef.current`，換 gate 立即生效。
    */
   const pollGateRef = useRef<IndexPollGate>(new IndexPollGate(null, POLL_INTERVAL_MS));
+  /**
+   * 「重新索引」的**同步**防重入鎖。
+   *
+   * 為什麼必須同步（在任何 await 之前就檢查並設 true）：`starting` 是 React state，要等下一次
+   * render 才讓按鈕 disabled；快速雙擊的第二次點擊會在 render 之前進到 `reindex`，送出第二份
+   * `POST /index`（被伺服器以 409 拒絕）。以 ref 在入口同步擋下，第二次呼叫直接返回。
+   */
+  const reindexingRef = useRef(false);
   /**
    * 寬限用盡仍沒觀察到本輪（`stalled`）：以可見提示告知使用者，不靜默。
    *
@@ -144,32 +159,49 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
    * 會讓「取消索引」按鈕整輪停用，使用者無法取消剛發起的那一輪。這裡只負責「發出請求＋
    * 建立輪詢門控」，狀態一律由輪詢接手（與 `AddRootFlow.beginIndex` 同一語意）。
    *
-   * 重複點擊防護：`starting` 會持續到輪詢觀察到本輪（`running`）或本輪結束；即使有漏網的
-   * 第二次請求，伺服器對同一 root 的進行中索引仍回 409（既有行為不變）。
+   * 重複點擊防護：入口以同步的 `reindexingRef` 擋下第二次呼叫（見該 ref 的說明），
+   * `starting` 則持續到輪詢觀察到本輪（`running`）或本輪結束。
    */
   const reindex = useCallback(async (): Promise<void> => {
-    setStarting(true);
-    setPollStalled(false);
-    // W1：baseline 必須在發 POST **之前**以一次同步 GET 取得「本輪之前的 runSeq」。
-    // 若沿用 React state 的 `status?.runSeq`，狀態尚未載入時為 null；而 root 可能已有
-    // 舊輪 runSeq=1，gate 會把舊輪終態誤判成本輪結束而停止輪詢（窄窗競態）。
-    // 這個 GET 在 POST 之前完成，順序確定、無競態；失敗時退回 null（等同「無舊輪」）。
-    const baseline = await getIndexStatus(root.id).catch(() => null);
-    pollGateRef.current = new IndexPollGate(baseline?.runSeq ?? null, POLL_INTERVAL_MS);
-    pollingRef.current = true;
-    // 遞增 treeKey 讓輪詢立刻重跑一次（此時 gate 已是正確 baseline），不必等 startIndex 回應。
-    setTreeKey((current) => current + 1);
-    // 不 await：失敗狀態由輪詢顯示；同時解除「請求中」以免按鈕卡住、並停止「期待新輪」。
-    void startIndex(root.id)
-      .then(() => {
-        // 索引結束（完成或取消，伺服器都在跑完後才回應 200）：刷新目錄樹，與原本
-        // 「等整輪跑完後重新載入」的行為一致。
-        setTreeKey((current) => current + 1);
-      })
-      .catch(() => {
-        pollingRef.current = false;
-        setStarting(false);
-      });
+    // 同步防重入（在任何 await 之前）：快速雙擊的第二次呼叫直接返回，不送出第二份 POST。
+    if (reindexingRef.current) return;
+    reindexingRef.current = true;
+    try {
+      setStarting(true);
+      setPollStalled(false);
+      // 先以 "unknown" 建立 gate 並讓輪詢起跑：此刻 preflight 還沒定案，用 "unknown" 模式
+      // （見 `PollBaseline`）才不會因取不到 baseline 而誤停輪詢。
+      pollGateRef.current = new IndexPollGate("unknown", POLL_INTERVAL_MS);
+      pollingRef.current = true;
+      // 遞增 treeKey 讓輪詢立刻重跑一次，不必等 startIndex 回應。
+      setTreeKey((current) => current + 1);
+      // W1：baseline 必須在發 POST **之前**以一次 GET 取得「本輪之前的 runSeq」。
+      // 若沿用 React state 的 `status?.runSeq`，狀態尚未載入時為 null；而 root 可能已有
+      // 舊輪 runSeq=1，gate 會把舊輪終態誤判成本輪結束而停止輪詢（窄窗競態）。
+      // 取不到時**一步**退成 "unknown"（不重試）：本輪真的啟動後會出現 running 或新終態，
+      // unknown 模式據此仍能正確收斂。
+      const baseline: PollBaseline = await getIndexStatus(root.id)
+        .then((snapshot) => snapshot.runSeq ?? null)
+        .catch((): PollBaseline => "unknown");
+      // baseline 定案：以正確值重建 gate（期間輪詢若已跑過，換上新 gate 後即用正確判準）。
+      pollGateRef.current = new IndexPollGate(baseline, POLL_INTERVAL_MS);
+      // 不 await：失敗狀態由輪詢顯示；同時解除「請求中」以免按鈕卡住、並停止「期待新輪」。
+      void startIndex(root.id)
+        .then(() => {
+          // 索引結束（完成或取消，伺服器都在跑完後才回應 200）：刷新目錄樹，與原本
+          // 「等整輪跑完後重新載入」的行為一致。
+          setTreeKey((current) => current + 1);
+        })
+        .catch((error: unknown) => {
+          // 409：單一工作模型下代表「同一 root 已有一輪索引在跑」，不是失敗。輪詢會接手顯示
+          // 實際狀態，因此**不**停止輪詢（把 pollingRef 清掉會讓正在跑的那輪整輪失去更新）。
+          if (isIndexAlreadyRunningError(error)) return;
+          pollingRef.current = false;
+          setStarting(false);
+        });
+    } finally {
+      reindexingRef.current = false;
+    }
   }, [root.id]);
 
   /** 取消進行中的索引；`startIndex` 的 promise 會隨後結束（伺服器回 200），由輪詢接手顯示。 */

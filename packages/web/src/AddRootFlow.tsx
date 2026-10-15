@@ -13,10 +13,12 @@ import {
   cancelIndexWithRetry,
   getIndexStatus,
   IndexPollGate,
+  isIndexAlreadyRunningError,
   previewRoot,
   removeRoot,
   startIndex,
   type IndexStatus,
+  type PollBaseline,
   type Root,
   type RootPreview,
 } from "./api";
@@ -88,13 +90,30 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
   const cancelRequestedRef = useRef(false);
 
   /**
-   * 發起本輪索引**前**取得的 `runSeq`（舊輪的值；新 root 為 null）。
+   * 「開始索引」的**同步**防重入鎖。
    *
-   * 由 `beginIndex` 在發 `POST /index` 之前以一次 `getIndexStatus` 取得（順序確定、無競態）；
-   * 輪詢只在本輪終態（`runSeq` 已改變）時才停止，避免第一次輪詢看到上一輪的終態
-   * 而提早停止（見 `IndexPollGate`）。
+   * 為什麼必須同步（在任何 await 之前就檢查並設 true）：`setStep`／按鈕 disabled 都是
+   * React state，要等下一次 render 才生效；快速雙擊的第二次點擊會在 render 之前就進到
+   * `beginIndex`。若等到 preflight 的 `await` 之後才防護，兩次點擊會各送出一份
+   * `POST /index`，第二份被伺服器以 409 拒絕、其 catch 會把流程誤判成 failed 並停掉輪詢，
+   * 但第一份 job 仍在跑。以 ref 在入口同步擋下，第二次呼叫直接返回，不會送出第二份請求。
    */
-  const pollBaselineRef = useRef<number | null>(null);
+  const indexStartingRef = useRef(false);
+
+  /**
+   * 本輪的輪詢門控（見 `IndexPollGate`）。
+   *
+   * 為什麼是 ref 而非 effect 內的區域變數：`beginIndex` 先同步完成 UI 轉場（進入
+   * `indexing`，輪詢 effect 隨即起跑），此時 preflight（`getIndexStatus`）還沒回來、
+   * baseline 尚未定案。先以 `"unknown"` 模式建立 gate（見 `PollBaseline`：不會因取不到
+   * baseline 而誤停輪詢），preflight 定案後再把整個 gate 換成帶正確 baseline 的新物件。
+   * 輪詢每次 tick 都讀 `pollGateRef.current`，因此換 gate 立即生效。
+   */
+  const pollGateRef = useRef<IndexPollGate>(new IndexPollGate("unknown", POLL_INTERVAL_MS));
+
+  /** 目前的步驟（供非同步回呼在 await 後判斷流程是否仍停在 `indexing`）。 */
+  const stepRef = useRef<Step>("input");
+  stepRef.current = step;
 
   // onDone／onRootCreated 用 ref 取用，避免它們每次 render 改變就重啟輪詢或重跑流程。
   const onDoneRef = useRef(onDone);
@@ -154,23 +173,41 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
 
   const beginIndex = async (): Promise<void> => {
     if (root === null) return;
-    setError(null);
-    setStalled(false);
-    cancelRequestedRef.current = false;
-    setCancelling(false);
-    // W1：baseline 在發 POST **之前**以一次 GET 取得（新 root 為 null，天然正確）；
-    // 若沿用 React state 的 `status?.runSeq`，狀態尚未載入時為 null，而既有 root 可能有
-    // runSeq=1，gate 會把舊輪終態誤判成本輪結束而停止輪詢。此 GET 先於 POST，無競態。
-    const baseline = await getIndexStatus(root.id).catch(() => null);
-    pollBaselineRef.current = baseline?.runSeq ?? null;
-    setStep("indexing");
-    // 不 await：POST /index 會等索引跑完才回應，進度靠輪詢。
-    void startIndex(root.id).catch((indexError: unknown) => {
-      // 使用者主動取消時 POST /index 也會結束（伺服器回 200），不該顯示成失敗。
-      if (cancelRequestedRef.current) return;
-      setError(indexError instanceof Error ? indexError.message : "索引失敗");
-      setStep("failed");
-    });
+    // 同步防重入（在任何 await 之前）：快速雙擊的第二次呼叫直接返回，不送出第二份 POST。
+    if (indexStartingRef.current) return;
+    indexStartingRef.current = true;
+    try {
+      setError(null);
+      setStalled(false);
+      cancelRequestedRef.current = false;
+      setCancelling(false);
+      // 先**同步**完成 UI 轉場：控制項（「開始索引」／「重新索引」／「重試」）立刻消失，
+      // 不給使用者再點的機會；同時讓輪詢 effect 以 "unknown" 模式起跑（baseline 尚未定案）。
+      setStep("indexing");
+      pollGateRef.current = new IndexPollGate("unknown", POLL_INTERVAL_MS);
+      // W1：baseline 在發 POST **之前**以一次 GET 取得（新 root 為 null，天然正確）；
+      // 若沿用 React state 的 `status?.runSeq`，狀態尚未載入時為 null，而既有 root 可能有
+      // runSeq=1，gate 會把舊輪終態誤判成本輪結束而停止輪詢。此 GET 先於 POST，無競態。
+      // 取不到時**一步**退成 "unknown"（不重試）：本輪真的啟動後就會出現 running 或新終態，
+      // unknown 模式據此仍能正確收斂，足以消解這種暫時性失敗（見 `PollBaseline`）。
+      const baseline: PollBaseline = await getIndexStatus(root.id)
+        .then((snapshot) => snapshot.runSeq ?? null)
+        .catch((): PollBaseline => "unknown");
+      // baseline 定案：以正確值重建 gate（若期間輪詢已跑過，換上新 gate 後即用正確判準）。
+      pollGateRef.current = new IndexPollGate(baseline, POLL_INTERVAL_MS);
+      // 不 await：POST /index 會等索引跑完才回應，進度靠輪詢。
+      void startIndex(root.id).catch((indexError: unknown) => {
+        // 使用者主動取消時 POST /index 也會結束（伺服器回 200），不該顯示成失敗。
+        if (cancelRequestedRef.current) return;
+        // 縱深防禦：單一工作模型下 409 代表「同一 root 已有一輪索引在跑」，不是失敗；
+        // 若輪詢門控仍在推進（流程還停在 indexing），把它轉 failed 會誤報、並停掉仍在跑的索引。
+        if (isIndexAlreadyRunningError(indexError) && stepRef.current === "indexing") return;
+        setError(indexError instanceof Error ? indexError.message : "索引失敗");
+        setStep("failed");
+      });
+    } finally {
+      indexStartingRef.current = false;
+    }
   };
 
   /**
@@ -208,15 +245,15 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
   useEffect(() => {
     if (step !== "indexing" || root === null) return;
     let cancelled = false;
-    // 本輪的輪詢判準：baseline 為發起本輪前取得的 runSeq（舊輪的值）；間隔用於換算寬限。
-    const gate = new IndexPollGate(pollBaselineRef.current, POLL_INTERVAL_MS);
 
     const tick = async (): Promise<void> => {
       try {
         const current = await getIndexStatus(root.id);
         if (cancelled) return;
         setStatus(current);
-        const outcome = gate.observe(current);
+        // 每次 tick 都讀 ref：preflight 定案後 `beginIndex` 會換上帶正確 baseline 的新 gate，
+        // 這裡立即生效（不必重啟 effect）。
+        const outcome = pollGateRef.current.observe(current);
         if (outcome.kind === "continue") return;
         if (outcome.kind === "stalled") {
           // 寬限用盡仍沒看到本輪：「可能只是註冊較慢」，不直接當成最終失敗；

@@ -213,10 +213,34 @@ export async function previewRoot(rootId: number): Promise<RootPreview> {
   return (await response.json()) as RootPreview;
 }
 
+/**
+ * 伺服器以非 2xx 狀態碼拒絕請求時丟出；`status` 保留原始 HTTP 狀態碼。
+ *
+ * 為什麼需要結構化錯誤：呼叫端有時要依狀態碼做不同處置，而不是只看訊息文字。
+ * 例如 `POST /index` 的 **409**（單一工作模型下代表「同一 root 已有一輪索引在跑」）
+ * 不是失敗，不該把流程轉成 `failed`（見 `AddRootFlow.beginIndex`）。
+ */
+export class HttpStatusError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "HttpStatusError";
+  }
+}
+
+/** 這個錯誤是否代表「同一 root 已有進行中的索引」（HTTP 409）？ */
+export function isIndexAlreadyRunningError(error: unknown): boolean {
+  return error instanceof HttpStatusError && error.status === 409;
+}
+
 /** 觸發索引。**會等到索引結束才回應**，呼叫端通常不 await 它，改為輪詢狀態。 */
 export async function startIndex(rootId: number): Promise<void> {
   const response = await apiFetch(`/roots/${rootId}/index`, { method: "POST" });
-  if (!response.ok) throw new Error(await readErrorMessage(response, "索引失敗"));
+  if (!response.ok) {
+    throw new HttpStatusError(response.status, await readErrorMessage(response, "索引失敗"));
+  }
 }
 
 /**
@@ -370,6 +394,17 @@ export type PollOutcome =
   | { kind: "stalled" };
 
 /**
+ * 輪詢門控的 baseline：發起本輪索引**之前**的 `runSeq`。
+ *
+ * - `number`：已知舊輪的 `runSeq`。
+ * - `null`：**確定**沒有舊輪（例如剛加入、尚未索引過的新 root；`idle` 的 `runSeq` 本就是 `null`）。
+ * - `"unknown"`：`getIndexStatus` 取不到 baseline（瞬時失敗）。**不可**退化成 `null`：
+ *   若舊輪 `runSeq=1`，`1 !== null` 會讓舊輪的終態被誤判成本輪結束而停止輪詢。此值進入
+ *   「未知 baseline」模式（見 `IndexPollGate`）。
+ */
+export type PollBaseline = number | null | "unknown";
+
+/**
  * 一輪索引的輪詢判準（修「重新索引時第一次輪詢看到上一輪終態而提早停止」的競態）。
  *
  * 問題：發起新一輪索引後立刻輪詢，此時 `POST /index` 可能還沒到伺服器，第一次輪詢會看到
@@ -379,25 +414,55 @@ export type PollOutcome =
  * 用法：發起新一輪前先取得當時的 `runSeq`（舊輪的值）建立此物件，並傳入該流程的輪詢間隔
  * （毫秒）；每次輪詢把結果交給 `observe()`：
  * - `state` 非終態（`idle`／`running`）→ 繼續輪（本輪可能還沒被觀察到）。
- * - 終態且 `runSeq !== baselineRunSeq` → 本輪終止。
- * - 終態且 `runSeq === baselineRunSeq` → 上一輪殘留，繼續輪；累計的殘留時間達
+ * - 終態且 `runSeq !== baseline` → 本輪終止。
+ * - 終態且 `runSeq === baseline` → 上一輪殘留，繼續輪；累計的殘留時間達
  *   `INDEX_POLL_GRACE_MS`（由 `pollIntervalMs` 換算成 tick 數）才回 `stalled`。
+ *
+ * **baseline 為 `"unknown"`（取不到）時**：不採信 `runSeq` 比對（沒有可信的舊值可比起），
+ * 改以「本輪進展」為準：
+ * - 第一次看到的終態先記下（可能是舊輪殘留），**不**據此停止；之後若一直看到**相同**
+ *   `runSeq` 的終態，累計到寬限用盡才回 `stalled`。
+ * - 觀察到 `running`，或看到**不同 `runSeq`** 的終態（代表有一輪新的索引跑起來／跑完），
+ *   即視為本輪已有進展；此後的終態就是本輪終止，回 `terminal`。
+ * 這個模式對「暫時取不到 baseline」已足夠：本輪真的啟動後一定會出現 `running` 或新終態，
+ * 屆時就能正確收斂（見 `AddRootFlow`／`ExplorerPanel` 的 preflight）。
  */
 export class IndexPollGate {
   private staleTicks = 0;
   /** 寬限 tick 數：`INDEX_POLL_GRACE_MS` 除以本流程輪詢間隔後無條件進位（至少 1）。 */
   private readonly graceTicks: number;
+  /** unknown 模式下第一次看到的終態 `runSeq`；用來判斷之後是否出現了「新一輪」的終態。 */
+  private seenTerminalRunSeq: number | null | undefined;
+  /** unknown 模式下是否看過 `running`（有一輪真的在跑 → 其後的終態即本輪終止）。 */
+  private sawRunning = false;
 
   constructor(
-    private readonly baselineRunSeq: number | null,
+    private readonly baseline: PollBaseline,
     pollIntervalMs: number,
   ) {
     this.graceTicks = Math.max(1, Math.ceil(INDEX_POLL_GRACE_MS / Math.max(1, pollIntervalMs)));
   }
 
   observe(status: Pick<IndexStatus, "state" | "runSeq">): PollOutcome {
-    if (!isTerminalIndexState(status.state)) return { kind: "continue" };
-    if (status.runSeq !== this.baselineRunSeq) return { kind: "terminal" };
+    if (!isTerminalIndexState(status.state)) {
+      // 非終態：本輪可能還沒被伺服器接受（idle），或正在跑（running）。繼續輪。
+      if (status.state === "running") this.sawRunning = true;
+      return { kind: "continue" };
+    }
+
+    if (this.baseline === "unknown") {
+      if (this.sawRunning) return { kind: "terminal" };
+      if (this.seenTerminalRunSeq === undefined) {
+        // 第一次看到終態：可能是舊輪殘留，先記下、不據此停止。
+        this.seenTerminalRunSeq = status.runSeq;
+      } else if (status.runSeq !== this.seenTerminalRunSeq) {
+        // 終態的 `runSeq` 變了 → 有一輪新的索引跑完 → 本輪終止。
+        return { kind: "terminal" };
+      }
+    } else if (status.runSeq !== this.baseline) {
+      return { kind: "terminal" };
+    }
+
     this.staleTicks += 1;
     return this.staleTicks >= this.graceTicks ? { kind: "stalled" } : { kind: "continue" };
   }
