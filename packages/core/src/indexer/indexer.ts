@@ -358,7 +358,8 @@ async function processFile(
  *   一律清除——不得因為出現在 skipped 就保留索引（隱私契約：不索引、不回傳）。
  *   內容層跳過（`binary-content`）的檔案仍在 `files` 內（掃描不讀內容，無法事先知道），
  *   因此由 `processFile` 自己清除（見 `purgeChunks`），結果同樣不保留索引。
- * - 可取消（`signal`，於每個檔案開始前與嵌入前檢查）與限併發（`concurrency`，預設 2）。
+ * - 可取消（`signal`：掃描期間於每個目錄／檔案迭代前檢查，worker 池於每個檔案開始前與嵌入前檢查）。
+ *   限併發（`concurrency`，預設 2）。
  * - **單檔失敗不中斷整輪**：`processFile` 的錯誤被記入 `failedFiles`（原因只留短標籤），
  *   其餘檔案照常處理；失敗檔的既有索引資料保留，下一輪重試（成功即自癒）。
  * - 進度：檔案級計數（`processed`／`skippedUnchanged`／`skipped`／`failed`）整輪可對帳
@@ -375,6 +376,8 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
   const concurrency = Math.max(1, Math.floor(options.concurrency ?? 2));
   const scanOptions: ScanOptions = {};
   if (options.maxFileBytes !== undefined) scanOptions.maxFileBytes = options.maxFileBytes;
+  // 把 signal 一路帶進掃描層：大目錄下取消不必等整輪走訪結束（見 ScanOptions.signal）。
+  if (signal !== undefined) scanOptions.signal = signal;
 
   const scan = await walkRoot(root, scanOptions);
   const files = scan.files;

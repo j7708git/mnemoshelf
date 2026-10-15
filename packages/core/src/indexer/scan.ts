@@ -59,6 +59,16 @@ export interface ScanRoot {
 export interface ScanOptions {
   /** 單檔大小上限，預設 `DEFAULT_MAX_FILE_BYTES`（10 MB）。 */
   maxFileBytes?: number;
+  /**
+   * 取消訊號（可選）。走訪期間在**每個目錄與每個檔案項目**迭代前檢查一次，
+   * 中止時拋 `AbortError`（沿用 core 既有的 `throwIfAborted` 慣例）。
+   *
+   * 為什麼要傳進掃描層：`indexRoot` 先 `await walkRoot(...)` 才進入 worker 池的
+   * `throwIfAborted`；大目錄下若不在此處檢查，取消得等整個走訪結束才生效。
+   * 參數可選：另一呼叫端（`previewRoot`，由 server 的 preview 使用）沒有 signal，
+   * 維持不傳，行為不變。
+   */
+  signal?: AbortSignal;
 }
 
 export interface ScanResult {
@@ -311,6 +321,26 @@ function isEisdir(error: unknown): boolean {
 }
 
 /**
+ * 取消檢查（沿用 `@mnemoshelf/core` indexer 的 `throwIfAborted` 慣例）。
+ *
+ * 優先使用 `AbortSignal.throwIfAborted()`；執行環境沒有時退回手動判斷。
+ */
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal === undefined) return;
+  if (typeof signal.throwIfAborted === "function") {
+    signal.throwIfAborted();
+    return;
+  }
+  if (signal.aborted) {
+    const reason = signal.reason;
+    if (reason instanceof Error) throw reason;
+    const error = new Error("掃描已取消");
+    error.name = "AbortError";
+    throw error;
+  }
+}
+
+/**
  * 讀取 root 內的 `.gitignore`；不存在、不可讀，或本身是目錄時回傳 null。
  *
  * `.gitignore` 只是輔助檔，讀不到不該讓整個預覽失敗，因此下列情況一律視為
@@ -362,6 +392,7 @@ async function guardedResolve(guardRoot: Root, abs: string): Promise<GuardOutcom
  */
 export async function walkRoot(root: ScanRoot, options: ScanOptions = {}): Promise<ScanResult> {
   const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
+  const signal = options.signal;
   const rootAbs = path.resolve(root.path);
   const guardRoot: Root = {
     id: 0,
@@ -414,6 +445,8 @@ export async function walkRoot(root: ScanRoot, options: ScanOptions = {}): Promi
   };
 
   const visit = async (absDir: string): Promise<void> => {
+    // 每個目錄進入時檢查一次：大樹下取消才能即時生效，不必等整輪走訪結束。
+    throwIfAborted(signal);
     let entries: Dirent[];
     try {
       entries = await fs.readdir(absDir, { withFileTypes: true });
@@ -425,6 +458,8 @@ export async function walkRoot(root: ScanRoot, options: ScanOptions = {}): Promi
     entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
     for (const entry of entries) {
+      // 每個檔案／子目錄項目迭代前檢查一次（含遞迴進入子目錄前）。
+      throwIfAborted(signal);
       const abs = path.join(absDir, entry.name);
       const rel = toPosix(path.relative(rootAbs, abs));
 

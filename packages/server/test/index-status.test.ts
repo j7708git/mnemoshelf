@@ -24,7 +24,33 @@ describe("IndexStatusTracker", () => {
   it("未開始過的 root 一律回 idle", () => {
     const tracker = new IndexStatusTracker();
     const status = tracker.status(7);
-    expect(status).toMatchObject({ rootId: 7, state: "idle", progress: null, result: null, error: null });
+    expect(status).toMatchObject({ rootId: 7, state: "idle", runSeq: null, progress: null, result: null, error: null });
+  });
+
+  it("runSeq：begin 單調遞增，idle 為 null，clear 後歸零", () => {
+    const tracker = new IndexStatusTracker();
+    expect(tracker.status(9).runSeq).toBeNull();
+
+    tracker.begin(9);
+    expect(tracker.status(9)).toMatchObject({ state: "running", runSeq: 1 });
+
+    tracker.finish(9, { total: 0, processed: 0, skippedUnchanged: 0, removedFiles: 0, skippedFiles: [], failedFiles: [] });
+    // 終態保留該輪序號（client 用它與舊輪值比對）。
+    expect(tracker.status(9)).toMatchObject({ state: "completed", runSeq: 1 });
+
+    tracker.begin(9);
+    expect(tracker.status(9)).toMatchObject({ state: "running", runSeq: 2 });
+    tracker.cancel(9);
+    expect(tracker.status(9)).toMatchObject({ state: "cancelled", runSeq: 2 });
+
+    tracker.begin(9);
+    expect(tracker.status(9).runSeq).toBe(3);
+
+    // clear 後回 idle（runSeq 為 null）；再 begin 從 1 重新起算。
+    tracker.clear(9);
+    expect(tracker.status(9).runSeq).toBeNull();
+    tracker.begin(9);
+    expect(tracker.status(9).runSeq).toBe(1);
   });
 
   it("begin → report → finish：完成狀態帶結果與耗時", () => {

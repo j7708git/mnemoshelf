@@ -22,6 +22,16 @@ export interface IndexErrorInfo {
 export interface IndexStatus {
   rootId: number;
   state: IndexState;
+  /**
+   * 單調遞增的輪次序號：每次 `begin()` 加一；從未開始過（`idle`）為 `null`。
+   *
+   * 用途：client 發起新一輪索引時先快照當時的 `runSeq`（舊輪的值），輪詢中只在
+   * 「終態且 `runSeq` 已改變」時才視為**本輪**結束——否則第一次輪詢可能看到上一輪的
+   * 終態（`POST /index` 還在路上），誤把新輪當成已結束而停止輪詢。
+   *
+   * 行程重啟後記憶體清空，回到 `idle`（`runSeq` 為 `null`），不需要持久化。
+   */
+  runSeq: number | null;
   /** 最近一次進度回報；從未回報時為 null。 */
   progress: IndexProgress | null;
   /** 本次索引開始時間（ISO 8601）；未開始過為 null。 */
@@ -38,6 +48,8 @@ export interface IndexStatus {
 
 interface TrackedEntry {
   state: IndexState;
+  /** 這一輪的序號（見 `IndexStatus.runSeq`）；`begin()` 時在上一輪基礎上加一。 */
+  runSeq: number;
   progress: IndexProgress | null;
   startedAt: string | null;
   startedAtMs: number | null;
@@ -52,6 +64,7 @@ function idleStatus(rootId: number): IndexStatus {
   return {
     rootId,
     state: "idle",
+    runSeq: null,
     progress: null,
     startedAt: null,
     finishedAt: null,
@@ -70,11 +83,12 @@ function idleStatus(rootId: number): IndexStatus {
 export class IndexStatusTracker {
   private readonly entries = new Map<number, TrackedEntry>();
 
-  /** 開始一輪索引：清除上一輪的結果，狀態為 `running`。 */
+  /** 開始一輪索引：清除上一輪的結果，狀態為 `running`；`runSeq` 在上一輪基礎上加一。 */
   begin(rootId: number): void {
     const now = Date.now();
     this.entries.set(rootId, {
       state: "running",
+      runSeq: (this.entries.get(rootId)?.runSeq ?? 0) + 1,
       progress: null,
       startedAt: new Date(now).toISOString(),
       startedAtMs: now,
@@ -142,6 +156,7 @@ export class IndexStatusTracker {
     return {
       rootId,
       state: entry.state,
+      runSeq: entry.runSeq,
       progress: entry.progress === null ? null : { ...entry.progress },
       startedAt: entry.startedAt,
       finishedAt: entry.finishedAt,

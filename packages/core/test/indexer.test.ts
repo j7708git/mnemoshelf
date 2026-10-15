@@ -88,6 +88,27 @@ class AbortingEmbedder extends RecordingEmbedder {
 }
 
 /**
+ * 前 `limit` 次取消檢查放行、之後拋 `AbortError` 的假 signal。
+ *
+ * 讓「掃描階段取消」可穩定重現：`indexRoot` 會把 signal 一路傳進 `walkRoot`，
+ * 走訪途中即中止，不必等整個掃描結束。
+ */
+function abortAfterChecks(limit: number): AbortSignal {
+  let checks = 0;
+  return {
+    aborted: false,
+    throwIfAborted(): void {
+      checks += 1;
+      if (checks > limit) {
+        const error = new Error("索引已取消");
+        error.name = "AbortError";
+        throw error;
+      }
+    },
+  } as unknown as AbortSignal;
+}
+
+/**
  * 對含特定標記的文字整批拋錯的 embedder，用來驗證「單檔失敗不中斷整輪」。
  *
  * 錯誤帶 `code`（模擬 Node 檔案系統錯誤的形狀），驗證 `failedFiles.reason` 會取用 `code`。
@@ -282,6 +303,17 @@ describe("indexRoot", () => {
 
     const rerun = await indexRoot(harness.root, options(harness));
     expect(rerun.processed + rerun.skippedUnchanged).toBe(rerun.total);
+  });
+
+  it("取消：掃描階段中止即以 AbortError 結束，DB 完全未動", async () => {
+    // signal 傳進 walkRoot，走訪途中（worker 池還沒開始）就中止。
+    await expect(
+      indexRoot(harness.root, { ...options(harness), signal: abortAfterChecks(2) }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+
+    // 掃描階段就取消：沒有任何 chunk 或向量被寫入。
+    expect(await harness.store.listRelPaths(harness.root.id)).toEqual([]);
+    expect(await harness.vec.count()).toBe(0);
   });
 
   it("進度數字可對帳：processed + skippedUnchanged === total", async () => {

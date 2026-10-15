@@ -632,17 +632,21 @@ describe("REST：索引取消與壞檔", () => {
     expect(finished.body).toMatchObject({ rootId: root.id, cancelled: true });
 
     const status = await api(server.instance, "GET", `/roots/${root.id}/index/status`);
-    const body = status.body as { state: string; error: unknown };
+    const body = status.body as { state: string; error: unknown; runSeq: number | null };
     expect(body.state).toBe("cancelled");
     expect(body.error).toBeNull();
+    // 被取消的那輪序號為 1（第一次 begin）。
+    expect(body.runSeq).toBe(1);
 
     // 取消後可再索引，且能跑完（已完成的檔案維持一致，未完成的下一輪重做）。
     const again = await api(server.instance, "POST", `/roots/${root.id}/index`);
     expect(again.status).toBe(200);
     const result = again.body as IndexRootResponse;
     expect(result.processed + result.skippedUnchanged).toBe(result.total);
+    // 第二次 begin：runSeq 遞增到 2（client 靠它分辨本輪終態）。
     expect((await api(server.instance, "GET", `/roots/${root.id}/index/status`)).body).toMatchObject({
       state: "completed",
+      runSeq: 2,
     });
   });
 
@@ -655,6 +659,12 @@ describe("REST：索引取消與壞檔", () => {
     const idle = await api(server.instance, "POST", `/roots/${root.id}/index/cancel`);
     expect(idle.status).toBe(404);
     expect(errorName(idle.body)).toBe("NotFoundError");
+
+    // 從未索引過：狀態為 idle 且 runSeq 為 null。
+    expect((await api(server.instance, "GET", `/roots/${root.id}/index/status`)).body).toMatchObject({
+      state: "idle",
+      runSeq: null,
+    });
 
     const unknown = await api(server.instance, "POST", "/roots/987654/index/cancel");
     expect(unknown.status).toBe(404);

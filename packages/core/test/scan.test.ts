@@ -239,4 +239,47 @@ describe("walkRoot", () => {
       expect(file).not.toHaveProperty("content");
     }
   });
+
+  it("已中止的 signal：掃描一開始就拋 AbortError", async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(walkRoot(baseRoot({ path: rootPath }), { signal: controller.signal })).rejects.toMatchObject({
+      name: "AbortError",
+    });
+  });
+
+  it("大樹中途取消：以 AbortError 結束，不留下部分結果（唯讀走訪）", async () => {
+    const big = path.join(base, "big-tree");
+    for (let i = 0; i < 50; i += 1) {
+      const dir = path.join(big, `d${i}`);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, "f.txt"), "x");
+    }
+
+    // 控制組：不帶 signal 可完整走完（證明上面中止的失敗是「取消」，不是掃描本身壞掉）。
+    const full = await walkRoot(baseRoot({ path: big }));
+    expect(full.files).toHaveLength(50);
+
+    // 前 5 次取消檢查放行、之後中止：走訪途中被取消（大樹下不必等整輪結束）。
+    const abortAfterChecks = (limit: number): AbortSignal => {
+      let checks = 0;
+      return {
+        aborted: false,
+        throwIfAborted: (): void => {
+          checks += 1;
+          if (checks > limit) {
+            const error = new Error("掃描已取消");
+            error.name = "AbortError";
+            throw error;
+          }
+        },
+      } as unknown as AbortSignal;
+    };
+
+    await expect(walkRoot(baseRoot({ path: big }), { signal: abortAfterChecks(5) })).rejects.toMatchObject({
+      name: "AbortError",
+    });
+    // 取消不會有副作用：再跑一次完整走訪仍得到全部檔案。
+    expect((await walkRoot(baseRoot({ path: big }))).files).toHaveLength(50);
+  });
 });

@@ -147,6 +147,13 @@ export interface TextPreviewBody {
 export interface IndexStatus {
   rootId: number;
   state: "idle" | "running" | "completed" | "failed" | "cancelled";
+  /**
+   * 單調遞增的輪次序號（伺服器每 `begin()` 加一）；`idle` 為 `null`。
+   *
+   * 用來分辨「本輪的終態」與「上一輪殘留的終態」：`POST /index` 還在路上時，
+   * 第一次輪詢可能看到上一輪的 `completed`／`failed`／`cancelled`（見 `IndexPollGate`）。
+   */
+  runSeq: number | null;
   progress: {
     processed: number;
     total: number;
@@ -215,13 +222,185 @@ export async function startIndex(rootId: number): Promise<void> {
 /**
  * 取消進行中的索引（`POST /roots/:id/index/cancel`）。
  *
- * 沒有進行中的索引時伺服器回 404，這裡不視為錯誤（冪等：目的已達成）；
+ * 回傳值區分兩種情況：
+ * - `"cancelled"`：伺服器回 200，確實中止了一輪進行中的索引。
+ * - `"not-running"`：伺服器回 404，代表**當下**沒有進行中的索引。這不是錯誤
+ *   （冪等語意保留：目的可能已達成），但呼叫端不能就此當成「已取消」——
+ *   `POST /index` 可能還在路上，索引隨後才啟動（見 `cancelIndexWithRetry`）。
+ *
  * 其餘失敗照常丟錯。實際狀態仍以 `getIndexStatus` 為準。
  */
-export async function cancelIndex(rootId: number): Promise<void> {
+export async function cancelIndex(rootId: number): Promise<"cancelled" | "not-running"> {
   const response = await apiFetch(`/roots/${rootId}/index/cancel`, { method: "POST" });
-  if (response.ok || response.status === 404) return;
+  if (response.ok) return "cancelled";
+  if (response.status === 404) return "not-running";
   throw new Error(await readErrorMessage(response, "取消索引失敗"));
+}
+
+/** 取消重試窗口的輪詢間隔（毫秒）。 */
+export const CANCEL_RETRY_INTERVAL_MS = 800;
+/**
+ * 取消重試窗口的輪詢次數上限。
+ *
+ * 為什麼是 10 次 × 800ms ≈ 8 秒：`POST /index` 是**背景觸發**（呼叫端不 await），
+ * 從按下「開始索引」到伺服器真的開始跑通常只差幾十毫秒；8 秒足以涵蓋本機服務的
+ * 正常排程延遲與一次短暫的請求重送，又不會讓「取消中…」的按鈕卡住使用者太久。
+ */
+export const CANCEL_RETRY_MAX_TICKS = 10;
+
+/** 取消請求的結果。 */
+export type CancelRequestOutcome =
+  /** 確實取消了一輪進行中的索引。 */
+  | "cancelled"
+  /** 窗口內沒能取消：任務已在終態，或這輪索引從未成功啟動。 */
+  | "finished";
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 要求取消索引，並處理「取消請求比索引註冊更早到達」的競態。
+ *
+ * 情境：UI 以 `void startIndex(rootId)` 觸發索引後**立即**顯示「取消索引」；使用者按下時，
+ * `POST /index` 可能還沒被伺服器處理，`POST /cancel` 因此回 404（當下沒有進行中的索引），
+ * 但索引隨後就啟動——若把 404 當成「已取消」，取消意圖會**靜默丟失**。
+ *
+ * 修法：404 時進入短重試窗口——每 `CANCEL_RETRY_INTERVAL_MS` 輪詢一次 `getIndexStatus`，
+ * 最多 `CANCEL_RETRY_MAX_TICKS` 次：
+ * - 看到本輪的 `running` → 再呼叫 `cancelIndex`；成功即回 `"cancelled"`。
+ * - 看到**本輪**的終態（`completed`／`failed`／`cancelled`）→ 任務已結束，回 `"finished"`。
+ * - 仍是 `idle`（索引尚未啟動）→ 繼續等，直到窗口結束。
+ *
+ * 「本輪」的判準用 `runSeq`：進入窗口前先取得當時的 `runSeq`（舊輪的值）。若看到的終態
+ * 帶**相同**的 `runSeq`，那是上一輪的殘留（例如重新索引後立刻取消），不是本輪，繼續等。
+ * 窗口用盡仍未觀察到本輪 → 回 `"finished"`（索引從未成功啟動，沒有可取消的對象），
+ * 讓呼叫端離開取消流程、不會卡死。
+ *
+ * **取不到 baseline 的取捨（W4）**：baseline 是判斷「本輪是否已結束」的唯一依據，取得失敗時
+ * **不能**把它當成 `null`——若舊輪 `runSeq=1`，`1 !== null` 會讓舊輪的終態被誤判成本輪結束，
+ * 取消意圖在索引真正啟動前就丟失。這裡先重試一次；仍失敗才進入「未知 baseline」模式：
+ * 不採信 `runSeq` 比對，改以「窗口內終態是否變化」判斷——第一次看到的終態先記下，若後續
+ * 觀察到不同 `runSeq` 的終態（代表有一輪新的索引跑完）才回 `"finished"`；若整個窗口都停在
+ * 同一個終態，視為舊輪殘留、等窗口用盡。代價是「索引在這輪窗口內跑完」時，最壞情況會多等
+ * 到窗口結束才回 `"finished"`（不會誤丟取消意圖，只是慢一點收斂）。
+ */
+export async function cancelIndexWithRetry(rootId: number): Promise<CancelRequestOutcome> {
+  // baseline 先取，失敗重試一次；兩次都失敗才走「未知 baseline」模式。
+  let baselineKnown = false;
+  let baselineRunSeq: number | null = null;
+  for (let attempt = 0; attempt < 2 && !baselineKnown; attempt += 1) {
+    try {
+      baselineRunSeq = (await getIndexStatus(rootId)).runSeq;
+      baselineKnown = true;
+    } catch {
+      // 讀取失敗：再試一次（第二次仍失敗則離開迴圈，`baselineKnown` 保持 false）。
+    }
+  }
+
+  const first = await cancelIndex(rootId);
+  if (first === "cancelled") return "cancelled";
+
+  // 未知 baseline 模式下，記下第一次看到的終態 `runSeq`；它改變才代表本輪真的結束。
+  let seenTerminalRunSeq: number | null | undefined;
+
+  for (let tick = 0; tick < CANCEL_RETRY_MAX_TICKS; tick += 1) {
+    await delay(CANCEL_RETRY_INTERVAL_MS);
+    let status: IndexStatus;
+    try {
+      status = await getIndexStatus(rootId);
+    } catch {
+      // 讀取失敗：窗口內再試一次。
+      continue;
+    }
+    if (status.state === "running") {
+      const again = await cancelIndex(rootId);
+      if (again === "cancelled") return "cancelled";
+      continue;
+    }
+    if (!isTerminalIndexState(status.state)) continue; // idle：本輪可能還沒被伺服器接受。
+
+    if (baselineKnown) {
+      if (status.runSeq !== baselineRunSeq) {
+        // 本輪已結束（完成／失敗／取消）：取消意圖已無作用對象。
+        return "finished";
+      }
+      continue; // 上一輪殘留的終態：繼續等窗口。
+    }
+
+    // 未知 baseline：不採信 `runSeq` 比對，改看「終態是否在窗口內變化」。
+    if (seenTerminalRunSeq === undefined) {
+      seenTerminalRunSeq = status.runSeq;
+      continue; // 第一次看到終態：可能是舊輪殘留，先觀察。
+    }
+    if (status.runSeq !== seenTerminalRunSeq) {
+      // 終態的 `runSeq` 在窗口內改變 → 有一輪新的索引跑完 → 本輪已結束。
+      return "finished";
+    }
+    // 仍是同一個終態：持續觀察，直到窗口用盡。
+  }
+  return "finished";
+}
+
+/** 是否為索引的終態（本輪不會再有變化）。 */
+export function isTerminalIndexState(state: IndexStatus["state"]): boolean {
+  return state === "completed" || state === "failed" || state === "cancelled";
+}
+
+/**
+ * 輪詢停止的寬限**毫秒預算**（見 `IndexPollGate`）。
+ *
+ * 為什麼要有界：若 `POST /index` 根本失敗、或伺服器一直回**上一輪**的終態，輪詢就永遠
+ * 觀察不到本輪而無限輪下去；寬限用盡就停止，讓 UI 收斂（不卡在「索引中」）。
+ *
+ * 為什麼用毫秒而非 tick 數：各流程的輪詢間隔不同（ExplorerPanel 1.5 秒、AddRootFlow
+ * 0.8 秒），同一個「tick 數」在兩邊代表不同長度。改以共同的毫秒預算表達，由
+ * `IndexPollGate` 依各流程傳入的間隔換算成 tick 數，兩邊的實際容忍時間才一致
+ * （12 秒＝1.5 秒 × 8 tick＝0.8 秒 × 15 tick）。
+ */
+export const INDEX_POLL_GRACE_MS = 12000;
+
+/** `IndexPollGate.observe` 的判定結果。 */
+export type PollOutcome =
+  /** 繼續輪詢（本輪還沒結束，或還沒被觀察到）。 */
+  | { kind: "continue" }
+  /** 本輪已終止；`state` 可信。 */
+  | { kind: "terminal" }
+  /** 寬限用盡仍沒看到本輪（POST 失敗或伺服器一直回舊輪終態）：停止輪詢。 */
+  | { kind: "stalled" };
+
+/**
+ * 一輪索引的輪詢判準（修「重新索引時第一次輪詢看到上一輪終態而提早停止」的競態）。
+ *
+ * 問題：發起新一輪索引後立刻輪詢，此時 `POST /index` 可能還沒到伺服器，第一次輪詢會看到
+ * **上一輪**的 `completed`／`failed`／`cancelled`；若據此停止輪詢，新一輪的進度與取消鈕
+ * 就會整輪隱藏。
+ *
+ * 用法：發起新一輪前先取得當時的 `runSeq`（舊輪的值）建立此物件，並傳入該流程的輪詢間隔
+ * （毫秒）；每次輪詢把結果交給 `observe()`：
+ * - `state` 非終態（`idle`／`running`）→ 繼續輪（本輪可能還沒被觀察到）。
+ * - 終態且 `runSeq !== baselineRunSeq` → 本輪終止。
+ * - 終態且 `runSeq === baselineRunSeq` → 上一輪殘留，繼續輪；累計的殘留時間達
+ *   `INDEX_POLL_GRACE_MS`（由 `pollIntervalMs` 換算成 tick 數）才回 `stalled`。
+ */
+export class IndexPollGate {
+  private staleTicks = 0;
+  /** 寬限 tick 數：`INDEX_POLL_GRACE_MS` 除以本流程輪詢間隔後無條件進位（至少 1）。 */
+  private readonly graceTicks: number;
+
+  constructor(
+    private readonly baselineRunSeq: number | null,
+    pollIntervalMs: number,
+  ) {
+    this.graceTicks = Math.max(1, Math.ceil(INDEX_POLL_GRACE_MS / Math.max(1, pollIntervalMs)));
+  }
+
+  observe(status: Pick<IndexStatus, "state" | "runSeq">): PollOutcome {
+    if (!isTerminalIndexState(status.state)) return { kind: "continue" };
+    if (status.runSeq !== this.baselineRunSeq) return { kind: "terminal" };
+    this.staleTicks += 1;
+    return this.staleTicks >= this.graceTicks ? { kind: "stalled" } : { kind: "continue" };
+  }
 }
 
 /** 輪詢索引进度。 */

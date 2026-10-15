@@ -5,7 +5,15 @@
  * 索引进度來自 `GET /roots/:id/index/status` 輪詢。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
-import { cancelIndex, getIndexStatus, startIndex, type DirEntry, type IndexStatus, type Root } from "./api";
+import {
+  cancelIndexWithRetry,
+  getIndexStatus,
+  IndexPollGate,
+  startIndex,
+  type DirEntry,
+  type IndexStatus,
+  type Root,
+} from "./api";
 import { DirectoryTree } from "./DirectoryTree";
 import { FilePreview } from "./FilePreview";
 import { formatBytes } from "./format";
@@ -15,6 +23,9 @@ export interface ExplorerPanelProps {
   /** 由外部遞增以強制重新載入目錄樹（例如索引完成後）。 */
   refreshKey: number;
 }
+
+/** 索引进度輪詢間隔（毫秒）；同時用來把 `INDEX_POLL_GRACE_MS` 換算成寬限 tick 數。 */
+const POLL_INTERVAL_MS = 1500;
 
 /** chunk 級進度的補充說明；掃描階段（預估 0 塊）為空字串。 */
 function chunkNote(status: IndexStatus | null): string {
@@ -51,12 +62,35 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
   const [selectedEntry, setSelectedEntry] = useState<DirEntry | null>(null);
   const [status, setStatus] = useState<IndexStatus | null>(null);
   const [treeKey, setTreeKey] = useState(refreshKey);
+  /** 取消請求進行中（`stopIndex`）：避免重複送出取消；**不**涵蓋整輪索引。 */
   const [busy, setBusy] = useState(false);
+  /**
+   * 已按下「重新索引」、但輪詢還沒觀察到本輪（`running`）或本輪結束。
+   *
+   * 為什麼與 `busy` 分開：`reindex` **不 await** `startIndex`（它要等整輪跑完才回應），
+   * 改由輪詢接手；`starting` 只負責在「請求已送出、本輪尚未被觀察到」的窗口停用
+   * 「重新索引」按鈕、避免重複送出。它**不**鎖「取消索引」——否則又會整輪停用取消鈕。
+   */
+  const [starting, setStarting] = useState(false);
   /**
    * 使用者剛按下「重新索引」：即使第一次輪詢還看到 `idle`（請求還在路上），也要持續輪詢，
    * 否則進度與「取消索引」按鈕不會出現（`startIndex` 要等整輪跑完才回應）。
    */
   const pollingRef = useRef(false);
+  /**
+   * 本輪的輪詢判準（見 `IndexPollGate`）。
+   *
+   * 為什麼需要：按下「重新索引」後立刻輪詢時，`POST /index` 可能還沒到伺服器，第一次輪詢會
+   * 看到**上一輪**的 `completed`／`failed`／`cancelled`；若據此停止輪詢，新一輪的進度與取消鈕
+   * 就會整輪隱藏。`reindex` 以「舊輪的 runSeq」重建這個 gate，只有終態且 runSeq 改變才算本輪結束。
+   */
+  const pollGateRef = useRef<IndexPollGate>(new IndexPollGate(null, POLL_INTERVAL_MS));
+  /**
+   * 寬限用盡仍沒觀察到本輪（`stalled`）：以可見提示告知使用者，不靜默。
+   *
+   * 與 `AddRootFlow` 對稱：兩邊都不把「無法確認索引是否啟動」直接當成失敗，只顯示可恢復提示。
+   */
+  const [pollStalled, setPollStalled] = useState(false);
 
   // 讀取／輪詢索引狀態：running（或剛啟動索引）時每 1.5 秒更新一次，其餘只讀一次。
   useEffect(() => {
@@ -68,11 +102,25 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
         const current = await getIndexStatus(root.id);
         if (cancelled) return;
         setStatus(current);
-        if (current.state === "completed" || current.state === "failed" || current.state === "cancelled") {
+        const outcome = pollGateRef.current.observe(current);
+        if (outcome.kind !== "continue") {
+          // 本輪終止（terminal），或寬限用盡仍未觀察到本輪（stalled）：停止輪詢。
           pollingRef.current = false;
         }
-        if (current.state === "running" || pollingRef.current) {
-          if (timer === undefined) timer = setInterval(() => void tick(), 1500);
+        if (outcome.kind === "stalled") {
+          // 不靜默：以可見提示告知「無法確認本輪是否啟動」，面板維持可操作（可再按「重新索引」）。
+          setPollStalled(true);
+        } else if (outcome.kind === "terminal") {
+          // 確實觀察到本輪終止：清除先前的 stalled 提示。
+          setPollStalled(false);
+        }
+        if (outcome.kind !== "continue" || current.state === "running") {
+          // 已觀察到本輪（running）或本輪已結束：解除「重新索引請求中」的鎖。
+          // 這裡刻意不碰 `busy`——取消請求進行中時，取消鈕要維持停用（見 `stopIndex`）。
+          setStarting(false);
+        }
+        if (outcome.kind === "continue" && (current.state === "running" || pollingRef.current)) {
+          if (timer === undefined) timer = setInterval(() => void tick(), POLL_INTERVAL_MS);
         } else if (timer !== undefined) {
           clearInterval(timer);
           timer = undefined;
@@ -89,27 +137,47 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
     };
   }, [root.id, refreshKey, treeKey]);
 
+  /**
+   * 觸發一輪重新索引。
+   *
+   * **不 await `startIndex`**：`POST /index` 會等整輪索引跑完才回應；若在等待期間持鎖，
+   * 會讓「取消索引」按鈕整輪停用，使用者無法取消剛發起的那一輪。這裡只負責「發出請求＋
+   * 建立輪詢門控」，狀態一律由輪詢接手（與 `AddRootFlow.beginIndex` 同一語意）。
+   *
+   * 重複點擊防護：`starting` 會持續到輪詢觀察到本輪（`running`）或本輪結束；即使有漏網的
+   * 第二次請求，伺服器對同一 root 的進行中索引仍回 409（既有行為不變）。
+   */
   const reindex = useCallback(async (): Promise<void> => {
-    setBusy(true);
+    setStarting(true);
+    setPollStalled(false);
+    // W1：baseline 必須在發 POST **之前**以一次同步 GET 取得「本輪之前的 runSeq」。
+    // 若沿用 React state 的 `status?.runSeq`，狀態尚未載入時為 null；而 root 可能已有
+    // 舊輪 runSeq=1，gate 會把舊輪終態誤判成本輪結束而停止輪詢（窄窗競態）。
+    // 這個 GET 在 POST 之前完成，順序確定、無競態；失敗時退回 null（等同「無舊輪」）。
+    const baseline = await getIndexStatus(root.id).catch(() => null);
+    pollGateRef.current = new IndexPollGate(baseline?.runSeq ?? null, POLL_INTERVAL_MS);
     pollingRef.current = true;
-    // 遞增 treeKey 讓輪詢立刻重跑一次，不必等 startIndex 回應。
+    // 遞增 treeKey 讓輪詢立刻重跑一次（此時 gate 已是正確 baseline），不必等 startIndex 回應。
     setTreeKey((current) => current + 1);
-    try {
-      await startIndex(root.id);
-      setTreeKey((current) => current + 1);
-      setStatus(await getIndexStatus(root.id));
-    } catch {
-      // 失敗狀態由輪詢顯示；這裡不重複報錯。
-    } finally {
-      setBusy(false);
-    }
+    // 不 await：失敗狀態由輪詢顯示；同時解除「請求中」以免按鈕卡住、並停止「期待新輪」。
+    void startIndex(root.id)
+      .then(() => {
+        // 索引結束（完成或取消，伺服器都在跑完後才回應 200）：刷新目錄樹，與原本
+        // 「等整輪跑完後重新載入」的行為一致。
+        setTreeKey((current) => current + 1);
+      })
+      .catch(() => {
+        pollingRef.current = false;
+        setStarting(false);
+      });
   }, [root.id]);
 
   /** 取消進行中的索引；`startIndex` 的 promise 會隨後結束（伺服器回 200），由輪詢接手顯示。 */
   const stopIndex = useCallback(async (): Promise<void> => {
     setBusy(true);
     try {
-      await cancelIndex(root.id);
+      // 走重試窗口版本：與 AddRootFlow 共用同一套「404 不當成已取消」的語意。
+      await cancelIndexWithRetry(root.id);
     } catch {
       // 取消失敗（例如連線中斷）：輪詢會在下一次 tick 反映實際狀態。
     } finally {
@@ -143,7 +211,7 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
             <button
               type="button"
               onClick={() => void reindex()}
-              disabled={busy || running}
+              disabled={busy || starting || running}
               className="rounded-md border border-line px-3 py-1.5 text-sm text-ink disabled:opacity-40"
             >
               {running ? "索引中…" : "重新索引"}
@@ -151,6 +219,12 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
           </div>
         )}
       </div>
+
+      {pollStalled && (
+        <p role="status" className="text-xs text-amber-700">
+          無法確認本輪索引是否啟動（上方顯示的可能是上一輪結果），請稍後再試或再按「重新索引」。
+        </p>
+      )}
 
       <div className="grid min-h-0 gap-4 lg:grid-cols-2">
         <div className="h-[60vh] min-h-0">

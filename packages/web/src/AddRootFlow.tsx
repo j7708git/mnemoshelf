@@ -10,8 +10,9 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import {
   addRoot,
-  cancelIndex,
+  cancelIndexWithRetry,
   getIndexStatus,
+  IndexPollGate,
   previewRoot,
   removeRoot,
   startIndex,
@@ -35,6 +36,9 @@ export interface AddRootFlowProps {
 }
 
 type Step = "input" | "preview" | "preview-failed" | "indexing" | "cancelled" | "done" | "failed";
+
+/** 索引中輪詢間隔（毫秒）；同時用來把 `INDEX_POLL_GRACE_MS` 換算成寬限 tick 數。 */
+const POLL_INTERVAL_MS = 800;
 
 /** 被跳過的原因 → 中文標籤。 */
 const SKIP_REASON_LABEL: Record<string, string> = {
@@ -72,10 +76,25 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  /**
+   * 寬限用盡仍沒觀察到本輪（`stalled`）：只顯示可恢復提示，不當成最終失敗。
+   *
+   * 因為這可能只是「索引註冊較慢」，並非真的失敗；`failed` 步驟據此改顯示提示而非「索引失敗」。
+   */
+  const [stalled, setStalled] = useState(false);
 
   // 使用者是否按過「取消索引」。`POST /index` 會在中止後才回應，這個旗標讓它的
   // rejection／回應不被誤判成「索引失敗」。
   const cancelRequestedRef = useRef(false);
+
+  /**
+   * 發起本輪索引**前**取得的 `runSeq`（舊輪的值；新 root 為 null）。
+   *
+   * 由 `beginIndex` 在發 `POST /index` 之前以一次 `getIndexStatus` 取得（順序確定、無競態）；
+   * 輪詢只在本輪終態（`runSeq` 已改變）時才停止，避免第一次輪詢看到上一輪的終態
+   * 而提早停止（見 `IndexPollGate`）。
+   */
+  const pollBaselineRef = useRef<number | null>(null);
 
   // onDone／onRootCreated 用 ref 取用，避免它們每次 render 改變就重啟輪詢或重跑流程。
   const onDoneRef = useRef(onDone);
@@ -133,11 +152,17 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
     onCancel();
   };
 
-  const beginIndex = (): void => {
+  const beginIndex = async (): Promise<void> => {
     if (root === null) return;
     setError(null);
+    setStalled(false);
     cancelRequestedRef.current = false;
     setCancelling(false);
+    // W1：baseline 在發 POST **之前**以一次 GET 取得（新 root 為 null，天然正確）；
+    // 若沿用 React state 的 `status?.runSeq`，狀態尚未載入時為 null，而既有 root 可能有
+    // runSeq=1，gate 會把舊輪終態誤判成本輪結束而停止輪詢。此 GET 先於 POST，無競態。
+    const baseline = await getIndexStatus(root.id).catch(() => null);
+    pollBaselineRef.current = baseline?.runSeq ?? null;
     setStep("indexing");
     // 不 await：POST /index 會等索引跑完才回應，進度靠輪詢。
     void startIndex(root.id).catch((indexError: unknown) => {
@@ -148,13 +173,28 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
     });
   };
 
-  /** 要求取消進行中的索引；狀態改由輪詢接手（`state: "cancelled"`）。 */
+  /**
+   * 要求取消進行中的索引。
+   *
+   * 伺服器回 404（取消請求比索引註冊更早到達）**不當成已取消**，改走短重試窗口
+   * （見 `cancelIndexWithRetry`）；窗口期間維持「取消中…」。窗口結束後重讀狀態：
+   * 若這輪索引從未啟動（仍是 idle），回到可重試畫面，不讓 UI 卡在「索引中」；
+   * 若已在終態，則由輪詢接手切換步驟。
+   */
   const requestCancel = async (): Promise<void> => {
     if (root === null || cancelling) return;
     cancelRequestedRef.current = true;
     setCancelling(true);
     try {
-      await cancelIndex(root.id);
+      const outcome = await cancelIndexWithRetry(root.id);
+      const current = await getIndexStatus(root.id);
+      setStatus(current);
+      if (outcome === "finished" && current.state === "idle") {
+        // 窗口內都沒觀察到本輪：POST 從未成功啟動，沒有可取消的對象。
+        cancelRequestedRef.current = false;
+        setError("索引沒有開始（可能是請求失敗），請重試。");
+        setStep("failed");
+      }
     } catch (cancelError) {
       // 取消失敗（例如連線中斷）：回到可重試的索引中畫面，讓輪詢繼續。
       cancelRequestedRef.current = false;
@@ -164,16 +204,28 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
     }
   };
 
-  // 索引中：每 800ms 輪詢一次狀態，直到 completed／failed／cancelled。
+  // 索引中：每 POLL_INTERVAL_MS 輪詢一次狀態，直到**本輪**到達終態（見 IndexPollGate）。
   useEffect(() => {
     if (step !== "indexing" || root === null) return;
     let cancelled = false;
+    // 本輪的輪詢判準：baseline 為發起本輪前取得的 runSeq（舊輪的值）；間隔用於換算寬限。
+    const gate = new IndexPollGate(pollBaselineRef.current, POLL_INTERVAL_MS);
 
     const tick = async (): Promise<void> => {
       try {
         const current = await getIndexStatus(root.id);
         if (cancelled) return;
         setStatus(current);
+        const outcome = gate.observe(current);
+        if (outcome.kind === "continue") return;
+        if (outcome.kind === "stalled") {
+          // 寬限用盡仍沒看到本輪：「可能只是註冊較慢」，不直接當成最終失敗；
+          // 以可恢復措辭呈現（`stalled` 讓 `failed` 步驟改顯示提示而非「索引失敗」）。
+          setStalled(true);
+          setError("尚未偵測到索引啟動，可能是註冊較慢或請求失敗；請按「重試」再試一次。");
+          setStep("failed");
+          return;
+        }
         if (current.state === "completed") {
           setStep("done");
           onDoneRef.current(root);
@@ -192,7 +244,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
     };
 
     void tick();
-    const timer = setInterval(() => void tick(), 800);
+    const timer = setInterval(() => void tick(), POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
       clearInterval(timer);
@@ -288,7 +340,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
           <div className="flex gap-2">
             <button
               type="button"
-              onClick={beginIndex}
+              onClick={() => void beginIndex()}
               disabled={preview.totalFiles === 0}
               className="rounded-md bg-ink px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
             >
@@ -359,7 +411,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
             {root !== null && (
               <button
                 type="button"
-                onClick={beginIndex}
+                onClick={() => void beginIndex()}
                 className="rounded-md bg-ink px-3 py-2 text-sm font-medium text-white"
               >
                 重新索引
@@ -382,13 +434,20 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
 
       {step === "failed" && (
         <div className="space-y-3">
-          <p role="alert" className="text-sm text-red-600">
-            索引失敗：{error ?? "未知錯誤"}
-          </p>
+          {stalled ? (
+            // stalled：可能只是註冊較慢，不當成最終失敗；用可恢復措辭（與 ExplorerPanel 對稱）。
+            <p role="status" className="text-sm text-amber-700">
+              {error ?? "尚未偵測到索引啟動，請按「重試」再試一次。"}
+            </p>
+          ) : (
+            <p role="alert" className="text-sm text-red-600">
+              索引失敗：{error ?? "未知錯誤"}
+            </p>
+          )}
           {root !== null && (
             <button
               type="button"
-              onClick={beginIndex}
+              onClick={() => void beginIndex()}
               className="rounded-md border border-line px-3 py-2 text-sm text-ink"
             >
               重試
