@@ -2,7 +2,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { classifyFile, matchesAnyGlob, matchesGlob, mimeTypeFor, walkRoot, type ScanRoot } from "../src/index.js";
+import { classifyFile, isJunkFile, matchesAnyGlob, matchesGlob, mimeTypeFor, walkRoot, type ScanRoot } from "../src/index.js";
 
 function baseRoot(overrides: Partial<ScanRoot> = {}): ScanRoot {
   return {
@@ -69,6 +69,36 @@ describe("classifyFile 與 mimeTypeFor", () => {
   });
 });
 
+describe("系統／垃圾檔排除", () => {
+  it("classifyFile 把系統／垃圾檔歸為 binary", () => {
+    expect(classifyFile(".DS_Store")).toBe("binary");
+    expect(classifyFile(".localized")).toBe("binary");
+    expect(classifyFile("._notes.md")).toBe("binary");
+    expect(classifyFile("Thumbs.db")).toBe("binary");
+    expect(classifyFile("desktop.ini")).toBe("binary");
+    expect(classifyFile(".Spotlight-V100")).toBe("binary");
+    expect(classifyFile(".Trashes")).toBe("binary");
+    expect(classifyFile("x.crdownload")).toBe("binary");
+    expect(classifyFile("x.part")).toBe("binary");
+    expect(classifyFile("x.partial")).toBe("binary");
+    expect(classifyFile("X.DOWNLOAD")).toBe("binary");
+  });
+
+  it("只有命中的檔名被排除，一般檔案不受影響", () => {
+    expect(classifyFile("notes")).toBe("text");
+    expect(classifyFile("a.ini")).toBe("text"); // desktop.ini 是具名例外，不是整個 .ini
+    expect(classifyFile("a.db.txt")).toBe("text");
+    expect(classifyFile("report.downloads")).toBe("text");
+    expect(classifyFile("my.part.notes")).toBe("text");
+  });
+
+  it("isJunkFile 只看 basename", () => {
+    expect(isJunkFile("notes/.DS_Store")).toBe(true);
+    expect(isJunkFile("notes/sub/desktop.ini")).toBe(true);
+    expect(isJunkFile("notes/readme.md")).toBe(false);
+  });
+});
+
 describe("walkRoot", () => {
   let base = "";
   let rootPath = "";
@@ -89,6 +119,14 @@ describe("walkRoot", () => {
     await fs.writeFile(path.join(rootPath, "secret", "hidden.md"), "# 機密");
     await fs.writeFile(path.join(rootPath, "big.txt"), "x".repeat(5000));
     await fs.writeFile(path.join(rootPath, ".gitignore"), "*.log\n");
+
+    // 系統／垃圾檔（應一律以 unsupported-type 跳過）
+    await fs.writeFile(path.join(rootPath, ".DS_Store"), Buffer.from([0x00, 0x01, 0x02, 0x03]));
+    await fs.writeFile(path.join(rootPath, "._notes.md"), "AppleDouble 中繼資料");
+    await fs.writeFile(path.join(rootPath, "Thumbs.db"), Buffer.from([0x00, 0x00, 0x01]));
+    await fs.writeFile(path.join(rootPath, "desktop.ini"), "[.ShellClassInfo]\n");
+    await fs.writeFile(path.join(rootPath, "download.crdownload"), "下載到一半");
+    await fs.writeFile(path.join(rootPath, "notes", "draft.part"), "下載到一半");
 
     const outside = path.join(base, "outside.txt");
     await fs.writeFile(outside, "outside");
@@ -176,6 +214,22 @@ describe("walkRoot", () => {
     expect(entry?.kind).toBe("text");
     // absPath 指向解析後的真實檔案
     expect(entry?.absPath).toBe(await fs.realpath(path.join(rootPath, "notes", "a.md")));
+  });
+
+  it("系統／垃圾檔記為 unsupported-type，不出現在 files", async () => {
+    const result = await walkRoot(baseRoot({ path: rootPath, respectGitignore: false }));
+    const junk = [
+      ".DS_Store",
+      "._notes.md",
+      "Thumbs.db",
+      "desktop.ini",
+      "download.crdownload",
+      "notes/draft.part",
+    ];
+    for (const rel of junk) {
+      expect(result.skipped).toContainEqual({ relPath: rel, reason: "unsupported-type" });
+      expect(rels(result.files)).not.toContain(rel);
+    }
   });
 
   it("掃描結果不含任何檔案內容", async () => {

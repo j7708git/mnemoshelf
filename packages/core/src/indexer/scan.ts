@@ -12,7 +12,11 @@ export const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
 
 /**
  * 跳過的原因。除了任務卡明列的 `blocked`／`excluded`／`modality-off`／`too-large`／
- * `unresolved-symlink`，另補三個由本實作決定的具名原因（見下方各處註解）。
+ * `unresolved-symlink`，另補四個由本實作決定的具名原因（見下方各處註解）：
+ * `symlink-dir`、`unsupported-type`（含系統／垃圾檔）、`binary-content`、`not-a-file`。
+ *
+ * `binary-content` 不由掃描產生：掃描**只列舉、不讀內容**，因此它是在索引階段
+ * （`indexer.processFile`）讀入後才判定的（見 `docs/roots-and-privacy.md` 的兩道防線）。
  */
 export type SkipReason =
   | "blocked"
@@ -22,6 +26,7 @@ export type SkipReason =
   | "unresolved-symlink"
   | "symlink-dir"
   | "unsupported-type"
+  | "binary-content"
   | "not-a-file";
 
 /** 一個會納入索引的檔案（不含內容）。 */
@@ -210,6 +215,40 @@ const BINARY_EXTS = new Set([
   ".eot",
 ]);
 
+/**
+ * 系統／垃圾檔的**檔名**（一律小寫，比對時用 basename）：一律不索引。
+ *
+ * 這些不是機密（機密走 `roots/blacklist.ts` 的 `blocked`），而是沒有檢索價值的
+ * 系統中繼資料；把它們當文字嵌入只會產生亂碼搜尋結果（例如 `.DS_Store`）。
+ */
+const JUNK_FILENAMES = new Set([
+  ".ds_store",
+  ".localized",
+  ".spotlight-v100",
+  ".trashes",
+  "thumbs.db",
+  "desktop.ini",
+]);
+
+/** 未完成下載的**副檔名**（一律小寫）：內容還不完整，跳過。 */
+const JUNK_EXTS = new Set([".crdownload", ".part", ".partial", ".download"]);
+
+/** AppleDouble 前綴（macOS 在非 HFS 卷上產生的中繼資料檔，例如 `._photo.jpg`）。 */
+const APPLEDOUBLE_PREFIX = "._";
+
+/**
+ * 是否為系統／垃圾檔（檔名或副檔名層；**不讀內容**）。
+ *
+ * 這是第一道防線，供 `classifyFile` 使用；第二道是索引階段的前段內容偵測
+ * （`indexer.looksBinary`），用來接住未來才出現、還沒列進清單的格式。
+ */
+export function isJunkFile(fileName: string): boolean {
+  const lower = path.basename(fileName).toLowerCase();
+  if (JUNK_FILENAMES.has(lower)) return true;
+  if (lower.startsWith(APPLEDOUBLE_PREFIX)) return true;
+  return JUNK_EXTS.has(path.extname(lower));
+}
+
 const IMAGE_MIME: Record<string, string> = {
   ".png": "image/png",
   ".jpg": "image/jpeg",
@@ -224,9 +263,15 @@ const IMAGE_MIME: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
-/** 由檔名推導種類；未知副檔名一律當文字（契約未明定，由本實作決定，見回報）。 */
+/**
+ * 由檔名推導種類；未知副檔名一律當文字（契約未明定，由本實作決定，見回報）。
+ *
+ * 系統／垃圾檔（`isJunkFile`）一律回 `binary`：呼叫端沿用既有的
+ * `skipped: "unsupported-type"` 路徑，預覽與索引的行為因此一致。
+ */
 export function classifyFile(fileName: string): ChunkKind | "binary" {
   const lower = fileName.toLowerCase();
+  if (isJunkFile(lower)) return "binary";
   const ext = path.extname(lower);
   if (IMAGE_EXTS.has(ext)) return "image";
   if (AUDIO_EXTS.has(ext)) return "audio";

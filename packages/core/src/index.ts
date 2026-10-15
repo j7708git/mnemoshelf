@@ -86,6 +86,8 @@ export {
 export {
   hashBytes,
   indexRoot,
+  looksBinary,
+  BINARY_SNIFF_BYTES,
   type IndexProgress,
   type IndexRootOptions,
   type IndexRootResult,
@@ -100,6 +102,7 @@ export {
 export {
   classifyFile,
   DEFAULT_MAX_FILE_BYTES,
+  isJunkFile,
   mimeTypeFor,
   walkRoot,
   type ScanEntry,

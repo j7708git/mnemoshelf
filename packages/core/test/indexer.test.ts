@@ -3,7 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  BINARY_SNIFF_BYTES,
   indexRoot,
+  looksBinary,
   openDatabase,
   RootNotIndexableError,
   SqliteMetadataStore,
@@ -408,6 +410,122 @@ describe("indexRoot", () => {
       expect(await harness.store.listChunksByPath(harness.root.id, "a.md")).toHaveLength(1);
     } finally {
       await fs.rm(outsideDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("內容層二進位偵測（binary-content）", () => {
+  /** 假的二進位內容：像 `.parquet`／`.h5` 之類未列進 BINARY_EXTS 的格式（含 NUL 位元組）。 */
+  const nulBytes = (): Buffer => Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00, 0x08, 0x00, 0xff, 0xfe]);
+
+  it("looksBinary：NUL／高比例不可印字元判為二進位，正常文字不誤判", () => {
+    expect(looksBinary(new Uint8Array(0))).toBe(false);
+    expect(looksBinary(Buffer.from("# 標題\n\n第一行\t縮排\r\n"))).toBe(false);
+    expect(looksBinary(Buffer.from("中文內容 emoji 🙂\n"))).toBe(false);
+    expect(looksBinary(Buffer.from([0x00]))).toBe(true);
+    expect(looksBinary(nulBytes())).toBe(true);
+    // 沒有 NUL 位元組，但幾乎全是非法 UTF-8 位元組（解碼後為 U+FFFD）
+    expect(looksBinary(Buffer.from(Array.from({ length: 200 }, () => 0x80)))).toBe(true);
+  });
+
+  it("前段剛好切在半個中文字中間時不誤判（8 KB 邊界）", () => {
+    const bytes = Buffer.from("中文內容測試。\n".repeat(1200), "utf8");
+    expect(bytes.length).toBeGreaterThan(BINARY_SNIFF_BYTES);
+    expect(looksBinary(bytes.subarray(0, BINARY_SNIFF_BYTES))).toBe(false);
+  });
+
+  it("含 NUL 的 text 檔被跳過：不切塊、不嵌入，其餘檔案照常索引", async () => {
+    const h = await makeHarness({ "ok.md": "# 標題\n\n正常內容", "fake.md": nulBytes() });
+    try {
+      const result = await indexRoot(h.root, options(h));
+      expect(result).toMatchObject({ total: 2, processed: 1, skippedUnchanged: 0 });
+      expect(result.skippedFiles).toEqual([{ relPath: "fake.md", reason: "binary-content" }]);
+      expect(await h.store.listChunksByPath(h.root.id, "fake.md")).toEqual([]);
+      expect(await h.embedder.batchSizes).toEqual([1]); // 只有 ok.md 被嵌入
+      expect(await h.store.listChunksByPath(h.root.id, "ok.md")).toHaveLength(1);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("改為二進位後，先前索引的 chunk 與向量被清除", async () => {
+    const h = await makeHarness({ "a.md": "# 標題\n\n第一份文件" });
+    try {
+      await indexRoot(h.root, options(h));
+      expect(await h.vec.count()).toBe(1);
+      const stale = (await h.store.listChunksByPath(h.root.id, "a.md")).map((chunk) => `c:${chunk.id}`);
+
+      await fs.writeFile(path.join(h.dir, "a.md"), nulBytes());
+      const result = await indexRoot(h.root, options(h));
+
+      expect(result).toMatchObject({ total: 1, processed: 0, skippedUnchanged: 0 });
+      expect(result.skippedFiles).toEqual([{ relPath: "a.md", reason: "binary-content" }]);
+      expect(await h.store.listChunksByPath(h.root.id, "a.md")).toEqual([]);
+      expect(await h.vec.count()).toBe(0);
+      expect([...(await h.vec.existingKeys(stale))]).toEqual([]);
+      expect(await h.store.searchKeyword("標題", {}, 10)).toEqual([]);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("進度對帳：processed + skippedUnchanged + skipped === total", async () => {
+    const h = await makeHarness({ "ok.md": "# 標題\n\n正常", "fake.md": nulBytes() });
+    try {
+      const progress: { processed: number; total: number; skippedUnchanged: number; skipped: number }[] = [];
+      const result = await indexRoot(h.root, {
+        ...options(h),
+        concurrency: 1,
+        onProgress: (p) => progress.push({ ...p }),
+      });
+      expect(progress).toHaveLength(2);
+      const last = progress.at(-1)!;
+      expect(last.skipped).toBe(1);
+      expect(last.processed + last.skippedUnchanged + last.skipped).toBe(last.total);
+      expect(last.processed + last.skippedUnchanged + result.skippedFiles.length).toBe(result.total);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("既有索引的系統檔資料：重新索引後舊 chunk 與向量被清除（.DS_Store 舊資料）", async () => {
+    const h = await makeHarness({ ".DS_Store": Buffer.from([0x00, 0x01]), "ok.md": "# 標題\n\n內容" });
+    try {
+      // 模擬舊版留下的壞資料：.DS_Store 曾被當文字索引（含 chunk 與向量）。
+      const legacy = await h.store.replaceChunks(h.root.id, ".DS_Store", [
+        { seq: 0, kind: "text", text: "亂碼內容", contentHash: "deadbeef" },
+      ]);
+      await h.vec.upsert([
+        {
+          key: `c:${legacy[0]!.id}`,
+          rootId: h.root.id,
+          embedderId: h.embedder.info.id,
+          vec: await h.embedder.embedQuery("亂碼內容"),
+        },
+      ]);
+      expect(await h.store.searchKeyword("亂碼", {}, 10)).toHaveLength(1);
+
+      const result = await indexRoot(h.root, options(h));
+      expect(result).toMatchObject({ total: 1, processed: 1, removedFiles: 1 });
+      expect(await h.store.listRelPaths(h.root.id)).toEqual(["ok.md"]);
+      expect(await h.store.searchKeyword("亂碼", {}, 10)).toEqual([]);
+      expect(await h.vec.count()).toBe(1); // 只剩 ok.md
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("正常中文多行文件不誤判（對照組）", async () => {
+    const h = await makeHarness({
+      "long.md": `# 標題\n\n${"中文內容測試。\n".repeat(1200)}`,
+      "multi.md": "# 標題\n\n第一行\n第二行\n\t縮排\n",
+    });
+    try {
+      const result = await indexRoot(h.root, options(h));
+      expect(result).toMatchObject({ total: 2, processed: 2 });
+      expect(result.skippedFiles).toEqual([]);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
     }
   });
 });

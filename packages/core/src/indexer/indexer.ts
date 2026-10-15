@@ -21,6 +21,14 @@ export interface IndexProgress {
   total: number;
   /** 因內容未變更、且向量齊全而整檔跳過的檔案數。 */
   skippedUnchanged: number;
+  /**
+   * 本次已判定跳過（不含 `skippedUnchanged`）的檔案數，對應結果的 `skippedFiles.length`。
+   *
+   * 來源有兩類：讀取前守衛再檢查失敗（`unresolved-symlink`／`blocked`），
+   * 以及內容層二進位偵測（`binary-content`）。
+   * 對帳語意：整輪跑完時 `processed + skippedUnchanged + skipped === total`。
+   */
+  skipped: number;
 }
 
 export interface IndexRootOptions {
@@ -42,10 +50,57 @@ export interface IndexRootResult {
   /** 從磁碟消失、或不再納入而清除資料的檔案數。 */
   removedFiles: number;
   /**
-   * 掃描時納入、但**讀取前守衛再檢查**失敗（例如掃描後路徑被換成 root 外 symlink）而跳過的檔案。
+   * 掃描時納入、但**讀取前守衛再檢查**失敗（例如掃描後路徑被換成 root 外 symlink），
+   * 或**內容層判定為二進位**（`binary-content`）而跳過的檔案。
    * 正常情況為空；計數上 `processed + skippedUnchanged + skippedFiles.length === total`。
    */
   skippedFiles: SkippedEntry[];
+}
+
+/** 內容層二進位偵測只看檔案前段這麼多 bytes（成本固定、與檔案大小無關）。 */
+export const BINARY_SNIFF_BYTES = 8 * 1024;
+
+/**
+ * 前段內容中「不可印字元」的比例上限，超過即視為二進位。
+ *
+ * 計數方式：把前段解碼為 UTF-8 後逐 code point 檢查，計入
+ * - C0／C1 控制字元（**保留 tab、LF、CR**——純文字檔的合法空白與換行）；
+ * - DEL（U+007F）；
+ * - U+FFFD（UTF-8 解碼失敗的替代字元，代表位元組不是合法 UTF-8）。
+ *
+ * 門檻 10% 是自訂值：正常文字（中文、emoji、程式碼）幾乎為 0；二進位檔即使沒有
+ * NUL 位元組，解碼後也常出現大量 U+FFFD 或控制字元。先做 NUL 位元組快篩
+ * （二進位格式幾乎必備），再用比例把關，兩者都不需要讀完整個檔案。
+ */
+const BINARY_MAX_NON_PRINTABLE_RATIO = 0.1;
+
+/**
+ * 前段內容看起來像二進位嗎？（副檔名說是文字／程式碼時的第二道防線）
+ *
+ * 為什麼需要：`classifyFile` 對未知副檔名一律回 `text`，所以 `.h5`／`.parquet`／
+ * `.dng` 或沒有副檔名的系統檔會被當文字硬讀、切成上千塊嵌入（成本爆炸且無意義）。
+ * 這裡在讀入後立刻放棄，不切塊、不嵌入。
+ *
+ * 已知限制：只看前 `BINARY_SNIFF_BYTES`（8 KB），NUL 位元組出現在更後面、
+ * 或前段剛好全是可印字元的二進位檔不會被擋下（此時仍由副檔名層負責）。
+ */
+export function looksBinary(head: Uint8Array): boolean {
+  if (head.includes(0)) return true;
+
+  // `stream: true`：前段剛好切在半個多位元組字元中間時，尾端的不完整序列會被保留，
+  // 不會變成 U+FFFD（否則正常的中文檔會因為 8 KB 邊界而誤判）。
+  const text = new TextDecoder("utf-8", { fatal: false }).decode(head, { stream: true });
+
+  let codePoints = 0;
+  let nonPrintable = 0;
+  for (const char of text) {
+    codePoints += 1;
+    const code = char.codePointAt(0) ?? 0;
+    if (code === 0x09 || code === 0x0a || code === 0x0d) continue; // tab / LF / CR
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f) || code === 0xfffd) nonPrintable += 1;
+  }
+  if (codePoints === 0) return false;
+  return nonPrintable / codePoints > BINARY_MAX_NON_PRINTABLE_RATIO;
 }
 
 /** 檔案位元組的 sha256（十六進位）。做為增量比對的檔案級內容 hash。 */
@@ -148,17 +203,33 @@ async function revalidateReadPath(
 }
 
 /**
+ * 移除某個檔案既有的 chunk 與向量（先刪向量再刪 chunk，與 `processFile` 的順序一致）。
+ *
+ * 用在「本次判定為 `binary-content`」的檔案：`indexRoot` 的清理迴圈只涵蓋
+ * 「掃描未納入（不在 `files` 內）」的檔案，內容層跳過的檔案仍在 `files` 內，
+ * 因此必須在這裡主動清除——否則先前被誤判為文字而嵌入的內容會留在索引裡
+ * （違反「被跳過就不得保留索引」的語意，搜尋也會繼續撈到亂碼）。
+ */
+async function purgeChunks(rootId: number, relPath: string, deps: ProcessDeps): Promise<void> {
+  const existing = await deps.store.listChunksByPath(rootId, relPath);
+  if (existing.length === 0) return;
+  await deps.vec.deleteByKeys(existing.map((chunk) => `c:${chunk.id}`));
+  await deps.store.deleteChunksByPath(rootId, relPath);
+}
+
+/**
  * 處理單一檔案。
  *
  * 順序（資料完整性優先）：
  * 1. 讀取前守衛再檢查（TOCTOU）。
  * 2. 讀檔、算檔案級 sha256。
- * 3. 增量判斷：hash 未變**且**該檔所有 `c:<id>` 向量都還在，才跳過；否則整檔重做。
- * 4. **先嵌入**（全部成功才動 DB）：embed 失敗或中止時 DB 完全不動，下一輪自動重做。
- * 5. **先刪舊向量**再 `replaceChunks`（見下方註解），最後 `vec.upsert` 新向量。
+ * 3. 內容層二進位偵測（僅文字／程式碼）：命中即清除該檔既有資料並記 `binary-content`。
+ * 4. 增量判斷：hash 未變**且**該檔所有 `c:<id>` 向量都還在，才跳過；否則整檔重做。
+ * 5. **先嵌入**（全部成功才動 DB）：embed 失敗或中止時 DB 完全不動，下一輪自動重做。
+ * 6. **先刪舊向量**再 `replaceChunks`（見下方註解），最後 `vec.upsert` 新向量。
  *
- * 第 5 步刻意「先刪舊向量」而不是「寫入後才刪」：如此任一中途失敗點都能在下輪自癒——
- * 若在刪除與寫入之間失敗，DB 仍是舊 hash 但向量已缺，下輪的增量判斷（第 3 步）會發現
+ * 第 6 步刻意「先刪舊向量」而不是「寫入後才刪」：如此任一中途失敗點都能在下輪自癒——
+ * 若在刪除與寫入之間失敗，DB 仍是舊 hash 但向量已缺，下輪的增量判斷（第 4 步）會發現
  * 「hash 未變但向量不齊」而重做；若反過來「寫入後才刪」，在 `replaceChunks`→`upsert`
  * 之間失敗會讓舊向量成為永遠不會再被回收的孤兒（下輪只看到新 hash 的新向量齊全而跳過）。
  */
@@ -173,6 +244,15 @@ async function processFile(
 
   const bytes = await fs.readFile(target.abs);
   const fileHash = hashBytes(bytes);
+
+  // 內容層防線放在增量判斷**之前**：hash 未變的舊資料也必須被清掉。
+  if (
+    (file.kind === "text" || file.kind === "code") &&
+    looksBinary(bytes.subarray(0, BINARY_SNIFF_BYTES))
+  ) {
+    await purgeChunks(root.id, file.relPath, deps);
+    return { status: "skipped", reason: "binary-content" };
+  }
 
   const existing = await deps.store.listChunksByPath(root.id, file.relPath);
   if (existing.length > 0 && existing.every((chunk) => chunk.contentHash === fileHash)) {
@@ -209,6 +289,8 @@ async function processFile(
  * - 清理：以 `listRelPaths(rootId)` 減去**本次將納入的 `files`** 為準。磁碟上已消失、或本次
  *   被跳過（排除規則、`.gitignore`、黑名單、關模態、超過大小上限等）的檔案，其 chunk 與向量
  *   一律清除——不得因為出現在 skipped 就保留索引（隱私契約：不索引、不回傳）。
+ *   內容層跳過（`binary-content`）的檔案仍在 `files` 內（掃描不讀內容，無法事先知道），
+ *   因此由 `processFile` 自己清除（見 `purgeChunks`），結果同樣不保留索引。
  * - 可取消（`signal`，於每個檔案開始前與嵌入前檢查）與限併發（`concurrency`，預設 2）。
  * - 全程唯讀使用者檔案。
  */
@@ -242,7 +324,8 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
   let processed = 0;
   let skippedUnchanged = 0;
   const skippedFiles: SkippedEntry[] = [];
-  const report = (): void => options.onProgress?.({ processed, total, skippedUnchanged });
+  const report = (): void =>
+    options.onProgress?.({ processed, total, skippedUnchanged, skipped: skippedFiles.length });
 
   let cursor = 0;
   const worker = async (): Promise<void> => {
