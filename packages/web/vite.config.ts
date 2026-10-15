@@ -13,7 +13,7 @@ import tailwindcss from "@tailwindcss/vite";
  */
 const CORE_ORIGIN = process.env.MNEMOSHELF_DEV_CORE ?? "http://127.0.0.1:8787";
 
-const API_PREFIXES = ["/health", "/roots", "/search", "/memories"];
+const API_PREFIXES = ["/health", "/roots", "/search", "/memories", "/diagnostics"];
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],

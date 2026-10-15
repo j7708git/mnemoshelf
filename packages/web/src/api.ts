@@ -405,3 +405,109 @@ export async function deleteMemory(id: number): Promise<void> {
   const response = await apiFetch(`/memories/${id}`, { method: "DELETE" });
   if (!response.ok) throw new Error(await readErrorMessage(response, "刪除記憶失敗"));
 }
+
+// ---------------------------------------------------------------------------
+// 除錯資訊匯出（`GET /diagnostics`）
+// ---------------------------------------------------------------------------
+
+/** `GET /diagnostics` 的應用與環境資訊（欄位以 server 契約為準）。 */
+export interface DiagnosticsAppInfo {
+  name: string;
+  version: string;
+  node: string;
+  platform: string;
+  arch: string;
+}
+
+/** 一個 root 的檔案統計；缺的欄位為 `null`（例如只有索引結果時）。 */
+export interface DiagnosticsFileStats {
+  totalFiles: number;
+  totalBytes: number | null;
+  byKind: Record<string, { count: number; bytes: number }> | null;
+  skippedByReason: Record<string, number>;
+  estimatedChunks: number | null;
+}
+
+/** 一個 root 最近一次索引結果的摘要（本行程；服務重啟後為 null）。 */
+export interface DiagnosticsIndexSummary {
+  state: "idle" | "running" | "completed" | "failed" | "cancelled";
+  startedAt: string | null;
+  finishedAt: string | null;
+  durationMs: number | null;
+  total: number | null;
+  processed: number | null;
+  skippedUnchanged: number | null;
+  skippedFiles: number;
+  failedFiles: number;
+  failedByReason: Record<string, number>;
+}
+
+/** 一個 root 的診斷資訊（路徑的家目錄前綴已遮罩成 `~`）。 */
+export interface DiagnosticsRoot {
+  id: number;
+  path: string;
+  mode: "browse" | "index";
+  modalities: string[];
+  include: string[];
+  exclude: string[];
+  respectGitignore: boolean;
+  createdAt: string;
+  stats: DiagnosticsFileStats | null;
+  statsSource: "preview" | "index" | null;
+  statsUnavailable: boolean;
+  lastIndex: DiagnosticsIndexSummary | null;
+}
+
+/** `GET /diagnostics` 的回應。 */
+export interface DiagnosticsResponse {
+  generatedAt: string;
+  app: DiagnosticsAppInfo;
+  embedder: { id: string; dim: number; capabilities: Record<string, boolean> };
+  roots: DiagnosticsRoot[];
+  indexing: { rootId: number; startedAt: string | null }[];
+}
+
+/** 取得診斷資訊（`GET /diagnostics`）。 */
+export async function fetchDiagnostics(): Promise<DiagnosticsResponse> {
+  const response = await apiFetch("/diagnostics");
+  if (!response.ok) throw new Error(await readErrorMessage(response, "讀取診斷資訊失敗"));
+  return (await response.json()) as DiagnosticsResponse;
+}
+
+/**
+ * 診斷檔的檔名：`mnemoshelf-diagnostics-<版本>-<YYYYMMDD>.json`。
+ *
+ * 版本來自伺服器回報的 app 版本；日期取 `generatedAt`（無法解析時標 `unknown-date`）。
+ */
+export function diagnosticsFilename(version: string, generatedAt: string): string {
+  const date = new Date(generatedAt);
+  const stamp = Number.isNaN(date.getTime())
+    ? "unknown-date"
+    : `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, "0")}${String(date.getDate()).padStart(2, "0")}`;
+  const safeVersion = version.replace(/[^0-9A-Za-z._-]/g, "_");
+  return `mnemoshelf-diagnostics-${safeVersion}-${stamp}.json`;
+}
+
+/**
+ * 匯出診斷資訊：取得 JSON 後以 Blob＋`<a download>` 觸發下載（與圖片 fetch 模式一致）。
+ *
+ * 回傳實際使用的檔名，讓 UI 能顯示「已匯出 …」。
+ */
+export async function downloadDiagnostics(): Promise<{ filename: string }> {
+  const diagnostics = await fetchDiagnostics();
+  const json = `${JSON.stringify(diagnostics, null, 2)}\n`;
+  const filename = diagnosticsFilename(diagnostics.app.version, diagnostics.generatedAt);
+  const url = URL.createObjectURL(new Blob([json], { type: "application/json" }));
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    // 讓瀏覽器有時間讀取 blob 之後再釋放。
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  return { filename };
+}

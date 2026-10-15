@@ -7,6 +7,7 @@
  * - `POST /roots/:id/preview`、`POST /roots/:id/index`、`POST /roots/:id/index/cancel`
  * - `GET  /roots/:id/entries?path=`（目錄子項）、`GET /roots/:id/file?path=`（文字預覽／圖片位元組）、
  *   `GET /roots/:id/thumb?path=`（縮圖）、`GET /roots/:id/index/status`（索引进度輪詢）
+ * - `GET  /diagnostics`（除錯資訊匯出：版本、平台、embedder、每 root 統計；家目錄前綴遮罩成 `~`）
  * - `POST /search`
  * - `POST /memories`、`GET /memories`、`POST /memories/:id/pin`、`DELETE /memories/:id`
  *
@@ -23,9 +24,9 @@
  *   且路徑「不像檔案」時才回 `index.html`；路徑解析不得超出靜態根目錄。
  * - 靜態根目錄不存在時（還沒 build）API 仍正常，靜態路徑回 404 JSON，不 crash。
  */
-import { existsSync, promises as fs } from "node:fs";
+import { existsSync, promises as fs, readFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import { homedir } from "node:os";
+import { arch, homedir, platform } from "node:os";
 import path from "node:path";
 import sirv from "sirv";
 import {
@@ -48,7 +49,10 @@ import {
   RootNotIndexableError,
   RootTooBroadError,
   type Embedder,
+  type EmbedderInfo,
   type VectorIndex,
+  type RootMode,
+  type RootPreview,
 } from "@mnemoshelf/core";
 import { LOOPBACK_HOST } from "../config.js";
 import {
@@ -65,7 +69,7 @@ import {
   UnsupportedFileTypeError,
   ValidationError,
 } from "../errors.js";
-import { IndexStatusTracker, type IndexStatus } from "../index-status.js";
+import { IndexStatusTracker, type IndexState, type IndexStatus } from "../index-status.js";
 import {
   listDirectoryEntries,
   makeThumbnail,
@@ -102,7 +106,7 @@ const MEMORY_SCOPES: readonly MemoryScope[] = ["global", "project", "agent"];
  * 只有這些前綴會進 API 路由（要 token）；其餘路徑才可能由靜態檔／SPA fallback 服務。
  * 這個分界必須與 `dispatch` 的 `switch (segments[0])` 一致。
  */
-export const API_PATH_PREFIXES: readonly string[] = ["health", "roots", "search", "memories"];
+export const API_PATH_PREFIXES: readonly string[] = ["health", "roots", "search", "memories", "diagnostics"];
 
 /** 靜態檔回應的 CSP（UI 與 API 同源；`<img>` 走 blob/data，故放行 blob: 與 data:）。 */
 export const STATIC_CSP = [
@@ -194,6 +198,93 @@ export interface CancelIndexResponse {
   rootId: number;
   /** 一律為 true；沒有進行中的索引時回 404 而非此主體。 */
   cancelled: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// 除錯資訊匯出（`GET /diagnostics`）
+// ---------------------------------------------------------------------------
+
+/** `GET /diagnostics` 的應用與環境資訊。 */
+export interface DiagnosticsAppInfo {
+  name: string;
+  /** 服務（`@mnemoshelf/server`）的 package.json version。 */
+  version: string;
+  /** `process.version`（例如 `v22.14.0`）。 */
+  node: string;
+  /** `os.platform()`（例如 `linux`／`darwin`／`win32`）。 */
+  platform: string;
+  /** `os.arch()`（例如 `x64`／`arm64`）。 */
+  arch: string;
+}
+
+/**
+ * 一個 root 的檔案統計。
+ *
+ * 來源是**既有**的 preview 或索引結果（見 `DiagnosticsRoot.statsSource`）；
+ * 索引結果不含位元組／模態分佈／chunk 估計，因此那些欄位為 `null`。
+ */
+export interface DiagnosticsFileStats {
+  totalFiles: number;
+  /** 總位元組；索引結果不帶此欄位 → `null`。 */
+  totalBytes: number | null;
+  /** 依模態分佈；索引結果不帶 → `null`。 */
+  byKind: Record<string, { count: number; bytes: number }> | null;
+  /** 被跳過的檔案依 `reason` 短標籤分組的計數。 */
+  skippedByReason: Record<string, number>;
+  /** 粗估 chunk 數；索引結果不帶 → `null`。 */
+  estimatedChunks: number | null;
+}
+
+/**
+ * 一個 root 最近一次索引結果的摘要（**本行程記憶體**；服務重啟後為 `null`）。
+ *
+ * 計數優先用完成的 `result`，索引仍在進行時退回最近一次 `progress`。
+ */
+export interface DiagnosticsIndexSummary {
+  state: IndexState;
+  startedAt: string | null;
+  finishedAt: string | null;
+  durationMs: number | null;
+  total: number | null;
+  processed: number | null;
+  skippedUnchanged: number | null;
+  /** 被跳過的檔案數（不含 `skippedUnchanged`）。 */
+  skippedFiles: number;
+  /** 處理失敗的檔案數。 */
+  failedFiles: number;
+  /** 失敗檔依短標籤 `reason` 分組的計數。 */
+  failedByReason: Record<string, number>;
+}
+
+/** 一個 root 的診斷資訊（路徑等字串的家目錄前綴已遮罩成 `~`）。 */
+export interface DiagnosticsRoot {
+  id: number;
+  /** 家目錄前綴已遮罩成 `~`。 */
+  path: string;
+  mode: RootMode;
+  modalities: Modality[];
+  include: string[];
+  exclude: string[];
+  respectGitignore: boolean;
+  createdAt: string;
+  /** 上次 preview 或索引的統計；從未量測過為 `null`。 */
+  stats: DiagnosticsFileStats | null;
+  /** 統計來源；從未 preview／索引過為 `null`。 */
+  statsSource: "preview" | "index" | null;
+  /** 從未 preview／索引過（`stats === null`）時為 true；不讓整體診斷失敗。 */
+  statsUnavailable: boolean;
+  lastIndex: DiagnosticsIndexSummary | null;
+}
+
+/** `GET /diagnostics` 的回應。 */
+export interface DiagnosticsResponse {
+  generatedAt: string;
+  app: DiagnosticsAppInfo;
+  /** embedder 的能力宣告（`id` 含 dtype 等識別資訊）。 */
+  embedder: EmbedderInfo;
+  roots: DiagnosticsRoot[];
+  /** 進行中的索引任務（本行程；沒有時為空陣列）。 */
+  indexing: { rootId: number; startedAt: string | null }[];
 }
 
 /** 統一的錯誤回應格式。 */
@@ -320,6 +411,79 @@ export function toHttpError(error: unknown): { status: number; body: ErrorRespon
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+/**
+ * 把家目錄前綴換成 `~`（跨平台：`/` 與 `\` 都視為分隔符）。
+ *
+ * 為什麼要自己處理分隔符：`node:path` 在 POSIX 上不把 `\` 當分隔符，Windows 風格的
+ * 字串（例如 `C:\Users\<user>\docs`）在 Linux 上以 `path.relative` 比對會失準。
+ * 這裡先把兩種分隔符正規化成 `/` 再比對，因此同一份程式碼在三平台都能正確遮罩。
+ *
+ * 只在「值就是家目錄本身，或家目錄後面緊接分隔符」時替換，避免把 `/home/user2`
+ * 誤遮成 `~2`；沒命中時原樣回傳。命中時的結果一律以 `/` 分隔（便於閱讀、不含 OS 差異）。
+ * Windows 磁碟路徑（`C:\...`）不分大小寫；POSIX 路徑區分大小寫。
+ */
+export function maskHomePath(value: string, homeDir: string): string {
+  if (homeDir.length === 0) return value;
+  const normalize = (input: string): string => input.replace(/\\/g, "/").replace(/\/+$/, "");
+  const home = normalize(homeDir);
+  if (home.length === 0) return value;
+  const target = normalize(value);
+
+  const caseInsensitive = /^[A-Za-z]:\//.test(home);
+  const comparable = caseInsensitive ? target.toLowerCase() : target;
+  const prefix = caseInsensitive ? home.toLowerCase() : home;
+  // 沒命中就原樣回傳（不順手改動分隔符，避免影響與家目錄無關的字串）。
+  if (comparable !== prefix && !comparable.startsWith(`${prefix}/`)) return value;
+
+  return comparable.length === prefix.length ? "~" : `~${target.slice(home.length)}`;
+}
+
+/**
+ * 遞迴把輸出中**所有字串**的家目錄前綴遮成 `~`。
+ *
+ * 為什麼整份遞迴而不是逐欄位遮罩：診斷輸出會隨欄位演進，逐欄位處理容易漏；
+ * 走完整份物件是「預設安全」的做法（新欄位自動被遮）。
+ */
+export function maskDiagnostics<T>(value: T, homeDir: string): T {
+  if (typeof value === "string") return maskHomePath(value, homeDir) as unknown as T;
+  if (Array.isArray(value)) return value.map((item) => maskDiagnostics(item, homeDir)) as unknown as T;
+  if (value !== null && typeof value === "object") {
+    const masked: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      masked[key] = maskDiagnostics(item, homeDir);
+    }
+    return masked as unknown as T;
+  }
+  return value;
+}
+
+/** 把帶 `reason` 的項目清單依 reason 分組計數。 */
+function countByReason(entries: readonly { reason: string }[]): Record<string, number> {
+  const counts: Record<string, number> = {};
+  for (const entry of entries) counts[entry.reason] = (counts[entry.reason] ?? 0) + 1;
+  return counts;
+}
+
+/**
+ * 服務版本：讀 `@mnemoshelf/server` 自己的 package.json。
+ *
+ * 為什麼不是桌面殼的版本：服務是獨立可跑的元件，不該相依 desktop 套件；
+ * 桌面殼若要報自己的版本，需另外提供（目前未接）。讀不到時回 `"0.0.0"`，不讓診斷失敗。
+ */
+function readPackageVersion(): string {
+  try {
+    const url = new URL("../../package.json", import.meta.url);
+    const parsed = JSON.parse(readFileSync(url, "utf8")) as { version?: unknown };
+    if (typeof parsed.version === "string" && parsed.version.trim() !== "") return parsed.version;
+  } catch {
+    // 打包或非標準佈局下讀不到：回退固定值。
+  }
+  return "0.0.0";
+}
+
+/** 服務版本（行程啟動時讀一次）。 */
+export const APP_VERSION = readPackageVersion();
 
 /** 讀取並解析 JSON 請求主體；空主體視為 `{}`。 */
 async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
@@ -476,6 +640,14 @@ export function createRestApp(deps: RestAppDeps): RestApp {
    * 這是刻意的取捨（PM 裁示：文件化，不持久化）；要持久化需 migration 與契約變更。
    */
   const maxFileBytesByRoot = new Map<number, number>();
+  /**
+   * 每 root 最近一次 preview 的統計（行程內記憶體）。
+   *
+   * 為什麼要留：preview 端點本身不寫入任何狀態，而 `GET /diagnostics` 需要「已加入的 root
+   * 上次看到什麼數字」。刻意**不**為了產診斷檔而臨時掃描磁碟（診斷不該變成慢操作），
+   * 因此只回報既有結果；從未 preview 過的 root 標 `statsUnavailable`。
+   */
+  const lastPreviewByRoot = new Map<number, RootPreview>();
   const indexing = new Map<number, Promise<IndexRootResult>>();
   /**
    * 進行中索引的 `AbortController`（每個 root 一個，與 `indexing` 同生命週期）。
@@ -620,6 +792,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       respectGitignore: root.respectGitignore,
       ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
     });
+    // 記住這次 preview 的統計：`GET /diagnostics` 會回報「上次量到的數字」（不重新掃描磁碟）。
+    lastPreviewByRoot.set(id, preview);
     return { status: 200, body: preview };
   };
 
@@ -735,12 +909,105 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     return { status: 200, body: status };
   };
 
+  /**
+   * 組出 `GET /diagnostics` 的主體（尚未遮罩家目錄）。
+   *
+   * 統計來源優先序：**preview**（欄位最完整）→ **索引結果**（缺位元組／模態／chunk 估計）。
+   * 兩者都沒有時 `stats` 為 `null`＋`statsUnavailable: true`，**不造數字、也不臨時掃描磁碟**。
+   * 單一 root 缺統計不影響其他 root，整體仍回 200。
+   */
+  const buildDiagnostics = async (): Promise<DiagnosticsResponse> => {
+    const roots = await deps.store.listRoots();
+    const rootSummaries: DiagnosticsRoot[] = roots.map((root) => {
+      const preview = lastPreviewByRoot.get(root.id) ?? null;
+      const status = indexStatus.status(root.id);
+      const result = status.result;
+
+      let stats: DiagnosticsFileStats | null = null;
+      let statsSource: "preview" | "index" | null = null;
+      if (preview !== null) {
+        stats = {
+          totalFiles: preview.totalFiles,
+          totalBytes: preview.totalBytes,
+          byKind: Object.fromEntries(
+            Object.entries(preview.byKind).map(([kind, stat]) => [kind, { count: stat.count, bytes: stat.bytes }]),
+          ),
+          skippedByReason: countByReason(preview.skipped),
+          estimatedChunks: preview.estimatedChunks,
+        };
+        statsSource = "preview";
+      } else if (result !== null) {
+        stats = {
+          totalFiles: result.total,
+          totalBytes: null,
+          byKind: null,
+          skippedByReason: countByReason(result.skippedFiles),
+          estimatedChunks: null,
+        };
+        statsSource = "index";
+      }
+
+      const lastIndex: DiagnosticsIndexSummary | null =
+        status.state === "idle"
+          ? null
+          : {
+              state: status.state,
+              startedAt: status.startedAt,
+              finishedAt: status.finishedAt,
+              durationMs: status.durationMs,
+              total: result?.total ?? status.progress?.total ?? null,
+              processed: result?.processed ?? status.progress?.processed ?? null,
+              skippedUnchanged: result?.skippedUnchanged ?? status.progress?.skippedUnchanged ?? null,
+              skippedFiles: result?.skippedFiles.length ?? status.progress?.skipped ?? 0,
+              failedFiles: result?.failedFiles.length ?? status.progress?.failed ?? 0,
+              failedByReason: result === null ? {} : countByReason(result.failedFiles),
+            };
+
+      return {
+        id: root.id,
+        path: root.path,
+        mode: root.mode,
+        modalities: root.modalities,
+        include: root.include,
+        exclude: root.exclude,
+        respectGitignore: root.respectGitignore,
+        createdAt: root.createdAt,
+        stats,
+        statsSource,
+        statsUnavailable: stats === null,
+        lastIndex,
+      };
+    });
+
+    const raw: DiagnosticsResponse = {
+      generatedAt: new Date().toISOString(),
+      app: {
+        name: "mnemoshelf",
+        version: APP_VERSION,
+        node: process.version,
+        platform: platform(),
+        arch: arch(),
+      },
+      embedder: deps.embedder.info,
+      roots: rootSummaries,
+      indexing: [...indexing.keys()].map((rootId) => ({ rootId, startedAt: indexStatus.status(rootId).startedAt })),
+    };
+    // 一律遮罩家目錄前綴：不輸出使用者家目錄的絕對路徑（見 repo 隱私規範）。
+    return maskDiagnostics(raw, homeDir);
+  };
+
+  /** `GET /diagnostics`：匯出環境與統計事實（家目錄前綴遮罩；不含檔案內容／token／子檔案清單）。 */
+  const getDiagnostics = async (): Promise<RouteResult> => {
+    return { status: 200, body: await buildDiagnostics() };
+  };
+
   const removeRoot = async (id: number, deleteData: boolean): Promise<{ status: number; body: unknown }> => {
     await getRootOr404(id);
     if (indexing.has(id)) throw new IndexInProgressError(id);
     const { removedChunkIds } = await deps.store.removeRoot(id, deleteData);
     if (deleteData) await deps.vec.deleteByRoot(id);
     maxFileBytesByRoot.delete(id);
+    lastPreviewByRoot.delete(id);
     indexStatus.clear(id);
     const body: RemoveRootResponse = {
       rootId: id,
@@ -945,6 +1212,11 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         break;
       case "memories":
         result = await routeMemories(request, method, segments, url);
+        break;
+      case "diagnostics":
+        if (segments.length !== 1) throw new NotFoundError("路徑");
+        if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
+        result = await getDiagnostics();
         break;
       default:
         throw new NotFoundError("路徑");

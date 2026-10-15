@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   clearToken,
+  downloadDiagnostics,
   getToken,
   listRoots,
   NetworkError,
@@ -65,6 +66,10 @@ export function App() {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  /** 匯出診斷資訊的狀態（與桌面設定無關，兩種模式都能用）。 */
+  const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
+  const [diagnosticsNotice, setDiagnosticsNotice] = useState<string | null>(null);
+  const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
 
   const load = useCallback(async (): Promise<void> => {
     setState({ kind: "loading" });
@@ -221,6 +226,21 @@ export function App() {
     [desktop],
   );
 
+  /** 匯出診斷資訊：抓 `GET /diagnostics` 後以檔名觸發下載。 */
+  const exportDiagnostics = useCallback(async (): Promise<void> => {
+    setDiagnosticsBusy(true);
+    setDiagnosticsNotice(null);
+    setDiagnosticsError(null);
+    try {
+      const { filename } = await downloadDiagnostics();
+      setDiagnosticsNotice(`已匯出 ${filename}`);
+    } catch (error) {
+      setDiagnosticsError(error instanceof Error ? error.message : "匯出診斷資訊失敗");
+    } finally {
+      setDiagnosticsBusy(false);
+    }
+  }, []);
+
   const onRootAdded = (root: Root): void => {
     setSelectedRootId(root.id);
     setView("explorer");
@@ -324,15 +344,13 @@ export function App() {
                   </button>
                 ))}
               </nav>
-              {desktop !== null && (
-                <button
-                  type="button"
-                  onClick={() => setShowSettings((current) => !current)}
-                  className="rounded-md border border-line px-3 py-1.5 text-sm text-ink"
-                >
-                  設定
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={() => setShowSettings((current) => !current)}
+                className="rounded-md border border-line px-3 py-1.5 text-sm text-ink"
+              >
+                設定
+              </button>
               {desktop === null && (
                 <button
                   type="button"
@@ -361,12 +379,16 @@ export function App() {
             </div>
           )}
 
-          {desktop !== null && showSettings && (
+          {showSettings && (
             <SettingsPanel
               settings={settings}
               error={settingsError}
               busy={settingsBusy}
+              diagnosticsBusy={diagnosticsBusy}
+              diagnosticsNotice={diagnosticsNotice}
+              diagnosticsError={diagnosticsError}
               onToggleAutostart={(enabled) => void toggleAutostart(enabled)}
+              onExportDiagnostics={() => void exportDiagnostics()}
               onClose={() => setShowSettings(false)}
             />
           )}
