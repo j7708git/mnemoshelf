@@ -230,7 +230,13 @@ export class HttpStatusError extends Error {
   }
 }
 
-/** 這個錯誤是否代表「同一 root 已有進行中的索引」（HTTP 409）？ */
+/**
+ * 這個錯誤是否代表「同一 root 已有進行中的索引」（HTTP 409）？
+ *
+ * 409 的語意不是失敗，而是「你要的那一輪**已經存在、正在跑**」。呼叫端的正確反應是
+ * **改為追蹤那一輪**（以採納型 gate，見 `IndexPollGate` 與 `PollTrack`），而不是把它當成
+ * 要忽略的舊輪、也不是把流程轉成 `failed`。
+ */
 export function isIndexAlreadyRunningError(error: unknown): boolean {
   return error instanceof HttpStatusError && error.status === 409;
 }
@@ -405,6 +411,23 @@ export type PollOutcome =
 export type PollBaseline = number | null | "unknown";
 
 /**
+ * 輪詢門控要追蹤哪一輪（`IndexPollGate` 的建構判準）。
+ *
+ * - `PollBaseline`（`number`／`null`／`"unknown"`）：發起**本輪之前**取得的舊輪 `runSeq`；
+ *   gate 等一個「`runSeq` **不同於** baseline」的終態，即本輪結束（見 `PollBaseline`）。
+ * - `{ adopt: number }`：**採納**某一輪——本輪就是該 `runSeq`（`POST /index` 回 409 時，
+ *   他方／先行啟動的那一輪）；該輪的終態即結束（見 `IndexPollGate` 的採納模式）。
+ *
+ * 兩者是同一件事的兩面：baseline 模式「排除舊輪、等新輪」，採納模式「直接認領正在跑的那一輪」。
+ */
+export type PollTrack = PollBaseline | { adopt: number };
+
+/** `PollTrack` 是否為採納模式（`PollBaseline` 中的 `null` 也是 object，故須一併排除）。 */
+function isAdoptTrack(track: PollTrack): track is { adopt: number } {
+  return typeof track === "object" && track !== null;
+}
+
+/**
  * 一輪索引的輪詢判準（修「重新索引時第一次輪詢看到上一輪終態而提早停止」的競態）。
  *
  * 問題：發起新一輪索引後立刻輪詢，此時 `POST /index` 可能還沒到伺服器，第一次輪詢會看到
@@ -426,6 +449,18 @@ export type PollBaseline = number | null | "unknown";
  *   即視為本輪已有進展；此後的終態就是本輪終止，回 `terminal`。
  * 這個模式對「暫時取不到 baseline」已足夠：本輪真的啟動後一定會出現 `running` 或新終態，
  * 屆時就能正確收斂（見 `AddRootFlow`／`ExplorerPanel` 的 preflight）。
+ *
+ * **採納模式（`{ adopt: runSeq }`）**：`POST /index` 回 409 時的語意是「你要的那一輪已經存在、
+ * 正在跑」——不是失敗，而是**改為追蹤那一輪**。此時 preflight 取到的 baseline 恰好就是他方
+ * 先啟動的那一輪（`runSeq` 較新）；若仍以它為 baseline，gate 會把那一輪的**終態**當成「要忽略
+ * 的舊輪殘留」而一路等到寬限 → 明明正常結束卻顯示 `stalled`。採納模式反過來認領它：
+ * - 終態且 `runSeq === adopted` → 本輪結束（`terminal`）。
+ * - 終態且 `runSeq > adopted`（採納後又跑了一輪更高的終態）→ 亦視為 `terminal`：我們要跟的那一輪
+ *   已被覆蓋，顯示**最新**狀態即可，不必再等（取捨：不區分「採納輪自己的終態」與「更新的終態」，
+ *   兩者對使用者都是「這輪已經結束、這是目前結果」）。
+ * - 終態但 `runSeq < adopted`（理論上 `runSeq` 單調、不會回頭；防禦性處理）→ 尚未看到採納輪，
+ *   累計寬限（與既有語意一致）。
+ * - `running`／非終態 → `continue`；一直沒看到採納輪的任何活動也是寬限用盡才 `stalled`。
  */
 export class IndexPollGate {
   private staleTicks = 0;
@@ -437,7 +472,7 @@ export class IndexPollGate {
   private sawRunning = false;
 
   constructor(
-    private readonly baseline: PollBaseline,
+    private readonly track: PollTrack,
     pollIntervalMs: number,
   ) {
     this.graceTicks = Math.max(1, Math.ceil(INDEX_POLL_GRACE_MS / Math.max(1, pollIntervalMs)));
@@ -450,7 +485,13 @@ export class IndexPollGate {
       return { kind: "continue" };
     }
 
-    if (this.baseline === "unknown") {
+    if (isAdoptTrack(this.track)) {
+      const adopted = this.track.adopt;
+      // `runSeq >= adopted`：採納輪自己的終態（`===`），或採納後又有一輪更高的終態（`>`）——
+      // 兩者都代表「這輪已經結束」，顯示最新狀態即可（見類別註解的取捨說明）。
+      if (status.runSeq !== null && status.runSeq >= adopted) return { kind: "terminal" };
+      // `runSeq < adopted`：採納輪之前的殘留終態，尚未看到採納輪 → 累計寬限。
+    } else if (this.track === "unknown") {
       if (this.sawRunning) return { kind: "terminal" };
       if (this.seenTerminalRunSeq === undefined) {
         // 第一次看到終態：可能是舊輪殘留，先記下、不據此停止。
@@ -459,7 +500,7 @@ export class IndexPollGate {
         // 終態的 `runSeq` 變了 → 有一輪新的索引跑完 → 本輪終止。
         return { kind: "terminal" };
       }
-    } else if (status.runSeq !== this.baseline) {
+    } else if (status.runSeq !== this.track) {
       return { kind: "terminal" };
     }
 

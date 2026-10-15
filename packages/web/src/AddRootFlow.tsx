@@ -19,6 +19,7 @@ import {
   startIndex,
   type IndexStatus,
   type PollBaseline,
+  type PollTrack,
   type Root,
   type RootPreview,
 } from "./api";
@@ -171,6 +172,27 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
     onCancel();
   };
 
+  /**
+   * 409 後的採納：改為追蹤「他方／先行啟動的那一輪」（見 `IndexPollGate` 的採納模式）。
+   *
+   * 為什麼需要：`POST /index` 回 409 的語意是「你要的那一輪已經存在、正在跑」——不是失敗。
+   * preflight（`beginIndex` 發 POST 前的 GET）取到的 baseline 恰好就是那一輪（他方先啟動，
+   * `runSeq` 較新）；若仍以它為 baseline，gate 會把那一輪的**終態**當成「要忽略的舊輪殘留」
+   * 而一路等到寬限 → 明明該輪已正常結束，UI 卻顯示「無法確認」（`stalled`）。
+   *
+   * 做法：同步補一次 `getIndexStatus`（catch 包住），以**當下那一輪的 `runSeq`** 建採納型 gate。
+   * 若該輪已進終態（409 與結束之間的窄窗），採納值就是該終態的 `runSeq`，gate 下一次 `observe`
+   * 立刻判 `terminal`，直接顯示結果。取不到狀態時退回 `"unknown"`（不誤判、等寬限），
+   * 與 preflight 的兜底一致。
+   */
+  const adoptRunningRound = async (): Promise<void> => {
+    if (root === null) return;
+    const track: PollTrack = await getIndexStatus(root.id)
+      .then((snapshot): PollTrack => (snapshot.runSeq === null ? "unknown" : { adopt: snapshot.runSeq }))
+      .catch((): PollTrack => "unknown");
+    pollGateRef.current = new IndexPollGate(track, POLL_INTERVAL_MS);
+  };
+
   const beginIndex = async (): Promise<void> => {
     if (root === null) return;
     // 同步防重入（在任何 await 之前）：快速雙擊的第二次呼叫直接返回，不送出第二份 POST。
@@ -199,9 +221,14 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
       void startIndex(root.id).catch((indexError: unknown) => {
         // 使用者主動取消時 POST /index 也會結束（伺服器回 200），不該顯示成失敗。
         if (cancelRequestedRef.current) return;
-        // 縱深防禦：單一工作模型下 409 代表「同一 root 已有一輪索引在跑」，不是失敗；
-        // 若輪詢門控仍在推進（流程還停在 indexing），把它轉 failed 會誤報、並停掉仍在跑的索引。
-        if (isIndexAlreadyRunningError(indexError) && stepRef.current === "indexing") return;
+        // 縱深防禦：單一工作模型下 409 代表「同一 root 已有一輪索引在跑」，不是失敗。
+        // 若輪詢門控仍在推進（流程還停在 indexing），改為**追蹤那一輪**（採納型 gate）；
+        // 仍以 preflight 的 baseline 判斷會把那一輪的終態誤當成殘留舊輪、等到寬限顯示 stalled
+        // （見 `adoptRunningRound` 與 `IndexPollGate` 的採納模式）。
+        if (isIndexAlreadyRunningError(indexError) && stepRef.current === "indexing") {
+          void adoptRunningRound();
+          return;
+        }
         setError(indexError instanceof Error ? indexError.message : "索引失敗");
         setStep("failed");
       });

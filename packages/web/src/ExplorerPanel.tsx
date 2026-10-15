@@ -14,6 +14,7 @@ import {
   type DirEntry,
   type IndexStatus,
   type PollBaseline,
+  type PollTrack,
   type Root,
 } from "./api";
 import { DirectoryTree } from "./DirectoryTree";
@@ -153,6 +154,25 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
   }, [root.id, refreshKey, treeKey]);
 
   /**
+   * 409 後的採納：改為追蹤「他方／先行啟動的那一輪」（見 `IndexPollGate` 的採納模式）。
+   *
+   * 為什麼需要：`POST /index` 回 409 的語意是「你要的那一輪已經存在、正在跑」——不是失敗。
+   * preflight（`reindex` 發 POST 前的 GET）取到的 baseline 恰好就是那一輪（他方先啟動，
+   * `runSeq` 較新）；若仍以它為 baseline，gate 會把那一輪的**終態**當成「要忽略的舊輪殘留」
+   * 而一路等到寬限 → 明明該輪已正常結束，面板卻顯示「無法確認」（`pollStalled`）。
+   *
+   * 做法：同步補一次 `getIndexStatus`（catch 包住），以**當下那一輪的 `runSeq`** 建採納型 gate；
+   * 輪詢下一 tick 讀到新 gate 即生效。若該輪已進終態（409 與結束之間的窄窗），採納值就是該
+   * 終態的 `runSeq`，下一次 `observe` 立刻判 `terminal`。取不到狀態時退回 `"unknown"`。
+   */
+  const adoptRunningRound = useCallback(async (): Promise<void> => {
+    const track: PollTrack = await getIndexStatus(root.id)
+      .then((snapshot): PollTrack => (snapshot.runSeq === null ? "unknown" : { adopt: snapshot.runSeq }))
+      .catch((): PollTrack => "unknown");
+    pollGateRef.current = new IndexPollGate(track, POLL_INTERVAL_MS);
+  }, [root.id]);
+
+  /**
    * 觸發一輪重新索引。
    *
    * **不 await `startIndex`**：`POST /index` 會等整輪索引跑完才回應；若在等待期間持鎖，
@@ -193,16 +213,20 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
           setTreeKey((current) => current + 1);
         })
         .catch((error: unknown) => {
-          // 409：單一工作模型下代表「同一 root 已有一輪索引在跑」，不是失敗。輪詢會接手顯示
-          // 實際狀態，因此**不**停止輪詢（把 pollingRef 清掉會讓正在跑的那輪整輪失去更新）。
-          if (isIndexAlreadyRunningError(error)) return;
+          // 409：單一工作模型下代表「同一 root 已有一輪索引在跑」，不是失敗。改為**追蹤那一輪**
+          // （採納型 gate）——仍以 preflight 的 baseline（他方先啟動那輪的 runSeq）判斷會把它的終態
+          // 誤當成殘留舊輪、等到寬限顯示 stalled（見 `adoptRunningRound` 與 `IndexPollGate`）。
+          if (isIndexAlreadyRunningError(error)) {
+            void adoptRunningRound();
+            return;
+          }
           pollingRef.current = false;
           setStarting(false);
         });
     } finally {
       reindexingRef.current = false;
     }
-  }, [root.id]);
+  }, [root.id, adoptRunningRound]);
 
   /** 取消進行中的索引；`startIndex` 的 promise 會隨後結束（伺服器回 200），由輪詢接手顯示。 */
   const stopIndex = useCallback(async (): Promise<void> => {
