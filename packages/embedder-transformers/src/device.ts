@@ -3,18 +3,23 @@
  *
  * 依據（2026-10-16 查核與實測）：
  *   - DirectML 只在 Windows x64／arm64 有預建二進位（`onnxruntime-node@1.30.0` 的
- *     `bin/napi-v6/win32/*` 帶 `DirectML.dll`）→ 非 Windows 一律維持現狀的 CPU。
+ *     `bin/napi-v6/win32/*` 帶 `DirectML.dll`）。
+ *   - CoreML EP 只在 macOS 的預建二進位內（同版本的 `darwin/arm64` 帶 `USE_COREML`；
+ *     transformers.js 4.3.1 也把 `coreml` 列進 darwin 的 `supportedDevices`）。
  *   - dml-bench 實測（`spikes/dml-bench`，在使用者 Windows 機器上跑）：DML 在 batch 32 最快
  *     （11.07 塊/s vs CPU batch 16 的 3.27 塊/s），向量與 CPU 的餘弦為 1.0。
  *   - DML 同一 session 不可並發 `Run`（onnxruntime 的 DirectML EP 官方文件）
  *     → `serializedInference` 為 true，索引器與 embedder 本身都會據此序列化。
  *   - 換 device 不會改變 `info.id`（只吃 model id 與 dtype 標籤）→ 既有索引不需重建。
+ *
+ * 平台的取捨：`auto` 只在「有預建二進位的那個平台」挑加速器（win32→dml、darwin→coreml），
+ * 其他平台維持 CPU；**Windows 的既有行為完全不動**（新增的只有 darwin 這一條）。
  */
 import { homedir } from "node:os";
 import type { EmbedderFallbackReason } from "@mnemoshelf/core";
 import { InvalidEmbedderOptionError } from "./errors.js";
 
-/** 覆寫裝置的環境變數（值：`auto`／`cpu`／`dml`）。 */
+/** 覆寫裝置的環境變數（值：`auto`／`cpu`／`dml`／`coreml`）。 */
 export const EMBED_DEVICE_ENV = "MNEMOSHELF_EMBED_DEVICE";
 
 /** 覆寫 DirectML adapter 索引的環境變數（非負整數，0＝預設顯示卡）。 */
@@ -56,14 +61,21 @@ export function parseOrtLogLevel(value: string | undefined): OrtLogSeverityLevel
 /** DirectML adapter 索引的預設值（0＝預設顯示卡；`IDXGIFactory::EnumAdapters` 的順序）。 */
 export const DEFAULT_DML_DEVICE_ID = 0;
 
-/** 嵌入執行裝置（目前只有 CPU 與 Windows 的 DirectML）。 */
-export type EmbedDevice = "cpu" | "dml";
+/**
+ * 嵌入執行裝置。
+ *
+ * - `cpu`：所有平台都有。
+ * - `dml`：DirectML（**只有 Windows x64／arm64 有預建二進位**）。
+ * - `coreml`：CoreML EP（**只有 macOS 的 onnxruntime 預編二進位內建**；需通過內建自我測試
+ *   才會自動採用，見 `self-test.ts`）。
+ */
+export type EmbedDevice = "cpu" | "dml" | "coreml";
 
 /** 裝置選項：`auto` 表示依平台自動決定。 */
 export type EmbedDeviceOption = EmbedDevice | "auto";
 
 /** 支援的裝置選項（解析與錯誤訊息共用同一份清單）。 */
-export const EMBED_DEVICE_OPTIONS: readonly EmbedDeviceOption[] = ["auto", "cpu", "dml"];
+export const EMBED_DEVICE_OPTIONS: readonly EmbedDeviceOption[] = ["auto", "cpu", "dml", "coreml"];
 
 /**
  * CPU 的批次視窗上限。
@@ -124,6 +136,19 @@ export function isDmlPlatform(platform: string): boolean {
 }
 
 /**
+ * CoreML 是否為這個平台的可用選項（只有 macOS 的預編二進位內建 CoreML EP）。
+ *
+ * 依據（研究筆記 F1，2026-10-16 查核）：`onnxruntime-node@1.30.0` 的 darwin-arm64 二進位
+ * 帶 `USE_COREML`，binding 內有 `ListSupportedBackends`／`coreMlFlags` 等符號；
+ * transformers.js 4.3.1 也把 `coreml` 列進 darwin 的 `supportedDevices`。
+ * 其他平台（含 Windows、Linux）**不得**嘗試：`device:"coreml"` 在非 darwin 會直接被
+ * transformers.js 拒絕（`Unsupported device`）。
+ */
+export function isCoreMlPlatform(platform: string): boolean {
+  return platform === "darwin";
+}
+
+/**
  * 解析 DirectML adapter 索引。
  *
  * 未設定或空字串 → `0`（預設顯示卡）。只接受十進位非負整數字串：
@@ -153,7 +178,7 @@ export function parseDmlDeviceId(value: string | undefined): number {
 
 /** 裝置解析的結果：要用的裝置，以及一開始就知道的退回原因。 */
 export interface EmbedDevicePlan {
-  /** 實際要使用的裝置（非 Windows 平台上不可能得到 `dml`）。 */
+  /** 實際要使用的裝置（非 Windows 平台上不可能得到 `dml`；非 macOS 不可能得到 `coreml`）。 */
   device: EmbedDevice;
   /** 立即成立的退回原因（例如明確要求 `dml` 但平台不支援）；沒有時為 `null`。 */
   fallbackReason: EmbedderFallbackReason | null;
@@ -163,30 +188,60 @@ export interface EmbedDevicePlan {
  * 依裝置選項與平台解析要用的裝置。
  *
  * - `cpu`：一律 CPU（維持現狀）。
- * - `auto`：**只在 Windows** 嘗試 `dml`；其他平台解析為 `cpu`，不算退回（沒有失敗發生）。
- * - `dml`：Windows 上嘗試 `dml`；非 Windows 直接以 `cpu` 開始並註明原因（不必白費一次載入）。
+ * - `auto`：依平台挑一個加速器——`win32` → `dml`（**既有行為，不動**）、
+ *   `darwin` → `coreml`（新；實際採不採用由內建自我測試決定，見 `self-test.ts`）、
+ *   其他 → `cpu`。挑不到加速器**不算退回**（沒有失敗發生）。
+ * - `dml`：Windows 上嘗試 `dml`；其他平台直接以 `cpu` 開始並註明原因（不必白費一次載入）。
+ * - `coreml`：macOS 上嘗試 `coreml`；其他平台直接以 `cpu` 開始並註明原因。
+ *   明示 `coreml` 的語意是「**使用者自負的強制嘗試**」：忽略自我測試快取、不寫回快取。
  */
 export function resolveEmbedDevice(option: EmbedDeviceOption, platform: string): EmbedDevicePlan {
   if (option === "cpu") return { device: "cpu", fallbackReason: null };
-  if (isDmlPlatform(platform)) return { device: "dml", fallbackReason: null };
-  if (option === "auto") return { device: "cpu", fallbackReason: null };
+  if (option === "auto") {
+    if (isDmlPlatform(platform)) return { device: "dml", fallbackReason: null };
+    if (isCoreMlPlatform(platform)) return { device: "coreml", fallbackReason: null };
+    return { device: "cpu", fallbackReason: null };
+  }
+  if (option === "dml") {
+    if (isDmlPlatform(platform)) return { device: "dml", fallbackReason: null };
+    return {
+      device: "cpu",
+      fallbackReason: {
+        code: "unsupported-platform",
+        message: `DirectML 只在 Windows 提供（目前平台 ${platform}）`,
+      },
+    };
+  }
+  if (isCoreMlPlatform(platform)) return { device: "coreml", fallbackReason: null };
   return {
     device: "cpu",
     fallbackReason: {
       code: "unsupported-platform",
-      message: `DirectML 只在 Windows 提供（目前平台 ${platform}）`,
+      message: `CoreML 只在 macOS 提供（目前平台 ${platform}）`,
     },
   };
 }
 
-/** 裝置對應的批次視窗大小。 */
+/**
+ * 裝置對應的批次視窗大小。
+ *
+ * CoreML 沿用 CPU 的 16：CoreML EP 收下的節點只是模型中段的小區塊（主算子 `MatMulNBits`
+ * 不被支援），區塊邊界要付 marshal 成本，放大批次只會放大每次往返的搬運量；
+ * 沒有實測證據支持更大或更小的值，因此先保守沿用（見研究筆記 I1／I2）。
+ */
 export function deviceBatchSize(device: EmbedDevice): number {
-  return device === "dml" ? DML_BATCH_SIZE : CPU_BATCH_SIZE;
+  if (device === "dml") return DML_BATCH_SIZE;
+  return CPU_BATCH_SIZE;
 }
 
-/** 這個裝置是否要求序列推論（同一 session 一次只能 `Run`）。 */
+/**
+ * 這個裝置是否要求序列推論（同一 session 一次只能 `Run`）。
+ *
+ * CoreML 與 DirectML 同屬「多個 EP 分區」的裝置：同一 session 的並發 `Run` 對分區間的
+ * 邊界搬運沒有好處，且與 DML 共用同一條序列化骨架最單純（先保守，未實測前不改）。
+ */
 export function requiresSerializedInference(device: EmbedDevice): boolean {
-  return device === "dml";
+  return device === "dml" || device === "coreml";
 }
 
 /**

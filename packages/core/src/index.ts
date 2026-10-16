@@ -36,6 +36,7 @@ export type {
   EmbedderFallbackReason,
   EmbedderInfo,
   EmbedderRuntimeStatus,
+  EmbedderSelfTestStatus,
   EmbedDocumentsOptions,
   ImageInput,
   ProbeResult,

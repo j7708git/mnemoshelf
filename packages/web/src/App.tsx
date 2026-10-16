@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import {
   clearToken,
   downloadDiagnostics,
+  fetchDiagnostics,
   getToken,
   listRoots,
   NetworkError,
@@ -10,6 +11,7 @@ import {
   UNAUTHORIZED_EVENT,
   UnauthorizedApiError,
   updateRootModalities,
+  type DiagnosticsEmbedderRuntime,
   type Root,
 } from "./api";
 import { AddRootFlow, modalitiesForImages } from "./AddRootFlow";
@@ -75,6 +77,12 @@ export function App() {
   const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
   const [diagnosticsNotice, setDiagnosticsNotice] = useState<string | null>(null);
   const [diagnosticsError, setDiagnosticsError] = useState<string | null>(null);
+  /**
+   * 設定頁顯示的執行裝置狀態（來自 `GET /diagnostics`）：`undefined`＝還在讀取、
+   * `null`＝服務未提供。只在設定頁打開時抓一次，不輪詢（裝置不會在使用中改變）。
+   */
+  const [embedderRuntime, setEmbedderRuntime] = useState<DiagnosticsEmbedderRuntime | null | undefined>(undefined);
+  const [embedderRuntimeError, setEmbedderRuntimeError] = useState<string | null>(null);
 
   const load = useCallback(async (): Promise<void> => {
     setState({ kind: "loading" });
@@ -135,6 +143,31 @@ export function App() {
       alive = false;
     };
   }, [desktop]);
+
+  /**
+   * 設定頁打開時讀一次診斷，取執行裝置（`embedderRuntime`）。
+   *
+   * 讀不到就顯示一行錯誤（不改整個畫面）：設定頁的其他功能都不依賴它。
+   * 讀完之後 `embedderRuntime` 為 `null` 代表服務沒有提供裝置資訊（純 CPU 實作）。
+   */
+  useEffect(() => {
+    if (!showSettings) return;
+    let alive = true;
+    setEmbedderRuntimeError(null);
+    void fetchDiagnostics()
+      .then((diagnostics) => {
+        if (!alive) return;
+        setEmbedderRuntime(diagnostics.embedderRuntime);
+      })
+      .catch((error: unknown) => {
+        if (!alive) return;
+        setEmbedderRuntime(undefined);
+        setEmbedderRuntimeError(error instanceof Error ? error.message : "發生未知的錯誤");
+      });
+    return () => {
+      alive = false;
+    };
+  }, [showSettings]);
 
   /**
    * 只有「真的在下載（或下載失敗）」才擋住介面。
@@ -411,6 +444,8 @@ export function App() {
               settings={settings}
               error={settingsError}
               busy={settingsBusy}
+              embedderRuntime={embedderRuntime}
+              embedderRuntimeError={embedderRuntimeError}
               diagnosticsBusy={diagnosticsBusy}
               diagnosticsNotice={diagnosticsNotice}
               diagnosticsError={diagnosticsError}

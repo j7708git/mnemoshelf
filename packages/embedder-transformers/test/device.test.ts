@@ -10,25 +10,35 @@
  *   2. `dml` 載入／推論／探測失敗 → 自動退回 `cpu`（含原因）且不中斷；取消不觸發退回。
  *   3. 裝置覆寫（選項優先於環境變數；非法值拋錯）與 `dml` 的序列推論互斥。
  */
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isMediaDecodeError, type EmbedderRuntimeStatus } from "@mnemoshelf/core";
 import {
+  COREML_MLPROGRAM_FLAG,
   DEFAULT_DML_DEVICE_ID,
+  DEFAULT_MODEL_ID,
+  DEVICE_DECISION_SCHEMA,
   DML_BATCH_SIZE,
   EmbedderInputError,
   EMBED_DEVICE_ENV,
   EMBED_DML_DEVICE_ID_ENV,
   InvalidEmbedderOptionError,
   MAX_BATCH_SIZE,
+  SELF_TEST_REASONS,
   TransformersEmbedder,
   CPU_BATCH_SIZE,
   deviceBatchSize,
+  isCoreMlPlatform,
   isDmlPlatform,
   parseDmlDeviceId,
   parseEmbedDeviceOption,
   requiresSerializedInference,
   resolveEmbedDevice,
   summarizeFailure,
+  writeDecisionRecord,
+  type DeviceDecisionRecord,
 } from "../src/index.js";
 
 // ---------------------------------------------------------------------------
@@ -45,6 +55,17 @@ const mocks = vi.hoisted(() => ({
     imageDecodeFails: false,
     /** `load_image` 拋 `AbortError`：模擬解碼階段被取消（必須原樣拋出、不算輸入錯誤）。 */
     imageDecodeAborts: false,
+    /** 建 CoreML session 失敗（自我測試的「載入錯」）。 */
+    loadFailsOnCoreml: false,
+    /**
+     * CoreML 在第 N 次推論之後開始失敗（`null`＝不失敗）。
+     * 自我測試本身會用掉 2 次（暖機＋計時），因此 2 代表「測試通過、真推論才壞」。
+     */
+    coremlInferenceFailsAfter: null as number | null,
+    /** CoreML 的向量偏移（加在第二維）：0＝與 CPU 完全一致，0.05 會讓餘弦掉到 0.99875。 */
+    coremlVectorDrift: 0,
+    /** 每個裝置的單次推論延遲（毫秒）：用來控制自我測試量到的吞吐倍率。 */
+    delayMs: { cpu: 0, dml: 0, coreml: 0 } as Record<string, number>,
   },
   /** `AutoModel.from_pretrained` 收到的選項（逐次）。 */
   modelOptions: [] as { device?: unknown; session_options?: unknown }[],
@@ -61,8 +82,15 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("@huggingface/transformers", () => {
-  /** 768 維的合成輸出列（第一維為 1 → 截斷正規化後模長仍是 1）。 */
-  const row = (): number[] => Array.from({ length: 768 }, (_, index) => (index === 0 ? 1 : 0));
+  /**
+   * 768 維的合成輸出列（第一維為 1 → 截斷正規化後模長仍是 1）。
+   * `drift` 加在第二維：與 CPU 的餘弦會變成 `1 / sqrt(1 + drift²)`，用來模擬精度差異。
+   */
+  const row = (drift = 0): number[] => {
+    const values: number[] = Array.from({ length: 768 }, (_, index) => (index === 0 ? 1 : 0));
+    if (drift !== 0) values[1] = drift;
+    return values;
+  };
 
   const processor = Object.assign(
     async (texts: unknown): Promise<{ batch: number }> => {
@@ -80,25 +108,42 @@ vi.mock("@huggingface/transformers", () => {
     AutoModel: {
       from_pretrained: async (_id: string, options?: { device?: unknown; session_options?: unknown }) => {
         mocks.modelOptions.push({ device: options?.device, session_options: options?.session_options });
-        if (mocks.behavior.loadFailsOnDml && options?.device === "dml") {
+        const device = options?.device as string;
+        if (mocks.behavior.loadFailsOnDml && device === "dml") {
           throw new Error("DirectML 載入失敗（模擬）");
         }
+        if (mocks.behavior.loadFailsOnCoreml && device === "coreml") {
+          throw new Error("CoreML 載入失敗（模擬）");
+        }
+        /** 這個 session 已被推論幾次（CoreML 的失敗開關用）。 */
+        let calls = 0;
         const model = async (inputs: { batch?: number }): Promise<unknown> => {
           const count = inputs?.batch ?? 1;
+          calls += 1;
           mocks.inflight += 1;
           mocks.maxInflight = Math.max(mocks.maxInflight, mocks.inflight);
           try {
             if (mocks.gate !== null) await mocks.gate;
-            if (options?.device === "dml") {
+            const delay = mocks.behavior.delayMs[device] ?? 0;
+            if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+            if (device === "dml") {
               if (mocks.behavior.inferenceAbortsOnDml) {
                 throw Object.assign(new Error("嵌入已取消（模擬）"), { name: "AbortError" });
               }
               if (mocks.behavior.inferenceFailsOnDml) throw new Error("DML 推論失敗（模擬）");
             }
+            if (
+              device === "coreml" &&
+              mocks.behavior.coremlInferenceFailsAfter !== null &&
+              calls > mocks.behavior.coremlInferenceFailsAfter
+            ) {
+              throw new Error("CoreML 推論失敗（模擬）");
+            }
+            const drift = device === "coreml" ? mocks.behavior.coremlVectorDrift : 0;
             return {
               sentence_embedding: {
                 dims: [count, 768],
-                tolist: async () => Array.from({ length: count }, row),
+                tolist: async () => Array.from({ length: count }, () => row(drift)),
               },
             };
           } finally {
@@ -130,6 +175,10 @@ function resetMocks(): void {
   mocks.behavior.inferenceAbortsOnDml = false;
   mocks.behavior.imageDecodeFails = false;
   mocks.behavior.imageDecodeAborts = false;
+  mocks.behavior.loadFailsOnCoreml = false;
+  mocks.behavior.coremlInferenceFailsAfter = null;
+  mocks.behavior.coremlVectorDrift = 0;
+  mocks.behavior.delayMs = { cpu: 0, dml: 0, coreml: 0 };
   mocks.modelOptions.length = 0;
   mocks.windows.length = 0;
   mocks.inflight = 0;
@@ -180,10 +229,60 @@ function norm(vec: Float32Array): number {
 const originalDeviceEnv = process.env[EMBED_DEVICE_ENV];
 const originalDmlDeviceIdEnv = process.env[EMBED_DML_DEVICE_ID_ENV];
 
+/** 測試用的暫存目錄（裝置決定快取檔放在裡面；絕不碰使用者的家目錄或真實快取）。 */
+const tempDirs: string[] = [];
+
+/** 建一個暫存目錄（macOS 分支的測試一律把 `deviceDecisionPath` 指進來）。 */
+function tempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), "mnemoshelf-embedder-test-"));
+  tempDirs.push(dir);
+  return dir;
+}
+
+/** 寫一份決定記錄（模擬「上一次啟動留下的決定」）。 */
+function writeRecord(path: string, overrides: Partial<DeviceDecisionRecord> = {}): void {
+  const record: DeviceDecisionRecord = {
+    schema: DEVICE_DECISION_SCHEMA,
+    outcome: "usable",
+    testedAt: "2026-10-15T00:00:00.000Z",
+    appVersion: "1.0.0",
+    modelId: DEFAULT_MODEL_ID,
+    dtype: "q4",
+    platform: "darwin",
+    arch: process.arch,
+    coreMlFlags: COREML_MLPROGRAM_FLAG,
+    ...overrides,
+  };
+  writeDecisionRecord(path, record);
+}
+
+/** 讀回決定記錄的原始欄位（測試斷言檔案內容用）。 */
+function readRecord(path: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+}
+
+/** 建立一個 macOS＋auto 的 embedder（暫存快取路徑），回傳它與快取檔路徑。 */
+function darwinEmbedder(options: { appVersion?: string; device?: "auto" | "coreml" } = {}): {
+  embedder: TransformersEmbedder;
+  decisionPath: string;
+} {
+  const dir = tempDir();
+  const decisionPath = join(dir, "device-decision.json");
+  const embedder = new TransformersEmbedder({
+    platform: "darwin",
+    cacheDir: CACHE_DIR,
+    deviceDecisionPath: decisionPath,
+    ...(options.appVersion === undefined ? {} : { appVersion: options.appVersion }),
+    ...(options.device === undefined ? {} : { device: options.device }),
+  });
+  return { embedder, decisionPath };
+}
+
 afterEach(() => {
   resetMocks();
   restoreEnv(EMBED_DEVICE_ENV, originalDeviceEnv);
   restoreEnv(EMBED_DML_DEVICE_ID_ENV, originalDmlDeviceIdEnv);
+  while (tempDirs.length > 0) rmSync(tempDirs.pop()!, { recursive: true, force: true });
 });
 
 /** 還原環境變數（原本不存在就刪掉）。 */
@@ -203,10 +302,12 @@ describe("裝置選項解析（parseEmbedDeviceOption）", () => {
     expect(parseEmbedDeviceOption("   ")).toBe("auto");
   });
 
-  it("cpu／dml／auto 都接受（去空白、不分大小寫）", () => {
+  it("cpu／dml／coreml／auto 都接受（去空白、不分大小寫）", () => {
     expect(parseEmbedDeviceOption("cpu")).toBe("cpu");
     expect(parseEmbedDeviceOption("dml")).toBe("dml");
+    expect(parseEmbedDeviceOption("coreml")).toBe("coreml");
     expect(parseEmbedDeviceOption(" DML ")).toBe("dml");
+    expect(parseEmbedDeviceOption(" CoreML ")).toBe("coreml");
     expect(parseEmbedDeviceOption("Auto")).toBe("auto");
   });
 
@@ -225,10 +326,17 @@ describe("裝置選項解析（parseEmbedDeviceOption）", () => {
 });
 
 describe("平台解析（resolveEmbedDevice）", () => {
-  it("auto：只在 Windows 解析為 dml，其他平台維持 cpu（不算退回）", () => {
+  it("auto：Windows → dml（既有行為不動）、macOS → coreml（新）、其他 → cpu（不算退回）", () => {
     expect(resolveEmbedDevice("auto", "win32")).toEqual({ device: "dml", fallbackReason: null });
+    expect(resolveEmbedDevice("auto", "darwin")).toEqual({ device: "coreml", fallbackReason: null });
     expect(resolveEmbedDevice("auto", "linux")).toEqual({ device: "cpu", fallbackReason: null });
-    expect(resolveEmbedDevice("auto", "darwin")).toEqual({ device: "cpu", fallbackReason: null });
+    expect(resolveEmbedDevice("auto", "freebsd")).toEqual({ device: "cpu", fallbackReason: null });
+  });
+
+  it("auto 不得在非 macOS 平台解析出 coreml（Linux／Windows 不觸 CoreML）", () => {
+    for (const platform of ["linux", "win32", "freebsd", "android"]) {
+      expect(resolveEmbedDevice("auto", platform).device).not.toBe("coreml");
+    }
   });
 
   it("cpu：任何平台都是 cpu", () => {
@@ -245,10 +353,23 @@ describe("平台解析（resolveEmbedDevice）", () => {
     expect(plan.fallbackReason?.message).toContain("DirectML");
   });
 
-  it("isDmlPlatform 只認 Windows", () => {
+  it("coreml：macOS 嘗試 coreml；其他平台直接 cpu 並註明原因", () => {
+    expect(resolveEmbedDevice("coreml", "darwin")).toEqual({ device: "coreml", fallbackReason: null });
+    for (const platform of ["linux", "win32"]) {
+      const plan = resolveEmbedDevice("coreml", platform);
+      expect(plan.device).toBe("cpu");
+      expect(plan.fallbackReason?.code).toBe("unsupported-platform");
+      expect(plan.fallbackReason?.message).toContain("CoreML");
+    }
+  });
+
+  it("isDmlPlatform 只認 Windows；isCoreMlPlatform 只認 macOS", () => {
     expect(isDmlPlatform("win32")).toBe(true);
     expect(isDmlPlatform("linux")).toBe(false);
     expect(isDmlPlatform("darwin")).toBe(false);
+    expect(isCoreMlPlatform("darwin")).toBe(true);
+    expect(isCoreMlPlatform("win32")).toBe(false);
+    expect(isCoreMlPlatform("linux")).toBe(false);
   });
 });
 
@@ -287,16 +408,18 @@ describe("DirectML adapter 索引解析（parseDmlDeviceId）", () => {
   });
 });
 
-describe("批次視窗與序列推論", () => {  it("dml 用 32、cpu 用 16；MAX_BATCH_SIZE 仍是 CPU 的 16（既有常數不變）", () => {
+describe("批次視窗與序列推論", () => {  it("dml 用 32、cpu／coreml 用 16；MAX_BATCH_SIZE 仍是 CPU 的 16（既有常數不變）", () => {
     expect(deviceBatchSize("dml")).toBe(DML_BATCH_SIZE);
     expect(deviceBatchSize("cpu")).toBe(CPU_BATCH_SIZE);
+    expect(deviceBatchSize("coreml")).toBe(CPU_BATCH_SIZE);
     expect(DML_BATCH_SIZE).toBe(32);
     expect(CPU_BATCH_SIZE).toBe(16);
     expect(MAX_BATCH_SIZE).toBe(CPU_BATCH_SIZE);
   });
 
-  it("只有 dml 需要序列推論（同 session 不可並發 Run）", () => {
+  it("dml 與 coreml 都需要序列推論（同 session 不可並發 Run）", () => {
     expect(requiresSerializedInference("dml")).toBe(true);
+    expect(requiresSerializedInference("coreml")).toBe(true);
     expect(requiresSerializedInference("cpu")).toBe(false);
   });
 });
@@ -792,6 +915,469 @@ describe("serializedInference 的內部互斥（同一實例的推論不重疊�
     const [, imageVector] = await Promise.all([first, image]);
     expect(imageVector).toHaveLength(embedder.info.dim);
     expect(mocks.maxInflight).toBe(1);
+
+    await embedder.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CoreML（macOS）：自我測試、決定快取與退回
+//
+// 這些測試全在**非 macOS** 的開發機上跑：`@huggingface/transformers` 以 `vi.mock` 注入，
+// 平台以建構子選項覆寫成 `darwin`，決定快取檔指向暫存目錄（絕不寫入使用者的家目錄）。
+// 量到的「吞吐倍率」以 mock 的推論延遲控制：`delayMs.cpu / delayMs.coreml` 就是倍率。
+// ---------------------------------------------------------------------------
+
+describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）", () => {
+  it("沒有快取：先量 CPU、再量 CoreML，通過後採用 coreml（並保留測試時建好的 session）", async () => {
+    mocks.behavior.delayMs = { cpu: 30, dml: 0, coreml: 5 };
+    const { embedder, decisionPath } = darwinEmbedder({ appVersion: "1.2.3" });
+
+    // 載入前：計畫裝置就是 coreml（尚未測試 → 沒有 selfTest）。
+    const before: EmbedderRuntimeStatus = embedder.runtimeStatus;
+    expect(before).toMatchObject({
+      requestedDevice: "auto",
+      device: "coreml",
+      loaded: false,
+      fallbackReason: null,
+      batchSize: CPU_BATCH_SIZE,
+      serializedInference: true,
+    });
+    expect(before.selfTest).toBeUndefined();
+
+    const vectors = await embedder.embedDocuments(documents(3));
+    expect(vectors).toHaveLength(3);
+
+    // 自我測試的順序：CPU 基準 → CoreML（各兩次推論：暖機＋計時）。
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu", "coreml"]);
+    expect(mocks.modelOptions[1]!.session_options).toEqual({
+      enableCpuMemArena: false,
+      executionProviders: [{ name: "coreml", coreMlFlags: COREML_MLPROGRAM_FLAG }],
+    });
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("coreml");
+    expect(status.loaded).toBe(true);
+    expect(status.fallbackReason).toBeNull();
+    expect(status.selfTest?.outcome).toBe("usable");
+    expect(status.selfTest?.throughputRatio).toBeGreaterThanOrEqual(1.3);
+    expect(status.selfTest?.minCosine).toBeCloseTo(1, 6);
+    expect(status.selfTest?.testedAt).toBeTypeOf("string");
+    // 建置耗時（純診斷數據）：兩邊都有值且是有限數字（真實時鐘；不設門檻）。
+    expect(status.selfTest?.cpuSessionBuildMs).toBeTypeOf("number");
+    expect(Number.isFinite(status.selfTest?.cpuSessionBuildMs)).toBe(true);
+    expect(status.selfTest?.coreMlSessionBuildMs).toBeTypeOf("number");
+    expect(Number.isFinite(status.selfTest?.coreMlSessionBuildMs)).toBe(true);
+
+    // 決定落地：檔案裡的欄位足以說明「是誰、什麼時候、量到多少」。
+    const record = readRecord(decisionPath);
+    expect(record["outcome"]).toBe("usable");
+    expect(record["appVersion"]).toBe("1.2.3");
+    expect(record["modelId"]).toBe(DEFAULT_MODEL_ID);
+    expect(record["dtype"]).toBe("q4");
+    expect(record["platform"]).toBe("darwin");
+    expect(record["arch"]).toBe(process.arch);
+    expect(record["coreMlFlags"]).toBe(COREML_MLPROGRAM_FLAG);
+    expect(record["schema"]).toBe(DEVICE_DECISION_SCHEMA);
+    expect(record["throughputRatio"]).toBeGreaterThanOrEqual(1.3);
+    expect(record["cpuSessionBuildMs"]).toBe(status.selfTest?.cpuSessionBuildMs);
+    expect(record["coreMlSessionBuildMs"]).toBe(status.selfTest?.coreMlSessionBuildMs);
+
+    // 沿用的是測試中建好的 session：再嵌入一次不會多載模型（CoreML 編譯很貴）。
+    await embedder.embedDocuments(documents(2));
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu", "coreml"]);
+
+    await embedder.dispose();
+  });
+
+  it("沒有快取且 CoreML 較慢：退回 cpu、記 accel-slow、寫下 unusable", async () => {
+    mocks.behavior.delayMs = { cpu: 5, dml: 0, coreml: 40 };
+    const { embedder, decisionPath } = darwinEmbedder({ appVersion: "1.0.0" });
+
+    const vectors = await embedder.embedDocuments(documents(2));
+    expect(vectors).toHaveLength(2);
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("cpu");
+    expect(status.batchSize).toBe(CPU_BATCH_SIZE);
+    expect(status.serializedInference).toBe(false);
+    expect(status.fallbackReason?.code).toBe("accel-slow");
+    expect(status.fallbackReason?.message).toContain("1.3");
+    expect(status.selfTest?.outcome).toBe("unusable");
+    expect(status.selfTest?.reason).toBe(SELF_TEST_REASONS.tooSlow);
+
+    // 測試的 CPU → coreml，之後正式用 CPU 重載一次。
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu", "coreml", "cpu"]);
+    const record = readRecord(decisionPath);
+    expect(record["outcome"]).toBe("unusable");
+    expect(record["reason"]).toBe(SELF_TEST_REASONS.tooSlow);
+    expect(record["throughputRatio"]).toBeLessThan(1.3);
+
+    await embedder.dispose();
+  });
+
+  it("沒有快取且向量不一致：退回 cpu、記 accel-inconsistent（餘弦 0.99875 < 0.999）", async () => {
+    mocks.behavior.delayMs = { cpu: 20, dml: 0, coreml: 5 };
+    mocks.behavior.coremlVectorDrift = 0.05;
+    const { embedder, decisionPath } = darwinEmbedder({ appVersion: "1.0.0" });
+
+    await embedder.embedDocuments(documents(1));
+
+    expect(embedder.runtimeStatus.device).toBe("cpu");
+    expect(embedder.runtimeStatus.fallbackReason?.code).toBe("accel-inconsistent");
+    expect(embedder.runtimeStatus.selfTest?.reason).toBe(SELF_TEST_REASONS.inconsistent);
+    const record = readRecord(decisionPath);
+    expect(record["reason"]).toBe(SELF_TEST_REASONS.inconsistent);
+    expect(record["minCosine"]).toBeLessThan(0.999);
+
+    await embedder.dispose();
+  });
+
+  it("沒有快取且 CoreML 載入失敗：退回 cpu、記 load-failed，並把結果寫進快取", async () => {
+    mocks.behavior.loadFailsOnCoreml = true;
+    const { embedder, decisionPath } = darwinEmbedder({ appVersion: "1.0.0" });
+
+    const vectors = await embedder.embedDocuments(documents(1));
+    expect(vectors).toHaveLength(1);
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("cpu");
+    expect(status.fallbackReason?.code).toBe("load-failed");
+    expect(status.fallbackReason?.message).toContain("ModelLoadError");
+    expect(status.fallbackReason?.message).toContain("CoreML 載入失敗（模擬）");
+    expect(status.selfTest?.outcome).toBe("unusable");
+    expect(status.selfTest?.reason).toBe(SELF_TEST_REASONS.loadFailed);
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu", "coreml", "cpu"]);
+
+    const record = readRecord(decisionPath);
+    expect(record["outcome"]).toBe("unusable");
+    expect(record["reason"]).toBe(SELF_TEST_REASONS.loadFailed);
+
+    await embedder.dispose();
+  });
+
+  it("快取記 crashed：完全不嘗試 coreml（永久用 cpu），並保留原記錄", async () => {
+    const { embedder, decisionPath } = darwinEmbedder({ appVersion: "1.0.0" });
+    writeRecord(decisionPath, { outcome: "crashed", reason: SELF_TEST_REASONS.crashed });
+    mocks.behavior.inferenceFailsOnDml = false;
+
+    // 需要「重新建構」才能讀到剛寫下的記錄（建構子同步讀快取）。
+    const second = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    const status = second.runtimeStatus;
+    expect(status.device).toBe("cpu");
+    expect(status.fallbackReason?.code).toBe("accel-crashed");
+    expect(status.selfTest?.outcome).toBe("crashed");
+
+    await second.embedDocuments(documents(1));
+    // 連一次 coreml 都沒試（崩潰是機器層級的事實，重試只會再死一次）。
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu"]);
+    expect(readRecord(decisionPath)["outcome"]).toBe("crashed");
+
+    await second.dispose();
+    await embedder.dispose();
+  });
+
+  it("快取是 pending（上次測試中行程死掉）：推導成 crashed、改寫檔案、永久用 cpu", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    writeRecord(decisionPath, {
+      outcome: "pending",
+      reason: undefined,
+      throughputRatio: undefined,
+      minCosine: undefined,
+    });
+    // pending 是「有人在測試中」的標記，不該有結論欄位。
+    expect(readRecord(decisionPath)["outcome"]).toBe("pending");
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("cpu");
+    expect(status.batchSize).toBe(CPU_BATCH_SIZE);
+    expect(status.fallbackReason?.code).toBe("accel-crashed");
+    expect(status.selfTest?.outcome).toBe("crashed");
+    expect(status.selfTest?.reason).toBe(SELF_TEST_REASONS.crashed);
+
+    // 檔案被補成 crashed（下一次啟動不必再判讀 pending）。
+    const rewritten = readRecord(decisionPath);
+    expect(rewritten["outcome"]).toBe("crashed");
+    expect(rewritten["reason"]).toBe(SELF_TEST_REASONS.crashed);
+    expect(rewritten["testedAt"]).toBe("2026-10-15T00:00:00.000Z");
+
+    await embedder.embedDocuments(documents(1));
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu"]);
+
+    await embedder.dispose();
+  });
+
+  it("快取記 usable（同版本）：直接載 coreml、不跑自我測試、不改寫檔案", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    writeRecord(decisionPath, {
+      outcome: "usable",
+      appVersion: "1.0.0",
+      throughputRatio: 2.5,
+      cpuSessionBuildMs: 380,
+      coreMlSessionBuildMs: 11_500,
+    });
+    const before = readFileSync(decisionPath, "utf8");
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    expect(embedder.runtimeStatus.device).toBe("coreml");
+    // 上一次量到的建置耗時也要從快取讀回來（診斷看得到「上次啟動花了多久編譯」）。
+    expect(embedder.runtimeStatus.selfTest).toMatchObject({
+      outcome: "usable",
+      throughputRatio: 2.5,
+      cpuSessionBuildMs: 380,
+      coreMlSessionBuildMs: 11_500,
+    });
+
+    await embedder.embedDocuments(documents(1));
+    // 只有一次載入，而且是 coreml（沒有為了量測而載 CPU）。
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["coreml"]);
+    expect(embedder.runtimeStatus.device).toBe("coreml");
+    expect(readFileSync(decisionPath, "utf8")).toBe(before);
+
+    await embedder.dispose();
+  });
+
+  it("快取記 unusable（同版本）：直接 cpu、不跑自我測試", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    writeRecord(decisionPath, {
+      outcome: "unusable",
+      reason: SELF_TEST_REASONS.tooSlow,
+      appVersion: "1.0.0",
+      throughputRatio: 0.9,
+    });
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("cpu");
+    expect(status.fallbackReason?.code).toBe("accel-slow");
+    expect(status.selfTest).toMatchObject({ outcome: "unusable", reason: SELF_TEST_REASONS.tooSlow });
+
+    await embedder.embedDocuments(documents(1));
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu"]);
+
+    await embedder.dispose();
+  });
+
+  it("appVersion 變更：重測一次並改寫記錄（即使是 usable 也重測）", async () => {
+    mocks.behavior.delayMs = { cpu: 15, dml: 0, coreml: 3 };
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    writeRecord(decisionPath, { outcome: "usable", appVersion: "0.9.0", throughputRatio: 9 });
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    // 版本不符＝沒有可用的決定 → 載入時重測。
+    expect(embedder.runtimeStatus.selfTest).toBeUndefined();
+    await embedder.embedDocuments(documents(1));
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu", "coreml"]);
+
+    const record = readRecord(decisionPath);
+    expect(record["appVersion"]).toBe("1.0.0");
+    expect(record["outcome"]).toBe("usable");
+    expect(record["throughputRatio"]).not.toBe(9);
+
+    await embedder.dispose();
+  });
+
+  it("dtype 不同：快取決定不適用（重測），不會被舊量測誤導", async () => {
+    mocks.behavior.delayMs = { cpu: 15, dml: 0, coreml: 3 };
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    writeRecord(decisionPath, { outcome: "unusable", reason: SELF_TEST_REASONS.tooSlow, dtype: "q8" });
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+    expect(embedder.runtimeStatus.device).toBe("coreml");
+
+    await embedder.embedDocuments(documents(1));
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu", "coreml"]);
+    expect(readRecord(decisionPath)["dtype"]).toBe("q4");
+
+    await embedder.dispose();
+  });
+
+  it("CoreML 建得起來但推論失敗：退回 cpu、記 inference-failed，並更新快取", async () => {
+    mocks.behavior.delayMs = { cpu: 10, dml: 0, coreml: 3 };
+    // 自我測試用掉 2 次推論（暖機＋計時），第 3 次（真正的嵌入）才失敗。
+    mocks.behavior.coremlInferenceFailsAfter = 2;
+    const { embedder, decisionPath } = darwinEmbedder({ appVersion: "1.0.0" });
+
+    const vectors = await embedder.embedDocuments(documents(2));
+    expect(vectors).toHaveLength(2);
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("cpu");
+    expect(status.fallbackReason?.code).toBe("inference-failed");
+    expect(status.fallbackReason?.message).toContain("CoreML 推論失敗（模擬）");
+    expect(status.selfTest).toMatchObject({ outcome: "unusable", reason: SELF_TEST_REASONS.inferenceFailed });
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu", "coreml", "cpu"]);
+
+    // 失敗的結果也寫進快取：下次啟動不必再用一次壞掉的裝置。
+    const record = readRecord(decisionPath);
+    expect(record["outcome"]).toBe("unusable");
+    expect(record["reason"]).toBe(SELF_TEST_REASONS.inferenceFailed);
+
+    await embedder.dispose();
+  });
+
+  it("明示 coreml（darwin）：強制嘗試、不跑自我測試、不讀也不寫快取", async () => {
+    mocks.behavior.delayMs = { cpu: 30, dml: 0, coreml: 5 };
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    // 即使有一份「崩潰」的記錄（auto 會永久退回 CPU），明示 coreml 仍然照試。
+    writeRecord(decisionPath, { outcome: "crashed" });
+    const before = readFileSync(decisionPath, "utf8");
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      device: "coreml",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    expect(embedder.runtimeStatus).toMatchObject({ requestedDevice: "coreml", device: "coreml" });
+    expect(embedder.runtimeStatus.selfTest).toBeUndefined();
+
+    await embedder.embedDocuments(documents(1));
+    // 沒有 CPU 基準、沒有自我測試：只有一次 coreml 載入。
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["coreml"]);
+    expect(embedder.runtimeStatus.device).toBe("coreml");
+    expect(embedder.runtimeStatus.fallbackReason).toBeNull();
+    expect(embedder.runtimeStatus.selfTest).toBeUndefined();
+    // 快取檔原封不動（不讀、不寫）。
+    expect(readFileSync(decisionPath, "utf8")).toBe(before);
+
+    await embedder.dispose();
+  });
+
+  it("coreml 的序列推論互斥：兩路併發不重疊（沿用 dml 的骨架）", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    writeRecord(decisionPath, { outcome: "usable", appVersion: "1.0.0" });
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+    const release = holdModel();
+
+    const first = embedder.embedDocuments(documents(1));
+    await waitForInflight(1);
+    const second = embedder.embedDocuments(documents(2));
+    await tick();
+
+    expect(mocks.maxInflight).toBe(1);
+    expect(mocks.windows).toEqual([1]);
+
+    release();
+    await Promise.all([first, second]);
+    expect(mocks.maxInflight).toBe(1);
+    expect(mocks.windows).toEqual([1, 2]);
+
+    await embedder.dispose();
+  });
+});
+
+describe("非 macOS／非 Windows 平台：不碰 CoreML，也不碰裝置決定快取", () => {
+  it("auto（linux）：全程 cpu，暫存目錄不會出現任何檔案", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    const embedder = new TransformersEmbedder({
+      platform: "linux",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+    });
+
+    expect(embedder.runtimeStatus).toMatchObject({ requestedDevice: "auto", device: "cpu" });
+    expect(embedder.runtimeStatus.selfTest).toBeUndefined();
+
+    await embedder.embedDocuments(documents(2));
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu"]);
+    expect(readdirSync(dir)).toEqual([]);
+
+    await embedder.dispose();
+  });
+
+  it("明示 coreml（linux）：以 cpu 開始、記 unsupported-platform、不載入 coreml", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    const embedder = new TransformersEmbedder({
+      platform: "linux",
+      device: "coreml",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+    });
+
+    expect(embedder.runtimeStatus.device).toBe("cpu");
+    expect(embedder.runtimeStatus.fallbackReason?.code).toBe("unsupported-platform");
+    expect(embedder.runtimeStatus.fallbackReason?.message).toContain("CoreML");
+
+    await embedder.embedDocuments(documents(1));
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu"]);
+    expect(readdirSync(dir)).toEqual([]);
+
+    await embedder.dispose();
+  });
+
+  it("auto（win32）：行為不變（dml），且完全不碰裝置決定快取", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    const embedder = new TransformersEmbedder({
+      platform: "win32",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+    });
+
+    expect(embedder.runtimeStatus).toMatchObject({ requestedDevice: "auto", device: "dml" });
+    expect(embedder.runtimeStatus.selfTest).toBeUndefined();
+
+    await embedder.embedDocuments(documents(2));
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["dml"]);
+    expect(mocks.modelOptions[0]!.session_options).toEqual({
+      enableCpuMemArena: false,
+      executionProviders: [{ name: "dml", deviceId: DEFAULT_DML_DEVICE_ID }],
+    });
+    expect(readdirSync(dir)).toEqual([]);
 
     await embedder.dispose();
   });

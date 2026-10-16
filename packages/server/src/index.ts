@@ -20,7 +20,7 @@ import {
 } from "@mnemoshelf/core";
 import { TransformersEmbedder } from "@mnemoshelf/embedder-transformers";
 import { LOOPBACK_HOST, loadServerConfig, type ServerConfig } from "./config.js";
-import { createRestApp, type RestApp } from "./http/app.js";
+import { APP_VERSION, createRestApp, type RestApp } from "./http/app.js";
 
 export interface CreateServerOptions {
   /** 環境變數來源；預設 `process.env`。 */
@@ -93,7 +93,13 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
   await store.migrate();
 
   const embedder: Embedder =
-    options.embedder ?? new TransformersEmbedder(config.modelDir === undefined ? {} : { cacheDir: config.modelDir });
+    options.embedder ??
+    new TransformersEmbedder({
+      // 應用版本是裝置決定快取的身分欄位之一：換版本時 macOS 的 CoreML 自我測試會重測一次
+      // （量測結果與當時的實作綁在一起，見 embedder 的 `self-test.ts`）。
+      appVersion: APP_VERSION,
+      ...(config.modelDir === undefined ? {} : { cacheDir: config.modelDir }),
+    });
   const vec: VectorIndex = new SqliteVectorIndex(db, embedder.info.dim);
 
   const app = createRestApp({

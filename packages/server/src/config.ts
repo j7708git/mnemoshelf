@@ -14,7 +14,7 @@
  *
  * | 變數 | 用途 | 預設 |
  * |---|---|---|
- * | `MNEMOSHELF_EMBED_DEVICE` | 嵌入裝置 `auto`／`cpu`／`dml`（`auto` 只在 Windows 試 dml） | `auto` |
+ * | `MNEMOSHELF_EMBED_DEVICE` | 嵌入裝置 `auto`／`cpu`／`dml`／`coreml`（`auto`＝Windows 試 dml、macOS 試 coreml） | `auto` |
  * | `MNEMOSHELF_EMBED_DML_DEVICE_ID` | DirectML adapter 索引（非負整數，多顯卡時指定獨顯） | `0`（預設顯示卡） |
  * | `MNEMOSHELF_EMBED_ORT_LOG` | ONNX Runtime log 等級 `0`–`4`（`0`＝verbose；診斷用） | 未設定（不覆寫 ORT 預設） |
  *

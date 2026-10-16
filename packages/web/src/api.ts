@@ -780,14 +780,37 @@ export interface DiagnosticsRoot {
 }
 
 /**
+ * 加速器自我測試的結果（`embedderRuntime.selfTest`；**選配**欄位）。
+ *
+ * 欄位不存在＝從未測試過（或該實作不做自我測試）。`outcome` 的語意見
+ * `docs/embedder-contract.md`：`usable`＝已採用加速器、`unusable`＝已改用 CPU、
+ * `crashed`＝上一次測試讓行程死掉（永久不再自動重試）。
+ */
+export interface DiagnosticsEmbedderSelfTest {
+  outcome: "usable" | "unusable" | "crashed";
+  /** 穩定短標籤（例如 `too-slow`／`inconsistent`／`memory-exceeded`／`crashed-during-self-test`）。 */
+  reason?: string;
+  /** 量測到的吞吐倍率（加速器 ÷ CPU）；未量到時不存在。 */
+  throughputRatio?: number;
+  /** 量測到的向量一致性下限；未量到時不存在。 */
+  minCosine?: number;
+  /** 測試期間建立 CPU session 的耗時（毫秒）；未量到時不存在。 */
+  cpuSessionBuildMs?: number;
+  /** 測試期間建立加速器 session 的耗時（毫秒）；載入失敗或未量到時不存在。 */
+  coreMlSessionBuildMs?: number;
+  /** 測試時間（ISO 8601）。 */
+  testedAt?: string;
+}
+
+/**
  * embedder 的執行裝置狀態（`GET /diagnostics` 的 `embedderRuntime`；欄位以 server 契約為準）。
  *
  * 未提供時 `embedderRuntime` 為 `null`；`fallbackReason` 有值代表曾經從 GPU 退回 CPU。
  */
 export interface DiagnosticsEmbedderRuntime {
-  /** 要求／設定的裝置選項（`auto`／`cpu`／`dml`）。 */
+  /** 要求／設定的裝置選項（`auto`／`cpu`／`dml`／`coreml`）。 */
   requestedDevice: string;
-  /** 目前使用的裝置（`cpu`／`dml`）；模型尚未載入時為計畫值。 */
+  /** 目前使用的裝置（`cpu`／`dml`／`coreml`）；模型尚未載入時為計畫值。 */
   device: string;
   /** 模型是否已載入（true 代表 `device` 是實際使用的裝置）。 */
   loaded: boolean;
@@ -795,10 +818,12 @@ export interface DiagnosticsEmbedderRuntime {
   fallbackReason: { code: string; message: string } | null;
   /** 目前的批次視窗大小。 */
   batchSize: number;
-  /** 同一 session 是否只允許序列推論（DML 為 true）。 */
+  /** 同一 session 是否只允許序列推論（DML／CoreML 為 true）。 */
   serializedInference: boolean;
   /** DirectML adapter 索引（設定值，0＝預設顯示卡）；沒有 adapter 概念的實作為 `null`。 */
   dmlDeviceId: number | null;
+  /** 加速器自我測試的結果（選配；見 `DiagnosticsEmbedderSelfTest`）。 */
+  selfTest?: DiagnosticsEmbedderSelfTest;
 }
 
 /** `GET /diagnostics` 的回應。 */

@@ -37,9 +37,15 @@ TypeScript、Node.js、pnpm、Electron、React。預設儲存為 SQLite（FTS5 +
 
 | 變數 | 值 | 預設 | 說明 |
 |---|---|---|---|
-| `MNEMOSHELF_EMBED_DEVICE` | `auto`／`cpu`／`dml` | `auto` | `auto` 只在 Windows 嘗試 DirectML GPU（`dml`），其他平台維持 CPU；`dml` 載入或推論失敗會自動退回 CPU，不中斷索引。 |
+| `MNEMOSHELF_EMBED_DEVICE` | `auto`／`cpu`／`dml`／`coreml` | `auto` | `auto`＝Windows 嘗試 DirectML GPU（`dml`）、macOS 嘗試 CoreML（`coreml`，**先自我測試：通過才採用**）、其他平台維持 CPU。`dml`／`coreml` 載入或推論失敗會自動退回 CPU，不中斷索引。 |
 | `MNEMOSHELF_EMBED_DML_DEVICE_ID` | 非負整數 | `0` | DirectML adapter 索引（`0`＝預設顯示卡；多顯卡筆電常用來指定獨顯）。非法值會直接拒絕啟動。 |
 | `MNEMOSHELF_EMBED_ORT_LOG` | `0`–`4` | 未設定（不覆寫） | ONNX Runtime 的 log 等級（`0`＝verbose、`4`＝fatal），只用於除錯：`0` 會印出內部配置訊息（含 arena 的擴張量），可診斷「單一配置有多大」。訊息量大、會拖慢啟動，平時不要開；非法值會直接拒絕啟動。 |
+
+**明示 `coreml` 的提醒**：設定 `MNEMOSHELF_EMBED_DEVICE=coreml` 表示「**忽略已快取的決定、
+強制嘗試 CoreML**」（不自我測試、也不寫回快取），由使用者自負後果。macOS 的 CoreML EP
+目前對這種量化模型沒有實測過的加速證據，且上游仍有未修的當機風險
+（onnxruntime 的 CoreML EP＋外部資料檔以檔案路徑載入曾造成 SIGBUS）；要驗證請以
+`MNEMOSHELF_EMBED_DEVICE=coreml` 單獨跑一次，**不要**當成日常設定。
 
 ## 授權
 

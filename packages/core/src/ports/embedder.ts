@@ -36,10 +36,42 @@ export interface EmbedderFallbackReason {
 }
 
 /**
+ * 加速器**自我測試**的結果（選填；只有需要「先量測再決定」的實作會提供）。
+ *
+ * 用途：有些加速器（例如 macOS 的 CoreML）「值不值得用」無法事先查詢，只能實測；
+ * 而實測成本高（編譯數秒到數分鐘）又有崩潰風險，因此實作會把量測結果持久化，
+ * 之後直接沿用決定。這個型別是那個決定的**摘要**，供診斷與設定頁顯示。
+ *
+ * `outcome` 的語意：
+ * - `usable`：量測通過，加速器已採用。
+ * - `unusable`：量測未通過（太慢／向量不一致／記憶體超限／載入失敗），已改用 CPU。
+ * - `crashed`：上一次測試**讓行程死掉**（實作以測試前落地的標記推導）→ 永久不再自動重試。
+ *
+ * 實作若從未測試、或該實作沒有自我測試概念，就不提供這個成員（欄位不存在＝「未測試」）。
+ * `reason` 為穩定短標籤（可程式比對），實作定義；契約檔列舉預設實作的標籤。
+ */
+export interface EmbedderSelfTestStatus {
+  /** 測試結論。 */
+  outcome: "usable" | "unusable" | "crashed";
+  /** 穩定短標籤（實作定義；例如 `too-slow`／`inconsistent`／`memory-exceeded`）。 */
+  reason?: string;
+  /** 量測到的吞吐倍率（加速器 ÷ CPU）；未量到時不存在。 */
+  throughputRatio?: number;
+  /** 量測到的向量一致性下限（逐樣本餘弦的最小值）；未量到時不存在。 */
+  minCosine?: number;
+  /** 測試期間建立 CPU session 的耗時（毫秒）；未量到時不存在。 */
+  cpuSessionBuildMs?: number;
+  /** 測試期間建立加速器 session 的耗時（毫秒）；載入失敗或未量到時不存在。 */
+  coreMlSessionBuildMs?: number;
+  /** 測試時間（ISO 8601）；未測試過時不存在。 */
+  testedAt?: string;
+}
+
+/**
  * embedder 的執行裝置狀態（**選填**能力，供診斷與排程參考）。
  *
  * 為什麼是選填：只有會用到加速器的實作才有「裝置」概念（目前是 `TransformersEmbedder`
- * 的 cpu／DirectML）。純軟體或其他實作不需要提供，索引器與 REST 層一律以
+ * 的 cpu／DirectML／CoreML）。純軟體或其他實作不需要提供，索引器與 REST 層一律以
  * 「欄位不存在」處理。`serializedInference` 為 true 時，索引器會把檔案間併發限制為 1。
  */
 export interface EmbedderRuntimeStatus {
@@ -47,7 +79,7 @@ export interface EmbedderRuntimeStatus {
   requestedDevice: string;
   /**
    * 目前使用的裝置；模型尚未載入時為**依平台與設定解析出的計畫裝置**。
-   * 值由實作定義（本專案目前為 `cpu`／`dml`）。
+   * 值由實作定義（本專案目前為 `cpu`／`dml`／`coreml`）。
    */
   device: string;
   /** 模型是否已載入；true 代表 `device` 是實際使用的裝置，而非計畫值。 */
@@ -69,6 +101,13 @@ export interface EmbedderRuntimeStatus {
    * 診斷才判讀得出「原本指定第 N 張卡、之後退回了」。沒有 adapter 概念的實作為 `null`。
    */
   dmlDeviceId: number | null;
+  /**
+   * 加速器自我測試的結果（選填；見 `EmbedderSelfTestStatus`）。
+   *
+   * 欄位不存在＝從未測試過（或該實作不做自我測試）；舊的實作與舊的診斷 payload
+   * 都不會因為缺這個欄位而出錯。
+   */
+  selfTest?: EmbedderSelfTestStatus;
 }
 
 /** 啟動探測的結果。 */

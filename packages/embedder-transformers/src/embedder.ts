@@ -9,11 +9,16 @@
  *   - 只載文字＋圖片：`config.audio_config = null`。**不用** `pipeline("feature-extraction")`（會載入全部編碼器）。
  *
  * 執行裝置（`device` 選項／`MNEMOSHELF_EMBED_DEVICE`）：
- *   - `auto`（預設）：**只在 Windows** 嘗試 DirectML GPU（`dml`），其他平台維持現狀 CPU。
+ *   - `auto`（預設）：**Windows** 嘗試 DirectML GPU（`dml`）、**macOS** 嘗試 CoreML
+ *     （`coreml`，需通過內建自我測試才會採用）、其他平台維持現狀 CPU。
  *   - `dml` 載入或推論失敗時**自動退回 CPU**，不中斷；原因可在 `runtimeStatus.fallbackReason` 讀到。
+ *   - `coreml` 的處置與 `dml` 相同（載入／推論失敗一律退回 CPU），但**多了一層自我測試**：
+ *     macOS 的 `auto` 在沒有（或過期的）決定快取時，會先量測 CoreML 與 CPU 的吞吐、
+ *     向量一致性與峰值記憶體，通過才採用；決定會持久化（見 `self-test.ts`）。
+ *     **明示** `coreml` 的語意是「忽略快取、強制嘗試」（使用者自負；不寫回快取）。
  *   - **例外：解碼／輸入類失敗不退**（`EmbedderInputError`／`code:"undecodable"`）。一張壞圖
  *     不該讓整場永久失去 GPU；這類錯誤照常往上拋，由 core 記成 `skipped(undecodable)`。
- *   - 批次視窗依裝置：DML 32、CPU 16（見 `device.ts` 的實測依據），另受 token 預算限制
+ *   - 批次視窗依裝置：DML 32、CPU／CoreML 16（見 `device.ts` 的實測依據），另受 token 預算限制
  *     （一窗的 token 總量上限，`BATCH_TOKEN_BUDGET`）。
  *   - 換裝置**不改變** `info.id`（只吃 model id 與 dtype）：向量兩者等值，既有索引不需重建。
  *
@@ -36,6 +41,7 @@ import type {
   EmbedderFallbackReason,
   EmbedderInfo,
   EmbedderRuntimeStatus,
+  EmbedderSelfTestStatus,
   EmbedDocumentsOptions,
   ImageInput,
   ProbeResult,
@@ -47,6 +53,7 @@ import {
   EMBED_DML_DEVICE_ID_ENV,
   EMBED_ORT_LOG_ENV,
   deviceBatchSize,
+  isCoreMlPlatform,
   parseDmlDeviceId,
   parseOrtLogLevel,
   requiresSerializedInference,
@@ -66,6 +73,21 @@ import {
   UnsupportedDtypeError,
 } from "./errors.js";
 import { runProbe } from "./probe.js";
+import {
+  COREML_MLPROGRAM_FLAG,
+  DEVICE_DECISION_SCHEMA,
+  SELF_TEST_REASONS,
+  classifyDecision,
+  describeSelfTestReason,
+  readDecisionRecord,
+  runCoreMlSelfTest,
+  selfTestFallbackCode,
+  toSelfTestStatus,
+  writeDecisionRecord,
+  type CoreMlSelfTestResult,
+  type DeviceDecisionIdentity,
+  type DeviceDecisionRecord,
+} from "./self-test.js";
 import { assertMrlDimension, truncateAndNormalize } from "./vector.js";
 
 /** 預設模型 id。 */
@@ -111,14 +133,30 @@ export interface TransformersEmbedderOptions {
   /**
    * 嵌入裝置，預設 `auto`（環境變數 `MNEMOSHELF_EMBED_DEVICE` 可設定；選項優先於環境變數）。
    *
-   * `auto`＝只在 Windows 嘗試 `dml`（DirectML GPU），其他平台維持現狀 CPU；
-   * `dml` 不可用或失敗時自動退回 `cpu`，原因見 `runtimeStatus.fallbackReason`。
+   * `auto`＝Windows 試 `dml`（DirectML GPU）、macOS 試 `coreml`（CoreML，需通過自我測試）、
+   * 其他平台維持 CPU；不可用或失敗時自動退回 `cpu`，原因見 `runtimeStatus.fallbackReason`。
+   * 明示 `coreml`＝忽略快取強制嘗試（可能不穩；見 `docs/embedder-contract.md`）。
    */
   device?: EmbedDeviceOption;
   /** 輸出維度，預設 512。僅允許 128／256／512／768。 */
   dim?: number;
   /** 模型快取目錄；預設環境變數 `MNEMOSHELF_MODEL_DIR`，再預設 OS 使用者資料目錄下的 `mnemoshelf/models`。 */
   cacheDir?: string;
+  /**
+   * 應用程式版本（寫進裝置決定快取；換版本時加速器自我測試會重測一次）。
+   *
+   * 未提供時為 `"unknown"`。組裝層（`@mnemoshelf/server`）會傳自己的 `APP_VERSION`，
+   * 因此發行新版後 macOS 的 CoreML 決定會自動重測。
+   */
+  appVersion?: string;
+  /**
+   * 裝置決定快取（CoreML 自我測試的結果）的檔案路徑；
+   * 預設 `<cacheDir>/device-decision.json`（與模型快取同處：兩者都必須是可寫的資料區，
+   * 打包後的桌面版把 `MNEMOSHELF_MODEL_DIR` 指向 `userData/models`）。
+   *
+   * 只為測試而存在時可覆寫；產品碼不需要設定。
+   */
+  deviceDecisionPath?: string;
   /** 圖片 soft token 預算，預設 70。 */
   maxSoftTokens?: number;
   /**
@@ -210,6 +248,19 @@ export function defaultModelCacheDir(): string {
   const fromEnv = process.env.MNEMOSHELF_MODEL_DIR;
   if (fromEnv && fromEnv.trim() !== "") return fromEnv;
   return join(osUserDataDir(homedir()), "mnemoshelf", "models");
+}
+
+/**
+ * 裝置決定快取（CoreML 自我測試的結果）的預設路徑：`<cacheDir>/device-decision.json`。
+ *
+ * 為什麼放在模型快取目錄：那個目錄**本來就必須可寫**（要下載模型），
+ * 而且桌面殼已把它指到 `userData/models`（打包後 `app.asar` 唯讀，只有這裡寫得進去）
+ * → 「dev 與打包皆可寫」用同一條路徑就成立，不需要再引入一個環境變數或第二個資料區。
+ * 代價：模型快取目錄若被設成唯讀的共用目錄，寫入會失敗——但那只讓下一次啟動重測一次
+ * （`writeDecisionRecord` 回傳 false，不影響任何流程）。
+ */
+export function defaultDeviceDecisionPath(cacheDir: string): string {
+  return join(cacheDir, "device-decision.json");
 }
 
 /** 取消檢查（沿用 @mnemoshelf/core indexer 的 `throwIfAborted` 慣例）。 */
@@ -315,16 +366,22 @@ function promptTokens(processed: Record<string, unknown>): number | null {
  * `dispose()` 後再呼叫 `embed*` 會**自動重新載入**（本實作選擇「自動重新載入」，見測試與註解）。
  *
  * 裝置與退回（`runtimeStatus` 可同步讀取，載入模型前就有值）：
- * - 建構子依 `device` 選項／環境變數與平台解析出**計畫裝置**（非 Windows 不可能是 `dml`）。
+ * - 建構子依 `device` 選項／環境變數與平台解析出**計畫裝置**（非 Windows 不可能是 `dml`、
+ *   非 macOS 不可能是 `coreml`）。
  * - 計畫裝置為 `dml` 時，載入或推論失敗**自動退回 CPU 並重試一次**（同一實例只退一次、退回後不再
  *   嘗試 `dml`），不讓整輪索引因此中斷；原因記在 `runtimeStatus.fallbackReason`。
+ * - 計畫裝置為 `coreml` 時走同一條骨架，但依情境分岔：
+ *   - macOS 的 `auto`：建構子先讀裝置決定快取（`<cacheDir>/device-decision.json`）。
+ *     已有可用決定就直接沿用；沒有或過期時，於 `loadModel()` 內跑一次自我測試
+ *     （`runCoreMlSelfTest`：CPU 基準 → CoreML 量測 → 判準），通過才保留 CoreML session。
+ *   - 明示 `coreml`：忽略快取、**強制嘗試**、不跑自我測試也不寫快取（使用者自負）。
  * - 取消（`AbortError`／`signal.aborted`）不算裝置失敗，一律原樣拋出。
  * - **輸入類失敗**（`EmbedderInputError`，例如解不開的圖）也不算裝置失敗：與裝置無關，
  *   不退回、不在同窗重試，原樣往上拋給 core 判定 `skipped(undecodable)`（見 `shouldFallBack`）。
  *
- * 序列推論（DirectML 的硬性限制）：
- * - `dml` 的同一 session 不支援並發 `Run`，而並發來源不止索引器（多個 root 同時索引、
- *   「索引＋搜尋」並行、探測與查詢交錯）。因此**本實例內建互斥佇列**：裝置為 `dml` 時，
+ * 序列推論（DirectML 的硬性限制；CoreML 沿用同一條骨架）：
+ * - `dml`／`coreml` 的同一 session 不支援並發 `Run`，而並發來源不止索引器（多個 root 同時索引、
+ *   「索引＋搜尋」並行、探測與查詢交錯）。因此**本實例內建互斥佇列**：裝置為 `dml`／`coreml` 時，
  *   同一實例的所有推論單位（一批文件、一段文字、一張圖片）永不重疊，呼叫端不需自行排隊。
  * - 等待中的呼叫若被 abort → 直接以取消錯誤拒絕、**不執行**、立即讓出佇列（不卡住後面的呼叫）；
  *   已在執行中的呼叫不受影響（照常跑完或依自己的 signal 中止）。
@@ -344,6 +401,21 @@ export class TransformersEmbedder implements Embedder {
   private readonly cacheDir: string;
   private readonly maxSoftTokens: number;
   private readonly requestedDevice: EmbedDeviceOption;
+  /** 平台（`options.platform` 可覆寫，測試用）。 */
+  private readonly platform: string;
+  /** 應用程式版本（裝置決定快取的身分欄位之一）。 */
+  private readonly appVersion: string;
+  /** 裝置決定快取的檔案路徑。 */
+  private readonly deviceDecisionPath: string;
+  /**
+   * 是否使用裝置決定快取：**只有 macOS 的 `auto`**（也就是會跑 CoreML 自我測試的那條路）。
+   *
+   * 這個單一開關同時保證三件事：Windows／Linux 完全不碰這個檔案（既有行為不動）、
+   * 明示 `cpu`／`dml`／`coreml` 時不讀不寫（env 明示＝忽略快取、強制嘗試）。
+   */
+  private readonly deviceDecisionEnabled: boolean;
+  /** 建構子已套用一份可用的決定（載入時不必再自我測試）。 */
+  private decisionApplied = false;
   /**
    * DirectML adapter 索引（設定值）：只有 `dml` 路徑會帶進 session options，
    * 但**非 dml 路徑與退回 CPU 後仍照原設定顯示**，診斷才看得出「原本指定第 N 張卡、已退回」。
@@ -361,10 +433,12 @@ export class TransformersEmbedder implements Embedder {
   private device: EmbedDevice;
   /** 退回原因；未退回為 null。 */
   private fallbackReason: EmbedderFallbackReason | null;
+  /** 加速器自我測試的摘要（有快取或跑過測試時才有值）。 */
+  private selfTest: EmbedderSelfTestStatus | undefined;
 
   private loaded: LoadedModel | null = null;
   private loading: Promise<LoadedModel> | null = null;
-  /** 序列推論的鎖：`true` 表示有人持有（只有 `dml` 會用到）。 */
+  /** 序列推論的鎖：`true` 表示有人持有（只有 `dml`／`coreml` 會用到）。 */
   private lockHeld = false;
   /** 等待序列鎖的佇列（FIFO）。 */
   private lockWaiters: LockWaiter[] = [];
@@ -386,9 +460,17 @@ export class TransformersEmbedder implements Embedder {
 
     // 選項優先於環境變數；兩者皆未設時為 "auto"。
     this.requestedDevice = parseEmbedDeviceOption(options.device ?? process.env[EMBED_DEVICE_ENV]);
-    const plan = resolveEmbedDevice(this.requestedDevice, options.platform ?? process.platform);
+    this.platform = options.platform ?? process.platform;
+    this.appVersion = options.appVersion ?? "unknown";
+    // 裝置決定快取與模型快取放在同一個可寫的資料區（見 defaultDeviceDecisionPath 的說明）。
+    this.deviceDecisionPath = options.deviceDecisionPath ?? defaultDeviceDecisionPath(this.cacheDir);
+    this.deviceDecisionEnabled = this.requestedDevice === "auto" && isCoreMlPlatform(this.platform);
+
+    const plan = resolveEmbedDevice(this.requestedDevice, this.platform);
     this.device = plan.device;
     this.fallbackReason = plan.fallbackReason;
+    // macOS 的 auto：先把已快取的決定套上（同步讀一個 tiny JSON；理由見 applyCachedDecision）。
+    if (this.deviceDecisionEnabled) this.applyCachedDecision();
     // adapter 索引一律先驗證（非法值立即失敗，不等到真的載入 dml 才發現）。
     this.dmlDeviceId = parseDmlDeviceId(process.env[EMBED_DML_DEVICE_ID_ENV]);
     // 診斷用的 ORT log 等級；同樣先驗證（未設定＝不覆寫）。
@@ -402,9 +484,13 @@ export class TransformersEmbedder implements Embedder {
     };
   }
 
-  /** 執行裝置狀態（診斷與索引器併發用）；載入模型前即為計畫值。 */
+  /**
+   * 執行裝置狀態（診斷與索引器併發用）；載入模型前即為計畫值。
+   *
+   * `selfTest` 只在「有決定快取」或「跑過自我測試」時才出現（欄位不存在＝未測試）。
+   */
   get runtimeStatus(): EmbedderRuntimeStatus {
-    return {
+    const status: EmbedderRuntimeStatus = {
       requestedDevice: this.requestedDevice,
       device: this.device,
       loaded: this.loaded !== null,
@@ -414,6 +500,8 @@ export class TransformersEmbedder implements Embedder {
       // 設定值（不隨退回改變）：診斷要能看出「DML 是哪一張卡」。
       dmlDeviceId: this.dmlDeviceId,
     };
+    if (this.selfTest !== undefined) status.selfTest = { ...this.selfTest };
+    return status;
   }
 
   async embedQuery(text: string): Promise<Float32Array> {
@@ -666,32 +754,147 @@ export class TransformersEmbedder implements Embedder {
   }
 
   /**
-   * 這個失敗是否該退回 CPU。只有 `dml`、且是「裝置／模型類」的失敗才退回。
+   * 這個失敗是否該退回 CPU。只有 `dml`／`coreml`、且是「裝置／模型類」的失敗才退回。
    *
    * - 取消（`AbortError`／`signal.aborted`）不算裝置失敗。
    * - **輸入類錯誤**（`EmbedderInputError`：解不開的圖、前處理失敗）也不算：換裝置、
    *   重試同一份位元組結果一樣，退回只會讓整場永久失去 GPU，卻什麼都沒換到。照常往上拋，
    *   由 core 認標記後記成 `skipped(undecodable)`。
+   *
+   * `coreml` 與 `dml` 同規則：CoreML EP 是「多個分區各自在不同硬體上跑」的裝置，
+   * 一旦某個輸入把它跑壞，之後每個輸入都可能踩到同一個問題 → 退回 CPU 並把結果記進快取
+   * （見 `fallBackToCpu`）。
    */
   private shouldFallBack(signal: AbortSignal | undefined, error: unknown): boolean {
-    if (this.device !== "dml") return false;
+    if (this.device !== "dml" && this.device !== "coreml") return false;
     if (signal?.aborted === true) return false;
     if (isAbortError(error)) return false;
     if (error instanceof EmbedderInputError) return false;
     return true;
   }
 
-  /** 退回 CPU：丟掉壞掉的 session、記錄原因，下一次 `ensureLoaded` 會載 CPU 模型。 */
+  /**
+   * 退回 CPU：丟掉壞掉的 session、記錄原因，下一次 `ensureLoaded` 會載 CPU 模型。
+   *
+   * 若丟掉的是 **CoreML** session，順手把「這台機器的加速器跑不起來」寫進決定快取
+   * （`unusable`／`inference-failed`）——不然下一次啟動又會帶著「可用」的舊決定再踩一次。
+   * 寫入與否由 `persistDecision` 的單一開關決定（明示 `coreml` 時不寫）。
+   */
   private async fallBackToCpu(code: string, error: unknown): Promise<void> {
+    const previous = this.device;
     const loaded = this.loaded;
     this.loaded = null;
     this.loading = null;
     this.device = "cpu";
     this.fallbackReason = { code, message: summarizeFailure(error) };
+    if (previous === "coreml") {
+      this.selfTest = {
+        outcome: "unusable",
+        reason: SELF_TEST_REASONS.inferenceFailed,
+        testedAt: new Date().toISOString(),
+      };
+      this.persistDecision(this.selfTest);
+    }
     try {
       await loaded?.model.dispose?.();
     } catch {
       // 釋放失敗不影響退回（session 會隨行程結束回收）；退回本身必須成功。
+    }
+  }
+
+  /** 這次量測代表的身分（寫進決定記錄；讀取時也用來比對）。 */
+  private decisionIdentity(): DeviceDecisionIdentity {
+    return {
+      appVersion: this.appVersion,
+      modelId: this.modelId,
+      dtype: dtypeLabel(this.dtype),
+      platform: this.platform,
+      arch: process.arch,
+      coreMlFlags: COREML_MLPROGRAM_FLAG,
+    };
+  }
+
+  /**
+   * 把快取的裝置決定套到 `this.device`／`this.selfTest`／`this.fallbackReason`。
+   *
+   * 為什麼在**建構子同步**讀檔：`runtimeStatus` 在任何時候（模型還沒載入時也算）都要能回答
+   * 「這台機器最後決定用什麼、為什麼」，而 REST 層讀 `runtimeStatus` 是同步的。
+   * 檔案只有幾百 bytes，且只在 macOS 的 `auto` 路徑讀一次。
+   *
+   * 三種處置（見 `classifyDecision`）：
+   * - `test-required`：不套用（計畫裝置維持 `coreml`，載入時再跑自我測試）。
+   * - `crashed`：**永久**改用 CPU，並把 `pending` 補寫成 `crashed`（不再自動重試）。
+   * - `decided`：`usable` 維持 `coreml`；`unusable` 改用 CPU 並記下原因。
+   */
+  private applyCachedDecision(): void {
+    const identity = this.decisionIdentity();
+    const classified = classifyDecision(readDecisionRecord(this.deviceDecisionPath), identity);
+    if (classified.kind === "test-required") return;
+
+    this.selfTest = classified.status;
+    this.decisionApplied = true;
+    if (classified.status.outcome === "usable") return;
+
+    this.device = "cpu";
+    this.fallbackReason = {
+      code: selfTestFallbackCode(classified.status.reason),
+      message: describeSelfTestReason(classified.status.reason),
+    };
+    if (classified.kind === "crashed" && classified.needsRewrite) {
+      // 上一次跑測試時行程死掉了：把存活標記改成結論，避免下次再被判讀成 pending。
+      this.persistDecision({
+        ...classified.status,
+        outcome: "crashed",
+        reason: SELF_TEST_REASONS.crashed,
+      });
+    }
+  }
+
+  /**
+   * 寫入裝置決定快取（best-effort）。
+   *
+   * **單一開關**：`deviceDecisionEnabled` 為 false（Windows／Linux，或明示裝置）時完全不寫，
+   * 因此 Windows 的既有行為與「env 明示不吃快取」都不需要各自記得判斷。
+   */
+  private persistDecision(status: EmbedderSelfTestStatus): void {
+    if (!this.deviceDecisionEnabled) return;
+    const record: DeviceDecisionRecord = {
+      schema: DEVICE_DECISION_SCHEMA,
+      ...this.decisionIdentity(),
+      outcome: status.outcome,
+      testedAt: status.testedAt ?? new Date().toISOString(),
+    };
+    if (status.reason !== undefined) record.reason = status.reason;
+    if (status.throughputRatio !== undefined) record.throughputRatio = status.throughputRatio;
+    if (status.minCosine !== undefined) record.minCosine = status.minCosine;
+    if (status.cpuSessionBuildMs !== undefined) record.cpuSessionBuildMs = status.cpuSessionBuildMs;
+    if (status.coreMlSessionBuildMs !== undefined) record.coreMlSessionBuildMs = status.coreMlSessionBuildMs;
+    writeDecisionRecord(this.deviceDecisionPath, record);
+  }
+
+  /** 以某個已載入的 session 嵌入樣本，回傳**最終向量**（截斷＋L2 正規化）。 */
+  private async embedSamples(
+    backend: LoadedModel,
+    texts: readonly string[],
+  ): Promise<readonly Float32Array[]> {
+    const prefixed = texts.map((text) => this.documentPrefix(text));
+    const inputs = await backend.processor(prefixed);
+    const rows = await runModel(this.modelId, backend.model, inputs);
+    if (rows.length !== prefixed.length) {
+      throw new ModelInferenceError(
+        this.modelId,
+        `批次回傳 ${rows.length} 筆向量，預期 ${prefixed.length} 筆`,
+      );
+    }
+    return rows.map((row) => truncateAndNormalize(Float32Array.from(row), this.dim));
+  }
+
+  /** 釋放一個 backend（自我測試用；失敗不往外拋）。 */
+  private async disposeBackend(backend: LoadedModel): Promise<void> {
+    try {
+      await backend.model.dispose?.();
+    } catch {
+      // 釋放失敗不影響流程（session 會隨行程結束回收）。
     }
   }
 
@@ -735,10 +938,17 @@ export class TransformersEmbedder implements Embedder {
         device,
         dtype: this.dtype,
         session_options: {
-          // 見上方說明：所有平台、兩個裝置路徑都關閉 CPU arena。
+          // 見上方說明：所有平台、所有裝置路徑都關閉 CPU arena。
           enableCpuMemArena: false,
           ...(device === "dml"
             ? { executionProviders: [{ name: "dml", deviceId: this.dmlDeviceId }] }
+            : {}),
+          ...(device === "coreml"
+            ? {
+                // 物件形式是唯一能帶旗標的方法（其他欄位會被綁定層靜默丟棄）；
+                // 帶 `0x010`＝MLProgram，理由見 `COREML_MLPROGRAM_FLAG`。
+                executionProviders: [{ name: "coreml", coreMlFlags: COREML_MLPROGRAM_FLAG }],
+              }
             : {}),
           // 只在明確設定時覆寫 ORT 的 log 等級（診斷用）。
           ...(this.ortLogLevel === undefined ? {} : { logSeverityLevel: this.ortLogLevel }),
@@ -753,17 +963,94 @@ export class TransformersEmbedder implements Embedder {
   }
 
   /**
-   * 依目前裝置載入模型；計畫裝置是 `dml` 且載入失敗時，自動退回 CPU 再載一次。
+   * 依目前裝置載入模型。
+   *
+   * - `cpu`：直接載。
+   * - `dml`（Windows）：載入失敗自動退回 CPU 再載一次（**既有行為，不動**）。
+   * - `coreml`（macOS）：見 `loadCoreMl`。
    *
    * CPU 也載不起來時 `ModelLoadError` 照常往外拋（沒有可退的地方）。
    */
   private async loadModel(): Promise<LoadedModel> {
     if (this.device === "cpu") return await this.createBackend("cpu");
+    if (this.device === "coreml") return await this.loadCoreMl();
     try {
       return await this.createBackend("dml");
     } catch (error) {
       this.fallbackReason = { code: "load-failed", message: summarizeFailure(error) };
       this.device = "cpu";
+      return await this.createBackend("cpu");
+    }
+  }
+
+  /**
+   * 載入 CoreML（macOS）。
+   *
+   * 三條分岔：
+   * 1. **明示 `coreml`**（`requestedDevice === "coreml"`）：忽略快取、強制嘗試——不跑自我測試、
+   *    也不寫回快取。使用者的意圖就是「我就是要試」，判斷與記帳都交給他們。
+   * 2. **已套用快取的可用決定**：直接載 CoreML（不重測，避免每次啟動都付編譯成本）。
+   * 3. **`auto` 且沒有可用決定**（第一次、身分變了、或換版本）：先跑自我測試再決定。
+   *
+   * 自我測試若**自己拋錯**（最典型：CPU 基準都載不起來），先把 `pending` 改寫成
+   * `unusable`／`load-failed` 再往外拋——否則下一次啟動會把「非崩潰的失敗」誤讀成
+   * 「上次死在測試中」，永久鎖在 CPU。
+   */
+  private async loadCoreMl(): Promise<LoadedModel> {
+    // 明示 `coreml`，或已經有可用的快取決定（`deviceDecisionEnabled` 為 false 或已套用）
+    // → 直接嘗試，不跑自我測試。
+    if (!this.deviceDecisionEnabled || this.decisionApplied) return await this.loadCoreMlOrFallback();
+
+    let result: CoreMlSelfTestResult<LoadedModel>;
+    try {
+      result = await runCoreMlSelfTest<LoadedModel>({
+        decisionPath: this.deviceDecisionPath,
+        identity: this.decisionIdentity(),
+        createBackend: (device) => this.createBackend(device),
+        embed: (backend, texts) => this.embedSamples(backend, texts),
+        disposeBackend: (backend) => this.disposeBackend(backend),
+      });
+    } catch (error) {
+      this.selfTest = {
+        outcome: "unusable",
+        reason: SELF_TEST_REASONS.loadFailed,
+        testedAt: new Date().toISOString(),
+      };
+      this.persistDecision(this.selfTest);
+      throw error;
+    }
+
+    this.selfTest = toSelfTestStatus(result.record);
+    if (result.backend !== null) return result.backend;
+
+    // 未通過：改用 CPU。測試中建立的 CoreML session 已由自我測試釋放。
+    this.device = "cpu";
+    this.fallbackReason = {
+      code: selfTestFallbackCode(result.record.reason),
+      message: result.message ?? describeSelfTestReason(result.record.reason),
+    };
+    return await this.createBackend("cpu");
+  }
+
+  /**
+   * 直接嘗試 CoreML；失敗就退回 CPU，並把「這次載不起來」寫進決定快取。
+   *
+   * 寫回的理由：快取說「可用」但這次載入失敗（驅動更新、ORT 換版、記憶體不足…），
+   * 下次啟動不該再付一次失敗的編譯成本。寫入與否仍由 `persistDecision` 的開關決定。
+   */
+  private async loadCoreMlOrFallback(): Promise<LoadedModel> {
+    try {
+      return await this.createBackend("coreml");
+    } catch (error) {
+      const message = summarizeFailure(error);
+      this.fallbackReason = { code: "load-failed", message };
+      this.selfTest = {
+        outcome: "unusable",
+        reason: SELF_TEST_REASONS.loadFailed,
+        testedAt: new Date().toISOString(),
+      };
+      this.device = "cpu";
+      this.persistDecision(this.selfTest);
       return await this.createBackend("cpu");
     }
   }

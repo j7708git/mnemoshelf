@@ -62,7 +62,7 @@ interface EmbedderRuntimeStatus {
   requestedDevice: string;
   /**
    * 目前使用的裝置；模型尚未載入時為**依平台與設定解析出的計畫裝置**。
-   * 值由實作定義（本專案的預設實作為 `cpu`／`dml`）。
+   * 值由實作定義（本專案的預設實作為 `cpu`／`dml`／`coreml`）。
    */
   device: string;
   /** 模型是否已載入；true 代表 `device` 是**實際使用**的裝置，而非計畫值。 */
@@ -83,6 +83,8 @@ interface EmbedderRuntimeStatus {
    * **沒有 adapter 概念的實作為 `null`。**
    */
   dmlDeviceId: number | null;
+  /** 加速器自我測試的結果（**選配**；見下一節）。欄位不存在＝未測試過。 */
+  selfTest?: EmbedderSelfTestStatus;
 }
 
 /** 從 GPU 退回 CPU 的原因（短標籤＋已去識別化的說明）。 */
@@ -93,6 +95,76 @@ interface EmbedderFallbackReason {
   message: string;
 }
 ```
+
+## 加速器自我測試（`runtimeStatus.selfTest`，選配）
+
+> 本節於 **2026-10-16 經使用者核准新增**。這只是一個**選配**的診斷欄位：不提供它的實作
+> 完全不受影響，`GET /diagnostics` 只是不會出現 `selfTest` 這個鍵（不是 `null`）。
+
+有些加速器「值不值得用」**無法事先查詢**（macOS 的 CoreML EP 沒有能力查詢 API），只能實測；
+而實測的成本（編譯時間可達數分鐘）與風險（上游已知問題可能直接終止行程）都高，
+因此實作會「量測一次、把決定持久化」，之後直接沿用。`selfTest` 就是那個決定的摘要。
+
+```ts
+/** 加速器自我測試的結果（選配）。 */
+interface EmbedderSelfTestStatus {
+  /** `usable`＝量測通過、已採用加速器；`unusable`＝量測未通過、已改用 CPU；
+   *  `crashed`＝上一次測試讓行程死掉（永久不再自動重試）。 */
+  outcome: "usable" | "unusable" | "crashed";
+  /** 穩定短標籤（實作定義；見下方預設實作的清單）。 */
+  reason?: string;
+  /** 量測到的吞吐倍率（加速器 ÷ CPU）；未量到時不存在。 */
+  throughputRatio?: number;
+  /** 量測到的向量一致性下限（逐樣本餘弦的最小值）；未量到時不存在。 */
+  minCosine?: number;
+  /** 測試期間建立 CPU session 的耗時（毫秒）；未量到時不存在。 */
+  cpuSessionBuildMs?: number;
+  /** 測試期間建立加速器 session 的耗時（毫秒）；載入失敗或未量到時不存在。 */
+  coreMlSessionBuildMs?: number;
+  /** 測試時間（ISO 8601）；未測試過時不存在。 */
+  testedAt?: string;
+}
+```
+
+**預設實作（`TransformersEmbedder`）的判準**：吞吐倍率 ≥ **1.3×**、向量一致性 min cos ≥ **0.999**、
+測試期峰值 RSS ≤ **6 GiB**。三者以「**剛好達到門檻即通過**」為準（`>=`／`<=`）。
+
+**session 建置耗時（`cpuSessionBuildMs`／`coreMlSessionBuildMs`）**：**純診斷數據，不參與判準**
+（不設門檻）。為什麼要記：Node 端拿不到 CoreML 的編譯快取（綁定層會丟棄
+`ModelCacheDirectory`），每次啟動第一次使用加速器都要重新編譯，這個數字就是
+「那次會不會卡」的直接讀數；CPU 那一邊一起記，才有可比較的基準。
+語意：CoreML **載入失敗**時不記（沒有建好的 session）；未量到時欄位不存在。
+
+**預設實作的 `reason` 標籤**（穩定字串，可程式比對）：
+
+| `reason` | 意義 |
+|---|---|
+| `too-slow` | 加速器不夠快（吞吐倍率未達門檻） |
+| `inconsistent` | 向量與 CPU 不一致（餘弦未達門檻） |
+| `memory-exceeded` | 測試期峰值記憶體超過門檻 |
+| `load-failed` | 加速器 session 載入失敗 |
+| `inference-failed` | session 建得起來，但推論失敗 |
+| `crashed-during-self-test` | 由「測試中」的落地標記推導：上一次測試讓行程死掉 |
+
+**預設實作的 `fallbackReason.code`**：自我測試擋下的情況用 `accel-*` 家族
+（`accel-slow`／`accel-inconsistent`／`accel-memory-exceeded`／`accel-crashed`），
+讓診斷一眼看出「是加速器自我測試擋的」而不是別的載入錯誤；載入失敗與推論失敗沿用既有的
+`load-failed`／`inference-failed`。
+
+**重測政策（預設實作）**：`crashed` 永不自動重試；其他結果在**應用程式版本**變更時重測一次
+（量測結果與當時的實作綁在一起）；模型 id／dtype／平台／CPU 架構任一改變也重測。
+決定快取存在模型快取目錄（`<cacheDir>/device-decision.json`）並以原子寫入更新。
+
+**明示 `coreml` 的語意**：只有 `auto` 會跑自我測試並讀寫決定快取；**明示** `coreml`
+（環境變數或建構子選項）代表「忽略已快取的決定、強制嘗試」，因此**不執行自我測試、也不讀寫
+決定快取**——載入失敗時 `selfTest` 只反映該次載入的結果、不落地。
+
+**已判定 `usable` 後的載入失敗**：該次載入失敗會把決定改寫成 `unusable`／`load-failed`，
+之後不再自動嘗試；重測只可能發生在**應用程式版本變更**或**明示 `coreml`** 時。
+
+**不屬於契約的部分**：快取檔的檔案格式、路徑與量測方法都由實作決定；契約只保證
+`selfTest` 這個欄位的形狀與它「不存在＝未測試」的語意。診斷輸出中的字串一律
+遵守「不含本機絕對路徑與個資」的既有規則。
 
 ## 批次方法（`embedDocuments`）
 
@@ -124,7 +196,7 @@ interface EmbedDocumentsOptions {
 - **取消**：`opts.signal` 沿用索引器的 `throwIfAborted` 慣例，實作應在開始推論前檢查。
 
 **批次上限**：一次 forward 的視窗上限由實作決定，並可由 `runtimeStatus.batchSize` 讀到。
-本專案的預設實作**依執行裝置**取上限：DirectML（`dml`）為 32、CPU 為 16
+本專案的預設實作**依執行裝置**取上限：DirectML（`dml`）為 32、CPU 與 CoreML（`coreml`）為 16
 （常數 `MAX_BATCH_SIZE` 即 CPU 的 16；DML 取 32 的依據為實測，見實作內註解）。批次會把同批
 文字 pad 到同批最長序列，過大的批次會讓 pad 成本與記憶體上升，因此需要上限；超過上限的輸入
 應由實作**內部切成多個視窗**後串接回傳，呼叫端不需自行分批。

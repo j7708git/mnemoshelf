@@ -316,4 +316,123 @@ describe("GET /diagnostics：embedderRuntime（執行裝置與退回原因）", 
     expect(body.embedderRuntime?.fallbackReason?.message).toBe("~/models/model.onnx 無法載入");
     expect(JSON.stringify(body)).not.toContain(fakeHome);
   });
+
+  it("selfTest 為選配：有提供就原樣帶出（macOS 的 CoreML 自我測試結果）", async () => {
+    server = await startTestServer({
+      embedder: embedderWithRuntime(
+        runtimeStatus({
+          requestedDevice: "auto",
+          device: "coreml",
+          batchSize: 16,
+          dmlDeviceId: 0,
+          selfTest: {
+            outcome: "usable",
+            throughputRatio: 2.4,
+            minCosine: 0.99997,
+            cpuSessionBuildMs: 410,
+            coreMlSessionBuildMs: 11_800,
+            testedAt: "2026-10-16T12:00:00.000Z",
+          },
+        }),
+      ),
+    });
+
+    const body = (await api(server.instance, "GET", "/diagnostics")).body as DiagnosticsResponse;
+    expect(body.embedderRuntime?.selfTest).toEqual({
+      outcome: "usable",
+      throughputRatio: 2.4,
+      minCosine: 0.99997,
+      cpuSessionBuildMs: 410,
+      coreMlSessionBuildMs: 11_800,
+      testedAt: "2026-10-16T12:00:00.000Z",
+    });
+    expect(body.embedderRuntime?.device).toBe("coreml");
+  });
+
+  it("session 建置耗時是選配中的選配：只有一邊有值也照樣帶出", async () => {
+    server = await startTestServer({
+      embedder: embedderWithRuntime(
+        runtimeStatus({
+          device: "cpu",
+          batchSize: 16,
+          serializedInference: false,
+          fallbackReason: { code: "load-failed", message: "加速器 session 載入失敗，已退回 CPU" },
+          // CoreML 載入失敗 → 沒有建好的 session，因此沒有它的建置耗時。
+          selfTest: {
+            outcome: "unusable",
+            reason: "load-failed",
+            cpuSessionBuildMs: 512,
+            testedAt: "2026-10-16T12:00:00.000Z",
+          },
+        }),
+      ),
+    });
+
+    const body = (await api(server.instance, "GET", "/diagnostics")).body as DiagnosticsResponse;
+    expect(body.embedderRuntime?.selfTest).toEqual({
+      outcome: "unusable",
+      reason: "load-failed",
+      cpuSessionBuildMs: 512,
+      testedAt: "2026-10-16T12:00:00.000Z",
+    });
+    expect(Object.keys(body.embedderRuntime?.selfTest ?? {})).not.toContain("coreMlSessionBuildMs");
+  });
+
+  it("selfTest 選配的失敗態：unusable 與 crashed 都帶得出原因，且沒有殘留未定義欄位", async () => {
+    server = await startTestServer({
+      embedder: embedderWithRuntime(
+        runtimeStatus({
+          device: "cpu",
+          batchSize: 16,
+          serializedInference: false,
+          fallbackReason: { code: "accel-slow", message: "加速器沒有明顯較快（吞吐倍率未達 1.3 倍）" },
+          selfTest: { outcome: "unusable", reason: "too-slow", throughputRatio: 0.98, testedAt: "2026-10-16T12:00:00.000Z" },
+        }),
+      ),
+    });
+    const unusable = (await api(server.instance, "GET", "/diagnostics")).body as DiagnosticsResponse;
+    expect(unusable.embedderRuntime?.selfTest?.outcome).toBe("unusable");
+    expect(unusable.embedderRuntime?.selfTest?.reason).toBe("too-slow");
+    expect(unusable.embedderRuntime?.fallbackReason?.code).toBe("accel-slow");
+    await server.close();
+
+    server = await startTestServer({
+      embedder: embedderWithRuntime(
+        runtimeStatus({
+          device: "cpu",
+          batchSize: 16,
+          serializedInference: false,
+          fallbackReason: { code: "accel-crashed", message: "上一次加速器自我測試造成行程結束，已永久改用 CPU" },
+          selfTest: { outcome: "crashed", reason: "crashed-during-self-test", testedAt: "2026-10-16T12:00:00.000Z" },
+        }),
+      ),
+    });
+    const crashed = (await api(server.instance, "GET", "/diagnostics")).body as DiagnosticsResponse;
+    expect(crashed.embedderRuntime?.selfTest).toEqual({
+      outcome: "crashed",
+      reason: "crashed-during-self-test",
+      testedAt: "2026-10-16T12:00:00.000Z",
+    });
+    // 沒有量到數字時不得出現 `throughputRatio: undefined` 這種欄位（JSON 也不該有這個鍵）。
+    expect(Object.keys(crashed.embedderRuntime?.selfTest ?? {})).toEqual(["outcome", "reason", "testedAt"]);
+  });
+
+  it("舊 payload 相容：沒有 selfTest 的 runtimeStatus 照常輸出（欄位不存在，不是 null）", async () => {
+    server = await startTestServer({
+      embedder: embedderWithRuntime(runtimeStatus({ device: "cpu", batchSize: 16, serializedInference: false })),
+    });
+
+    const body = (await api(server.instance, "GET", "/diagnostics")).body as DiagnosticsResponse;
+    // 舊欄位齊全、新欄位完全不出現（客戶端不需要為選配欄位做 null 檢查）。
+    expect(body.embedderRuntime).toEqual({
+      requestedDevice: "auto",
+      device: "cpu",
+      loaded: true,
+      fallbackReason: null,
+      batchSize: 16,
+      serializedInference: false,
+      dmlDeviceId: 0,
+    });
+    expect("selfTest" in (body.embedderRuntime ?? {})).toBe(false);
+  });
 });
