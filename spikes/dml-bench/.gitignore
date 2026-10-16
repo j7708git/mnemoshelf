@@ -1,0 +1,10 @@
+# 依賴：Windows 使用者自己 npm install（數百 MB，不進版控）
+node_modules/
+
+# 量測產出物：每台機器重跑即可再生
+dml-bench-report.json
+dml-bench-report.*.json
+results/
+
+# 模型快取：首次執行會從 Hugging Face 下載（約 200 MB，實測 197 MiB）
+.cache/

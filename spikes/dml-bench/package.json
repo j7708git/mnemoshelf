@@ -1,0 +1,20 @@
+{
+  "name": "mnemoshelf-spike-dml-bench",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Spike：量測 EmbeddingGemma 2（ONNX）在 DirectML（GPU）與 CPU 的文字嵌入吞吐、批次效應、首次載入與向量一致性",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "bench": "node bench.mjs",
+    "bench:quick": "node bench.mjs --quick",
+    "bench:cpu": "node bench.mjs --device cpu",
+    "bench:dml": "node bench.mjs --device dml"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "4.3.1",
+    "onnxruntime-node": "1.30.0"
+  }
+}
