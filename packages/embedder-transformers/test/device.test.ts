@@ -34,6 +34,7 @@ import {
   isDmlPlatform,
   parseDmlDeviceId,
   parseEmbedDeviceOption,
+  readDecisionRecord,
   requiresSerializedInference,
   resolveEmbedDevice,
   summarizeFailure,
@@ -64,6 +65,19 @@ const mocks = vi.hoisted(() => ({
     coremlInferenceFailsAfter: null as number | null,
     /** CoreML 的向量偏移（加在第二維）：0＝與 CPU 完全一致，0.05 會讓餘弦掉到 0.99875。 */
     coremlVectorDrift: 0,
+    /**
+     * 被觀察的決定檔路徑（非 null 時，每次建 CoreML session 都會讀它一次，
+     * 用來斷言「碰 CoreML 之前，存活標記已經在磁碟上」）。
+     */
+    watchDecisionPath: null as string | null,
+    /** 每次建 CoreML session 當下，決定檔的 `outcome`（或 null）。 */
+    pendingAtCoreMlLoad: [] as (string | null)[],
+    /** 每次建 CoreML session 當下，決定檔的 `pendingPhase`（或 null）。 */
+    pendingPhaseAtCoreMlLoad: [] as (string | null)[],
+    /** 每次建 CoreML session 當下，決定檔的 `suspectedLoadCrashes`（沒有時 null）。 */
+    loadCrashCountAtCoreMlLoad: [] as (number | null)[],
+    /** 每次建 CoreML session 當下，決定檔的完整內容（用來檢查存活標記帶了哪些欄位）。 */
+    markerSnapshots: [] as Record<string, unknown>[],
     /** 每個裝置的單次推論延遲（毫秒）：用來控制自我測試量到的吞吐倍率。 */
     delayMs: { cpu: 0, dml: 0, coreml: 0 } as Record<string, number>,
   },
@@ -109,6 +123,20 @@ vi.mock("@huggingface/transformers", () => {
       from_pretrained: async (_id: string, options?: { device?: unknown; session_options?: unknown }) => {
         mocks.modelOptions.push({ device: options?.device, session_options: options?.session_options });
         const device = options?.device as string;
+        if (device === "coreml" && mocks.behavior.watchDecisionPath !== null) {
+          // 護欄斷言：碰 CoreML 的當下，磁碟上必須已經有存活標記。
+          let snapshot: Record<string, unknown> | null = null;
+          try {
+            snapshot = JSON.parse(readFileSync(mocks.behavior.watchDecisionPath, "utf8")) as Record<string, unknown>;
+          } catch {
+            snapshot = null;
+          }
+          mocks.behavior.pendingAtCoreMlLoad.push((snapshot?.["outcome"] as string | undefined) ?? null);
+          mocks.behavior.pendingPhaseAtCoreMlLoad.push((snapshot?.["pendingPhase"] as string | undefined) ?? null);
+          const count = snapshot?.["suspectedLoadCrashes"];
+          mocks.behavior.loadCrashCountAtCoreMlLoad.push(typeof count === "number" ? count : null);
+          if (snapshot !== null) mocks.behavior.markerSnapshots.push(snapshot);
+        }
         if (mocks.behavior.loadFailsOnDml && device === "dml") {
           throw new Error("DirectML 載入失敗（模擬）");
         }
@@ -178,6 +206,11 @@ function resetMocks(): void {
   mocks.behavior.loadFailsOnCoreml = false;
   mocks.behavior.coremlInferenceFailsAfter = null;
   mocks.behavior.coremlVectorDrift = 0;
+  mocks.behavior.watchDecisionPath = null;
+  mocks.behavior.pendingAtCoreMlLoad.length = 0;
+  mocks.behavior.pendingPhaseAtCoreMlLoad.length = 0;
+  mocks.behavior.loadCrashCountAtCoreMlLoad.length = 0;
+  mocks.behavior.markerSnapshots.length = 0;
   mocks.behavior.delayMs = { cpu: 0, dml: 0, coreml: 0 };
   mocks.modelOptions.length = 0;
   mocks.windows.length = 0;
@@ -1121,7 +1154,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
     await embedder.dispose();
   });
 
-  it("快取記 usable（同版本）：直接載 coreml、不跑自我測試、不改寫檔案", async () => {
+  it("快取記 usable（同版本）：直接載 coreml、不跑自我測試（護欄只重寫同一份決定）", async () => {
     const dir = tempDir();
     const decisionPath = join(dir, "device-decision.json");
     writeRecord(decisionPath, {
@@ -1131,7 +1164,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
       cpuSessionBuildMs: 380,
       coreMlSessionBuildMs: 11_500,
     });
-    const before = readFileSync(decisionPath, "utf8");
+    mocks.behavior.watchDecisionPath = decisionPath;
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
@@ -1152,8 +1185,18 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
     await embedder.embedDocuments(documents(1));
     // 只有一次載入，而且是 coreml（沒有為了量測而載 CPU）。
     expect(mocks.modelOptions.map((options) => options.device)).toEqual(["coreml"]);
+    // 載入期護欄照樣落地（`pending(load)`），成功後再寫回同一份「可用」決定。
+    expect(mocks.behavior.pendingAtCoreMlLoad).toEqual(["pending"]);
+    expect(mocks.behavior.pendingPhaseAtCoreMlLoad).toEqual(["load"]);
     expect(embedder.runtimeStatus.device).toBe("coreml");
-    expect(readFileSync(decisionPath, "utf8")).toBe(before);
+
+    const record = readRecord(decisionPath);
+    expect(record["outcome"]).toBe("usable");
+    expect(record["appVersion"]).toBe("1.0.0");
+    expect(record["throughputRatio"]).toBe(2.5);
+    expect(record["cpuSessionBuildMs"]).toBe(380);
+    expect(record["coreMlSessionBuildMs"]).toBe(11_500);
+    expect(record["testedAt"]).toBe("2026-10-15T00:00:00.000Z");
 
     await embedder.dispose();
   });
@@ -1378,6 +1421,396 @@ describe("非 macOS／非 Windows 平台：不碰 CoreML，也不碰裝置決定
       executionProviders: [{ name: "dml", deviceId: DEFAULT_DML_DEVICE_ID }],
     });
     expect(readdirSync(dir)).toEqual([]);
+
+    await embedder.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 載入期護欄（F1）：每一次「為正式使用」建 CoreML session 之前都要先落 pending(load)
+//
+// 為什麼要這一層：`#28005` 的 SIGBUS 若是間歇性的，可能「自我測試那次剛好沒踩到、
+// 之後每次啟動都踩到」——那就是無上限的啟動閃退迴圈、而記錄永遠停在 `usable`。
+// 這些測試模擬「上一次啟動死在載入期」留下的 `pending(load)` 記錄，驗證容忍與永久停用。
+// ---------------------------------------------------------------------------
+
+describe("auto 在 macOS：載入期護欄與疑似崩潰的容忍", () => {
+  it("快取 usable：載入前先落 pending(load)、成功後寫回 usable（量測欄位保留、計數歸零）", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    writeRecord(decisionPath, {
+      outcome: "usable",
+      appVersion: "1.0.0",
+      throughputRatio: 2.5,
+      minCosine: 0.9997,
+      cpuSessionBuildMs: 380,
+      coreMlSessionBuildMs: 11_500,
+      suspectedLoadCrashes: 1,
+    });
+    mocks.behavior.watchDecisionPath = decisionPath;
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    expect(embedder.runtimeStatus.device).toBe("coreml");
+
+    const vectors = await embedder.embedDocuments(documents(2));
+    expect(vectors).toHaveLength(2);
+
+    // 碰 CoreML 的當下，磁碟上必須是 `pending(load)`（護欄）。
+    expect(mocks.behavior.pendingAtCoreMlLoad).toEqual(["pending"]);
+    expect(mocks.behavior.pendingPhaseAtCoreMlLoad).toEqual(["load"]);
+
+    const record = readRecord(decisionPath);
+    expect(record["outcome"]).toBe("usable");
+    // 量測欄位沿用上一輪，不因這次載入而消失。
+    expect(record["throughputRatio"]).toBe(2.5);
+    expect(record["minCosine"]).toBe(0.9997);
+    expect(record["cpuSessionBuildMs"]).toBe(380);
+    expect(record["coreMlSessionBuildMs"]).toBe(11_500);
+    // 載入成功 → 疑似崩潰的計數歸零（欄位不再出現）。
+    expect(record["suspectedLoadCrashes"]).toBeUndefined();
+    // 護欄帶上了上一次的計數（載入成功才歸零）：若這一步不成立，下一次崩潰就會被誤判成「第一次」。
+    expect(mocks.behavior.loadCrashCountAtCoreMlLoad).toEqual([1]);
+    expect(embedder.runtimeStatus.device).toBe("coreml");
+    expect(embedder.runtimeStatus.fallbackReason).toBeNull();
+
+    await embedder.dispose();
+  });
+
+  it("存活標記只帶量測欄位＋階段：舊結論（reason／outcome）不得被搬進 pending 標記（C1）", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    // 種子刻意帶一個**不屬於載入階段**的舊 reason（例如舊版本留下的記錄）：
+    // 護欄改寫時只准搬量測欄位，不能把這個理由一起寫進「載入中」的存活標記。
+    writeRecord(decisionPath, {
+      outcome: "usable",
+      reason: "too-slow",
+      appVersion: "1.0.0",
+      throughputRatio: 2.5,
+      minCosine: 0.9997,
+      cpuSessionBuildMs: 380,
+      coreMlSessionBuildMs: 11_500,
+    });
+    mocks.behavior.watchDecisionPath = decisionPath;
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    await embedder.embedDocuments(documents(1));
+
+    expect(mocks.behavior.markerSnapshots).toHaveLength(1);
+    const marker = mocks.behavior.markerSnapshots[0]!;
+    // 標記＝身分 ＋ outcome(pending) ＋ 量測欄位 ＋ 階段／次數；**沒有** reason 這種結論欄位。
+    expect(marker["outcome"]).toBe("pending");
+    expect(marker["pendingPhase"]).toBe("load");
+    expect(marker["reason"]).toBeUndefined();
+    expect(Object.keys(marker)).not.toContain("reason");
+    expect(marker["throughputRatio"]).toBe(2.5);
+    expect(marker["minCosine"]).toBe(0.9997);
+    expect(marker["cpuSessionBuildMs"]).toBe(380);
+    expect(marker["coreMlSessionBuildMs"]).toBe(11_500);
+    expect(marker["testedAt"]).toBe("2026-10-15T00:00:00.000Z");
+
+    // 載入成功後的結論同樣乾淨（usable、沒有殘留的舊 reason，量測欄位留著）。
+    const record = readRecord(decisionPath);
+    expect(record["outcome"]).toBe("usable");
+    expect(Object.keys(record)).not.toContain("reason");
+    expect(record["minCosine"]).toBe(0.9997);
+
+    await embedder.dispose();
+  });
+
+  it("疑似載入崩潰第一次：這次完全不碰 coreml、寫回 usable＋次數 1（下次啟動再試）", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    // 上一次啟動留下的存活標記（載入期、次數 0）；量測欄位仍在（marker 會沿用它們）。
+    writeRecord(decisionPath, {
+      outcome: "pending",
+      pendingPhase: "load",
+      appVersion: "1.0.0",
+      throughputRatio: 2.5,
+      minCosine: 0.9997,
+      cpuSessionBuildMs: 380,
+      coreMlSessionBuildMs: 11_500,
+    });
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("cpu");
+    expect(status.fallbackReason?.code).toBe("accel-load-crashed");
+    expect(status.fallbackReason?.message).toContain("下次啟動再試一次");
+    // 決定沒被推翻：呈現上仍是「可用」（只是這次先用 CPU）。
+    expect(status.selfTest?.outcome).toBe("usable");
+    expect(status.selfTest?.throughputRatio).toBe(2.5);
+    expect(status.selfTest?.minCosine).toBe(0.9997);
+    expect(status.selfTest?.coreMlSessionBuildMs).toBe(11_500);
+
+    // 寫回 usable＋次數 1，量測欄位（含 minCosine）與原 testedAt 沿用。
+    const record = readRecord(decisionPath);
+    expect(record["outcome"]).toBe("usable");
+    expect(record["suspectedLoadCrashes"]).toBe(1);
+    expect(record["throughputRatio"]).toBe(2.5);
+    expect(record["minCosine"]).toBe(0.9997);
+    expect(record["cpuSessionBuildMs"]).toBe(380);
+    expect(record["coreMlSessionBuildMs"]).toBe(11_500);
+    expect(record["testedAt"]).toBe("2026-10-15T00:00:00.000Z");
+
+    await embedder.embedDocuments(documents(1));
+    // 這次連一次 coreml 都不碰（那條路徑剛剛才殺掉上一個行程）。
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu"]);
+
+    await embedder.dispose();
+  });
+
+  it("疑似載入崩潰第二次（連續）：永久 crashed、記錄寫成 crashed-during-load", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    writeRecord(decisionPath, {
+      outcome: "pending",
+      pendingPhase: "load",
+      appVersion: "1.0.0",
+      suspectedLoadCrashes: 1,
+    });
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("cpu");
+    expect(status.fallbackReason?.code).toBe("accel-crashed");
+    expect(status.fallbackReason?.message).toContain("連續兩次");
+    expect(status.selfTest?.outcome).toBe("crashed");
+    expect(status.selfTest?.reason).toBe("crashed-during-load");
+
+    const record = readRecord(decisionPath);
+    expect(record["outcome"]).toBe("crashed");
+    expect(record["reason"]).toBe("crashed-during-load");
+    expect(record["suspectedLoadCrashes"]).toBe(2);
+
+    await embedder.embedDocuments(documents(1));
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu"]);
+
+    await embedder.dispose();
+  });
+
+  it("已記成 crashed-during-load：永久不碰 coreml（重啟後也一樣）", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    writeRecord(decisionPath, {
+      outcome: "crashed",
+      reason: "crashed-during-load",
+      suspectedLoadCrashes: 2,
+      appVersion: "1.0.0",
+    });
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    expect(embedder.runtimeStatus.device).toBe("cpu");
+    expect(embedder.runtimeStatus.selfTest?.reason).toBe("crashed-during-load");
+    await embedder.embedDocuments(documents(1));
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu"]);
+    expect(readRecord(decisionPath)["outcome"]).toBe("crashed");
+
+    await embedder.dispose();
+  });
+
+  it("護欄寫不進去（決定檔唯讀）：不碰 coreml，以 accel-unavailable 回報且不改寫決策", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    writeRecord(decisionPath, { outcome: "usable", appVersion: "1.0.0", throughputRatio: 2.5 });
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+    // 建構子已經讀完快取；現在讓「寫入」必定失敗（把目錄換成一個普通檔案）。
+    rmSync(dir, { recursive: true, force: true });
+    writeFileSync(dir, "blocked", "utf8");
+
+    const vectors = await embedder.embedDocuments(documents(1));
+    expect(vectors).toHaveLength(1);
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("cpu");
+    expect(status.fallbackReason?.code).toBe("accel-unavailable");
+    expect(status.fallbackReason?.message).toContain("無法寫入裝置決定快取");
+    // 保護鏈的前提不存在 → 連一次 coreml 都沒試。
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu"]);
+    // 決策沒有被改寫：寫入的目標已經是個檔案，沒有任何新的決策落地。
+    expect(readFileSync(dir, "utf8")).toBe("blocked");
+    expect(readDecisionRecord(join(dir, "device-decision.json"))).toBeNull();
+
+    await embedder.dispose();
+  });
+
+  it("自我測試路徑的護欄：marker 寫不進去時也不碰 coreml", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    // 沒有快取決定（第一次），但決定檔的路徑寫不進去。
+    const blocker = join(dir, "blocker");
+    writeFileSync(blocker, "not a directory", "utf8");
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: join(blocker, "device-decision.json"),
+      appVersion: "1.0.0",
+    });
+
+    expect(embedder.runtimeStatus.device).toBe("coreml");
+
+    const vectors = await embedder.embedDocuments(documents(1));
+    expect(vectors).toHaveLength(1);
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("cpu");
+    expect(status.fallbackReason?.code).toBe("accel-unavailable");
+    // 沒有 CPU 基準、沒有 CoreML：只有最終退回 CPU 的那一次載入。
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu"]);
+
+    await embedder.dispose();
+  });
+
+  it("快取 usable 但載入失敗：寫回 unusable／load-failed 時沿用量測欄位與原 testedAt（R2）", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    writeRecord(decisionPath, {
+      outcome: "usable",
+      appVersion: "1.0.0",
+      throughputRatio: 2.5,
+      minCosine: 0.9997,
+      cpuSessionBuildMs: 380,
+      coreMlSessionBuildMs: 11_500,
+    });
+    mocks.behavior.loadFailsOnCoreml = true;
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    const vectors = await embedder.embedDocuments(documents(1));
+    expect(vectors).toHaveLength(1);
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("cpu");
+    expect(status.fallbackReason?.code).toBe("load-failed");
+    // 結論換了，但量測數據與測試時間留著（診斷與設定頁仍看得到「（吞吐 …）」）。
+    expect(status.selfTest).toEqual({
+      outcome: "unusable",
+      reason: "load-failed",
+      throughputRatio: 2.5,
+      minCosine: 0.9997,
+      cpuSessionBuildMs: 380,
+      coreMlSessionBuildMs: 11_500,
+      testedAt: "2026-10-15T00:00:00.000Z",
+    });
+
+    const record = readRecord(decisionPath);
+    expect(record["outcome"]).toBe("unusable");
+    expect(record["reason"]).toBe("load-failed");
+    expect(record["throughputRatio"]).toBe(2.5);
+    expect(record["minCosine"]).toBe(0.9997);
+    expect(record["cpuSessionBuildMs"]).toBe(380);
+    expect(record["coreMlSessionBuildMs"]).toBe(11_500);
+    expect(record["testedAt"]).toBe("2026-10-15T00:00:00.000Z");
+
+    // 護欄先落 pending(load)，載入失敗後才退回 CPU。
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["coreml", "cpu"]);
+
+    await embedder.dispose();
+  });
+
+  it("快取 usable 但推論失敗：寫回 unusable／inference-failed 時同樣沿用量測欄位與原 testedAt", async () => {
+    const dir = tempDir();
+    const decisionPath = join(dir, "device-decision.json");
+    writeRecord(decisionPath, {
+      outcome: "usable",
+      appVersion: "1.0.0",
+      throughputRatio: 2.5,
+      minCosine: 0.9997,
+      cpuSessionBuildMs: 380,
+      coreMlSessionBuildMs: 11_500,
+    });
+    // 快取已定案 → 不跑自我測試；第一次真正推論就失敗。
+    mocks.behavior.coremlInferenceFailsAfter = 0;
+
+    const embedder = new TransformersEmbedder({
+      platform: "darwin",
+      cacheDir: CACHE_DIR,
+      deviceDecisionPath: decisionPath,
+      appVersion: "1.0.0",
+    });
+
+    const vectors = await embedder.embedDocuments(documents(1));
+    expect(vectors).toHaveLength(1);
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("cpu");
+    expect(status.fallbackReason?.code).toBe("inference-failed");
+    expect(status.selfTest).toEqual({
+      outcome: "unusable",
+      reason: "inference-failed",
+      throughputRatio: 2.5,
+      minCosine: 0.9997,
+      cpuSessionBuildMs: 380,
+      coreMlSessionBuildMs: 11_500,
+      testedAt: "2026-10-15T00:00:00.000Z",
+    });
+
+    const record = readRecord(decisionPath);
+    expect(record["outcome"]).toBe("unusable");
+    expect(record["reason"]).toBe("inference-failed");
+    expect(record["minCosine"]).toBe(0.9997);
+    expect(record["testedAt"]).toBe("2026-10-15T00:00:00.000Z");
+
+    await embedder.dispose();
+  });
+
+  it("F2：自我測試通過後，同一實例 dispose→重載不重跑自我測試（只重載一次 coreml）", async () => {
+    mocks.behavior.delayMs = { cpu: 15, dml: 0, coreml: 3 };
+    const { embedder } = darwinEmbedder({ appVersion: "1.0.0" });
+
+    await embedder.embedDocuments(documents(2));
+    // 第一次：自我測試（CPU 基準 → CoreML 量測）。
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu", "coreml"]);
+    expect(embedder.runtimeStatus.selfTest?.outcome).toBe("usable");
+
+    resetMocks();
+    await embedder.dispose();
+    await embedder.embedDocuments(documents(2));
+
+    // 只重載一次 coreml（走載入期護欄），**沒有**再跑一次自我測試（沒有 CPU 基準）。
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["coreml"]);
+    expect(embedder.runtimeStatus.selfTest?.outcome).toBe("usable");
 
     await embedder.dispose();
   });

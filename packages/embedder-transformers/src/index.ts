@@ -19,17 +19,22 @@ export {
 } from "./embedder.js";
 
 export {
+  ACCEL_UNAVAILABLE_MESSAGE,
   COREML_MLPROGRAM_FLAG,
   DEVICE_DECISION_SCHEMA,
+  MAX_SUSPECTED_LOAD_CRASHES,
   SELF_TEST_CRITERIA,
   SELF_TEST_REASONS,
   SELF_TEST_SAMPLES,
   classifyDecision,
   cosineSimilarity,
   decisionMatchesIdentity,
+  describeLoadCrashRetry,
   describeSelfTestReason,
   evaluateSelfTest,
+  measurementFieldsOf,
   minCosineOf,
+  nextLoadCrashDecision,
   parseDecisionRecord,
   readDecisionRecord,
   runCoreMlSelfTest,
@@ -41,9 +46,11 @@ export {
   type DecisionClassification,
   type DeviceDecisionIdentity,
   type DeviceDecisionOutcome,
+  type DeviceDecisionPhase,
   type DeviceDecisionRecord,
   type SelfTestCriteria,
   type SelfTestMeasurement,
+  type SelfTestMeasurementFields,
   type SelfTestReason,
 } from "./self-test.js";
 

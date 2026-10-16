@@ -74,11 +74,14 @@ import {
 } from "./errors.js";
 import { runProbe } from "./probe.js";
 import {
+  ACCEL_UNAVAILABLE_MESSAGE,
   COREML_MLPROGRAM_FLAG,
   DEVICE_DECISION_SCHEMA,
   SELF_TEST_REASONS,
   classifyDecision,
+  describeLoadCrashRetry,
   describeSelfTestReason,
+  measurementFieldsOf,
   readDecisionRecord,
   runCoreMlSelfTest,
   selfTestFallbackCode,
@@ -86,7 +89,10 @@ import {
   writeDecisionRecord,
   type CoreMlSelfTestResult,
   type DeviceDecisionIdentity,
+  type DeviceDecisionOutcome,
+  type DeviceDecisionPhase,
   type DeviceDecisionRecord,
+  type SelfTestMeasurementFields,
 } from "./self-test.js";
 import { assertMrlDimension, truncateAndNormalize } from "./vector.js";
 
@@ -417,6 +423,13 @@ export class TransformersEmbedder implements Embedder {
   /** 建構子已套用一份可用的決定（載入時不必再自我測試）。 */
   private decisionApplied = false;
   /**
+   * 疑似「載入期崩潰」的累計次數（由決定快取帶進來；載入成功時歸零）。
+   *
+   * 用途：載入期護欄把它寫進 `pending(load)` 標記，下一次啟動才能判斷「這是連續第幾次」
+   * 而決定要不要永久停用加速器。
+   */
+  private suspectedLoadCrashes = 0;
+  /**
    * DirectML adapter 索引（設定值）：只有 `dml` 路徑會帶進 session options，
    * 但**非 dml 路徑與退回 CPU 後仍照原設定顯示**，診斷才看得出「原本指定第 N 張卡、已退回」。
    */
@@ -666,14 +679,16 @@ export class TransformersEmbedder implements Embedder {
   }
 
   /**
-   * 執行一次推論操作：先取得序列鎖（`dml` 時）、載入模型、執行，並在 `dml` 失敗時退回 CPU 重試。
+   * 執行一次推論操作：先取得序列鎖（`dml`／`coreml` 時）、載入模型、執行，
+   * 並在裝置類失敗時退回 CPU 重試。
    *
    * 鎖的範圍刻意涵蓋「載入 → 推論 → 退回重載」整段：退回會丟掉舊 session 並換裝置，
    * 不能與另一個正在使用舊 session 的呼叫重疊。
    *
-   * 退回只做一次、且只針對 `dml`：`fallBackToCpu` 會把 `this.device` 改成 `cpu`，之後的呼叫
-   * 走的就是 CPU 路徑。取消（`AbortError`／`signal.aborted`）與輸入類錯誤
-   * （`EmbedderInputError`）不算裝置失敗，原樣拋出（見 `shouldFallBack`）。
+   * 退回只做一次、且只針對 `dml`／`coreml`：`fallBackToCpu` 會把 `this.device` 改成 `cpu`，
+   * 之後的呼叫走的就是 CPU 路徑（CoreML 額外會把結果寫進決定快取，見 `fallBackToCpu`）。
+   * 取消（`AbortError`／`signal.aborted`）與輸入類錯誤（`EmbedderInputError`）不算裝置失敗，
+   * 原樣拋出（見 `shouldFallBack`）。
    */
   private async runWithFallback<T>(
     operation: (loaded: LoadedModel) => Promise<T>,
@@ -695,11 +710,11 @@ export class TransformersEmbedder implements Embedder {
   }
 
   /**
-   * 序列推論的互斥佇列：`serializedInference`（DML）時，同一實例的推論單位永不重疊。
+   * 序列推論的互斥佇列：`serializedInference`（`dml`／`coreml`）時，同一實例的推論單位永不重疊。
    *
    * - 先到先跑（FIFO）；`operation` 拋錯也會釋放，不會卡住佇列。
    * - 等待中被 abort → 以取消錯誤拒絕、**不執行**，且立刻從佇列移除（其他等待者的順序不變）。
-   * - 裝置不是 `dml`（含退回後）時完全不排隊，直接執行。
+   * - 裝置不需要序列推論時（`cpu`，含退回後）完全不排隊，直接執行。
    */
   private async withLock<T>(signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
     if (!requiresSerializedInference(this.device)) return await operation();
@@ -778,7 +793,8 @@ export class TransformersEmbedder implements Embedder {
    *
    * 若丟掉的是 **CoreML** session，順手把「這台機器的加速器跑不起來」寫進決定快取
    * （`unusable`／`inference-failed`）——不然下一次啟動又會帶著「可用」的舊決定再踩一次。
-   * 寫入與否由 `persistDecision` 的單一開關決定（明示 `coreml` 時不寫）。
+   * 與載入失敗同一條規則：**沿用上一輪的量測欄位與 `testedAt`**，只改 `outcome`／`reason`。
+   * 寫入與否由 `writeDecision` 的單一開關決定（明示 `coreml` 時不寫）。
    */
   private async fallBackToCpu(code: string, error: unknown): Promise<void> {
     const previous = this.device;
@@ -788,12 +804,14 @@ export class TransformersEmbedder implements Embedder {
     this.device = "cpu";
     this.fallbackReason = { code, message: summarizeFailure(error) };
     if (previous === "coreml") {
+      const measured = this.measurementFields();
       this.selfTest = {
+        ...measured,
         outcome: "unusable",
         reason: SELF_TEST_REASONS.inferenceFailed,
-        testedAt: new Date().toISOString(),
+        testedAt: measured.testedAt ?? new Date().toISOString(),
       };
-      this.persistDecision(this.selfTest);
+      this.writeDecision("unusable", this.selfTest);
     }
     try {
       await loaded?.model.dispose?.();
@@ -821,10 +839,16 @@ export class TransformersEmbedder implements Embedder {
    * 「這台機器最後決定用什麼、為什麼」，而 REST 層讀 `runtimeStatus` 是同步的。
    * 檔案只有幾百 bytes，且只在 macOS 的 `auto` 路徑讀一次。
    *
-   * 三種處置（見 `classifyDecision`）：
+   * 五種處置（見 `classifyDecision`）：
    * - `test-required`：不套用（計畫裝置維持 `coreml`，載入時再跑自我測試）。
-   * - `crashed`：**永久**改用 CPU，並把 `pending` 補寫成 `crashed`（不再自動重試）。
-   * - `decided`：`usable` 維持 `coreml`；`unusable` 改用 CPU 並記下原因。
+   * - `usable`：維持 `coreml`，並把疑似載入崩潰計數帶進載入期護欄。
+   * - `unusable`：改用 CPU 並記下原因。
+   * - `load-crash-retry`：上一次啟動疑似死在 CoreML 載入（第一次）→ **這次用 CPU**、
+   *   把決定寫回 `usable`（次數 +1），下次啟動自然再試一次。
+   * - `crashed`：**永久**改用 CPU；若磁碟上還是 `pending` 存活標記就補寫成結論。
+   *
+   * 為什麼「疑似載入崩潰」當次不重試：那條路徑剛剛才殺掉上一個行程，同一次啟動再試
+   * 只會陷入「啟動→崩潰→啟動」的迴圈，而且計數會停在同一個值、永遠到不了永久停用的門檻。
    */
   private applyCachedDecision(): void {
     const identity = this.decisionIdentity();
@@ -833,21 +857,39 @@ export class TransformersEmbedder implements Embedder {
 
     this.selfTest = classified.status;
     this.decisionApplied = true;
-    if (classified.status.outcome === "usable") return;
+
+    if (classified.kind === "usable") {
+      this.suspectedLoadCrashes = classified.suspectedLoadCrashes;
+      return;
+    }
+
+    if (classified.kind === "load-crash-retry") {
+      this.suspectedLoadCrashes = classified.suspectedLoadCrashes;
+      this.device = "cpu";
+      this.fallbackReason = {
+        code: "accel-load-crashed",
+        message: describeLoadCrashRetry(classified.suspectedLoadCrashes),
+      };
+      // 寫回 `usable`（量測欄位沿用、次數 +1）：下次啟動會照常載入 CoreML 再試一次。
+      this.persistRecord(classified.rewrite);
+      return;
+    }
 
     this.device = "cpu";
     this.fallbackReason = {
       code: selfTestFallbackCode(classified.status.reason),
       message: describeSelfTestReason(classified.status.reason),
     };
-    if (classified.kind === "crashed" && classified.needsRewrite) {
-      // 上一次跑測試時行程死掉了：把存活標記改成結論，避免下次再被判讀成 pending。
-      this.persistDecision({
-        ...classified.status,
-        outcome: "crashed",
-        reason: SELF_TEST_REASONS.crashed,
-      });
+    if (classified.kind === "crashed" && classified.rewrite !== null) {
+      // 上一次碰 CoreML 時行程死掉了：把存活標記改成結論，避免下次再被判讀成 pending。
+      this.persistRecord(classified.rewrite);
     }
+  }
+
+  /** 依現有的量測數據寫入決定快取（值的鍵一律由這裡決定，避免各處拼字不一致）。 */
+  private persistRecord(record: DeviceDecisionRecord): void {
+    if (!this.deviceDecisionEnabled) return;
+    writeDecisionRecord(this.deviceDecisionPath, record);
   }
 
   /**
@@ -855,21 +897,43 @@ export class TransformersEmbedder implements Embedder {
    *
    * **單一開關**：`deviceDecisionEnabled` 為 false（Windows／Linux，或明示裝置）時完全不寫，
    * 因此 Windows 的既有行為與「env 明示不吃快取」都不需要各自記得判斷。
+   *
+   * `lifecycle` 只放生命週期欄位（`pendingPhase`／`suspectedLoadCrashes`）：它們不屬於
+   * `selfTest` 摘要（那是給診斷看的），但必須落在同一個檔案裡才原子。
    */
-  private persistDecision(status: EmbedderSelfTestStatus): void {
-    if (!this.deviceDecisionEnabled) return;
+  private writeDecision(
+    outcome: DeviceDecisionOutcome,
+    fields: Partial<EmbedderSelfTestStatus> = {},
+    lifecycle: { pendingPhase?: DeviceDecisionPhase; suspectedLoadCrashes?: number } = {},
+  ): boolean {
+    if (!this.deviceDecisionEnabled) return false;
     const record: DeviceDecisionRecord = {
       schema: DEVICE_DECISION_SCHEMA,
       ...this.decisionIdentity(),
-      outcome: status.outcome,
-      testedAt: status.testedAt ?? new Date().toISOString(),
+      outcome,
+      testedAt: fields.testedAt ?? new Date().toISOString(),
     };
-    if (status.reason !== undefined) record.reason = status.reason;
-    if (status.throughputRatio !== undefined) record.throughputRatio = status.throughputRatio;
-    if (status.minCosine !== undefined) record.minCosine = status.minCosine;
-    if (status.cpuSessionBuildMs !== undefined) record.cpuSessionBuildMs = status.cpuSessionBuildMs;
-    if (status.coreMlSessionBuildMs !== undefined) record.coreMlSessionBuildMs = status.coreMlSessionBuildMs;
-    writeDecisionRecord(this.deviceDecisionPath, record);
+    if (fields.reason !== undefined) record.reason = fields.reason;
+    if (fields.throughputRatio !== undefined) record.throughputRatio = fields.throughputRatio;
+    if (fields.minCosine !== undefined) record.minCosine = fields.minCosine;
+    if (fields.cpuSessionBuildMs !== undefined) record.cpuSessionBuildMs = fields.cpuSessionBuildMs;
+    if (fields.coreMlSessionBuildMs !== undefined) record.coreMlSessionBuildMs = fields.coreMlSessionBuildMs;
+    if (lifecycle.pendingPhase !== undefined) record.pendingPhase = lifecycle.pendingPhase;
+    if (lifecycle.suspectedLoadCrashes !== undefined) {
+      record.suspectedLoadCrashes = lifecycle.suspectedLoadCrashes;
+    }
+    return writeDecisionRecord(this.deviceDecisionPath, record);
+  }
+
+  /**
+   * 目前記憶體裡的**量測欄位**（`outcome`／`reason` 一律不搬）。
+   *
+   * 只放量測欄位是刻意的：這個物件會被寫進 `pending` 存活標記，若把舊的結論或失敗原因一起帶進去，
+   * 下一次啟動就會讀到一個不屬於那個階段的 `reason`。過濾由共用的 `measurementFieldsOf` 負責，
+   * 避免「這個方法的名字說只給量測欄位、行為卻不是」。
+   */
+  private measurementFields(): SelfTestMeasurementFields {
+    return measurementFieldsOf(this.selfTest ?? {});
   }
 
   /** 以某個已載入的 session 嵌入樣本，回傳**最終向量**（截斷＋L2 正規化）。 */
@@ -987,20 +1051,29 @@ export class TransformersEmbedder implements Embedder {
    * 載入 CoreML（macOS）。
    *
    * 三條分岔：
-   * 1. **明示 `coreml`**（`requestedDevice === "coreml"`）：忽略快取、強制嘗試——不跑自我測試、
-   *    也不寫回快取。使用者的意圖就是「我就是要試」，判斷與記帳都交給他們。
-   * 2. **已套用快取的可用決定**：直接載 CoreML（不重測，避免每次啟動都付編譯成本）。
-   * 3. **`auto` 且沒有可用決定**（第一次、身分變了、或換版本）：先跑自我測試再決定。
+   * 1. **明示 `coreml`**（`requestedDevice` 不是 `auto`）：忽略快取、強制嘗試——不跑自我測試、
+   *    不讀寫決定快取、**也不加載入期護欄**（沒有快取就沒有可寫的 marker；契約語意）。
+   *    使用者的意圖就是「我就是要試」，判斷與記帳都交給他們。
+   * 2. **`auto` 且尚未有可沿用的決定**：跑一次自我測試（marker＝`pending(self-test)`）。
+   * 3. **`auto` 且有可沿用的決定**：走**載入期護欄**（marker＝`pending(load)`）——載入成功才把
+   *    決定寫回 `usable`，疑似崩潰則由下一次啟動的 `classifyDecision` 處理。
    *
    * 自我測試若**自己拋錯**（最典型：CPU 基準都載不起來），先把 `pending` 改寫成
    * `unusable`／`load-failed` 再往外拋——否則下一次啟動會把「非崩潰的失敗」誤讀成
    * 「上次死在測試中」，永久鎖在 CPU。
    */
   private async loadCoreMl(): Promise<LoadedModel> {
-    // 明示 `coreml`，或已經有可用的快取決定（`deviceDecisionEnabled` 為 false 或已套用）
-    // → 直接嘗試，不跑自我測試。
-    if (!this.deviceDecisionEnabled || this.decisionApplied) return await this.loadCoreMlOrFallback();
+    if (!this.deviceDecisionEnabled) {
+      // 明示 `coreml`：強制嘗試、不讀不寫快取（見上方第 1 點）。
+      const attempt = await this.attemptCoreMlLoad();
+      return attempt.backend;
+    }
+    if (!this.decisionApplied) return await this.loadCoreMlAfterSelfTest();
+    return await this.loadCoreMlWithGuard();
+  }
 
+  /** `auto`＋尚未定案：跑自我測試，依結果決定沿用它的 session 或改用 CPU。 */
+  private async loadCoreMlAfterSelfTest(): Promise<LoadedModel> {
     let result: CoreMlSelfTestResult<LoadedModel>;
     try {
       result = await runCoreMlSelfTest<LoadedModel>({
@@ -1016,11 +1089,21 @@ export class TransformersEmbedder implements Embedder {
         reason: SELF_TEST_REASONS.loadFailed,
         testedAt: new Date().toISOString(),
       };
-      this.persistDecision(this.selfTest);
+      this.writeDecision("unusable", this.measurementFields());
       throw error;
     }
 
+    if (result.kind === "unavailable") {
+      // 存活標記寫不進去 → 不得碰 CoreML（保護鏈的前提不存在）。改用 CPU，
+      // 且**不嘗試持久化任何決策**（存不了就是存不了；低機率下最壞＝下次啟動保守誤記，安全側）。
+      this.device = "cpu";
+      this.fallbackReason = { code: "accel-unavailable", message: ACCEL_UNAVAILABLE_MESSAGE };
+      return await this.createBackend("cpu");
+    }
+
     this.selfTest = toSelfTestStatus(result.record);
+    // 決定已經落地（或已嘗試落地）：同一實例不必再測一次（`dispose()` 後重載也一樣）。
+    this.decisionApplied = true;
     if (result.backend !== null) return result.backend;
 
     // 未通過：改用 CPU。測試中建立的 CoreML session 已由自我測試釋放。
@@ -1033,25 +1116,71 @@ export class TransformersEmbedder implements Embedder {
   }
 
   /**
-   * 直接嘗試 CoreML；失敗就退回 CPU，並把「這次載不起來」寫進決定快取。
+   * `auto`＋已有可沿用的決定：**載入期護欄**。
+   *
+   * 為什麼要有這一層：`#28005` 的 SIGBUS 若只是間歇性的，那麼「自我測試剛好沒踩到、
+   * 之後每次啟動都踩到」就會變成**無上限的啟動閃退迴圈**，而記錄永遠停在 `usable`
+   * ——超出使用者核准的「閃一次就記住」。因此每次為正式使用建 CoreML session 前，
+   * 先原子落地 `pending(load)`；成功才把決定寫回 `usable`（計數歸零），
+   * 失敗則沿用既有的 `unusable`／`load-failed` 持久化，崩潰則由下一次啟動結算。
+   *
+   * 護欄寫不進去時**不碰 CoreML**（見 `docs/embedder-contract.md`）：改用 CPU 並用
+   * `fallbackReason` 回報，不嘗試持久化任何決策。
+   */
+  private async loadCoreMlWithGuard(): Promise<LoadedModel> {
+    const markerWritten = this.writeDecision("pending", this.measurementFields(), {
+      pendingPhase: "load",
+      suspectedLoadCrashes: this.suspectedLoadCrashes,
+    });
+    if (!markerWritten) {
+      this.device = "cpu";
+      this.fallbackReason = { code: "accel-unavailable", message: ACCEL_UNAVAILABLE_MESSAGE };
+      return await this.createBackend("cpu");
+    }
+
+    const attempt = await this.attemptCoreMlLoad();
+    if (attempt.usedCoreMl) {
+      // 建置成功：寫回 `usable`（量測欄位沿用、疑似載入崩潰的計數歸零、不帶任何舊結論）。
+      const status: EmbedderSelfTestStatus = {
+        ...this.measurementFields(),
+        outcome: "usable",
+        testedAt: this.selfTest?.testedAt ?? new Date().toISOString(),
+      };
+      this.selfTest = status;
+      this.suspectedLoadCrashes = 0;
+      this.writeDecision("usable", status);
+    }
+    return attempt.backend;
+  }
+
+  /**
+   * 直接嘗試建 CoreML session；失敗就退回 CPU 並把 `unusable`／`load-failed` 寫進決定快取。
    *
    * 寫回的理由：快取說「可用」但這次載入失敗（驅動更新、ORT 換版、記憶體不足…），
-   * 下次啟動不該再付一次失敗的編譯成本。寫入與否仍由 `persistDecision` 的開關決定。
+   * 下次啟動不該再付一次失敗的編譯成本。`usedCoreMl` 讓呼叫端分辨「真的用了 CoreML」
+   * 與「已退回 CPU」，不必回頭猜 `this.device`。
+   *
+   * 寫回時**沿用上一輪的量測欄位與 `testedAt`**（只改 `outcome`／`reason`）：那些數字描述的是
+   * 「這台機器的加速器量起來如何」，不會因為某次載入失敗而失效；丟掉它們只會讓診斷與設定頁
+   * 少掉「（吞吐 …）」的資訊，與載入期崩潰路徑的處置也不一致。
    */
-  private async loadCoreMlOrFallback(): Promise<LoadedModel> {
+  private async attemptCoreMlLoad(): Promise<{ backend: LoadedModel; usedCoreMl: boolean }> {
     try {
-      return await this.createBackend("coreml");
+      const backend = await this.createBackend("coreml");
+      return { backend, usedCoreMl: true };
     } catch (error) {
       const message = summarizeFailure(error);
+      const measured = this.measurementFields();
       this.fallbackReason = { code: "load-failed", message };
       this.selfTest = {
+        ...measured,
         outcome: "unusable",
         reason: SELF_TEST_REASONS.loadFailed,
-        testedAt: new Date().toISOString(),
+        testedAt: measured.testedAt ?? new Date().toISOString(),
       };
       this.device = "cpu";
-      this.persistDecision(this.selfTest);
-      return await this.createBackend("cpu");
+      this.writeDecision("unusable", this.selfTest);
+      return { backend: await this.createBackend("cpu"), usedCoreMl: false };
     }
   }
 }

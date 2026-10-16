@@ -60,14 +60,15 @@ export function selfTestSummary(selfTest: DiagnosticsEmbedderSelfTest | undefine
   const detail = numbers.length > 0 ? `（${numbers.join("、")}）` : "";
   if (selfTest.outcome === "usable") return `CoreML 已採用${detail}`;
   if (selfTest.outcome === "unusable") return `CoreML 不適用，已改用 CPU${detail}`;
-  return "CoreML 曾於測試中結束行程，已永久停用";
+  return "CoreML 曾造成行程結束，已永久停用";
 }
 
 /**
  * 執行裝置那一行的文字（沒有資料時明說「未測試」，不假裝有結果）。
  *
- * 只在使用者真的會遇到 CoreML 自我測試時才顯示「自動偵測」段：Windows 的 DirectML
- * 是「每次直接試、失敗即退回」，沒有自我測試這回事，寫「未測試」只會誤導。
+ * 只有 `auto` 才顯示「自動偵測」段：**手動指定**裝置時本來就不會跑自我測試，
+ * 寫「未測試」會讓使用者以為有一場自動測試還沒跑完；Windows 的 DirectML 也是
+ * 「每次直接試、失敗即退回」，沒有自我測試這回事。
  */
 export function describeEmbedderRuntime(
   runtime: DiagnosticsEmbedderRuntime | null | undefined,
@@ -79,10 +80,13 @@ export function describeEmbedderRuntime(
 
   const parts = [`目前裝置：${DEVICE_LABELS[runtime.device] ?? runtime.device}`];
   if (!runtime.loaded) parts.push("（模型尚未載入，顯示的是計畫裝置）");
-  if (runtime.selfTest !== undefined || runtime.device === "coreml" || runtime.requestedDevice === "coreml") {
+  if (runtime.requestedDevice !== "auto") {
+    // 明示模式（env／選項指定）：不存在「自動偵測的結果」，不要顯示「未測試」。
+    parts.push("｜（裝置為手動指定）");
+  } else if (runtime.selfTest !== undefined || runtime.device === "coreml") {
     parts.push(`｜自動偵測：${selfTestSummary(runtime.selfTest)}`);
   }
-  // 崩潰的說明已經在自我測試那一句裡（「曾於測試中結束行程」），不必再重複一次。
+  // 崩潰的說明已經在自我測試那一句裡（「曾造成行程結束」），不必再重複一次。
   if (runtime.fallbackReason !== null && runtime.selfTest?.outcome !== "crashed") {
     parts.push(`｜${runtime.fallbackReason.message}`);
   }

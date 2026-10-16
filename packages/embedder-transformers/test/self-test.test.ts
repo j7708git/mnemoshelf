@@ -7,24 +7,31 @@
  */
 import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { EmbedderSelfTestStatus } from "@mnemoshelf/core";
 import {
+  ACCEL_UNAVAILABLE_MESSAGE,
   COREML_MLPROGRAM_FLAG,
   DEVICE_DECISION_SCHEMA,
+  MAX_SUSPECTED_LOAD_CRASHES,
   SELF_TEST_CRITERIA,
   SELF_TEST_REASONS,
   classifyDecision,
   cosineSimilarity,
   decisionMatchesIdentity,
+  describeLoadCrashRetry,
   describeSelfTestReason,
   evaluateSelfTest,
+  measurementFieldsOf,
+  nextLoadCrashDecision,
   parseDecisionRecord,
   readDecisionRecord,
   runCoreMlSelfTest,
   selfTestFallbackCode,
   toSelfTestStatus,
   writeDecisionRecord,
+  type CoreMlSelfTestResult,
   type DeviceDecisionIdentity,
   type DeviceDecisionRecord,
 } from "../src/index.js";
@@ -141,6 +148,41 @@ describe("向量比較工具", () => {
     expect(cosineSimilarity([1, 0], [0, 1])).toBeCloseTo(0, 10);
     // 不同長度時只看共同的前綴。
     expect(cosineSimilarity([1, 0, 0], [1, 0])).toBeCloseTo(1, 10);
+  });
+});
+
+describe("量測欄位的過濾（measurementFieldsOf）", () => {
+  it("只留量測欄位：outcome／reason 一律不搬（避免舊結論被寫進 pending 標記）", () => {
+    // 刻意用**變數**（生產路徑就是這樣傳的：整個 selfTest 摘要進去）而不是字面物件。
+    const status: EmbedderSelfTestStatus = {
+      outcome: "unusable",
+      reason: SELF_TEST_REASONS.tooSlow,
+      throughputRatio: 0.9,
+      minCosine: 0.9995,
+      cpuSessionBuildMs: 410,
+      coreMlSessionBuildMs: 11_800,
+      testedAt: "2026-10-16T00:00:00.000Z",
+    };
+    const fields = measurementFieldsOf(status);
+    expect(fields).toEqual({
+      throughputRatio: 0.9,
+      minCosine: 0.9995,
+      cpuSessionBuildMs: 410,
+      coreMlSessionBuildMs: 11_800,
+      testedAt: "2026-10-16T00:00:00.000Z",
+    });
+    expect(Object.keys(fields)).not.toContain("outcome");
+    expect(Object.keys(fields)).not.toContain("reason");
+  });
+
+  it("缺的欄位不會變成 undefined 鍵（JSON 才不會出現 null／undefined）", () => {
+    expect(measurementFieldsOf({})).toEqual({});
+    expect(measurementFieldsOf({ minCosine: 1 })).toEqual({ minCosine: 1 });
+    // 記錄（身分 + 結論 + 量測）也可以直接餵進來。
+    expect(measurementFieldsOf(record({ throughputRatio: 2.4 }))).toEqual({
+      throughputRatio: 2.4,
+      testedAt: "2026-10-16T00:00:00.000Z",
+    });
   });
 });
 
@@ -294,15 +336,19 @@ describe("決定是否可沿用（classifyDecision）", () => {
 
   it("usable／unusable 且身分與版本相同 → 直接沿用", () => {
     const usable = classifyDecision(record(), IDENTITY);
-    expect(usable.kind).toBe("decided");
-    expect(usable.kind === "decided" && usable.status.outcome).toBe("usable");
+    expect(usable.kind).toBe("usable");
+    expect(usable.kind === "usable" && usable.status.outcome).toBe("usable");
+    expect(usable.kind === "usable" && usable.suspectedLoadCrashes).toBe(0);
+
+    const withCount = classifyDecision(record({ suspectedLoadCrashes: 1 }), IDENTITY);
+    expect(withCount.kind === "usable" && withCount.suspectedLoadCrashes).toBe(1);
 
     const unusable = classifyDecision(
       record({ outcome: "unusable", reason: SELF_TEST_REASONS.memoryExceeded }),
       IDENTITY,
     );
-    expect(unusable.kind).toBe("decided");
-    expect(unusable.kind === "decided" && unusable.status.reason).toBe(SELF_TEST_REASONS.memoryExceeded);
+    expect(unusable.kind).toBe("unusable");
+    expect(unusable.kind === "unusable" && unusable.status.reason).toBe(SELF_TEST_REASONS.memoryExceeded);
   });
 
   it("appVersion 變更 → 重測一次（不沿用也不當成崩潰）", () => {
@@ -324,17 +370,94 @@ describe("決定是否可沿用（classifyDecision）", () => {
     }
   });
 
-  it("crashed 是機器層級的事實：即使身分不同也不重試", () => {
+  it("crashed 是機器層級的事實：即使身分不同也不重試，且磁碟上已是結論（不必改寫）", () => {
     const classified = classifyDecision(record({ outcome: "crashed", modelId: "other/model" }), IDENTITY);
     expect(classified.kind).toBe("crashed");
-    expect(classified.kind === "crashed" && classified.needsRewrite).toBe(false);
+    expect(classified.kind === "crashed" && classified.rewrite).toBeNull();
+    expect(classified.kind === "crashed" && classified.status.outcome).toBe("crashed");
   });
 
-  it("pending（上次測試中死掉）→ crashed，且要改寫檔案", () => {
+  it("pending（上次測試中死掉）→ crashed，並改寫檔案成結論", () => {
     const classified = classifyDecision(record({ outcome: "pending", throughputRatio: undefined }), IDENTITY);
     expect(classified.kind).toBe("crashed");
-    expect(classified.kind === "crashed" && classified.needsRewrite).toBe(true);
     expect(classified.kind === "crashed" && classified.status.outcome).toBe("crashed");
+    expect(classified.kind === "crashed" && classified.status.reason).toBe(SELF_TEST_REASONS.crashed);
+    const rewrite = classified.kind === "crashed" ? classified.rewrite : null;
+    expect(rewrite?.outcome).toBe("crashed");
+    expect(rewrite?.reason).toBe(SELF_TEST_REASONS.crashed);
+    expect(rewrite?.pendingPhase).toBe("self-test");
+  });
+
+  it("舊檔沒有 pendingPhase → 視為自我測試（保守：永久停用）", () => {
+    const classified = classifyDecision(record({ outcome: "pending" }), IDENTITY);
+    expect(classified.kind).toBe("crashed");
+    expect(classified.kind === "crashed" && classified.status.reason).toBe(SELF_TEST_REASONS.crashed);
+  });
+
+  it("pending(self-test) 的記錄在呈現上與 crashed 一致（不因階段而放寬）", () => {
+    const classified = classifyDecision(record({ outcome: "pending", pendingPhase: "self-test" }), IDENTITY);
+    expect(classified.kind).toBe("crashed");
+  });
+});
+
+describe("載入期崩潰的容忍（classifyDecision ＋ nextLoadCrashDecision）", () => {
+  it("容忍上限＝2：第一次疑似→重試（寫回 usable）、連續第二次→永久停用", () => {
+    expect(MAX_SUSPECTED_LOAD_CRASHES).toBe(2);
+    expect(nextLoadCrashDecision(0)).toEqual({ count: 1, permanent: false });
+    expect(nextLoadCrashDecision(1)).toEqual({ count: 2, permanent: true });
+    // 不會無限成長：達到上限後仍是永久處置。
+    expect(nextLoadCrashDecision(2)).toEqual({ count: 3, permanent: true });
+  });
+
+  it("pending(load) 第一次：這次用 CPU，決定寫回 usable＋次數 1（量測欄位沿用）", () => {
+    const classified = classifyDecision(
+      record({
+        outcome: "pending",
+        pendingPhase: "load",
+        throughputRatio: 2.4,
+        minCosine: 0.9995,
+        cpuSessionBuildMs: 410,
+        coreMlSessionBuildMs: 11_800,
+      }),
+      IDENTITY,
+    );
+    expect(classified.kind).toBe("load-crash-retry");
+    if (classified.kind !== "load-crash-retry") throw new Error("預期 load-crash-retry");
+    expect(classified.suspectedLoadCrashes).toBe(1);
+    // 呈現上仍是「可用」（決定沒被推翻，只是這次先用 CPU）。
+    expect(classified.status.outcome).toBe("usable");
+    // 寫回磁碟的記錄：usable、次數 1、量測欄位沿用（崩潰不該讓量測數據消失）。
+    expect(classified.rewrite.outcome).toBe("usable");
+    expect(classified.rewrite.suspectedLoadCrashes).toBe(1);
+    expect(classified.rewrite.pendingPhase).toBe("load");
+    expect(classified.rewrite.throughputRatio).toBe(2.4);
+    expect(classified.rewrite.minCosine).toBe(0.9995);
+    expect(classified.rewrite.cpuSessionBuildMs).toBe(410);
+    expect(classified.rewrite.coreMlSessionBuildMs).toBe(11_800);
+    expect(classified.rewrite.testedAt).toBe("2026-10-16T00:00:00.000Z");
+  });
+
+  it("pending(load) 連續第二次：永久停用（crashed-during-load），次數記 2", () => {
+    const classified = classifyDecision(
+      record({ outcome: "pending", pendingPhase: "load", suspectedLoadCrashes: 1 }),
+      IDENTITY,
+    );
+    expect(classified.kind).toBe("crashed");
+    if (classified.kind !== "crashed") throw new Error("預期 crashed");
+    expect(classified.status.reason).toBe(SELF_TEST_REASONS.crashedDuringLoad);
+    expect(classified.rewrite?.outcome).toBe("crashed");
+    expect(classified.rewrite?.reason).toBe(SELF_TEST_REASONS.crashedDuringLoad);
+    expect(classified.rewrite?.suspectedLoadCrashes).toBe(2);
+  });
+
+  it("已是結論的 crashed（crashed-during-load）不必再改寫，且不因身分不同而放寬", () => {
+    const classified = classifyDecision(
+      record({ outcome: "crashed", reason: SELF_TEST_REASONS.crashedDuringLoad, suspectedLoadCrashes: 2, modelId: "other" }),
+      IDENTITY,
+    );
+    expect(classified.kind).toBe("crashed");
+    expect(classified.kind === "crashed" && classified.rewrite).toBeNull();
+    expect(classified.kind === "crashed" && classified.status.reason).toBe(SELF_TEST_REASONS.crashedDuringLoad);
   });
 });
 
@@ -389,6 +512,11 @@ function harness(options: {
   cpuLoadFails?: boolean;
   /** 量測期間的 RSS 腳本（逐次讀取回傳；超出即重複最後一項）。 */
   rss?: number[];
+  /**
+   * 模擬「marker 寫得進去、但最終決定寫不進去」：在建立 CoreML session 的那一刻把決定檔的
+   * 目錄換成一個普通檔案，之後任何寫入都會失敗（`ENOTDIR`）。
+   */
+  failFinalWrite?: boolean;
   /** 決定記錄的檔案路徑（預設在暫存目錄）。 */
   decisionPath?: string;
 } = {}) {
@@ -411,6 +539,11 @@ function harness(options: {
       created.push(device);
       if (device === "coreml") {
         pendingAtCoreMlLoad.push(readDecisionRecord(decisionPath)?.outcome ?? null);
+        if (options.failFinalWrite === true) {
+          // marker 已經落地了；現在把它的目錄換成檔案 → 之後的最終寫入必定失敗。
+          rmSync(dirname(decisionPath), { recursive: true, force: true });
+          writeFileSync(dirname(decisionPath), "blocked", "utf8");
+        }
         if (options.coremlLoadFails === true) throw new Error("CoreML 載入失敗（模擬）");
       }
       if (device === "cpu" && options.cpuLoadFails === true) throw new Error("CPU 載入失敗（模擬）");
@@ -442,6 +575,13 @@ function harness(options: {
   return { deps, decisionPath, created, disposed, pendingAtCoreMlLoad };
 }
 
+/** 跑自我測試並要求「marker 落地成功」那條路徑（既有測試都走這條）。 */
+async function runTested(deps: Parameters<typeof runCoreMlSelfTest<FakeBackend>>[0]) {
+  const result: CoreMlSelfTestResult<FakeBackend> = await runCoreMlSelfTest<FakeBackend>(deps);
+  if (result.kind !== "tested") throw new Error(`預期 tested，得到 ${result.kind}`);
+  return result;
+}
+
 describe("自我測試的編排（runCoreMlSelfTest）", () => {
   it("通過：判定 usable、保留 CoreML session、寫下量測數字與兩邊的建置耗時", async () => {
     const { deps, decisionPath, created, disposed, pendingAtCoreMlLoad } = harness({
@@ -449,7 +589,7 @@ describe("自我測試的編排（runCoreMlSelfTest）", () => {
       inferenceMs: { cpu: 100, coreml: 50 },
     });
 
-    const result = await runCoreMlSelfTest<FakeBackend>(deps);
+    const result = await runTested(deps);
 
     // 先量 CPU（量完立刻釋放），再量 CoreML。
     expect(created).toEqual(["cpu", "coreml"]);
@@ -477,19 +617,19 @@ describe("自我測試的編排（runCoreMlSelfTest）", () => {
       buildMs: { cpu: 500, coreml: 600_000 },
       inferenceMs: { cpu: 100, coreml: 50 },
     });
-    const result = await runCoreMlSelfTest<FakeBackend>(deps);
+    const result = await runTested(deps);
     expect(result.record.outcome).toBe("usable");
     expect(result.record.coreMlSessionBuildMs).toBeCloseTo(600_000, 10);
   });
 
   it("倍率剛好 1.3 通過；1.29 未達（門檻含邊界）", async () => {
     const exactly = harness({ inferenceMs: { cpu: 130, coreml: 100 } });
-    expect((await runCoreMlSelfTest<FakeBackend>(exactly.deps)).record).toMatchObject({
+    expect((await runTested(exactly.deps)).record).toMatchObject({
       outcome: "usable",
     });
 
     const below = harness({ inferenceMs: { cpu: 129, coreml: 100 } });
-    const belowResult = await runCoreMlSelfTest<FakeBackend>(below.deps);
+    const belowResult = await runTested(below.deps);
     expect(belowResult.record.outcome).toBe("unusable");
     expect(belowResult.record.reason).toBe(SELF_TEST_REASONS.tooSlow);
     // 未通過的 CoreML session 必須被釋放，而且不交回呼叫端。
@@ -502,7 +642,7 @@ describe("自我測試的編排（runCoreMlSelfTest）", () => {
 
   it("向量不一致 → inconsistent，並記下量到的餘弦", async () => {
     const { deps, disposed } = harness({ drift: 0.05 });
-    const result = await runCoreMlSelfTest<FakeBackend>(deps);
+    const result = await runTested(deps);
     expect(result.record.outcome).toBe("unusable");
     expect(result.record.reason).toBe(SELF_TEST_REASONS.inconsistent);
     // 兩個已正規化向量的內積＝餘弦：`1 / sqrt(1 + drift²)` ≈ 0.99875 < 0.999。
@@ -512,14 +652,14 @@ describe("自我測試的編排（runCoreMlSelfTest）", () => {
 
   it("峰值 RSS 超限 → memory-exceeded（即使倍率與一致性都過）", async () => {
     const { deps } = harness({ rss: [GIB, GIB, 7 * GIB, GIB] });
-    const result = await runCoreMlSelfTest<FakeBackend>(deps);
+    const result = await runTested(deps);
     expect(result.record.outcome).toBe("unusable");
     expect(result.record.reason).toBe(SELF_TEST_REASONS.memoryExceeded);
   });
 
   it("CoreML 載入失敗 → load-failed，附上去識別化的訊息摘要", async () => {
     const { deps, decisionPath } = harness({ coremlLoadFails: true });
-    const result = await runCoreMlSelfTest<FakeBackend>(deps);
+    const result = await runTested(deps);
     expect(result.record.outcome).toBe("unusable");
     expect(result.record.reason).toBe(SELF_TEST_REASONS.loadFailed);
     expect(result.record.throughputRatio).toBeUndefined();
@@ -534,28 +674,38 @@ describe("自我測試的編排（runCoreMlSelfTest）", () => {
 
   it("CoreML 載入成功但推論失敗 → inference-failed（與載入失敗分得開），建置耗時照記", async () => {
     const { deps } = harness({ coremlEmbedFails: true, buildMs: { cpu: 380, coreml: 9_500 } });
-    const result = await runCoreMlSelfTest<FakeBackend>(deps);
+    const result = await runTested(deps);
     expect(result.record.reason).toBe(SELF_TEST_REASONS.inferenceFailed);
     expect(result.message).toContain("CoreML 推論失敗（模擬）");
     // session 建起來了（推論才失敗）→ 建置耗時有值。
     expect(result.record.coreMlSessionBuildMs).toBeCloseTo(9_500, 10);
   });
 
-  it("CPU 基準載入失敗：往外拋（沒有可退的地方），pending 留在磁碟上由呼叫端改寫", async () => {
+  it("CPU 基準載入失敗：往外拋（沒有可退的地方），pending(self-test) 留在磁碟上由呼叫端改寫", async () => {
     const { deps, decisionPath, created } = harness({ cpuLoadFails: true });
     await expect(runCoreMlSelfTest<FakeBackend>(deps)).rejects.toThrow("CPU 載入失敗（模擬）");
     expect(created).toEqual(["cpu"]);
     // 呼叫端（embedder）負責把 pending 改成 unusable：否則下次啟動會誤記成崩潰。
-    expect(readDecisionRecord(decisionPath)?.outcome).toBe("pending");
+    const leftover = readDecisionRecord(decisionPath);
+    expect(leftover?.outcome).toBe("pending");
+    expect(leftover?.pendingPhase).toBe("self-test");
   });
 
-  it("決定寫不進磁碟時仍回傳決定（快取只是加速，不是正確性來源）", async () => {
+  it("marker 寫不進去就不碰 CoreML：回 unavailable、沒有建立任何 session", async () => {
     const dir = tempDir();
     const blocker = join(dir, "blocker");
     writeFileSync(blocker, "not a directory", "utf8");
-    const { deps } = harness({ decisionPath: join(blocker, "device-decision.json") });
+    const { deps, created } = harness({ decisionPath: join(blocker, "device-decision.json") });
 
     const result = await runCoreMlSelfTest<FakeBackend>(deps);
+    expect(result).toEqual({ kind: "unavailable", reason: "marker-write-failed" });
+    // 保護鏈的前提不存在 → 完全不碰模型（連 CPU 基準都不做）。
+    expect(created).toEqual([]);
+  });
+
+  it("marker 寫得進去、最終決定寫不進去：仍回傳 tested 的決定（快取只是加速，不是正確性來源）", async () => {
+    const { deps } = harness({ failFinalWrite: true });
+    const result = await runTested(deps);
     expect(result.record.outcome).toBe("usable");
     expect(result.backend?.device).toBe("coreml");
   });

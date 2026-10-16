@@ -144,12 +144,14 @@ interface EmbedderSelfTestStatus {
 | `memory-exceeded` | 測試期峰值記憶體超過門檻 |
 | `load-failed` | 加速器 session 載入失敗 |
 | `inference-failed` | session 建得起來，但推論失敗 |
-| `crashed-during-self-test` | 由「測試中」的落地標記推導：上一次測試讓行程死掉 |
+| `crashed-during-self-test` | 由「測試中」的存活標記推導：上一次測試讓行程死掉 |
+| `crashed-during-load` | 由「載入中」的存活標記推導：連續第二次在正式載入時疑似讓行程死掉 |
 
 **預設實作的 `fallbackReason.code`**：自我測試擋下的情況用 `accel-*` 家族
 （`accel-slow`／`accel-inconsistent`／`accel-memory-exceeded`／`accel-crashed`），
 讓診斷一眼看出「是加速器自我測試擋的」而不是別的載入錯誤；載入失敗與推論失敗沿用既有的
-`load-failed`／`inference-failed`。
+`load-failed`／`inference-failed`；疑似載入崩潰但還在容忍內為 `accel-load-crashed`，
+存活標記寫不進去（因此不敢碰加速器）為 `accel-unavailable`。
 
 **重測政策（預設實作）**：`crashed` 永不自動重試；其他結果在**應用程式版本**變更時重測一次
 （量測結果與當時的實作綁在一起）；模型 id／dtype／平台／CPU 架構任一改變也重測。
@@ -161,6 +163,31 @@ interface EmbedderSelfTestStatus {
 
 **已判定 `usable` 後的載入失敗**：該次載入失敗會把決定改寫成 `unusable`／`load-failed`，
 之後不再自動嘗試；重測只可能發生在**應用程式版本變更**或**明示 `coreml`** 時。
+
+**載入期的崩潰政策**：加速器可能在**任何一次**載入時讓行程結束（上游已知問題），而「自我測試
+那次剛好沒踩到、之後每次啟動都踩到」是最壞的情況；因此 `auto` 的每一次正式載入前都會先落地
+一張存活標記（決定檔的 `pending` 記錄；標記**一律**帶階段——自我測試為 `self-test`、正式載入為
+`load`——而**只有載入期護欄的標記**另帶疑似載入崩潰的次數），並依下列規則結算：
+
+- **自我測試期崩潰**（階段 `self-test`，等同舊檔缺階段的記錄）→ 永久 `crashed`（`crashed-during-self-test`），不再自動重試。
+- **載入期崩潰**（階段 `load`）→ 疑似一次：**該次啟動改用 CPU**、把決定寫回 `usable`（次數 +1），
+  下次啟動再試一次；**連續第二次**才永久 `crashed`（`crashed-during-load`）。
+- **載入成功**時疑似崩潰的次數歸零（量測欄位沿用，不因載入而遺失）。
+
+**存活標記寫不進去時不得碰加速器**：任何「先寫標記、再碰 CoreML」的路徑，若標記無法落地，
+該次**不嘗試**加速器（以 CPU 執行、`fallbackReason.code` 為 `accel-unavailable`），
+且不嘗試持久化任何決策（寫不進去就是寫不進去）。
+
+**最終結果寫不進去時的行為**：該次的決定在記憶體中仍然有效（本次執行照它走），磁碟上留下的則是
+那一輪的存活標記，因此下一次啟動的處置**依路徑而不同**：
+
+- **自我測試路徑**留下 `pending(self-test)` → 保守記成 `crashed`（`crashed-during-self-test`，
+  永久改用 CPU）。
+- **載入期護欄**留下 `pending(load)` → 該次先用 CPU、疑似崩潰次數 +1，下次啟動再試一次
+  （與「疑似載入期崩潰」同一條規則；連續第二次就永久停用——磁碟上「真的崩潰」與「只是寫不進去」
+  無法區分，這是刻意的保守取捨）。
+
+兩者都是**安全側**的結果；改寫後仍寫不進去就接受（低機率、且下一次啟動的處置仍然保守）。
 
 **不屬於契約的部分**：快取檔的檔案格式、路徑與量測方法都由實作決定；契約只保證
 `selfTest` 這個欄位的形狀與它「不存在＝未測試」的語意。診斷輸出中的字串一律

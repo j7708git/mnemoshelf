@@ -8,8 +8,10 @@
  *     可能數分鐘；而 Node 綁定拿不到該選項），所以「每次啟動都先試」不可接受
  *     → 必須「量測一次、把決定快取起來」。
  *   - 已知的上游風險：`onnxruntime#28005`（CoreML EP＋external data＋以檔案路徑建 session 的
- *     SIGBUS，未修）可能在測試中直接殺掉行程。因此**測試前先落地 `pending` 標記**，
- *     下次啟動看到它就知道「前一輪死於測試中」，永久改用 CPU（見 `classifyDecision`）。
+ *     SIGBUS，未修）可能在**任何一次**碰 CoreML 時殺掉行程。因此每一條「先落 marker、再碰
+ *     CoreML」的路徑都有存活標記：自我測試期用 `pending(self-test)`，正式載入期用
+ *     `pending(load)`（見 `classifyDecision` 與 `nextLoadCrashDecision`）。**marker 落不了地時
+ *     一律不碰 CoreML**（`{kind:"unavailable"}`）——保護鏈的前提不存在，就沒有理由去踩那條路。
  *
  * 這一輪的判斷沿用既有判準（`spikes/dml-bench` 的原則）：吞吐倍率 ≥ 1.3×、
  * 向量一致性 min cos ≥ 0.999、測試期峰值 RSS ≤ 6 GiB。三者皆以「剛好達到」為通過。
@@ -110,12 +112,44 @@ export const SELF_TEST_REASONS = {
   inconsistent: "inconsistent",
   /** 測試期峰值 RSS 超限。 */
   memoryExceeded: "memory-exceeded",
-  /** 由 `pending` 標記推導：上一次測試讓行程死掉。 */
+  /** 由 `pending` 標記推導：上一次**自我測試**讓行程死掉。 */
   crashed: "crashed-during-self-test",
+  /** 由 `pending` 標記推導：上一次**正式載入**疑似讓行程死掉（且已達容忍上限）。 */
+  crashedDuringLoad: "crashed-during-load",
 } as const;
 
 /** 失敗原因標籤。 */
 export type SelfTestReason = (typeof SELF_TEST_REASONS)[keyof typeof SELF_TEST_REASONS];
+
+/**
+ * 決定記錄的階段（只有 `pending` 用得到）：這張「測試中／載入中」的存活標記是誰留下的。
+ *
+ * 為什麼要分辨：兩種崩潰的後果不同。自我測試期崩潰（使用者已核准的最壞情況）→ 永久改用 CPU；
+ * 載入期崩潰可能是間歇性的（同一個載入路徑偶爾才踩到），因此允許「疑似一次」的重試，
+ * 連續第二次才永久停用（見 `nextLoadCrashDecision`）。
+ * **舊檔沒有這個欄位時一律視為 `self-test`**（保守：直接永久停用）。
+ */
+export type DeviceDecisionPhase = "self-test" | "load";
+
+/**
+ * 疑似載入期崩潰的容忍次數上限：**連續第二次**就把加速器永久停用。
+ *
+ * 取值理由：上限 2＝「首次疑似重試一次」。間歇性崩潰最壞只會讓使用者多閃退一次
+ * （與已核准的自我測試最壞情況同一個量級），而確定性的崩潰最多也只會被觀察兩次；
+ * 每次都寫回記錄，因此這個計數不會無上限成長。
+ */
+export const MAX_SUSPECTED_LOAD_CRASHES = 2;
+
+/**
+ * 觀察到一次「疑似載入期崩潰」之後的處置（純函式，邊界可獨立測試）。
+ *
+ * `permanent` 為 false 時呼叫端應把決定寫回 `usable`（並記下新的次數）＝下次啟動再試一次；
+ * 為 true 時永久停用（`crashed`／`crashed-during-load`）。
+ */
+export function nextLoadCrashDecision(currentCount: number): { count: number; permanent: boolean } {
+  const count = currentCount + 1;
+  return { count, permanent: count >= MAX_SUSPECTED_LOAD_CRASHES };
+}
 
 /** 決定記錄的 schema 版本（檔案第一個欄位；版本不同一律視為無效並重測）。 */
 export const DEVICE_DECISION_SCHEMA = 1;
@@ -157,6 +191,41 @@ export interface DeviceDecisionRecord extends DeviceDecisionIdentity {
   coreMlSessionBuildMs?: number;
   /** 這次測試（或崩潰的那次測試）的時間（ISO 8601）。 */
   testedAt: string;
+  /** 只有 `pending` 用得到：這張存活標記是誰留下的（舊檔缺欄＝`self-test`）。 */
+  pendingPhase?: DeviceDecisionPhase;
+  /** 疑似「載入期崩潰」的累計次數（未觀察到時不存在＝0）。 */
+  suspectedLoadCrashes?: number;
+}
+
+/**
+ * 「量測欄位」：跨生命週期沿用時**只搬這些**（不含結論與身分）。
+ *
+ * 為什麼要有型別／過濾器：決定記錄會在多條路徑間改寫（自我測試 → 護欄標記 → 載入成功／失敗），
+ * 而**結論欄位（`outcome`／`reason`）不該被搬**——否則一個舊的失敗原因會被寫進「測試中」的
+ * 存活標記裡，下次啟動就讀到一個不屬於那個階段的理由。全部選填：來源可能還沒有量測數據
+ * （例如明示模式、或第一次測試）。
+ */
+export interface SelfTestMeasurementFields {
+  throughputRatio?: number;
+  minCosine?: number;
+  cpuSessionBuildMs?: number;
+  coreMlSessionBuildMs?: number;
+  testedAt?: string;
+}
+
+/**
+ * 從記錄或摘要取出量測欄位（逐欄挑選，**不帶** `outcome`／`reason`）。
+ *
+ * 傳入的是記錄或 `runtimeStatus.selfTest` 都可以（兩者的量測欄位同名同型）。
+ */
+export function measurementFieldsOf(source: SelfTestMeasurementFields): SelfTestMeasurementFields {
+  const fields: SelfTestMeasurementFields = {};
+  if (source.throughputRatio !== undefined) fields.throughputRatio = source.throughputRatio;
+  if (source.minCosine !== undefined) fields.minCosine = source.minCosine;
+  if (source.cpuSessionBuildMs !== undefined) fields.cpuSessionBuildMs = source.cpuSessionBuildMs;
+  if (source.coreMlSessionBuildMs !== undefined) fields.coreMlSessionBuildMs = source.coreMlSessionBuildMs;
+  if (source.testedAt !== undefined) fields.testedAt = source.testedAt;
+  return fields;
 }
 
 /** 量測結果（餵給判準的三個數字）。 */
@@ -217,12 +286,22 @@ export function minCosineOf(
   return min;
 }
 
-/** 記錄 → 診斷用的摘要（`pending` 推導成 `crashed`；見檔頭）。 */
+/**
+ * 記錄 → 診斷用的摘要（`pending` 推導成 `crashed`；階段決定原因是「測試」還是「載入」）。
+ *
+ * 舊檔（沒有 `pendingPhase`）一律當成自我測試階段——保守：直接永久停用。
+ */
 export function toSelfTestStatus(record: DeviceDecisionRecord): EmbedderSelfTestStatus {
   const crashed = record.outcome === "pending" || record.outcome === "crashed";
+  const crashedDuringLoad =
+    record.pendingPhase === "load" || record.reason === SELF_TEST_REASONS.crashedDuringLoad;
   const status: EmbedderSelfTestStatus = {
     outcome: crashed ? "crashed" : record.outcome === "usable" ? "usable" : "unusable",
-    reason: crashed ? SELF_TEST_REASONS.crashed : record.reason,
+    reason: crashed
+      ? crashedDuringLoad
+        ? SELF_TEST_REASONS.crashedDuringLoad
+        : SELF_TEST_REASONS.crashed
+      : record.reason,
     testedAt: record.testedAt,
   };
   if (record.throughputRatio !== undefined) status.throughputRatio = record.throughputRatio;
@@ -311,6 +390,14 @@ export function parseDecisionRecord(text: string): DeviceDecisionRecord | null {
   if (typeof cpuSessionBuildMs === "number") record.cpuSessionBuildMs = cpuSessionBuildMs;
   const coreMlSessionBuildMs = raw["coreMlSessionBuildMs"];
   if (typeof coreMlSessionBuildMs === "number") record.coreMlSessionBuildMs = coreMlSessionBuildMs;
+  // 階段只認兩個已知值；不認識的值一律留空（＝當成 `self-test`，保守處置）。
+  const pendingPhase = raw["pendingPhase"];
+  if (pendingPhase === "self-test" || pendingPhase === "load") record.pendingPhase = pendingPhase;
+  // 計數必須是非負整數；壞值一律忽略（當成 0）。
+  const suspectedLoadCrashes = raw["suspectedLoadCrashes"];
+  if (typeof suspectedLoadCrashes === "number" && Number.isInteger(suspectedLoadCrashes) && suspectedLoadCrashes >= 0) {
+    record.suspectedLoadCrashes = suspectedLoadCrashes;
+  }
   return record;
 }
 
@@ -355,41 +442,108 @@ export function writeDecisionRecord(path: string, record: DeviceDecisionRecord):
 }
 
 /**
- * 決定記錄的三種處置。
+ * 啟動時對快取記錄的處置。
  *
- * - `test-required`：沒有記錄、身分不符（換模型／dtype／平台／架構／旗標）、
- *   或 `appVersion` 變了 → 必須重測一次。
- * - `crashed`：上一次測試讓行程死掉（`pending` 或已記成 `crashed`）→ **永久不自動重試**。
- *   這一條**刻意不看身分**：崩潰是這台機器（驅動／EP／記憶體）的事實，
- *   換模型不會讓它消失，重試只是再死一次。
- * - `decided`：可用或不可以用，直接沿用（`needsRewrite` 表示檔案裡的 `pending`
- *   還沒被改寫成 `crashed`，呼叫端應補寫）。
+ * - `test-required`：沒有記錄、身分不符（換模型／dtype／平台／架構／旗標）、或 `appVersion` 變了
+ *   → 必須重測一次。
+ * - `usable`：沿用「加速器可用」（`suspectedLoadCrashes` 是載入期護欄要帶上的計數）。
+ * - `unusable`：沿用「加速器不可用」→ 直接用 CPU。
+ * - `load-crash-retry`：上一次啟動**疑似死在 CoreML 載入**（第一次）→ 這次用 CPU、
+ *   把決定寫回 `usable`（`rewrite`，次數 +1），下次啟動自然再試一次。
+ * - `crashed`：永久停用加速器（自我測試期崩潰，或疑似載入期崩潰已達上限）；
+ *   `rewrite` 非 null 表示要覆寫磁碟（把 `pending` 存活標記改成結論）。
+ *
+ * 為什麼崩潰的判定**刻意不看身分**：崩潰是這台機器（驅動／EP／記憶體）的事實，
+ * 換模型不會讓它消失，重試只是再死一次。
  */
 export type DecisionClassification =
   | { kind: "test-required" }
-  | { kind: "crashed"; status: EmbedderSelfTestStatus; record: DeviceDecisionRecord; needsRewrite: boolean }
-  | { kind: "decided"; status: EmbedderSelfTestStatus; record: DeviceDecisionRecord };
+  | {
+      kind: "usable";
+      status: EmbedderSelfTestStatus;
+      record: DeviceDecisionRecord;
+      suspectedLoadCrashes: number;
+    }
+  | { kind: "unusable"; status: EmbedderSelfTestStatus; record: DeviceDecisionRecord }
+  | {
+      kind: "load-crash-retry";
+      status: EmbedderSelfTestStatus;
+      record: DeviceDecisionRecord;
+      suspectedLoadCrashes: number;
+      /** 要覆寫回磁碟的記錄（寫回 `usable`＋新次數）。 */
+      rewrite: DeviceDecisionRecord;
+    }
+  | {
+      kind: "crashed";
+      status: EmbedderSelfTestStatus;
+      record: DeviceDecisionRecord;
+      /** 要覆寫回磁碟的記錄；`null`＝磁碟上已經是結論（不必改寫）。 */
+      rewrite: DeviceDecisionRecord | null;
+    };
 
-/** 依記錄與現在的環境，決定「要不要重測」。 */
+/** 依記錄與現在的環境，決定「要不要重測／要不要沿用／要不要改寫」。 */
 export function classifyDecision(
   record: DeviceDecisionRecord | null,
   identity: DeviceDecisionIdentity,
 ): DecisionClassification {
   if (record === null) return { kind: "test-required" };
 
-  if (record.outcome === "pending" || record.outcome === "crashed") {
+  if (record.outcome === "pending") {
+    // 階段缺欄＝自我測試（保守：直接永久停用）。
+    if ((record.pendingPhase ?? "self-test") === "load") {
+      const { count, permanent } = nextLoadCrashDecision(record.suspectedLoadCrashes ?? 0);
+      const reason = SELF_TEST_REASONS.crashedDuringLoad;
+      if (permanent) {
+        return {
+          kind: "crashed",
+          status: toSelfTestStatus({ ...record, reason }),
+          record,
+          rewrite: {
+            ...record,
+            ...identity,
+            outcome: "crashed",
+            reason,
+            pendingPhase: "load",
+            suspectedLoadCrashes: count,
+          },
+        };
+      }
+      return {
+        kind: "load-crash-retry",
+        status: toSelfTestStatus({ ...record, outcome: "usable", reason: undefined }),
+        record,
+        suspectedLoadCrashes: count,
+        rewrite: {
+          ...record,
+          ...identity,
+          outcome: "usable",
+          reason: undefined,
+          pendingPhase: "load",
+          suspectedLoadCrashes: count,
+        },
+      };
+    }
     return {
       kind: "crashed",
       status: toSelfTestStatus(record),
       record,
-      needsRewrite: record.outcome === "pending",
+      rewrite: { ...record, ...identity, outcome: "crashed", reason: SELF_TEST_REASONS.crashed, pendingPhase: "self-test" },
     };
+  }
+
+  if (record.outcome === "crashed") {
+    return { kind: "crashed", status: toSelfTestStatus(record), record, rewrite: null };
   }
 
   if (!decisionMatchesIdentity(record, identity)) return { kind: "test-required" };
   // 換版本時重測一次：量測結果與當時的實作綁在一起（編譯器、EP、我們的載入方式都可能變）。
   if (record.appVersion !== identity.appVersion) return { kind: "test-required" };
-  return { kind: "decided", status: toSelfTestStatus(record), record };
+
+  const status = toSelfTestStatus(record);
+  if (record.outcome === "usable") {
+    return { kind: "usable", status, record, suspectedLoadCrashes: record.suspectedLoadCrashes ?? 0 };
+  }
+  return { kind: "unusable", status, record };
 }
 
 /** 失敗原因標籤 → 記憶體裡的退回代碼（`accel-*` 家族；讓診斷看得出是加速器自我測試擋的）。 */
@@ -397,7 +551,9 @@ export function selfTestFallbackCode(reason: string | undefined): string {
   if (reason === SELF_TEST_REASONS.tooSlow) return "accel-slow";
   if (reason === SELF_TEST_REASONS.inconsistent) return "accel-inconsistent";
   if (reason === SELF_TEST_REASONS.memoryExceeded) return "accel-memory-exceeded";
-  if (reason === SELF_TEST_REASONS.crashed) return "accel-crashed";
+  if (reason === SELF_TEST_REASONS.crashed || reason === SELF_TEST_REASONS.crashedDuringLoad) {
+    return "accel-crashed";
+  }
   if (reason === SELF_TEST_REASONS.inferenceFailed) return "inference-failed";
   return "load-failed";
 }
@@ -408,9 +564,21 @@ export function describeSelfTestReason(reason: string | undefined): string {
   if (reason === SELF_TEST_REASONS.inconsistent) return "加速器算出的向量與 CPU 不一致（餘弦未達 0.999）";
   if (reason === SELF_TEST_REASONS.memoryExceeded) return "測試期峰值記憶體超過 6 GiB";
   if (reason === SELF_TEST_REASONS.crashed) return "上一次加速器自我測試造成行程結束，已永久改用 CPU";
+  if (reason === SELF_TEST_REASONS.crashedDuringLoad) {
+    return "連續兩次在載入加速器時疑似造成行程結束，已永久改用 CPU";
+  }
   if (reason === SELF_TEST_REASONS.inferenceFailed) return "加速器推論失敗，已退回 CPU";
   if (reason === SELF_TEST_REASONS.loadFailed) return "加速器 session 載入失敗，已退回 CPU";
   return "加速器自我測試未通過，已退回 CPU";
+}
+
+/** 「決定檔寫不進去、因此不敢碰加速器」時對外的說明（保護鏈寫不進去就不碰 CoreML）。 */
+export const ACCEL_UNAVAILABLE_MESSAGE =
+  "無法寫入裝置決定快取，為避免每次啟動重複崩潰，這次改用 CPU";
+
+/** 「疑似載入期崩潰（第一次）」時對外的說明。 */
+export function describeLoadCrashRetry(count: number): string {
+  return `上一次啟動疑似在載入加速器時結束（第 ${count} 次）；這次先用 CPU，下次啟動再試一次`;
 }
 
 /** 自我測試需要的（注入式）相依：建 session、嵌入、釋放、時鐘與記憶體讀數。 */
@@ -437,23 +605,28 @@ export interface CoreMlSelfTestOptions<TBackend> {
   nowIso?: () => string;
 }
 
-/** 自我測試的結果：決定本身，以及「判定可用時」可以直接沿用的 session。 */
-export interface CoreMlSelfTestResult<TBackend> {
-  /** 已寫入磁碟（或嘗試寫入）的決定記錄。 */
-  record: DeviceDecisionRecord;
-  /**
-   * 判定可用時＝測試中已建好的 CoreML session（呼叫端直接沿用，**不必重編**）；
-   * 不可用時＝`null`（已釋放）。
-   */
-  backend: TBackend | null;
-  /**
-   * 失敗的**已去識別化**摘要（錯誤名稱＋訊息首行、家目錄遮罩、長度上限）。
-   *
-   * 只放在回傳值裡、**不寫進磁碟**：診斷要能當場看到「CoreML 是怎麼失敗的」，
-   * 但決定記錄只存穩定短標籤（重啟後由呼叫端用人類可讀的通用說明呈現）。
-   */
-  message?: string;
-}
+/**
+ * 自我測試的結果。
+ *
+ * - `unavailable`：**marker 落不了地**（決定檔寫不進去）。保護鏈的前提不存在，因此呼叫端
+ *   **不得**碰 CoreML，該次以 CPU 執行（見 `docs/embedder-contract.md`）；也沒有任何結果可持久化。
+ * - `tested`：測試真的跑過（成功或失敗都算），記錄已寫入磁碟（或嘗試寫入）。
+ *   `backend` 為判定可用時的 CoreML session（呼叫端直接沿用，**不必重編**）。
+ */
+export type CoreMlSelfTestResult<TBackend> =
+  | { kind: "unavailable"; reason: "marker-write-failed" }
+  | {
+      kind: "tested";
+      record: DeviceDecisionRecord;
+      backend: TBackend | null;
+      /**
+       * 失敗的**已去識別化**摘要（錯誤名稱＋訊息首行、家目錄遮罩、長度上限）。
+       *
+       * 只放在回傳值裡、**不寫進磁碟**：診斷要能當場看到「CoreML 是怎麼失敗的」，
+       * 但決定記錄只存穩定短標籤（重啟後由呼叫端用人類可讀的通用說明呈現）。
+       */
+      message?: string;
+    };
 
 /** 釋放 session，失敗只吞掉（session 會隨行程結束回收；不能因為釋放失敗讓載入失敗）。 */
 async function disposeQuietly<TBackend>(
@@ -471,10 +644,12 @@ async function disposeQuietly<TBackend>(
  * 跑一次「CPU 基準 vs CoreML」的自我測試，落地 `pending` 標記後再寫最終決定。
  *
  * 流程（順序刻意如此）：
- *   1. 先寫 `pending`（**在任何有風險的動作之前**：CPU 階段若也炸掉，同樣要留痕）。
+ *   1. 先寫 `pending(self-test)`（**在任何有風險的動作之前**：CPU 階段若也炸掉，同樣要留痕）。
+ *      **這張標記寫不進去就什麼都不做**——保護鏈的前提不存在時不得碰 CoreML，直接回
+ *      `{kind:"unavailable"}` 讓呼叫端改用 CPU（見檔頭與契約）。
  *   2. 量 CPU（暖機一次再計時；兩邊用完全相同的樣本與協定）。
  *   3. 量 CoreML（建 session 是主要成本；失敗→`load-failed`、推論失敗→`inference-failed`）。
- *   4. 依判準寫下最終記錄。
+ *   4. 依判準寫下最終記錄（寫入失敗時仍回傳結果：決定在記憶體裡有效，只是下次啟動要重測）。
  *
  * 為什麼 CPU 先、CoreML 後：兩邊**不同時常駐**（16 GB 機器的峰值會被兩份模型污染，
  * 這也是研究筆記的明確建議），而 CoreML 的編譯是唯一昂貴的載入成本——
@@ -495,13 +670,17 @@ export async function runCoreMlSelfTest<TBackend>(
   const readRss = options.readRss ?? ((): number => process.memoryUsage.rss());
   const nowIso = options.nowIso ?? ((): string => new Date().toISOString());
 
-  // 1. `pending`：這是「測試中」的存活證明（崩潰後由下一次啟動推導成 `crashed`）。
-  writeDecisionRecord(options.decisionPath, {
+  // 1. `pending(self-test)`：這是「測試中」的存活證明（崩潰後由下一次啟動推導成 `crashed`）。
+  //    **寫不進去就不得碰 CoreML**：保護鏈的價值全在這張標記上，沒有它就去踩已知會殺掉行程的
+  //    路徑（`onnxruntime#28005`）＝每次啟動都可能閃退一次，正是要避免的最壞情況。
+  const markerWritten = writeDecisionRecord(options.decisionPath, {
     schema: DEVICE_DECISION_SCHEMA,
     ...options.identity,
     outcome: "pending",
+    pendingPhase: "self-test",
     testedAt: nowIso(),
   });
+  if (!markerWritten) return { kind: "unavailable", reason: "marker-write-failed" };
 
   let peakRssBytes = readRss();
   const sampleRss = (): void => {
@@ -585,9 +764,12 @@ export async function runCoreMlSelfTest<TBackend>(
   if (minCosine !== undefined) record.minCosine = minCosine;
   record.cpuSessionBuildMs = cpuSessionBuildMs;
   if (coreMlSessionBuildMs !== undefined) record.coreMlSessionBuildMs = coreMlSessionBuildMs;
+  // 最終結果寫入失敗時不更改回傳值：決定在記憶體裡仍然有效（本次執行照它走），
+  // 只是下次啟動會沒有可沿用的記錄而重測一次。**不重試、不繞道**：寫不進去就是寫不進去。
   writeDecisionRecord(options.decisionPath, record);
 
   const result: CoreMlSelfTestResult<TBackend> = {
+    kind: "tested",
     record,
     backend: decision.outcome === "usable" ? coreMlBackend : null,
   };
