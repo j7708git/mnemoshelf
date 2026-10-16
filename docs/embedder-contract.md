@@ -29,21 +29,70 @@ interface EmbedderInfo {
 ```ts
 interface Embedder {
   readonly info: EmbedderInfo;
+  /** 執行裝置狀態（**選配**成員，見「執行裝置狀態」一節）；沒有加速器概念的實作可以不提供。 */
+  readonly runtimeStatus?: EmbedderRuntimeStatus;
   /** 查詢文字（會套用查詢 prefix）。 */
   embedQuery(text: string): Promise<Float32Array>;
   /** 文件文字；title 沒有時用 "none"（會套用文件 prefix）。 */
   embedDocument(text: string, title?: string): Promise<Float32Array>;
-  /** 文件文字批次；輸出與 inputs 一一對應且順序相同（見下節）。 */
+  /** 文件文字批次；輸出與 inputs 一一對應且順序相同（見「批次方法」一節）。 */
   embedDocuments(inputs: readonly DocumentInput[], opts?: EmbedDocumentsOptions): Promise<Float32Array[]>;
   /** 圖片。輸入為已解碼的像素或檔案位元組，由實作決定，但必須明確定義。 */
   embedImage(image: ImageInput): Promise<Float32Array>;
-  /** 啟動探測，見下節。 */
+  /** 啟動探測，見「啟動探測」一節。 */
   probe(): Promise<ProbeResult>;
   dispose(): Promise<void>;
 }
 ```
 
 所有回傳的向量：長度為 `info.dim`、**已 L2 正規化**（模長 1，容差 1e-3）。
+
+## 執行裝置狀態（`runtimeStatus`，選配）
+
+> 本節於 **2026-10-16 經使用者核准新增**。這個成員在型別上是**選配**：既有實作不需要提供
+> 也不會受影響，索引器與 REST 層遇到「欄位不存在」時照舊運作。
+
+只有會用到加速器的實作才有「裝置」概念，因此 `runtimeStatus` 是**選配**成員；
+它提供診斷（例如 `GET /diagnostics` 顯示實際裝置與退回原因）與索引器併發決策所需的資訊。
+
+```ts
+/** embedder 的執行裝置狀態（選配能力，供診斷與排程參考）。 */
+interface EmbedderRuntimeStatus {
+  /** 要求／設定的裝置選項（`auto` 表示依平台自動決定）；值由實作定義。 */
+  requestedDevice: string;
+  /**
+   * 目前使用的裝置；模型尚未載入時為**依平台與設定解析出的計畫裝置**。
+   * 值由實作定義（本專案的預設實作為 `cpu`／`dml`）。
+   */
+  device: string;
+  /** 模型是否已載入；true 代表 `device` 是**實際使用**的裝置，而非計畫值。 */
+  loaded: boolean;
+  /** 曾從 GPU 退回 CPU 時的原因；未退回為 `null`。 */
+  fallbackReason: EmbedderFallbackReason | null;
+  /** 目前的批次視窗大小（一次送進模型的輸入數上限）。 */
+  batchSize: number;
+  /**
+   * 同一 session 是否只允許序列推論（同一時間僅一次 `Run`）。
+   * 為 true 時索引器把**檔案間**併發限制為 1，且實作本身必須在同一實例內
+   * 序列化所有 `embed*` 呼叫（多個索引 job、搜尋與探測都可能並發）。
+   */
+  serializedInference: boolean;
+  /**
+   * DirectML 的 adapter **設定值**（`IDXGIFactory::EnumAdapters` 順序，0＝預設顯示卡）。
+   * 非 dml 路徑與退回 CPU 後仍顯示這個設定值，診斷才判讀得出「原本指定第 N 張卡、之後退回了」。
+   * **沒有 adapter 概念的實作為 `null`。**
+   */
+  dmlDeviceId: number | null;
+}
+
+/** 從 GPU 退回 CPU 的原因（短標籤＋已去識別化的說明）。 */
+interface EmbedderFallbackReason {
+  /** 穩定短標籤（可程式比對），例如 `unsupported-platform`／`load-failed`／`inference-failed`。 */
+  code: string;
+  /** 人類可讀的短說明；**不得**含本機絕對路徑或個資（會經 `GET /diagnostics` 外洩）。 */
+  message: string;
+}
+```
 
 ## 批次方法（`embedDocuments`）
 
@@ -74,10 +123,11 @@ interface EmbedDocumentsOptions {
 - **失敗**：任一項失敗（模型輸出形狀不符、取消）即**整批拋錯**，不回傳部分結果。
 - **取消**：`opts.signal` 沿用索引器的 `throwIfAborted` 慣例，實作應在開始推論前檢查。
 
-**批次上限**：一次 forward 的視窗上限由實作決定（預設 embedder 為 16，常數
-`MAX_BATCH_SIZE`）。批次會把同批文字 pad 到同批最長序列，過大的批次會讓 pad 成本與
-記憶體上升，因此需要上限；超過上限的輸入應由實作**內部切成多個視窗**後串接回傳，
-呼叫端不需自行分批。
+**批次上限**：一次 forward 的視窗上限由實作決定，並可由 `runtimeStatus.batchSize` 讀到。
+本專案的預設實作**依執行裝置**取上限：DirectML（`dml`）為 32、CPU 為 16
+（常數 `MAX_BATCH_SIZE` 即 CPU 的 16；DML 取 32 的依據為實測，見實作內註解）。批次會把同批
+文字 pad 到同批最長序列，過大的批次會讓 pad 成本與記憶體上升，因此需要上限；超過上限的輸入
+應由實作**內部切成多個視窗**後串接回傳，呼叫端不需自行分批。
 
 ## 啟動探測（probe）
 

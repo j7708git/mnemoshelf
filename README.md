@@ -1,6 +1,6 @@
 # Mnemoshelf
 
-> 狀態：規劃與可行性驗證階段，尚無可用版本。
+> 狀態：開發進行中，功能仍可能變動；桌面版安裝檔與版本請見 GitHub Releases。
 
 Mnemoshelf 是一個本機桌面應用程式，目標有兩個：
 
@@ -29,6 +29,16 @@ Mnemoshelf 是一個本機桌面應用程式，目標有兩個：
 ## 技術棧
 
 TypeScript、Node.js、pnpm、Electron、React。預設儲存為 SQLite（FTS5 + sqlite-vec）。
+
+## 進階環境變數（選用）
+
+一般使用不需要設定。以下是嵌入模型執行裝置相關的開關（裝置與退回的完整語意，
+見 [docs/embedder-contract.md](docs/embedder-contract.md)）：
+
+| 變數 | 值 | 預設 | 說明 |
+|---|---|---|---|
+| `MNEMOSHELF_EMBED_DEVICE` | `auto`／`cpu`／`dml` | `auto` | `auto` 只在 Windows 嘗試 DirectML GPU（`dml`），其他平台維持 CPU；`dml` 載入或推論失敗會自動退回 CPU，不中斷索引。 |
+| `MNEMOSHELF_EMBED_DML_DEVICE_ID` | 非負整數 | `0` | DirectML adapter 索引（`0`＝預設顯示卡；多顯卡筆電常用來指定獨顯）。非法值會直接拒絕啟動。 |
 
 ## 授權
 
