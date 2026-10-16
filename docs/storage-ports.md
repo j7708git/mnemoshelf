@@ -8,6 +8,9 @@
 >
 > 2026-10-14（M3）新增 §記憶的釘選：`Memory.pinned` 欄位與 `MetadataStore.setMemoryPinned`
 > 方法（兩後端皆實作、通過同一組契約測試）；`listMemories` 的排序語意不變。
+>
+> 2026-10-16 新增 §root 設定的更新：`MetadataStore.updateRoot(id, patch)` 與 `RootPatch`
+> 型別（目前僅 `modalities`）——兩後端皆實作、通過同一組契約測試。
 
 | 介面 | 職責 | 預設實作 | 預計的替代實作 |
 |---|---|---|---|
@@ -81,6 +84,31 @@ keyword 路把 vector 路原本正確的命中壓了下去（RRF 讓兩路等權
 契約測試（`@mnemoshelf/core/testing` 的 `runMetadataStoreContract`）新增兩例：釘選／取消
 （含冪等，且 `getMemory` 與 `listMemories` 都反映），以及不存在 id 的無操作。SQLite 與
 PostgreSQL 兩個後端都必須通過同一組測試。
+
+## root 設定的更新（2026-10-16）
+
+root 建立之後只有一部分設定可變更；`MetadataStore.updateRoot(id, patch)` 是唯一入口，
+可變欄位由 `RootPatch`（`ports/types.ts`）界定。
+
+| 方法 | 語意 |
+|---|---|
+| `MetadataStore.updateRoot(id, patch)` | 更新 `RootPatch`（目前只有 `modalities`）；回傳**更新後**的 `Root` |
+
+- **目前只有 `modalities` 可改。** `path`／`mode` 變更等同換一個 root（索引內容與清理語意都會變），
+  應以「移除再加入」處理；`include`／`exclude`／`respectGitignore` 尚無變更語意，故不在 `RootPatch`。
+- **冪等**：同樣的 patch 重複套用結果相同；`patch` 未提供的欄位＝該欄位不變。空陣列 `[]` 是合法值
+  （＝全部模態關閉，與 `addRoot` 接受空陣列一致），與「未提供該欄位」不同。
+- **回傳更新後的 `Root`**，呼叫端不必再讀一次；`getRoot` 與 `listRoots` 也都反映新值。
+- **不存在的 id 回 `null`**（不拋錯，與 `setMemoryPinned` 對不存在 id 的「無操作」風格一致，
+  也不會建立新列）；REST 層據此回 `404`。既有資料與 `createdAt` 等不可變欄位原樣保留。
+- **只改設定，不動既有資料。** 新模態在下一次 `indexRoot` 才生效：關掉模態**不會立刻**釋放既有的
+  chunk／向量（重新索引時才由清理迴圈清掉），開新模態也不會自動補索引。
+- **與 `removeRoot` ＋重新 `addRoot` 的差異**：`updateRoot` 保留同一個 `id`、`createdAt` 與既有
+  chunks／向量，適合「只是想多索引一種模態」；`removeRoot` ＋ `addRoot` 會得到新 `id`，
+  既有索引與衍生資料需重建（`removeRoot(id, true)` 會連 chunks 一起刪掉）。
+- 契約測試（`@mnemoshelf/core/testing` 的 `runMetadataStoreContract`）新增四例：更新並回傳
+  （不可變欄位原樣保留）、冪等與關閉模態、`patch` 未提供欄位、不存在的 id。SQLite 與 PostgreSQL
+  兩個後端都必須通過同一組測試。
 
 ## 全文檢索與中文
 
