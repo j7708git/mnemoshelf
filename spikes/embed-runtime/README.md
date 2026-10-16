@@ -5,8 +5,8 @@
 而且速度與記憶體可接受？** 這是 Mnemoshelf（本機多模態語意檔案總管）能否照原技術
 路線走的關卡。
 
-量測結果與結論寫在
-`project-notes/projects/mnemoshelf/research/spike-embed-runtime.md`（private repo，不在此處）。
+量測結果與結論的完整研究紀錄為內部文件，不隨本 repo 公開；本目錄只保留可重跑的
+量測程式，以及 `results/` 下的原始數字。
 
 這裡的程式碼是一次性驗證用的 spike：可以醜，但**必須可重跑**。
 

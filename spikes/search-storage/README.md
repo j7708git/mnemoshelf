@@ -7,8 +7,8 @@
 3. `sqlite-vec` 在 1 萬～100 萬筆規模的查詢延遲、`root_id` 過濾寫法、量化效果，
    以及混合排序（RRF）是否比單一路徑好。
 
-量測結果與逐題結論寫在
-`project-notes/projects/mnemoshelf/research/spike-search-storage.md`（private repo）。
+量測結果與逐題結論的完整研究紀錄為內部文件，不隨本 repo 公開；本目錄只保留可重跑的
+量測程式，以及 `results/` 下的原始數字。
 這裡的程式碼是一次性驗證用的 spike：可醜，但**必須可重跑**。
 
 ## 環境需求
@@ -31,7 +31,7 @@ pnpm install
 pnpm run drivers
 
 # Q2/Q3：中文檢索評測（需要 CORPUS_DIR 與 :8181）
-CORPUS_DIR=~/workspace/agent/project-notes/projects pnpm run eval
+CORPUS_DIR=<你的語料目錄> pnpm run eval   # 例如含 *.md 的任何本機目錄
 
 # Q4/Q5/Q6：規模、root_id 過濾、量化（不需要 :8181）
 pnpm run scale
