@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   BINARY_SNIFF_BYTES,
+  chunkText,
   indexRoot,
   isMediaDecodeError,
   looksBinary,
@@ -531,6 +532,99 @@ describe("indexRoot", () => {
     }
   });
 
+  /**
+   * 對含指定標記的**文字／程式碼**檔拋出給定錯誤的 embedder。
+   *
+   * 對照組：`isMediaDecodeError` 的判準（`code`／`name`／訊息措辭）本身與檔案種類無關，
+   * 「能不能降級成 skipped」的守衛在 `processFile`（只有媒體檔才降級）。這裡就是要驗
+   * 那一半——少了它，一個文字檔只要帶著 `undecodable` 形狀的錯誤就會被靜默吞成跳過。
+   */
+  class UndecodableTextEmbedder extends RecordingEmbedder {
+    constructor(
+      private readonly error: Error,
+      private readonly marker: string,
+    ) {
+      super();
+    }
+
+    override async embedDocuments(
+      inputs: readonly DocumentInput[],
+      opts?: EmbedDocumentsOptions,
+    ): Promise<Float32Array[]> {
+      if (inputs.some((input) => input.text.includes(this.marker))) throw this.error;
+      return super.embedDocuments(inputs, opts);
+    }
+  }
+
+  it("文字檔帶 undecodable 形狀的錯誤仍記 failedFiles（媒體守衛不得套用到文字檔）", async () => {
+    const marker = "MNEMO-BAD-TEXT";
+    const media = await makeHarness({ "notes.md": `# 筆記\n\n${marker}\n` }, { modalities: ["text", "code"] });
+    try {
+      const cases: Error[] = [
+        // 穩定錯誤碼（core 對媒體檔的**主要**判準）。
+        Object.assign(new Error("模擬：文字檔路徑上冒出的解碼樣錯誤"), { code: "undecodable" }),
+        // 已知的輸入類錯誤名稱。
+        Object.assign(new Error("模擬：文字檔路徑上冒出的輸入類錯誤"), { name: "EmbedderInputError" }),
+        // 訊息措辭後備判準（sharp／libvips 的實際字串）。
+        new Error("Input buffer contains unsupported image format"),
+      ];
+
+      for (const error of cases) {
+        media.embedder = new UndecodableTextEmbedder(error, marker);
+        const result = await indexRoot(media.root, options(media));
+
+        expect(result.processed, `錯誤＝${error.message}`).toBe(0);
+        expect(result.skippedFiles, `錯誤＝${error.message}`).toEqual([]);
+        expect(result.failedFiles.length, `錯誤＝${error.message}`).toBe(1);
+        expect(result.failedFiles[0]?.relPath).toBe("notes.md");
+      }
+    } finally {
+      await fs.rm(media.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("程式碼檔同理：解碼形狀的錯誤不得降級成 skipped", async () => {
+    const marker = "MNEMO-BAD-CODE";
+    const media = await makeHarness({ "src/a.ts": `// ${marker}\nexport const a = 1;\n` }, {
+      modalities: ["text", "code"],
+    });
+    try {
+      media.embedder = new UndecodableTextEmbedder(
+        Object.assign(new Error("模擬：程式碼檔收到的解碼樣錯誤"), { code: "undecodable" }),
+        marker,
+      );
+
+      const result = await indexRoot(media.root, options(media));
+
+      expect(result.skippedFiles).toEqual([]);
+      expect(result.failedFiles).toEqual([{ relPath: "src/a.ts", reason: "undecodable" }]);
+    } finally {
+      await fs.rm(media.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("對照組：同一組錯誤在媒體檔上確實降級成 skipped(undecodable)", async () => {
+    const media = await makeHarness(
+      { "photo.heic": Buffer.from("MNEMO-BAD-IMAGE"), "notes.md": "# 筆記\n\n正常文字檔" },
+      { modalities: ["text", "code", "image"] },
+    );
+    try {
+      // 與文字檔案例完全同形狀的錯誤（code:"undecodable"），只差在檔案種類。
+      media.embedder = new UndecodableImageEmbedder(
+        Object.assign(new Error("模擬：圖片解不開"), { code: "undecodable" }),
+        "MNEMO-BAD-IMAGE",
+      );
+
+      const result = await indexRoot(media.root, options(media));
+
+      expect(result.processed).toBe(1);
+      expect(result.failedFiles).toEqual([]);
+      expect(result.skippedFiles).toEqual([{ relPath: "photo.heic", reason: "undecodable" }]);
+    } finally {
+      await fs.rm(media.dir, { recursive: true, force: true });
+    }
+  });
+
   it("isMediaDecodeError 只認得已知的解碼失敗形狀", () => {
     // 認得（sharp／libvips 與 transformers.js 的實際措辭）。
     expect(isMediaDecodeError(new Error("Input buffer contains unsupported image format"))).toBe(true);
@@ -575,14 +669,17 @@ describe("indexRoot", () => {
     const oldKeys = oldChunks.map((chunk) => `c:${chunk.id}`);
     expect(oldKeys.length).toBeGreaterThan(0);
 
-    // 改成會切成兩塊的內容（塊數改變，新 chunk 會有新 id）
-    await fs.writeFile(path.join(harness.dir, "a.md"), `# 標題\n\n${"內容".repeat(800)}`);
+    // 改成會切成更多塊的內容（CJK 1600 字；受切塊端的 token 預算限制 ⇒ 塊數由 1 變多）。
+    const rewritten = `# 標題\n\n${"內容".repeat(800)}`;
+    await fs.writeFile(path.join(harness.dir, "a.md"), rewritten);
 
     await indexRoot(harness.root, options(harness));
 
+    const expectedChunks = chunkText(rewritten).length;
+    expect(expectedChunks).toBeGreaterThan(oldChunks.length);
     const newChunks = await harness.store.listChunksByPath(harness.root.id, "a.md");
-    expect(newChunks.length).toBe(2);
-    expect(await harness.vec.count()).toBe(newChunks.length + 1); // a.md 兩塊 + b.ts 一塊
+    expect(newChunks.length).toBe(expectedChunks);
+    expect(await harness.vec.count()).toBe(newChunks.length + 1); // a.md 多塊 + b.ts 一塊
 
     // 舊 key 已被回收，不再出現在索引
     expect([...(await harness.vec.existingKeys(oldKeys))]).toEqual([]);

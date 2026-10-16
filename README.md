@@ -32,13 +32,14 @@ TypeScript、Node.js、pnpm、Electron、React。預設儲存為 SQLite（FTS5 +
 
 ## 進階環境變數（選用）
 
-一般使用不需要設定。以下是嵌入模型執行裝置相關的開關（裝置與退回的完整語意，
+一般使用不需要設定。以下是嵌入模型執行裝置與診斷相關的開關（裝置與退回的完整語意，
 見 [docs/embedder-contract.md](docs/embedder-contract.md)）：
 
 | 變數 | 值 | 預設 | 說明 |
 |---|---|---|---|
 | `MNEMOSHELF_EMBED_DEVICE` | `auto`／`cpu`／`dml` | `auto` | `auto` 只在 Windows 嘗試 DirectML GPU（`dml`），其他平台維持 CPU；`dml` 載入或推論失敗會自動退回 CPU，不中斷索引。 |
 | `MNEMOSHELF_EMBED_DML_DEVICE_ID` | 非負整數 | `0` | DirectML adapter 索引（`0`＝預設顯示卡；多顯卡筆電常用來指定獨顯）。非法值會直接拒絕啟動。 |
+| `MNEMOSHELF_EMBED_ORT_LOG` | `0`–`4` | 未設定（不覆寫） | ONNX Runtime 的 log 等級（`0`＝verbose、`4`＝fatal），只用於除錯：`0` 會印出內部配置訊息（含 arena 的擴張量），可診斷「單一配置有多大」。訊息量大、會拖慢啟動，平時不要開；非法值會直接拒絕啟動。 |
 
 ## 授權
 

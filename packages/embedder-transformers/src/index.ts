@@ -18,22 +18,27 @@ export {
 } from "./embedder.js";
 
 export {
+  BATCH_TOKEN_BUDGET,
   CPU_BATCH_SIZE,
   DEFAULT_DML_DEVICE_ID,
   DML_BATCH_SIZE,
   EMBED_DEVICE_ENV,
   EMBED_DEVICE_OPTIONS,
   EMBED_DML_DEVICE_ID_ENV,
+  EMBED_ORT_LOG_ENV,
+  ORT_LOG_SEVERITY_LEVELS,
   deviceBatchSize,
   isDmlPlatform,
   parseDmlDeviceId,
   parseEmbedDeviceOption,
+  parseOrtLogLevel,
   requiresSerializedInference,
   resolveEmbedDevice,
   summarizeFailure,
   type EmbedDevice,
   type EmbedDeviceOption,
   type EmbedDevicePlan,
+  type OrtLogSeverityLevel,
 } from "./device.js";
 
 export {

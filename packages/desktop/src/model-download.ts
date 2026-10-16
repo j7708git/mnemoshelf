@@ -6,6 +6,14 @@
  * 只有用同一組參數，預先下載的檔案才會正好是 embedder 之後要用的那一組。
  * 兩個時期的檔案清單必須相同，這件事由打包產物的自動流程實測（下載後 vs 跑完一次索引後）。
  *
+ * `session_options.enableCpuMemArena = false` 也**必須與 embedder 一致**（見 `createBackend()`）：
+ * 這裡建的是一次**真推論**的 session（下載後驗證模型能載入並跑完），不是只有讀檔案。
+ * ONNX Runtime 的 CPU arena 在請求超過目前 chunk 時會把 chunk 以 2 的冪次往上翻，
+ * 一次超過 1 GiB 的請求因而變成 ≥2 GiB 的單一配置，而這個大小在 Chromium／Electron 內
+ * 會被 PartitionAlloc **直接終止行程**（整個 app 閃退）。少了這個開關，全新安裝在 macOS
+ * 的「下載後驗證」階段就可能踩到與索引時同一個崩潰；而且兩個時期的 options 不一致
+ * 會讓之後的診斷更難（同一顆地雷時有時無）。
+ *
  * 為什麼不在 embedder 上加進度回呼：本卡的允許修改範圍不含 `packages/embedder-transformers`
  * （那是既有套件），因此進度整合放在桌面殼這一側。
  */
@@ -26,6 +34,15 @@ export interface DownloadModelOptions {
 interface DisposableModel {
   dispose?: () => Promise<unknown>;
 }
+
+/**
+ * 建 session 時共用的 ONNX Runtime options。
+ *
+ * 單獨寫成常數是為了讓「每一個 session 建立點都帶同一組 options」變成看得見的事實：
+ * 這個模組目前只有一個建立點，之後若多出第二個（例如分開啟用視覺編碼器），
+ * 沿用同一個常數即可，不會再出現「其中一條路徑忘了帶」的落差。
+ */
+export const MODEL_SESSION_OPTIONS = { enableCpuMemArena: false } as const;
 
 /**
  * 抓齊模型檔案。**不**回傳模型：載入一次只為了把檔案抓下來，之後立刻釋放，
@@ -55,6 +72,8 @@ export async function downloadModelFiles(options: DownloadModelOptions): Promise
     device: "cpu",
     dtype: profile.dtype,
     progress_callback,
+    // 見檔頭說明：與 embedder 的 createBackend() 保持一致（關閉 CPU arena）。
+    session_options: { ...MODEL_SESSION_OPTIONS },
   })) as unknown as DisposableModel;
 
   if (typeof model.dispose === "function") {

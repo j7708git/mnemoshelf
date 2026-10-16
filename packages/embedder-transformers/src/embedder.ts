@@ -13,8 +13,16 @@
  *   - `dml` 載入或推論失敗時**自動退回 CPU**，不中斷；原因可在 `runtimeStatus.fallbackReason` 讀到。
  *   - **例外：解碼／輸入類失敗不退**（`EmbedderInputError`／`code:"undecodable"`）。一張壞圖
  *     不該讓整場永久失去 GPU；這類錯誤照常往上拋，由 core 記成 `skipped(undecodable)`。
- *   - 批次視窗依裝置：DML 32、CPU 16（見 `device.ts` 的實測依據）。
+ *   - 批次視窗依裝置：DML 32、CPU 16（見 `device.ts` 的實測依據），另受 token 預算限制
+ *     （一窗的 token 總量上限，`BATCH_TOKEN_BUDGET`）。
  *   - 換裝置**不改變** `info.id`（只吃 model id 與 dtype）：向量兩者等值，既有索引不需重建。
+ *
+ * Session options（`createBackend`，所有裝置共用）：
+ *   - `enableCpuMemArena: false`：關閉 ORT 的 CPU arena。arena 在請求超過目前 chunk 時會把
+ *     chunk 以 2 的冪次往上翻，一次超過 1 GiB 的請求因而變成 ≥2 GiB 的單一配置；這個大小
+ *     在 Chromium／Electron 內會被 PartitionAlloc **直接終止行程**（整個 app 閃退）。
+ *     關掉即整條路移除，並大幅降低 RSS（代價：同工作負載約 +5% 時間，實測在噪聲範圍內）。
+ *   - 選填 `logSeverityLevel`（環境變數 `MNEMOSHELF_EMBED_ORT_LOG`，診斷用，預設不開）。
  *
  * 文字 prefix：查詢 `task: search result | query: {q}`；文件 `title: {title} | text: {content}`
  * （無標題用 `title: none`）。**圖片不加 prefix**。
@@ -33,17 +41,21 @@ import type {
   ProbeResult,
 } from "@mnemoshelf/core";
 import {
+  BATCH_TOKEN_BUDGET,
   CPU_BATCH_SIZE,
   EMBED_DEVICE_ENV,
   EMBED_DML_DEVICE_ID_ENV,
+  EMBED_ORT_LOG_ENV,
   deviceBatchSize,
   parseDmlDeviceId,
+  parseOrtLogLevel,
   requiresSerializedInference,
   parseEmbedDeviceOption,
   resolveEmbedDevice,
   summarizeFailure,
   type EmbedDevice,
   type EmbedDeviceOption,
+  type OrtLogSeverityLevel,
 } from "./device.js";
 import {
   EmbedderInputError,
@@ -72,7 +84,8 @@ export const DEFAULT_MAX_SOFT_TOKENS = 70;
  * 又不會讓記憶體失控」的折衷。
  *
  * DirectML 用 `DML_BATCH_SIZE`（32，依實測最佳）；實際值見 `runtimeStatus.batchSize`。
- * 超過上限的輸入由 `embedDocuments` 內部切成多個視窗，呼叫端不需自行分批。
+ * 超過上限的輸入由 `embedDocuments` 內部切成多個視窗，呼叫端不需自行分批；
+ * 另外，一窗的 token 總量若超過 `BATCH_TOKEN_BUDGET`，視窗會再自動縮小。
  */
 export const MAX_BATCH_SIZE = CPU_BATCH_SIZE;
 
@@ -267,10 +280,32 @@ function isAbortError(error: unknown): boolean {
  * - 取消（`AbortError`）原樣拋出：取消不是「輸入壞掉」。
  * - 已是 `EmbedderInputError` 者原樣拋出，不重複包裝。
  * - 其餘包成 `EmbedderInputError`，底層摘要（已去識別化）放進訊息與 `cause`，方便診斷。
+ *
+ * `cause` 放的是**已遮罩的摘要**而不是原始錯誤：訊息會被遮罩（`summarizeFailure` 把家目錄
+ * 換成 `~`），但原始錯誤物件若留在 `cause`，任何 `console.error(error)`／`util.inspect(error)`
+ * 都會把 `[cause]` 連同裡面的本機絕對路徑一起印出來——也就是遮罩等於白做。`cause` 因此
+ * 只放 `summarizeFailure` 的結果（錯誤名稱＋訊息首行、已遮罩、已截斷）。
  */
 function asImageInputError(error: unknown): EmbedderInputError {
   if (error instanceof EmbedderInputError) return error;
-  return new EmbedderInputError(`圖片解碼／前處理失敗：${summarizeFailure(error)}`, { cause: error });
+  const summary = summarizeFailure(error);
+  return new EmbedderInputError(`圖片解碼／前處理失敗：${summary}`, { cause: new Error(summary) });
+}
+
+/**
+ * 取這一窗的 prompt token 總量（batch × 序列長度，含 padding）；取不到形狀時回 `null`。
+ *
+ * 用 processor 實際算出的 `input_ids` 形狀而不是自己估：`processor` 就是模型真正吃的
+ * tokenizer 管線，形狀是精確值；估算法（見 core 的 `estimateTokens`）只在切塊端用來
+ * 決定「一塊多大」，兩者互補。
+ */
+function promptTokens(processed: Record<string, unknown>): number | null {
+  const inputIds = processed["input_ids"] as { dims?: unknown } | undefined;
+  const dims = inputIds?.dims;
+  if (!Array.isArray(dims) || dims.length !== 2) return null;
+  const [batch, length] = dims as unknown[];
+  if (typeof batch !== "number" || typeof length !== "number") return null;
+  return batch * length;
 }
 
 /**
@@ -314,6 +349,13 @@ export class TransformersEmbedder implements Embedder {
    * 但**非 dml 路徑與退回 CPU 後仍照原設定顯示**，診斷才看得出「原本指定第 N 張卡、已退回」。
    */
   private readonly dmlDeviceId: number;
+  /**
+   * ONNX Runtime 的 log 等級覆寫（`undefined`＝不覆寫）。
+   *
+   * 只為診斷而存在（見 `EMBED_ORT_LOG_ENV`）；`0` 會讓 ORT 印出 arena 擴張的
+   * `num_bytes`，用來確認「單一配置到底多大」。
+   */
+  private readonly ortLogLevel: OrtLogSeverityLevel | undefined;
 
   /** 目前（或計畫）使用的裝置；退回後永久為 `cpu`。 */
   private device: EmbedDevice;
@@ -349,6 +391,8 @@ export class TransformersEmbedder implements Embedder {
     this.fallbackReason = plan.fallbackReason;
     // adapter 索引一律先驗證（非法值立即失敗，不等到真的載入 dml 才發現）。
     this.dmlDeviceId = parseDmlDeviceId(process.env[EMBED_DML_DEVICE_ID_ENV]);
+    // 診斷用的 ORT log 等級；同樣先驗證（未設定＝不覆寫）。
+    this.ortLogLevel = parseOrtLogLevel(process.env[EMBED_ORT_LOG_ENV]);
 
     this.info = {
       id: buildEmbedderId(this.modelId, dtypeLabel(this.dtype)),
@@ -387,6 +431,10 @@ export class TransformersEmbedder implements Embedder {
    * - 輸出與 `inputs` 一一對應且順序相同；每列各自截斷成 `info.dim` 並重新 L2 正規化。
    * - 超過視窗上限（DML 32、CPU 16，見 `runtimeStatus.batchSize`）時內部切成多個視窗
    *   （順序串接），呼叫端不需自行分批。
+   * - **另受 token 預算限制**（`BATCH_TOKEN_BUDGET`）：processor 算出的 `input_ids` 形狀
+   *   顯示這一窗的 token 總量超過預算時，會**縮小視窗重試**（依超出比例按比例縮減、
+   *   至少減 1 筆，直到單筆為止）。這一層保護的是「一窗的總量」；單一輸入的長度由切塊端的
+   *   `CHUNK_MAX_TOKENS` 控制，這裡**不切分單一輸入**（輸出必須與輸入一一對應）。
    * - **視窗在每次嘗試時才切**：若某個視窗在 `dml` 上失敗而退回 CPU，該位置會以 CPU 的
    *   視窗大小（16）**重新切窗**再重試，後續視窗也用 CPU 大小。
    * - 任一視窗失敗（模型輸出形狀不符、取消）即整批拋錯，不回傳部分結果；若失敗發生在
@@ -406,17 +454,29 @@ export class TransformersEmbedder implements Embedder {
       const windowStart = start;
       const attempt = await this.runWithFallback(async ({ processor, model }) => {
         // 視窗大小依「當下」的裝置決定：退回 CPU 後這裡會重新切（見上方第 5 點）。
-        const window = inputs.slice(windowStart, windowStart + deviceBatchSize(this.device));
-        const prefixed = window.map((input) => this.documentPrefix(input.text, input.title));
-        const processed = await processor(prefixed);
-        const rows = await runModel(this.modelId, model, processed);
-        if (rows.length !== window.length) {
-          throw new ModelInferenceError(
-            this.modelId,
-            `批次回傳 ${rows.length} 筆向量，預期 ${window.length} 筆`,
-          );
+        let windowSize = deviceBatchSize(this.device);
+        for (;;) {
+          const window = inputs.slice(windowStart, windowStart + windowSize);
+          const prefixed = window.map((input) => this.documentPrefix(input.text, input.title));
+          const processed = await processor(prefixed);
+          // token 預算護欄：超過即以「按比例縮小」重試（至少減 1 筆，保證收斂）。
+          // 單筆仍超預算時無處可退：輸出必須與輸入一一對應，這裡不切分單一輸入
+          // （單塊長度由切塊端的 CHUNK_MAX_TOKENS 控制），照常送給模型。
+          const tokens = promptTokens(processed);
+          if (tokens !== null && tokens > BATCH_TOKEN_BUDGET && window.length > 1) {
+            const scaled = Math.floor((BATCH_TOKEN_BUDGET * window.length) / tokens);
+            windowSize = Math.max(1, Math.min(window.length - 1, scaled));
+            continue;
+          }
+          const rows = await runModel(this.modelId, model, processed);
+          if (rows.length !== window.length) {
+            throw new ModelInferenceError(
+              this.modelId,
+              `批次回傳 ${rows.length} 筆向量，預期 ${window.length} 筆`,
+            );
+          }
+          return { windowLength: window.length, rows };
         }
-        return { windowLength: window.length, rows };
       }, opts?.signal);
 
       for (const row of attempt.rows) {
@@ -638,6 +698,21 @@ export class TransformersEmbedder implements Embedder {
   /**
    * 建立指定裝置的模型 session；DML 另外指定 EP 與 adapter（沿用 `spikes/dml-bench` 的作法）。
    *
+   * `session_options.enableCpuMemArena = false`（**所有平台、兩個裝置路徑都帶**）：
+   * ORT 的 CPU arena 在擴張時會把 chunk 翻倍（`BFCArena::Extend` 的 `while … *= 2`），
+   * 當單一配置請求超過 1 GiB 時會直接翻成 2 GiB 的單一配置；這個大小的配置在
+   * Chromium／Electron 內會被 PartitionAlloc **依設計直接殺掉行程**（見 `docs/` 與研究筆記）。
+   * 關掉 arena 等於整條路移除，並附帶大幅降低 RSS（同工作負載實測 4.8 GB → 0.7 GB），
+   * 代價是同工作負載的執行時間約 +5%。
+   *
+   * 為什麼全平台而不是只有 darwin：
+   * 1. 這條路徑是「arena 擴張 × 底層配置器上限」的組合問題，與平台無關；PA 在
+   *    Chromium 的 Linux 版同樣啟用，本專案沒有實測證據說 Linux 免疫。
+   * 2. 兩個裝置（cpu／dml）共用同一組 options，避免「其中一條路徑忘了帶」這種
+   *    最難查的落差（本 bug 原本就只加在 dml 分支）。
+   * 3. RSS 收益（模型常駐 + 索引峰值）在所有平台都成立。
+   * 4. 成本已量測且有界（≈+5%），而崩潰的代價是整個 app。
+   *
    * `session_options.executionProviders` 用物件形式指定 `deviceId`（預設 0＝預設顯示卡，
    * 可用環境變數 `MNEMOSHELF_EMBED_DML_DEVICE_ID` 改；多顯卡的筆電常需指定獨顯）；
    * transformers.js 以 `??=` 保留使用者指定的 EP 清單，因此與 `device:"dml"` 並用不衝突。
@@ -659,13 +734,15 @@ export class TransformersEmbedder implements Embedder {
         config,
         device,
         dtype: this.dtype,
-        ...(device === "dml"
-          ? {
-              session_options: {
-                executionProviders: [{ name: "dml", deviceId: this.dmlDeviceId }],
-              },
-            }
-          : {}),
+        session_options: {
+          // 見上方說明：所有平台、兩個裝置路徑都關閉 CPU arena。
+          enableCpuMemArena: false,
+          ...(device === "dml"
+            ? { executionProviders: [{ name: "dml", deviceId: this.dmlDeviceId }] }
+            : {}),
+          // 只在明確設定時覆寫 ORT 的 log 等級（診斷用）。
+          ...(this.ortLogLevel === undefined ? {} : { logSeverityLevel: this.ortLogLevel }),
+        },
       })) as unknown as GemmaModel;
 
       return { processor, model };

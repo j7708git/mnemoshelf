@@ -20,6 +20,39 @@ export const EMBED_DEVICE_ENV = "MNEMOSHELF_EMBED_DEVICE";
 /** 覆寫 DirectML adapter 索引的環境變數（非負整數，0＝預設顯示卡）。 */
 export const EMBED_DML_DEVICE_ID_ENV = "MNEMOSHELF_EMBED_DML_DEVICE_ID";
 
+/**
+ * 覆寫 ONNX Runtime log 等級的環境變數（`0`–`4`；未設定＝不覆寫）。
+ *
+ * 診斷用途：`0`（verbose）會印出 ORT 內部的配置訊息，包括 arena 的每一次擴張
+ * （`Extending BFCArena … num_bytes: N`），是「單一配置到底多大」唯一的直接讀數。
+ * **不要預設開啟**：verbose 會印出完整的 graph 資訊，量大且會拖慢啟動。
+ */
+export const EMBED_ORT_LOG_ENV = "MNEMOSHELF_EMBED_ORT_LOG";
+
+/** ONNX Runtime 的 log 等級（0＝verbose、1＝info、2＝warning、3＝error、4＝fatal）。 */
+export type OrtLogSeverityLevel = 0 | 1 | 2 | 3 | 4;
+
+/** 支援的 ORT log 等級（解析與錯誤訊息共用同一份清單）。 */
+export const ORT_LOG_SEVERITY_LEVELS: readonly OrtLogSeverityLevel[] = [0, 1, 2, 3, 4];
+
+/**
+ * 解析 ORT log 等級。未設定或空字串 → `undefined`（不覆寫 ORT 預設，由 transformers.js 決定）；
+ * 其他無法識別的值一律拋錯（與 `MNEMOSHELF_EMBED_DEVICE`／`MNEMOSHELF_EMBED_DML_DEVICE_ID`
+ * 同一個「非法值不靜默回預設」的慣例）。
+ */
+export function parseOrtLogLevel(value: string | undefined): OrtLogSeverityLevel | undefined {
+  if (value === undefined || value.trim() === "") return undefined;
+  const trimmed = value.trim();
+  if (!ORT_LOG_SEVERITY_LEVELS.some((level) => String(level) === trimmed)) {
+    throw new InvalidEmbedderOptionError(
+      "ortLogLevel",
+      value,
+      `只接受 ${ORT_LOG_SEVERITY_LEVELS.join("／")}（0＝verbose…4＝fatal；可經環境變數 ${EMBED_ORT_LOG_ENV} 設定）`,
+    );
+  }
+  return Number(trimmed) as OrtLogSeverityLevel;
+}
+
 /** DirectML adapter 索引的預設值（0＝預設顯示卡；`IDXGIFactory::EnumAdapters` 的順序）。 */
 export const DEFAULT_DML_DEVICE_ID = 0;
 
@@ -44,6 +77,25 @@ export const CPU_BATCH_SIZE = 16;
 
 /** DirectML 的批次視窗上限；來源：dml-bench 實測（batch 32 最快，8／16／64 都較差）。 */
 export const DML_BATCH_SIZE = 32;
+
+/**
+ * 單一推論視窗的 **prompt token 總量**上限（batch × 序列長度，含 padding）。
+ *
+ * 為什麼需要：推論時的單一配置大小隨「一窗的 token 總量」成長，而底層配置器對單一配置
+ * 有硬上限——Chromium 的 PartitionAlloc 刻意把 `MaxAllocationSize()` 設在 2 GiB 以下並
+ * **直接終止行程**（`PA_IMMEDIATE_CRASH`）。ONNX Runtime 的 CPU arena 更會把 chunk 以
+ * 2 的冪次往上翻（上限 1 GiB），因此一次超過 1 GiB 的請求會變成 ≥2 GiB 的單一配置，
+ * 在 Electron 內就是整個 app 閃退。實測（同一顆模型、16 塊中文一批）：一窗約 8k token 的
+ * 最大單一配置請求約 0.3 GB，約 14k token 時約 0.7 GB。
+ *
+ * 取值 8192：取在實測安全區之下並留有餘裕（約 8k token ≈ 0.3 GB，離 1 GiB 的翻倍門檻
+ * 還有 3 倍以上）。純英文的既有工作負載遠低於此值（1200 字元 ≈ 270 token，
+ * 16 塊 ≈ 4.3k），不受影響。
+ *
+ * 這個上限只縮小「一窗幾個輸入」——`embedDocuments` 的輸出必須與輸入一一對應，
+ * 因此**不切分單一輸入**（單塊的長度上限在切塊端，見 core 的 `CHUNK_MAX_TOKENS`）。
+ */
+export const BATCH_TOKEN_BUDGET = 8192;
 
 /** 退回原因訊息的字數上限（診斷輸出不宜過長）。 */
 export const FALLBACK_MESSAGE_MAX_CHARS = 200;

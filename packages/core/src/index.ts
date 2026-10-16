@@ -75,9 +75,11 @@ export {
 // Indexer 與 root 預覽（M1）
 export {
   CHUNK_MAX_CHARS,
+  CHUNK_MAX_TOKENS,
   CHUNK_MIN_CHARS,
   chunkCode,
   chunkText,
+  estimateTokens,
   type TextChunk,
 } from "./indexer/chunk-text.js";
 export { RootNotIndexableError } from "./indexer/errors.js";

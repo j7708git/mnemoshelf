@@ -350,6 +350,8 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
     expect(mocks.modelOptions).toHaveLength(1);
     expect(mocks.modelOptions[0]!.device).toBe("dml");
     expect(mocks.modelOptions[0]!.session_options).toEqual({
+      // 所有裝置路徑都關閉 CPU arena（單一配置不得逼近 2 GiB；見 createBackend 的說明）。
+      enableCpuMemArena: false,
       executionProviders: [{ name: "dml", deviceId: 0 }],
     });
 
@@ -435,7 +437,8 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
     await embedder.embedDocuments(documents(2));
     expect(mocks.modelOptions).toHaveLength(1);
     expect(mocks.modelOptions[0]!.device).toBe("cpu");
-    expect(mocks.modelOptions[0]!.session_options).toBeUndefined();
+    // CPU 路徑也帶 CPU arena 開關（不再是 undefined：那正是原本只加在 dml 分支的落差）。
+    expect(mocks.modelOptions[0]!.session_options).toEqual({ enableCpuMemArena: false });
     expect(embedder.runtimeStatus.serializedInference).toBe(false);
 
     await embedder.dispose();
@@ -509,6 +512,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
     await embedder.embedDocuments(documents(2));
     expect(mocks.modelOptions[0]!.device).toBe("dml");
     expect(mocks.modelOptions[0]!.session_options).toEqual({
+      enableCpuMemArena: false,
       executionProviders: [{ name: "dml", deviceId: 1 }],
     });
     expect(embedder.runtimeStatus.dmlDeviceId).toBe(1);
@@ -521,6 +525,8 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
     await embedder.embedDocuments(documents(1));
     expect(embedder.runtimeStatus.dmlDeviceId).toBe(DEFAULT_DML_DEVICE_ID);
     expect(mocks.modelOptions[0]!.session_options).toEqual({
+      // 所有裝置路徑都關閉 CPU arena（單一配置不得逼近 2 GiB；見 createBackend 的說明）。
+      enableCpuMemArena: false,
       executionProviders: [{ name: "dml", deviceId: 0 }],
     });
     await embedder.dispose();
