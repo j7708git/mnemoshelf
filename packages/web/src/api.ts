@@ -743,11 +743,35 @@ export interface DiagnosticsRoot {
   lastIndex: DiagnosticsIndexSummary | null;
 }
 
+/**
+ * embedder 的執行裝置狀態（`GET /diagnostics` 的 `embedderRuntime`；欄位以 server 契約為準）。
+ *
+ * 未提供時 `embedderRuntime` 為 `null`；`fallbackReason` 有值代表曾經從 GPU 退回 CPU。
+ */
+export interface DiagnosticsEmbedderRuntime {
+  /** 要求／設定的裝置選項（`auto`／`cpu`／`dml`）。 */
+  requestedDevice: string;
+  /** 目前使用的裝置（`cpu`／`dml`）；模型尚未載入時為計畫值。 */
+  device: string;
+  /** 模型是否已載入（true 代表 `device` 是實際使用的裝置）。 */
+  loaded: boolean;
+  /** 退回 CPU 的原因；未退回為 `null`。 */
+  fallbackReason: { code: string; message: string } | null;
+  /** 目前的批次視窗大小。 */
+  batchSize: number;
+  /** 同一 session 是否只允許序列推論（DML 為 true）。 */
+  serializedInference: boolean;
+  /** DirectML adapter 索引（設定值，0＝預設顯示卡）；沒有 adapter 概念的實作為 `null`。 */
+  dmlDeviceId: number | null;
+}
+
 /** `GET /diagnostics` 的回應。 */
 export interface DiagnosticsResponse {
   generatedAt: string;
   app: DiagnosticsAppInfo;
   embedder: { id: string; dim: number; capabilities: Record<string, boolean> };
+  /** 執行裝置狀態；embedder 未提供時為 `null`。 */
+  embedderRuntime: DiagnosticsEmbedderRuntime | null;
   roots: DiagnosticsRoot[];
   indexing: { rootId: number; startedAt: string | null }[];
 }

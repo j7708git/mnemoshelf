@@ -27,6 +27,50 @@ export interface EmbedderInfo {
   };
 }
 
+/** 從 GPU 退回 CPU 的原因（短標籤＋已去識別化的說明）。 */
+export interface EmbedderFallbackReason {
+  /** 穩定短標籤（可程式比對），例如 `unsupported-platform`／`load-failed`／`inference-failed`。 */
+  code: string;
+  /** 人類可讀的短說明；**不得**含本機絕對路徑或個資（會經 `GET /diagnostics` 外洩）。 */
+  message: string;
+}
+
+/**
+ * embedder 的執行裝置狀態（**選填**能力，供診斷與排程參考）。
+ *
+ * 為什麼是選填：只有會用到加速器的實作才有「裝置」概念（目前是 `TransformersEmbedder`
+ * 的 cpu／DirectML）。純軟體或其他實作不需要提供，索引器與 REST 層一律以
+ * 「欄位不存在」處理。`serializedInference` 為 true 時，索引器會把檔案間併發限制為 1。
+ */
+export interface EmbedderRuntimeStatus {
+  /** 要求／設定的裝置選項（`auto` 表示依平台自動決定）；值由實作定義。 */
+  requestedDevice: string;
+  /**
+   * 目前使用的裝置；模型尚未載入時為**依平台與設定解析出的計畫裝置**。
+   * 值由實作定義（本專案目前為 `cpu`／`dml`）。
+   */
+  device: string;
+  /** 模型是否已載入；true 代表 `device` 是實際使用的裝置，而非計畫值。 */
+  loaded: boolean;
+  /** 曾從 GPU 退回 CPU 時的原因；未退回為 `null`。 */
+  fallbackReason: EmbedderFallbackReason | null;
+  /** 目前的批次視窗大小（一次送進模型的輸入數上限）。 */
+  batchSize: number;
+  /**
+   * 同一 session 是否只允許序列推論（同一時間僅一次 `Run`）。
+   * DirectML 有此官方限制 → 為 true 時索引器把檔案間併發固定為 1，
+   * 且實作本身必須在同一實例內序列化所有 `embed*` 呼叫（多個索引 job、搜尋與探測都可能並發）。
+   */
+  serializedInference: boolean;
+  /**
+   * DirectML 的 adapter **設定值**（`IDXGIFactory::EnumAdapters` 順序，0＝預設顯示卡）。
+   *
+   * 語意：只有 `dml` 路徑會拿它建立 session，但**非 dml 路徑與退回 CPU 後仍顯示這個設定值**，
+   * 診斷才判讀得出「原本指定第 N 張卡、之後退回了」。沒有 adapter 概念的實作為 `null`。
+   */
+  dmlDeviceId: number | null;
+}
+
 /** 啟動探測的結果。 */
 export interface ProbeResult {
   ok: boolean;
@@ -54,6 +98,13 @@ export interface EmbedDocumentsOptions {
 /** 模態 embedding 介面。所有回傳向量必須長度為 info.dim 且已 L2 正規化（容差 1e-3）。 */
 export interface Embedder {
   readonly info: EmbedderInfo;
+  /**
+   * 執行裝置狀態（**選填**的加值成員，向後相容）：有加速器概念的實作才提供。
+   *
+   * 用途：`GET /diagnostics` 顯示實際裝置與退回原因；索引器依
+   * `serializedInference` 決定檔案間併發上限（見 `indexRoot`）。
+   */
+  readonly runtimeStatus?: EmbedderRuntimeStatus;
   /** 查詢文字（實作會套用查詢 prefix）。 */
   embedQuery(text: string): Promise<Float32Array>;
   /** 文件文字；title 沒有時用 "none"（實作會套用文件 prefix）。 */

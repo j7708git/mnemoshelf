@@ -18,6 +18,25 @@ export {
 } from "./embedder.js";
 
 export {
+  CPU_BATCH_SIZE,
+  DEFAULT_DML_DEVICE_ID,
+  DML_BATCH_SIZE,
+  EMBED_DEVICE_ENV,
+  EMBED_DEVICE_OPTIONS,
+  EMBED_DML_DEVICE_ID_ENV,
+  deviceBatchSize,
+  isDmlPlatform,
+  parseDmlDeviceId,
+  parseEmbedDeviceOption,
+  requiresSerializedInference,
+  resolveEmbedDevice,
+  summarizeFailure,
+  type EmbedDevice,
+  type EmbedDeviceOption,
+  type EmbedDevicePlan,
+} from "./device.js";
+
+export {
   EmptyImageInputError,
   InvalidEmbedderOptionError,
   ModelInferenceError,

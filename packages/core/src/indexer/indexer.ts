@@ -70,7 +70,12 @@ export interface IndexRootOptions {
   embedder: Embedder;
   store: MetadataStore;
   vec: VectorIndex;
-  /** 同時處理的檔案數上限（預設 2）。 */
+  /**
+   * 同時處理的檔案數上限（預設 2）。
+   *
+   * `embedder.runtimeStatus.serializedInference` 為 true 時（例如 DirectML：同一 session
+   * 不可並發 `Run`）一律降為 1，呼叫端不需自行判斷。
+   */
   concurrency?: number;
   signal?: AbortSignal;
   onProgress?: (progress: IndexProgress) => void;
@@ -359,7 +364,7 @@ async function processFile(
  *   內容層跳過（`binary-content`）的檔案仍在 `files` 內（掃描不讀內容，無法事先知道），
  *   因此由 `processFile` 自己清除（見 `purgeChunks`），結果同樣不保留索引。
  * - 可取消（`signal`：掃描期間於每個目錄／檔案迭代前檢查，worker 池於每個檔案開始前與嵌入前檢查）。
- *   限併發（`concurrency`，預設 2）。
+ *   限併發（`concurrency`，預設 2；embedder 宣告 `runtimeStatus.serializedInference` 時固定為 1）。
  * - **單檔失敗不中斷整輪**：`processFile` 的錯誤被記入 `failedFiles`（原因只留短標籤），
  *   其餘檔案照常處理；失敗檔的既有索引資料保留，下一輪重試（成功即自癒）。
  * - 進度：檔案級計數（`processed`／`skippedUnchanged`／`skipped`／`failed`）整輪可對帳
@@ -373,7 +378,10 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
   }
 
   const { embedder, store, vec, signal } = options;
-  const concurrency = Math.max(1, Math.floor(options.concurrency ?? 2));
+  // 序列推論的裝置（例如 DirectML）不允許同一 session 並發 `Run`：一律單一檔案 worker。
+  // 這裡是唯一的下限來源，呼叫端傳進來的 concurrency 也不得超過它。
+  const serialized = embedder.runtimeStatus?.serializedInference === true;
+  const concurrency = serialized ? 1 : Math.max(1, Math.floor(options.concurrency ?? 2));
   const scanOptions: ScanOptions = {};
   if (options.maxFileBytes !== undefined) scanOptions.maxFileBytes = options.maxFileBytes;
   // 把 signal 一路帶進掃描層：大目錄下取消不必等整輪走訪結束（見 ScanOptions.signal）。

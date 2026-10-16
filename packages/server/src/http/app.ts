@@ -7,7 +7,8 @@
  * - `POST /roots/:id/preview`、`POST /roots/:id/index`、`POST /roots/:id/index/cancel`
  * - `GET  /roots/:id/entries?path=`（目錄子項）、`GET /roots/:id/file?path=`（文字預覽／圖片位元組）、
  *   `GET /roots/:id/thumb?path=`（縮圖）、`GET /roots/:id/index/status`（索引进度輪詢）
- * - `GET  /diagnostics`（除錯資訊匯出：版本、平台、embedder、每 root 統計；家目錄前綴遮罩成 `~`）
+ * - `GET  /diagnostics`（除錯資訊匯出：版本、平台、embedder（含執行裝置與退回原因）、每 root 統計；
+ *   家目錄前綴遮罩成 `~`）
  * - `POST /search`
  * - `POST /memories`、`GET /memories`、`POST /memories/:id/pin`、`DELETE /memories/:id`
  *
@@ -50,6 +51,7 @@ import {
   RootTooBroadError,
   type Embedder,
   type EmbedderInfo,
+  type EmbedderRuntimeStatus,
   type VectorIndex,
   type RootMode,
   type RootPreview,
@@ -282,6 +284,13 @@ export interface DiagnosticsResponse {
   app: DiagnosticsAppInfo;
   /** embedder 的能力宣告（`id` 含 dtype 等識別資訊）。 */
   embedder: EmbedderInfo;
+  /**
+   * embedder 的執行裝置狀態（實際使用的 device／退回原因／批次視窗）。
+   *
+   * embedder 未提供 `runtimeStatus`（例如測試用的假實作）時為 `null`。模型尚未載入時
+   * `device` 是依平台與設定解析出的計畫值（`loaded: false`）。
+   */
+  embedderRuntime: EmbedderRuntimeStatus | null;
   roots: DiagnosticsRoot[];
   /** 進行中的索引任務（本行程；沒有時為空陣列）。 */
   indexing: { rootId: number; startedAt: string | null }[];
@@ -991,6 +1000,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         arch: arch(),
       },
       embedder: deps.embedder.info,
+      // 執行裝置狀態（選填能力）：DML／CPU、退回原因、批次視窗；未提供時為 null。
+      embedderRuntime: deps.embedder.runtimeStatus ?? null,
       roots: rootSummaries,
       indexing: [...indexing.keys()].map((rootId) => ({ rootId, startedAt: indexStatus.status(rootId).startedAt })),
     };

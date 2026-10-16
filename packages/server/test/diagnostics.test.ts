@@ -8,6 +8,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { Embedder, EmbedderRuntimeStatus } from "@mnemoshelf/core";
+import { FakeEmbedder } from "@mnemoshelf/core/testing";
 import {
   api,
   errorName,
@@ -19,6 +21,28 @@ import {
   type TestServer,
 } from "./helpers.js";
 import { maskHomePath, type DiagnosticsResponse } from "../src/index.js";
+
+/**
+ * 假 embedder ＋ 自訂 `runtimeStatus`（模擬 DML／CPU 實作；`FakeEmbedder` 本身不提供此成員）。
+ * 用來驗證 `/diagnostics` 的 `embedderRuntime` 帶出與遮罩。
+ */
+function embedderWithRuntime(status: EmbedderRuntimeStatus): Embedder {
+  return Object.assign(new FakeEmbedder(), { runtimeStatus: status });
+}
+
+/** 一份完整的裝置狀態（帶退回原因），供測試改寫個別欄位。 */
+function runtimeStatus(overrides: Partial<EmbedderRuntimeStatus> = {}): EmbedderRuntimeStatus {
+  return {
+    requestedDevice: "auto",
+    device: "dml",
+    loaded: true,
+    fallbackReason: null,
+    batchSize: 32,
+    serializedInference: true,
+    dmlDeviceId: 0,
+    ...overrides,
+  };
+}
 
 let server: TestServer | undefined;
 /** 追蹤要刪除的頂層暫存目錄（含其子目錄）。 */
@@ -218,5 +242,78 @@ describe("GET /diagnostics", () => {
     await indexing;
     const after = (await api(server.instance, "GET", "/diagnostics")).body as DiagnosticsResponse;
     expect(after.indexing).toEqual([]);
+  });
+});
+
+describe("GET /diagnostics：embedderRuntime（執行裝置與退回原因）", () => {
+  it("embedder 提供 runtimeStatus → 原樣帶出（device、deviceId、批次視窗、序列推論）", async () => {
+    server = await startTestServer({
+      embedder: embedderWithRuntime(
+        runtimeStatus({ requestedDevice: "dml", device: "dml", batchSize: 32, serializedInference: true, dmlDeviceId: 1 }),
+      ),
+    });
+
+    const body = (await api(server.instance, "GET", "/diagnostics")).body as DiagnosticsResponse;
+    expect(body.embedderRuntime).toEqual({
+      requestedDevice: "dml",
+      device: "dml",
+      loaded: true,
+      fallbackReason: null,
+      batchSize: 32,
+      serializedInference: true,
+      dmlDeviceId: 1,
+    });
+  });
+
+  it("退回 CPU 的狀態：device 為 cpu、原因可讀、deviceId 仍是設定值", async () => {
+    server = await startTestServer({
+      embedder: embedderWithRuntime(
+        runtimeStatus({
+          device: "cpu",
+          batchSize: 16,
+          serializedInference: false,
+          dmlDeviceId: 2,
+          fallbackReason: { code: "load-failed", message: "ModelLoadError: DirectML 載入失敗（模擬）" },
+        }),
+      ),
+    });
+
+    const body = (await api(server.instance, "GET", "/diagnostics")).body as DiagnosticsResponse;
+    expect(body.embedderRuntime?.device).toBe("cpu");
+    expect(body.embedderRuntime?.batchSize).toBe(16);
+    expect(body.embedderRuntime?.serializedInference).toBe(false);
+    expect(body.embedderRuntime?.dmlDeviceId).toBe(2);
+    expect(body.embedderRuntime?.fallbackReason?.code).toBe("load-failed");
+    expect(body.embedderRuntime?.fallbackReason?.message).toContain("DirectML 載入失敗");
+  });
+
+  it("embedder 未提供 runtimeStatus → embedderRuntime 為 null（不造數字）", async () => {
+    server = await startTestServer({ embedder: new FakeEmbedder() });
+
+    const body = (await api(server.instance, "GET", "/diagnostics")).body as DiagnosticsResponse;
+    expect(body.embedderRuntime).toBeNull();
+    // 既有欄位不受影響。
+    expect(body.embedder.id).not.toBe("");
+  });
+
+  it("家目錄遮罩涵蓋新欄位：整份輸出不含原始家目錄字串", async () => {
+    const fakeHome = await tempDir("mnemoshelf-home-");
+    server = await startTestServer({
+      homeDir: fakeHome,
+      embedder: embedderWithRuntime(
+        runtimeStatus({
+          device: "cpu",
+          batchSize: 16,
+          serializedInference: false,
+          dmlDeviceId: null,
+          fallbackReason: { code: "load-failed", message: `${fakeHome}/models/model.onnx 無法載入` },
+        }),
+      ),
+    });
+
+    const body = (await api(server.instance, "GET", "/diagnostics")).body as DiagnosticsResponse;
+    // 遮罩以「值開頭就是家目錄」的情境生效（與既有 roots.path 同一套 maskHomePath）。
+    expect(body.embedderRuntime?.fallbackReason?.message).toBe("~/models/model.onnx 無法載入");
+    expect(JSON.stringify(body)).not.toContain(fakeHome);
   });
 });

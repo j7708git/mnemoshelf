@@ -14,6 +14,7 @@ import {
   type Embedder,
   type EmbedderInfo,
   type EmbedDocumentsOptions,
+  type EmbedderRuntimeStatus,
   type ImageInput,
   type IndexProgress,
   type ProbeResult,
@@ -136,6 +137,52 @@ interface Harness {
   embedder: RecordingEmbedder;
   root: Root;
   dir: string;
+}
+
+/**
+ * 量測「同時進行中的嵌入呼叫數」的 embedder，用來驗證檔案間併發上限。
+ *
+ * 進入 `embedDocuments` 時 +1、結束時 −1，並刻意延遲一小段時間讓 worker 有機會重疊；
+ * `serialized` 為 `true`／`false` 時提供對應的 `runtimeStatus`（模擬 DML／CPU 實作），
+ * 為 `undefined` 時**不提供**（模擬既有 embedder：沒有裝置概念）。
+ */
+class ConcurrencyProbeEmbedder extends RecordingEmbedder {
+  active = 0;
+  maxActive = 0;
+
+  constructor(
+    private readonly serialized: boolean | undefined,
+    private readonly delayMs = 50,
+  ) {
+    super();
+  }
+
+  get runtimeStatus(): EmbedderRuntimeStatus | undefined {
+    if (this.serialized === undefined) return undefined;
+    return {
+      requestedDevice: this.serialized ? "auto" : "cpu",
+      device: this.serialized ? "dml" : "cpu",
+      loaded: true,
+      fallbackReason: null,
+      batchSize: this.serialized ? 32 : 16,
+      serializedInference: this.serialized,
+      dmlDeviceId: this.serialized ? 0 : null,
+    };
+  }
+
+  override async embedDocuments(
+    inputs: readonly DocumentInput[],
+    opts?: EmbedDocumentsOptions,
+  ): Promise<Float32Array[]> {
+    this.active += 1;
+    this.maxActive = Math.max(this.maxActive, this.active);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+      return await super.embedDocuments(inputs, opts);
+    } finally {
+      this.active -= 1;
+    }
+  }
 }
 
 let opened: SqliteDatabase[] = [];
@@ -722,6 +769,73 @@ describe("逐塊進度（processedChunks／estimatedChunks）", () => {
       const last = progress.at(-1)!;
       expect(last.processedChunks).toBeLessThanOrEqual(last.estimatedChunks);
       expect(last.processedChunks).toBeGreaterThan(0);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * 檔案間併發上限：DirectML 同一 session 不可並發 `Run`，因此 embedder 宣告
+   * `runtimeStatus.serializedInference` 時必須壓成 1；沒有裝置概念的 embedder 維持預設 2。
+   */
+  it("embedder 宣告 serializedInference → 檔案間併發為 1；未宣告 → 維持預設 2", async () => {
+    const files = {
+      "a.md": "# 標題\n\n第一份文件",
+      "b.md": "# 標題\n\n第二份文件",
+      "c.md": "# 標題\n\n第三份文件",
+      "d.md": "# 標題\n\n第四份文件",
+    };
+
+    // 模擬 DML：serializedInference = true → 一次只有一個檔案在嵌入。
+    const serialized = await makeHarness(files);
+    try {
+      const probe = new ConcurrencyProbeEmbedder(true);
+      serialized.embedder = probe;
+      const result = await indexRoot(serialized.root, options(serialized));
+      expect(result).toMatchObject({ total: 4, processed: 4 });
+      expect(probe.maxActive).toBe(1);
+    } finally {
+      await fs.rm(serialized.dir, { recursive: true, force: true });
+    }
+
+    // 明示 serializedInference = false（CPU）→ 預設併發 2，兩個 worker 會重疊。
+    const parallel = await makeHarness(files);
+    try {
+      const probe = new ConcurrencyProbeEmbedder(false);
+      parallel.embedder = probe;
+      const result = await indexRoot(parallel.root, options(parallel));
+      expect(result).toMatchObject({ total: 4, processed: 4 });
+      expect(probe.maxActive).toBe(2);
+    } finally {
+      await fs.rm(parallel.dir, { recursive: true, force: true });
+    }
+
+    // 完全不提供 runtimeStatus（既有 embedder）→ 行為不變，仍是預設 2。
+    const legacy = await makeHarness(files);
+    try {
+      const probe = new ConcurrencyProbeEmbedder(undefined);
+      legacy.embedder = probe;
+      const result = await indexRoot(legacy.root, options(legacy));
+      expect(result).toMatchObject({ total: 4, processed: 4 });
+      expect(probe.maxActive).toBe(2);
+    } finally {
+      await fs.rm(legacy.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("serializedInference 時，呼叫端指定的 concurrency 2 也不得突破下限", async () => {
+    const files = {
+      "a.md": "# 標題\n\n第一份文件",
+      "b.md": "# 標題\n\n第二份文件",
+      "c.md": "# 標題\n\n第三份文件",
+    };
+    const h = await makeHarness(files);
+    try {
+      const probe = new ConcurrencyProbeEmbedder(true);
+      h.embedder = probe;
+      const result = await indexRoot(h.root, { ...options(h), concurrency: 4 });
+      expect(result).toMatchObject({ total: 3, processed: 3 });
+      expect(probe.maxActive).toBe(1);
     } finally {
       await fs.rm(h.dir, { recursive: true, force: true });
     }

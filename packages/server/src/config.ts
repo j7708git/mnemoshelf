@@ -9,6 +9,14 @@
  * | `MNEMOSHELF_PORT` | 監聽埠 | `0`（隨機埠） |
  * | `MNEMOSHELF_WEB_DIR` | Web UI 靜態檔目錄 | 本 repo 的 `packages/web/dist` |
  *
+ * 另有兩個**由 embedder 直接讀取**（不經此處解析，本表僅登錄以免漏查；見
+ * `@mnemoshelf/embedder-transformers` 的 `device.ts`）：
+ *
+ * | 變數 | 用途 | 預設 |
+ * |---|---|---|
+ * | `MNEMOSHELF_EMBED_DEVICE` | 嵌入裝置 `auto`／`cpu`／`dml`（`auto` 只在 Windows 試 dml） | `auto` |
+ * | `MNEMOSHELF_EMBED_DML_DEVICE_ID` | DirectML adapter 索引（非負整數，多顯卡時指定獨顯） | `0`（預設顯示卡） |
+ *
  * token 刻意不自動產生：自動生成會讓使用者誤以為已經有保護，實際上 token 沒人知道、
  * 也沒人能通過驗證。未設時直接失敗並提示產生方式（`MissingTokenError`）。
  */

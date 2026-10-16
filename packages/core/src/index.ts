@@ -32,7 +32,9 @@ export type { VectorIndex, VectorItem } from "./ports/vector-index.js";
 export type {
   DocumentInput,
   Embedder,
+  EmbedderFallbackReason,
   EmbedderInfo,
+  EmbedderRuntimeStatus,
   EmbedDocumentsOptions,
   ImageInput,
   ProbeResult,
