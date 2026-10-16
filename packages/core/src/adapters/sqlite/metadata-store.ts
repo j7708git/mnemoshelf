@@ -17,6 +17,7 @@ import type {
   RankedHit,
   Root,
   RootMode,
+  RootPatch,
   SearchFilter,
 } from "../../ports/types.js";
 import { selectRow, selectRows, type SqliteDatabase } from "./driver.js";
@@ -130,6 +131,24 @@ export class SqliteMetadataStore implements MetadataStore {
 
   async listRoots(): Promise<Root[]> {
     return selectRows(this.db, `select ${ROOT_COLUMNS} from roots order by id`).map(rowToRoot);
+  }
+
+  /**
+   * 更新可變設定（`RootPatch`）。
+   *
+   * 先讀回現值再寫入（而不是 `update … set modalities = coalesce(?, modalities)`）：
+   * 欄位省略＝不變的語意留在這裡，`null` 這種 SQL 值不必進到介面；
+   * 代價是多一次 select（roots 只有個位數筆，可忽略）。
+   */
+  async updateRoot(id: number, patch: RootPatch): Promise<Root | null> {
+    const existing = await this.getRoot(id);
+    if (existing === null) return null;
+
+    this.db
+      .prepare("update roots set modalities = ? where id = ?")
+      .run(JSON.stringify(patch.modalities ?? existing.modalities), id);
+
+    return await this.getRoot(id);
   }
 
   async removeRoot(id: number, deleteData: boolean): Promise<{ removedChunkIds: number[] }> {

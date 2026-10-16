@@ -155,4 +155,101 @@ describe.skipIf(!ENABLED)("e2e（MNEMOSHELF_E2E=1 才執行）：真實 embedder
     };
     console.log(`[e2e] ${JSON.stringify(summary, null, 2)}`);
   });
+
+  it("加入時不含圖片（預設）→ PATCH 開圖片 → 重新索引後文字查詢才命中圖片", async () => {
+    const rootDir = await makeTempDir("mnemoshelf-e2e-patch-root-");
+    const dataDir = await makeTempDir("mnemoshelf-e2e-patch-data-");
+    tempDirs.push(rootDir, dataDir);
+
+    const image = createProbeImages(256).find((entry) => entry.id === "blue_square")!;
+    const query = image.descriptions[0]!; // "a solid blue square on a plain white background"
+    await fs.writeFile(
+      path.join(rootDir, "notes.md"),
+      "# 後端筆記\n\n這份文件說明 TypeScript 建置流程與 pnpm workspace 的拓樸順序，與圖片無關。\n",
+      "utf8",
+    );
+    await fs.writeFile(path.join(rootDir, "blue_square.png"), image.image.bytes);
+
+    const embedder = new TransformersEmbedder({ cacheDir: MODEL_DIR });
+    const server = await createServer({
+      env: {},
+      token: TEST_TOKEN,
+      dataDir,
+      port: 0,
+      embedder,
+      homeDir: os.homedir(),
+    });
+    try {
+      // 1. 加入時**不帶**圖片模態（等同 UI 不勾「含圖片」）：圖片應以 modality-off 跳過。
+      const created = await api(server, "POST", "/roots", { body: { path: rootDir, modalities: ["text"] } });
+      expect(created.status).toBe(201);
+      const root = created.body as { id: number; modalities: string[] };
+      expect(root.modalities).toEqual(["text"]);
+
+      const before = await api(server, "POST", `/roots/${root.id}/preview`);
+      const previewBefore = before.body as RootPreview;
+      expect(previewBefore.byKind.image.count).toBe(0);
+      expect(previewBefore.skipped).toContainEqual({ relPath: "blue_square.png", reason: "modality-off" });
+
+      const firstIndex = await api(server, "POST", `/roots/${root.id}/index`);
+      expect(firstIndex.status).toBe(200);
+      expect((firstIndex.body as IndexRootResponse).total).toBe(1); // 只有 notes.md
+
+      const statusBeforePatch = await api(server, "GET", `/roots/${root.id}/index/status`);
+      const runSeqBeforePatch = (statusBeforePatch.body as { runSeq: number | null }).runSeq;
+
+      const beforeSearch = await api(server, "POST", "/search", { body: { query, mode: "vector", k: 5 } });
+      expect(
+        (beforeSearch.body as UnifiedSearchResult).hits.some(
+          (hit) => hit.type === "chunk" && hit.relPath === "blue_square.png",
+        ),
+      ).toBe(false);
+
+      // 2. PATCH 開圖片：只改設定，不自動重新索引（沒有新的一輪：state／runSeq 都不動）。
+      const patched = await api(server, "PATCH", `/roots/${root.id}`, { body: { modalities: ["text", "image"] } });
+      expect(patched.status).toBe(200);
+      const statusAfterPatch = await api(server, "GET", `/roots/${root.id}/index/status`);
+      const afterPatch = statusAfterPatch.body as { state: string; runSeq: number | null };
+      expect(afterPatch.state).toBe("completed"); // 上一輪的終態，不是新的一輪
+      expect(afterPatch.runSeq).toBe(runSeqBeforePatch);
+
+      // 3. 重新索引：圖片被索引（notes.md 未變 ⇒ skippedUnchanged），且沒有失敗檔。
+      const secondIndex = await api(server, "POST", `/roots/${root.id}/index`);
+      expect(secondIndex.status).toBe(200);
+      const indexed = secondIndex.body as IndexRootResponse;
+      expect(indexed.processed).toBe(1);
+      expect(indexed.skippedUnchanged).toBe(1);
+      expect(indexed.failedFiles).toEqual([]);
+      expect(indexed.skippedFiles).toEqual([]);
+
+      // 4. 文字查詢命中圖片（Top-1）。
+      const afterSearch = await api(server, "POST", "/search", { body: { query, mode: "vector", k: 5 } });
+      const top = (afterSearch.body as UnifiedSearchResult).hits[0]!;
+      expect(top.type).toBe("chunk");
+      if (top.type !== "chunk") throw new Error("vector 模式的 Top-1 不是 chunk");
+      expect(top.relPath).toBe("blue_square.png");
+      expect(top.kind).toBe("image");
+
+      // 5. 估時校正的對照：一張圖不再顯示不到 1 秒。
+      const after = await api(server, "POST", `/roots/${root.id}/preview`);
+      const previewAfter = after.body as RootPreview;
+      expect(previewAfter.byKind.image.count).toBe(1);
+      expect(previewAfter.estimated.imageSeconds).toBeGreaterThanOrEqual(2.4);
+
+      console.log(
+        `[e2e-patch] ${JSON.stringify(
+          {
+            indexedImage: { processed: indexed.processed, durationMs: indexed.durationMs },
+            top: { relPath: top.relPath, kind: top.kind, score: top.score },
+            estimate: previewAfter.estimated,
+            query,
+          },
+          null,
+          2,
+        )}`,
+      );
+    } finally {
+      await server.close();
+    }
+  });
 });

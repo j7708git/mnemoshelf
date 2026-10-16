@@ -18,6 +18,7 @@ export type {
   RankedHit,
   Root,
   RootMode,
+  RootPatch,
   SearchFilter,
 } from "./ports/types.js";
 
@@ -88,6 +89,7 @@ export {
 export {
   hashBytes,
   indexRoot,
+  isMediaDecodeError,
   looksBinary,
   BINARY_SNIFF_BYTES,
   type FailedFileEntry,
@@ -98,6 +100,7 @@ export {
 export {
   DEFAULT_PREVIEW_MODALITIES,
   previewRoot,
+  type PreviewEstimate,
   type PreviewKindStat,
   type PreviewRootInput,
   type RootPreview,

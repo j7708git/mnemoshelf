@@ -206,6 +206,7 @@ export type {
   JsonRouteResult,
   ListEntriesResponse,
   ListMemoriesResponse,
+  PatchRootRequest,
   RemoveRootResponse,
   RestApp,
   RestAppDeps,

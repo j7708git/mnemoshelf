@@ -9,6 +9,12 @@ build 產物（`dist/`）由 `@mnemoshelf/server` 同源提供，因此 UI 與 A
 - token 輸入頁、連線狀態、roots 清單（可選取與移除）。
 - **加入資料夾引導**：輸入路徑 → `POST /roots` → 預覽統計（`POST /roots/:id/preview`）→
   「開始索引」→ 背景索引 ＋ 輪詢 `GET /roots/:id/index/status` 顯示進度 → 完成。
+- **圖片模態入口（2026-10-16）**：加入資料夾時有「**這個資料夾含照片，一起索引**」勾選
+  （**預設關**；不勾的行為與 v0.1.2 完全相同）。勾選會在 `POST /roots` 帶
+  `modalities:["text","code","image"]`；預覽頁可以再開關（走 `PATCH /roots/:id`），
+  預覽同時顯示估時分解（文字／圖片分開），照片多時看得到代價。
+  已加入的資料夾在側欄也有「含照片」開關（`PATCH /roots/:id`）。
+  **改模態只改設定，不自動重新索引**：畫面明講「重新索引後生效」。
 - **虛擬化目錄樹**：展開時才載入子項（`GET /roots/:id/entries`，lazy），以
   `@tanstack/react-virtual` 虛擬化（節點多時不爆 DOM）。
 - **檔案預覽**：文字（`GET /roots/:id/file`，截斷會標明）與圖片（`GET /roots/:id/thumb` 縮圖，

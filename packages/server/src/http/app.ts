@@ -3,7 +3,8 @@
  *
  * 契約（任務卡 §REST API）：
  * - `GET  /health`（免 token）→ `{status:"ok"}`
- * - `POST /roots`、`GET /roots`、`GET /roots/:id`、`DELETE /roots/:id?deleteData=1`
+ * - `POST /roots`、`GET /roots`、`GET /roots/:id`、`PATCH /roots/:id`（改 `modalities`）、
+ *   `DELETE /roots/:id?deleteData=1`
  * - `POST /roots/:id/preview`、`POST /roots/:id/index`、`POST /roots/:id/index/cancel`
  * - `GET  /roots/:id/entries?path=`（目錄子項）、`GET /roots/:id/file?path=`（文字預覽／圖片位元組）、
  *   `GET /roots/:id/thumb?path=`（縮圖）、`GET /roots/:id/index/status`（索引进度輪詢）
@@ -160,6 +161,11 @@ export interface AddRootRequest {
   respectGitignore?: boolean;
   /** 單檔大小上限；`Root` 契約沒有此欄位，因此只存在行程內，重啟後回退預設 10 MB（見 README）。 */
   maxFileBytes?: number;
+}
+
+/** `PATCH /roots/:id` 的請求主體（目前只有 `modalities` 可改；見 `RootPatch`）。 */
+export interface PatchRootRequest {
+  modalities?: Modality[];
 }
 
 /** `DELETE /roots/:id` 的回應。 */
@@ -792,6 +798,29 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     return { status: 201, body: root };
   };
 
+  /**
+   * `PATCH /roots/:id`：更新 root 的可變設定（目前只有 `modalities`）。
+   *
+   * 語意：
+   * - `modalities` 必須提供（本端點只改這個欄位）；缺少或非法 → `400`；未知的 root → `404`。
+   * - 成功回 `200`＋更新後的 root。
+   * - **不自動觸發重新索引**：改的是設定，掃描層下一次索引才會看到新的模態；
+   *   關掉某個模態時既有的 chunk／向量也**不會立刻**釋放，要在下一次索引時由清理迴圈清掉
+   *   （與 `DELETE`／模態切換的既有語意一致，見 README）。
+   */
+  const patchRoot = async (request: IncomingMessage, id: number): Promise<{ status: number; body: unknown }> => {
+    await getRootOr404(id);
+    const body = (await readJsonBody(request)) as unknown as PatchRootRequest;
+    if (body.modalities === undefined) {
+      throw new ValidationError("modalities", "必須提供要更新的欄位（目前只支援 modalities）");
+    }
+    const modalities = validateModalities(body.modalities);
+    const updated = await deps.store.updateRoot(id, { modalities });
+    // 先行 getRootOr404 之後理論上不會是 null；並行刪除時仍以 404 回應，不吞掉。
+    if (updated === null) throw new NotFoundError("root", id);
+    return { status: 200, body: updated };
+  };
+
   const previewFor = async (id: number): Promise<{ status: number; body: unknown }> => {
     const root = await getRootOr404(id);
     const maxFileBytes = maxFileBytesByRoot.get(id);
@@ -1096,8 +1125,9 @@ export function createRestApp(deps: RestAppDeps): RestApp {
 
     if (segments.length === 2) {
       if (method === "GET") return { status: 200, body: await getRootOr404(id) };
+      if (method === "PATCH") return await patchRoot(request, id);
       if (method === "DELETE") return await removeRoot(id, booleanFlag(url.searchParams.get("deleteData"), "deleteData", false));
-      throw new MethodNotAllowedError(method, ["GET", "DELETE"]);
+      throw new MethodNotAllowedError(method, ["GET", "PATCH", "DELETE"]);
     }
 
     if (segments.length === 3) {

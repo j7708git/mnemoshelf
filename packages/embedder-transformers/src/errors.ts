@@ -55,6 +55,28 @@ export class ModelLoadError extends Error {
   }
 }
 
+/**
+ * 輸入本身無法處理（圖片解不開、格式不支援、通道數不符…）。
+ *
+ * 這一類錯誤**與執行裝置無關**：換 CPU 或重試同一份位元組結果一樣，因此呼叫端應該
+ * 跳過這個檔案，而不是退回裝置或重試。屬「輸入類」而非「裝置／模型類」失敗。
+ *
+ * 與 `@mnemoshelf/core` 的跨套件契約（core 不得 import 本套件）：本錯誤以**穩定錯誤碼**
+ * `code:"undecodable"` 標記（同名於 core 的 `SkipReason`）。core 的
+ * `isMediaDecodeError` 以這個碼為主要判準，不必解析訊息文字——訊息措辭會隨 sharp／
+ * transformers.js 版本變動。其他 embedder 實作只要照樣帶這個 `code`（或沿用已知的
+ * 訊息措辭）即可被 core 認成同一類。
+ */
+export class EmbedderInputError extends Error {
+  /** 穩定錯誤碼：讓 core 以結構化標記辨識「解不開」，不依賴訊息文字。 */
+  readonly code = "undecodable";
+
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
+    this.name = "EmbedderInputError";
+  }
+}
+
 /** 推論失敗（模型輸出缺少可用的 sentence_embedding，或形狀不符）。 */
 export class ModelInferenceError extends Error {
   /** 模型 id。 */
@@ -67,8 +89,13 @@ export class ModelInferenceError extends Error {
   }
 }
 
-/** 空白圖片輸入（零位元組）。 */
-export class EmptyImageInputError extends Error {
+/**
+ * 空白圖片輸入（零位元組）。
+ *
+ * 是 `EmbedderInputError` 的特例（零位元組＝永遠解不開），因此也帶 `code:"undecodable"`；
+ * 保留自己的名字是為了讓既有以 `name` 判定的路徑（core 與既有測試）繼續辨識得出。
+ */
+export class EmptyImageInputError extends EmbedderInputError {
   constructor() {
     super("圖片輸入為空：bytes 長度為 0");
     this.name = "EmptyImageInputError";

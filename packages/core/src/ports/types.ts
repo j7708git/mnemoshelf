@@ -30,6 +30,19 @@ export interface Root {
 /** 新增 root 時的輸入（id 與 createdAt 由儲存層產生）。 */
 export type NewRoot = Omit<Root, "id" | "createdAt">;
 
+/**
+ * 更新既有 root 時**可變更**的欄位（`MetadataStore.updateRoot`）。
+ *
+ * 為什麼只有 `modalities`：`path`／`mode` 改變等同換一個 root（索引內容、清理語意都會變），
+ * 應以「移除再加入」處理；`include`／`exclude`／`respectGitignore` 目前沒有 UI／REST 入口，
+ * 尚未定義變更語意。欄位未提供（`undefined`）＝該欄位不變。
+ *
+ * 變更模態**不會**動任何既有 chunk／向量：要重新索引才會生效（見 `indexRoot` 的清理語意）。
+ */
+export interface RootPatch {
+  modalities?: Modality[];
+}
+
 /** 檔案切塊後的內容單位。 */
 export interface Chunk {
   id: number;

@@ -82,6 +82,49 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       await expect(store.addRoot(rootInput())).rejects.toBeInstanceOf(DuplicateRootError);
     });
 
+    it("updateRoot 更新 modalities 並回傳更新後的 root（其他欄位不變）", async () => {
+      const root = await store.addRoot(
+        rootInput({ modalities: ["text", "code"], include: [], exclude: ["**/skip/**"] }),
+      );
+
+      const updated = await store.updateRoot(root.id, { modalities: ["text", "code", "image"] });
+      expect(updated).not.toBeNull();
+      expect(updated?.id).toBe(root.id);
+      expect(updated?.modalities).toEqual(["text", "code", "image"]);
+      // 不可變欄位原樣保留。
+      expect(updated?.path).toBe(root.path);
+      expect(updated?.mode).toBe(root.mode);
+      expect(updated?.exclude).toEqual(["**/skip/**"]);
+      expect(updated?.createdAt).toBe(root.createdAt);
+
+      // 讀回來也要是新的值（不能只改回傳物件）。
+      expect(await store.getRoot(root.id)).toEqual(updated);
+      expect((await store.listRoots())[0]?.modalities).toEqual(["text", "code", "image"]);
+    });
+
+    it("updateRoot 是冪等的，也可以把模態關掉", async () => {
+      const root = await store.addRoot(rootInput({ modalities: ["text", "code", "image"] }));
+
+      const first = await store.updateRoot(root.id, { modalities: ["text"] });
+      const second = await store.updateRoot(root.id, { modalities: ["text"] });
+      expect(first).toEqual(second);
+      expect(second?.modalities).toEqual(["text"]);
+
+      // 空陣列＝全部關閉（與 addRoot 接受空陣列一致）。
+      expect((await store.updateRoot(root.id, { modalities: [] }))?.modalities).toEqual([]);
+    });
+
+    it("updateRoot 不提供欄位時只回傳現值（無變更）", async () => {
+      const root = await store.addRoot(rootInput());
+      expect(await store.updateRoot(root.id, {})).toEqual(root);
+    });
+
+    it("updateRoot 對不存在的 id 回傳 null（不拋錯、不建立列）", async () => {
+      expect(await store.updateRoot(987654, { modalities: ["text"] })).toBeNull();
+      expect(await store.updateRoot(987654, {})).toBeNull();
+      expect(await store.listRoots()).toEqual([]);
+    });
+
     it("replaceChunks 先清舊再寫新（冪等）", async () => {
       const root = await store.addRoot(rootInput());
       const first = await store.replaceChunks(root.id, "notes/a.md", [

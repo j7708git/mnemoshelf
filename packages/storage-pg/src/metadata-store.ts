@@ -15,6 +15,7 @@ import {
   type RankedHit,
   type Root,
   type RootMode,
+  type RootPatch,
   type SearchFilter,
 } from "@mnemoshelf/core";
 import type { Pool } from "pg";
@@ -217,6 +218,26 @@ export class PgMetadataStore implements MetadataStore {
   async listRoots(): Promise<Root[]> {
     const result = await this.pool.query(`select ${ROOT_COLUMNS} from ${this.roots} order by id`);
     return result.rows.map(rowToRoot);
+  }
+
+  /**
+   * 更新可變設定（`RootPatch`）；語意與 SQLite 後端完全相同（見 `MetadataStore.updateRoot`）。
+   *
+   * 以 `returning` 在同一次查詢拿到更新後的資料列：0 列＝id 不存在 → 回 `null`，
+   * 不必先 select 再 update（也避免兩個後端語意分岔）。
+   */
+  async updateRoot(id: number, patch: RootPatch): Promise<Root | null> {
+    if (patch.modalities === undefined) {
+      // 沒有要改的欄位：只確認存在（與 SQLite 端「讀到才回傳」一致）。
+      const current = await this.pool.query(`select ${ROOT_COLUMNS} from ${this.roots} where id = $1`, [id]);
+      return current.rows.length === 0 ? null : rowToRoot(current.rows[0]!);
+    }
+
+    const result = await this.pool.query(
+      `update ${this.roots} set modalities = $2 where id = $1 returning ${ROOT_COLUMNS}`,
+      [id, JSON.stringify(patch.modalities)],
+    );
+    return result.rows.length === 0 ? null : rowToRoot(result.rows[0]!);
   }
 
   async removeRoot(id: number, deleteData: boolean): Promise<{ removedChunkIds: number[] }> {

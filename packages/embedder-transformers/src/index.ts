@@ -37,6 +37,7 @@ export {
 } from "./device.js";
 
 export {
+  EmbedderInputError,
   EmptyImageInputError,
   InvalidEmbedderOptionError,
   ModelInferenceError,

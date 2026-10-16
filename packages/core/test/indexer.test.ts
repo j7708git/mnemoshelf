@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   BINARY_SNIFF_BYTES,
   indexRoot,
+  isMediaDecodeError,
   looksBinary,
   openDatabase,
   RootNotIndexableError,
@@ -394,6 +395,176 @@ describe("indexRoot", () => {
     } finally {
       await fs.rm(media.dir, { recursive: true, force: true });
     }
+  });
+
+  // ── 解不開的媒體檔：skipped（不是 failed）──────────────────────────────
+
+  /**
+   * 對含指定標記的圖片拋出給定錯誤的 embedder。
+   *
+   * 模擬真實 embedder（transformers.js → sharp／libvips 或 `RawImage.rgb()`）在解不開時
+   * 拋出的錯誤形狀：**一般的 `Error`、沒有 `code`**、訊息是一句英文描述。
+   */
+  class UndecodableImageEmbedder extends RecordingEmbedder {
+    constructor(
+      private readonly error: Error,
+      private readonly marker: string,
+    ) {
+      super();
+    }
+
+    override async embedImage(image: ImageInput): Promise<Float32Array> {
+      if (Buffer.from(image.bytes).includes(this.marker)) throw this.error;
+      return super.embedImage(image);
+    }
+  }
+
+  /** 解不開的圖片樣本：內容含標記，讓 `UndecodableImageEmbedder` 認得。 */
+  const undecodableBytes = Buffer.from("MNEMO-BAD-IMAGE");
+
+  it("解不開的圖記 skipped(undecodable)：整輪完成、不中斷、failedFiles 不含它", async () => {
+    const media = await makeHarness(
+      { "notes.md": "# 筆記\n\n正常文字檔", "photo.heic": undecodableBytes },
+      { modalities: ["text", "code", "image"] },
+    );
+    try {
+      media.embedder = new UndecodableImageEmbedder(
+        new Error("Input buffer contains unsupported image format"),
+        "MNEMO-BAD-IMAGE",
+      );
+
+      const result = await indexRoot(media.root, options(media));
+
+      // 整輪完成：文字照常處理，圖片只是被跳過（沒有中斷、沒有 failed）。
+      expect(result.total).toBe(2);
+      expect(result.processed).toBe(1);
+      expect(result.failedFiles).toEqual([]);
+      expect(result.skippedFiles).toEqual([{ relPath: "photo.heic", reason: "undecodable" }]);
+
+      // 被跳過的檔案不得保留索引。
+      expect(await media.store.listChunksByPath(media.root.id, "photo.heic")).toEqual([]);
+      // 文字檔正常寫入。
+      expect((await media.store.listChunksByPath(media.root.id, "notes.md")).length).toBeGreaterThan(0);
+    } finally {
+      await fs.rm(media.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("解不開的圖：重跑結果一致，且不會留下上一次讀得出來時的舊向量", async () => {
+    const media = await makeHarness(
+      { "photo.png": Buffer.from("MNEMO-OK-IMAGE-v1") },
+      { modalities: ["image"] },
+    );
+    try {
+      // 第一輪：讀得出來，正常索引。
+      const first = await indexRoot(media.root, options(media));
+      expect(first.processed).toBe(1);
+      const chunksBefore = await media.store.listChunksByPath(media.root.id, "photo.png");
+      expect(chunksBefore).toHaveLength(1);
+
+      // 內容被換成解不開的位元組（hash 改變 ⇒ 會重新嵌入）。
+      await fs.writeFile(path.join(media.dir, "photo.png"), undecodableBytes);
+      media.embedder = new UndecodableImageEmbedder(
+        new Error("Input buffer has corrupt header"),
+        "MNEMO-BAD-IMAGE",
+      );
+
+      const second = await indexRoot(media.root, options(media));
+      expect(second).toMatchObject({ total: 1, processed: 0, skippedUnchanged: 0, failedFiles: [] });
+      expect(second.skippedFiles).toEqual([{ relPath: "photo.png", reason: "undecodable" }]);
+
+      // 舊向量與舊 chunk 都被清掉：搜尋不會再撈到讀不出來的舊內容。
+      expect(await media.store.listChunksByPath(media.root.id, "photo.png")).toEqual([]);
+      expect(await media.vec.count()).toBe(0);
+
+      // 第三輪（同樣的壞內容）：結果與第二輪一致，不中斷。
+      const third = await indexRoot(media.root, options(media));
+      expect(third).toMatchObject({ total: 1, processed: 0, failedFiles: [] });
+      expect(third.skippedFiles).toEqual([{ relPath: "photo.png", reason: "undecodable" }]);
+    } finally {
+      await fs.rm(media.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("帶穩定標記的輸入錯誤（訊息不含已知措辭）也記 skipped(undecodable)", async () => {
+    const media = await makeHarness(
+      { "notes.md": "# 筆記\n\n正常文字檔", "photo.heic": undecodableBytes },
+      { modalities: ["text", "code", "image"] },
+    );
+    try {
+      // 模擬本專案 embedder 的 `EmbedderInputError` 形狀：core 不得 import embedder，
+      // 因此以同樣的 name／code 複製形狀——這也正是給其他 embedder 實作的跨套件契約
+      // （見 errors.ts 的 EmbedderInputError 與 isMediaDecodeError 的註解）。
+      media.embedder = new UndecodableImageEmbedder(
+        Object.assign(new Error("輸入解不開（訊息刻意不含任何已知解碼措辭）"), {
+          name: "EmbedderInputError",
+          code: "undecodable",
+        }),
+        "MNEMO-BAD-IMAGE",
+      );
+
+      const result = await indexRoot(media.root, options(media));
+
+      // 主要判準是標記（code／name），不是訊息措辭：仍記 skipped、不記 failed。
+      expect(result.processed).toBe(1);
+      expect(result.failedFiles).toEqual([]);
+      expect(result.skippedFiles).toEqual([{ relPath: "photo.heic", reason: "undecodable" }]);
+    } finally {
+      await fs.rm(media.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("非解碼類的錯誤仍記 failedFiles（保守：不把真正的失敗降級成跳過）", async () => {
+    const media = await makeHarness({ "photo.png": Buffer.from("MNEMO-BAD-IMAGE") }, { modalities: ["image"] });
+    try {
+      media.embedder = new UndecodableImageEmbedder(
+        Object.assign(new Error("模擬模型載入失敗"), { code: "EMODELFAIL" }),
+        "MNEMO-BAD-IMAGE",
+      );
+
+      const result = await indexRoot(media.root, options(media));
+      expect(result.processed).toBe(0);
+      expect(result.skippedFiles).toEqual([]);
+      expect(result.failedFiles).toEqual([{ relPath: "photo.png", reason: "EMODELFAIL" }]);
+    } finally {
+      await fs.rm(media.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("isMediaDecodeError 只認得已知的解碼失敗形狀", () => {
+    // 認得（sharp／libvips 與 transformers.js 的實際措辭）。
+    expect(isMediaDecodeError(new Error("Input buffer contains unsupported image format"))).toBe(true);
+    expect(isMediaDecodeError(new Error("Input file contains unsupported image format"))).toBe(true);
+    expect(isMediaDecodeError(new Error("Input buffer has corrupt header"))).toBe(true);
+    expect(isMediaDecodeError(new Error("Input image exceeds pixel limit"))).toBe(true);
+    expect(isMediaDecodeError(new Error("Conversion failed due to unsupported number of channels: 2"))).toBe(true);
+    const empty = new Error("圖片輸入為空：bytes 長度為 0");
+    empty.name = "EmptyImageInputError";
+    expect(isMediaDecodeError(empty)).toBe(true);
+
+    // 穩定標記（本專案 embedder 的 EmbedderInputError／code:"undecodable"）：**主要判準**，
+    // 即使訊息不含任何已知措辭也命中（結構化標記優先於訊息措辭）。
+    const typedByName = new Error("輸入解不開（訊息刻意不含任何已知解碼措辭）");
+    typedByName.name = "EmbedderInputError";
+    expect(isMediaDecodeError(typedByName)).toBe(true);
+    const typedByCode = Object.assign(new Error("whatever"), { code: "undecodable" });
+    expect(isMediaDecodeError(typedByCode)).toBe(true);
+
+    // 不認得（維持 failedFiles）：一般錯誤、有 code 的錯誤、取消、非 Error 值。
+    expect(isMediaDecodeError(new Error("模擬嵌入失敗"))).toBe(false);
+    expect(isMediaDecodeError(Object.assign(new Error("ENOENT: no such file or directory"), { code: "ENOENT" }))).toBe(
+      false,
+    );
+    const aborted = new Error("索引已取消");
+    aborted.name = "AbortError";
+    expect(isMediaDecodeError(aborted)).toBe(false);
+    // 取消即使被錯誤地掛上 undecodable 碼也不降級：取消原樣拋出、中止整輪。
+    expect(isMediaDecodeError(Object.assign(new Error("索引已取消"), { name: "AbortError", code: "undecodable" }))).toBe(
+      false,
+    );
+    expect(isMediaDecodeError("just a string")).toBe(false);
+    expect(isMediaDecodeError(undefined)).toBe(false);
+    expect(isMediaDecodeError(null)).toBe(false);
   });
 
   // ── 修復輪：資料完整性與安全 ──────────────────────────────────────────────

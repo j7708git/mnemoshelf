@@ -11,10 +11,11 @@
  *   3. 裝置覆寫（選項優先於環境變數；非法值拋錯）與 `dml` 的序列推論互斥。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { EmbedderRuntimeStatus } from "@mnemoshelf/core";
+import { isMediaDecodeError, type EmbedderRuntimeStatus } from "@mnemoshelf/core";
 import {
   DEFAULT_DML_DEVICE_ID,
   DML_BATCH_SIZE,
+  EmbedderInputError,
   EMBED_DEVICE_ENV,
   EMBED_DML_DEVICE_ID_ENV,
   InvalidEmbedderOptionError,
@@ -40,6 +41,10 @@ const mocks = vi.hoisted(() => ({
     loadFailsOnDml: false,
     inferenceFailsOnDml: false,
     inferenceAbortsOnDml: false,
+    /** `load_image`（解碼階段）失敗：模擬解不開的圖。訊息刻意**不含** core 認得的措辭。 */
+    imageDecodeFails: false,
+    /** `load_image` 拋 `AbortError`：模擬解碼階段被取消（必須原樣拋出、不算輸入錯誤）。 */
+    imageDecodeAborts: false,
   },
   /** `AutoModel.from_pretrained` 收到的選項（逐次）。 */
   modelOptions: [] as { device?: unknown; session_options?: unknown }[],
@@ -103,7 +108,16 @@ vi.mock("@huggingface/transformers", () => {
         return Object.assign(model, { dispose: async () => undefined });
       },
     },
-    load_image: async () => ({}),
+    load_image: async () => {
+      if (mocks.behavior.imageDecodeAborts) {
+        throw Object.assign(new Error("解碼已取消（模擬）"), { name: "AbortError" });
+      }
+      if (mocks.behavior.imageDecodeFails) {
+        // 刻意用一句 core 的訊息清單**認不得**的措辭：分類只能靠 EmbedderInputError 標記。
+        throw new Error("圖片位元組解不開（模擬，措辭不在 core 的清單內）");
+      }
+      return {};
+    },
   };
 });
 
@@ -114,6 +128,8 @@ function resetMocks(): void {
   mocks.behavior.loadFailsOnDml = false;
   mocks.behavior.inferenceFailsOnDml = false;
   mocks.behavior.inferenceAbortsOnDml = false;
+  mocks.behavior.imageDecodeFails = false;
+  mocks.behavior.imageDecodeAborts = false;
   mocks.modelOptions.length = 0;
   mocks.windows.length = 0;
   mocks.inflight = 0;
@@ -576,6 +592,85 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
     expect(mocks.windows).toEqual([32, 16, 16, 8]);
     expect(mocks.windows.slice(1).every((size) => size <= CPU_BATCH_SIZE)).toBe(true);
     expect(embedder.runtimeStatus.batchSize).toBe(CPU_BATCH_SIZE);
+
+    await embedder.dispose();
+  });
+});
+
+/**
+ * 圖片解碼／輸入類錯誤**不**觸發裝置退回（修復輪：一張壞圖不該讓整場永久退回 CPU）。
+ *
+ * 判別力：`imageDecodeFails` 的訊息刻意不在 core 的措辭清單內，因此「被分類」只可能來自
+ * `EmbedderInputError` 標記；若把 `shouldFallBack` 的輸入類例外拿掉，第一條測試會看到
+ * `device` 變成 cpu、`fallbackReason` 非 null、且模型被重新載入成 cpu → 失敗。
+ */
+describe("圖片解碼／輸入類失敗：不退回 CPU（mock 模型）", () => {
+  it("dml 下的解碼失敗：不退回、以 EmbedderInputError 分類、core 認得", async () => {
+    mocks.behavior.imageDecodeFails = true;
+    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+
+    const error = await embedder.embedImage({ bytes: Uint8Array.from([1, 2, 3]) }).then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(EmbedderInputError);
+    expect((error as EmbedderInputError).code).toBe("undecodable");
+    // 跨套件契約：core 以穩定標記（而非訊息措辭）判成「解不開」→ 會被記成 skipped。
+    expect(isMediaDecodeError(error)).toBe(true);
+
+    const status = embedder.runtimeStatus;
+    expect(status.device).toBe("dml");
+    expect(status.fallbackReason).toBeNull();
+    // 沒有退回＝沒有第二次載入（更沒有 CPU 的載入）。
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["dml"]);
+
+    await embedder.dispose();
+  });
+
+  it("對照組：dml 下的**推論**錯誤（圖片路徑）仍會退回 CPU 並重試", async () => {
+    mocks.behavior.inferenceFailsOnDml = true;
+    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+
+    const vector = await embedder.embedImage({ bytes: Uint8Array.from([1, 2, 3]) });
+
+    expect(vector).toHaveLength(embedder.info.dim);
+    expect(embedder.runtimeStatus.device).toBe("cpu");
+    expect(embedder.runtimeStatus.fallbackReason?.code).toBe("inference-failed");
+    expect(mocks.modelOptions.map((options) => options.device)).toEqual(["dml", "cpu"]);
+
+    await embedder.dispose();
+  });
+
+  it("cpu 下的解碼失敗：同樣以 EmbedderInputError 分類（indexer 才記得到 skipped 而非 failed）", async () => {
+    mocks.behavior.imageDecodeFails = true;
+    const embedder = new TransformersEmbedder({ platform: "linux", cacheDir: CACHE_DIR });
+
+    const error = await embedder.embedImage({ bytes: Uint8Array.from([1, 2, 3]) }).then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(EmbedderInputError);
+    expect(isMediaDecodeError(error)).toBe(true);
+    expect(embedder.runtimeStatus.device).toBe("cpu");
+
+    await embedder.dispose();
+  });
+
+  it("解碼階段被取消（AbortError）：原樣拋出、不算輸入錯誤、也不退回", async () => {
+    mocks.behavior.imageDecodeAborts = true;
+    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+
+    const error = await embedder.embedImage({ bytes: Uint8Array.from([1, 2, 3]) }).then(
+      () => null,
+      (caught: unknown) => caught,
+    );
+
+    expect((error as Error).name).toBe("AbortError");
+    expect(error).not.toBeInstanceOf(EmbedderInputError);
+    expect(embedder.runtimeStatus.device).toBe("dml");
+    expect(embedder.runtimeStatus.fallbackReason).toBeNull();
 
     await embedder.dispose();
   });

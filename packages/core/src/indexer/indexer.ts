@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import { PathBlockedError, PathOutsideRootError } from "../errors.js";
 import type { DocumentInput, Embedder, ImageInput } from "../ports/embedder.js";
 import type { MetadataStore } from "../ports/metadata-store.js";
-import type { NewChunk, Root } from "../ports/types.js";
+import type { ChunkKind, NewChunk, Root } from "../ports/types.js";
 import type { VectorIndex, VectorItem } from "../ports/vector-index.js";
 import { resolveInsideRoot } from "../roots/path-guard.js";
 import { chunkCode, chunkText } from "./chunk-text.js";
@@ -24,8 +24,8 @@ export interface IndexProgress {
   /**
    * 本次已判定跳過（不含 `skippedUnchanged`）的檔案數，對應結果的 `skippedFiles.length`。
    *
-   * 來源有兩類：讀取前守衛再檢查失敗（`unresolved-symlink`／`blocked`），
-   * 以及內容層二進位偵測（`binary-content`）。
+   * 來源有三類：讀取前守衛再檢查失敗（`unresolved-symlink`／`blocked`）、
+   * 內容層二進位偵測（`binary-content`），以及媒體檔解不開（`undecodable`）。
    */
   skipped: number;
   /**
@@ -90,9 +90,10 @@ export interface IndexRootResult {
   /** 從磁碟消失、或不再納入而清除資料的檔案數。 */
   removedFiles: number;
   /**
-   * 掃描時納入、但**讀取前守衛再檢查**失敗（例如掃描後路徑被換成 root 外 symlink），
-   * 或**內容層判定為二進位**（`binary-content`）而跳過的檔案。
-   * 正常情況為空；計數上 `processed + skippedUnchanged + skippedFiles.length === total`。
+   * 掃描時納入、但**讀取前守衛再檢查**失敗（例如掃描後路徑被換成 root 外 symlink）、
+   * **內容層判定為二進位**（`binary-content`），或**媒體檔解不開**（`undecodable`）
+   * 而跳過的檔案。正常情況為空；
+   * 計數上 `processed + skippedUnchanged + skippedFiles.length + failedFiles.length === total`。
    */
   skippedFiles: SkippedEntry[];
   /**
@@ -154,6 +155,93 @@ export function hashBytes(bytes: Uint8Array): string {
   return createHash("sha256").update(bytes).digest("hex");
 }
 
+/**
+ * 這個檔案是不是「整檔交給 embedder 解碼」的媒體檔（非文字／程式碼）？
+ *
+ * 媒體檔每檔固定一個 chunk，嵌入前不切塊、也不做內容層二進位偵測
+ * （圖片本來就是二進位；`looksBinary` 只服務 text／code）。
+ */
+function isMediaKind(kind: ChunkKind): boolean {
+  return kind !== "text" && kind !== "code";
+}
+
+/**
+ * 解碼失敗的**穩定錯誤碼**清單（跨 embedder 實作的結構化標記）。
+ *
+ * 本專案的 embedder（`@mnemoshelf/embedder-transformers`）把解不開的輸入拋成
+ * `EmbedderInputError`（`code:"undecodable"`）。core 以這個碼為**主要**判準，不必解析
+ * 訊息文字，也不需 import 該套件（core 不該知道 embedder 內用哪個解碼器）。`undecodable`
+ * 與 `SkipReason` 同名是刻意的：同一個語意、同一個字。
+ *
+ * 其他 embedder 實作照樣帶這個 `code` 即可被認成同一類；沒帶的則靠下方的訊息措辭後備判定。
+ */
+const DECODE_FAILURE_ERROR_CODES: readonly string[] = ["undecodable"];
+
+/**
+ * 解碼失敗訊息的特徵（一律以**小寫**比對 `String(error.message)`）。
+ *
+ * **後備判準**：主要判準是上面的穩定錯誤碼；這裡保留訊息比對是為了**其他 embedder 實作**
+ * 與既有行為（解碼發生在 embedder 內部，有些實作只拋一般的 `Error`：沒有 `code`、
+ * `error.name` 也只是 `"Error"`——core 拿不到更結構化的訊號；而 core 也不該知道 embedder
+ * 內部用了哪個解碼器）。
+ *
+ * 保守原則：**只認得清單內的措辭才降級成 skipped**，其餘（含未知的新錯誤）一律維持
+ * `failedFiles`。萬一解碼器改了措辭，症狀會是「又出現 failed 的圖」這種看得見的回歸，
+ * 而不是把真正的嵌入錯誤靜默吞成 skipped。
+ *
+ * 清單來源（皆為實際會拋出的字串，2026-10-16 查證 sharp 0.35／transformers.js 4.3.1）：
+ * - sharp／libvips：`Input file contains unsupported image format`、
+ *   `Input buffer contains unsupported image format`、`Input buffer has corrupt header`、
+ *   `Input image exceeds pixel limit`（`limitInputPixels` 預設約 268 MP）。
+ *   前兩者正是 HEIC／BMP／ICO 這類 sharp prebuilt 不支援的格式會走到的路。
+ * - transformers.js：`Conversion failed due to unsupported number of channels: 2`
+ *   （灰階＋alpha 的 2 通道圖）。
+ */
+const DECODE_FAILURE_MESSAGE_PATTERNS: readonly string[] = [
+  "unsupported image format",
+  "corrupt header",
+  "unsupported number of channels",
+  "exceeds pixel limit",
+];
+
+/**
+ * 解碼失敗的錯誤**名稱**清單（同樣保守：只認得這些名字才降級）。
+ *
+ * 都是**本專案自己的** embedder 定義的穩定標籤，因此用名稱而非訊息：
+ * - `EmbedderInputError`：輸入類錯誤的基底（解碼／前處理失敗），帶 `code:"undecodable"`。
+ * - `EmptyImageInputError`：零位元組圖片輸入（例如 iCloud「最佳化儲存空間」留下的
+ *   0 byte 佔位檔）；位元組為空＝永遠解不開，是 `EmbedderInputError` 的特例。
+ */
+const DECODE_FAILURE_ERROR_NAMES: readonly string[] = ["EmbedderInputError", "EmptyImageInputError"];
+
+/**
+ * 這個錯誤是否代表「媒體檔**解不開**」（而不是讀取／模型／寫入等真正的失敗）？
+ *
+ * 判準（依序）：
+ * 1. **結構化標記優先**：錯誤的 `code` 是 `undecodable`（`DECODE_FAILURE_ERROR_CODES`），
+ *    或錯誤名稱是已知的輸入類錯誤（`DECODE_FAILURE_ERROR_NAMES`）。這是與 embedder
+ *    實作的穩定契約，與訊息措辭無關。
+ * 2. **訊息措辭後備**：只認得 `DECODE_FAILURE_MESSAGE_PATTERNS` 內的措辭（保守原則見上），
+ *    服務其他沒有帶 `code` 的 embedder 實作。
+ *
+ * 命中的檔案在 `indexRoot` 會被記成 `skipped(undecodable)`，不進 `failedFiles`、不中斷整輪。
+ *
+ * 取消（`AbortError`）**不算**解碼失敗：呼叫端必須先 `throwIfAborted`，讓取消照舊中止整輪；
+ * 這裡也先擋掉 `AbortError`，免得它被帶有 `undecodable` 碼的包裝錯誤誤判（見 else 分支）。
+ */
+export function isMediaDecodeError(error: unknown): boolean {
+  if (error instanceof Error && error.name === "AbortError") return false;
+  if (error instanceof Error) {
+    const code = (error as { code?: unknown }).code;
+    if (typeof code === "string" && DECODE_FAILURE_ERROR_CODES.includes(code)) return true;
+    if (DECODE_FAILURE_ERROR_NAMES.includes(error.name)) return true;
+  }
+  const message = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+  if (message === "") return false;
+  const lower = message.toLowerCase();
+  return DECODE_FAILURE_MESSAGE_PATTERNS.some((pattern) => lower.includes(pattern));
+}
+
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal === undefined) return;
   if (typeof signal.throwIfAborted === "function") {
@@ -172,7 +260,7 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 /** 依種類把檔案內容切成要寫入的 chunk 輸入。 */
 function buildChunkInputs(file: ScanEntry, fileHash: string, bytes: Buffer): ChunkInput[] {
   // 媒體檔每檔一個 chunk（text: null）；文字／程式碼依內容切塊。
-  if (file.kind !== "text" && file.kind !== "code") {
+  if (isMediaKind(file.kind)) {
     return [{ seq: 0, kind: file.kind, text: null, contentHash: fileHash }];
   }
 
@@ -204,7 +292,7 @@ async function embedInputs(
 ): Promise<Float32Array[]> {
   if (inputs.length === 0) return [];
 
-  if (file.kind !== "text" && file.kind !== "code") {
+  if (isMediaKind(file.kind)) {
     throwIfAborted(signal);
     const image: ImageInput = file.mimeType === null ? { bytes } : { bytes, mimeType: file.mimeType };
     return [await embedder.embedImage(image)];
@@ -275,10 +363,10 @@ async function revalidateReadPath(
 /**
  * 移除某個檔案既有的 chunk 與向量（先刪向量再刪 chunk，與 `processFile` 的順序一致）。
  *
- * 用在「本次判定為 `binary-content`」的檔案：`indexRoot` 的清理迴圈只涵蓋
- * 「掃描未納入（不在 `files` 內）」的檔案，內容層跳過的檔案仍在 `files` 內，
- * 因此必須在這裡主動清除——否則先前被誤判為文字而嵌入的內容會留在索引裡
- * （違反「被跳過就不得保留索引」的語意，搜尋也會繼續撈到亂碼）。
+ * 用在「本次判定為 `binary-content`」與「媒體檔解不開（`undecodable`）」的檔案：
+ * `indexRoot` 的清理迴圈只涵蓋「掃描未納入（不在 `files` 內）」的檔案，這兩類仍在 `files` 內，
+ * 因此必須在這裡主動清除——否則先前（內容不同時）被索引的內容會留在索引裡
+ * （違反「被跳過就不得保留索引」的語意，搜尋也會繼續撈到讀不出來的舊內容）。
  */
 async function purgeChunks(rootId: number, relPath: string, deps: ProcessDeps): Promise<void> {
   const existing = await deps.store.listChunksByPath(rootId, relPath);
@@ -296,6 +384,7 @@ async function purgeChunks(rootId: number, relPath: string, deps: ProcessDeps): 
  * 3. 內容層二進位偵測（僅文字／程式碼）：命中即清除該檔既有資料並記 `binary-content`。
  * 4. 增量判斷：hash 未變**且**該檔所有 `c:<id>` 向量都還在，才跳過；否則整檔重做。
  * 5. **先嵌入**（全部成功才動 DB）：embed 失敗或中止時 DB 完全不動，下一輪自動重做。
+ *    媒體檔的「解不開」（已知的解碼失敗）不算失敗：清除既有資料後記 `undecodable` 跳過。
  * 6. **先刪舊向量**再 `replaceChunks`（見下方註解），最後 `vec.upsert` 新向量。
  *
  * 第 6 步刻意「先刪舊向量」而不是「寫入後才刪」：如此任一中途失敗點都能在下輪自癒——
@@ -334,7 +423,23 @@ async function processFile(
 
   const inputs = buildChunkInputs(file, fileHash, bytes);
   hooks.onChunked?.(inputs.length);
-  const vectors = await embedInputs(inputs, file, bytes, deps.embedder, signal);
+  let vectors: Float32Array[];
+  try {
+    vectors = await embedInputs(inputs, file, bytes, deps.embedder, signal);
+  } catch (error) {
+    // 取消不是「檔案壞掉」：原樣拋出，讓整輪以 AbortError 結束（見 throwIfAborted）。
+    throwIfAborted(signal);
+    if (!isMediaKind(file.kind) || !isMediaDecodeError(error)) throw error;
+    // 解不開的媒體檔（HEIC／BMP／ICO、2 通道圖、0 byte 佔位檔…）**不是**處理失敗：
+    // 它這輩子都索引不了，記 failed 只會讓照片庫一開就滿是失敗，而且重跑結果相同。
+    // 因此記成 skipped(undecodable)（短標籤、不含路徑），整輪照常完成。
+    //
+    // 既有索引資料一律清除（與 `binary-content` 同一條規則：「被跳過者不得保留索引」）：
+    // 這個檔案先前可能是讀得出來、已被索引的版本，內容被換成解不開的位元組後，
+    // 若保留舊向量，搜尋會一直撈到讀不出來的舊內容。
+    await purgeChunks(root.id, file.relPath, deps);
+    return { status: "skipped", reason: "undecodable" };
+  }
   throwIfAborted(signal);
 
   // 舊 chunk 的向量先回收（replaceChunks 會換成新的 autoincrement id）。
@@ -361,12 +466,14 @@ async function processFile(
  * - 清理：以 `listRelPaths(rootId)` 減去**本次將納入的 `files`** 為準。磁碟上已消失、或本次
  *   被跳過（排除規則、`.gitignore`、黑名單、關模態、超過大小上限等）的檔案，其 chunk 與向量
  *   一律清除——不得因為出現在 skipped 就保留索引（隱私契約：不索引、不回傳）。
- *   內容層跳過（`binary-content`）的檔案仍在 `files` 內（掃描不讀內容，無法事先知道），
- *   因此由 `processFile` 自己清除（見 `purgeChunks`），結果同樣不保留索引。
+ *   內容層跳過（`binary-content`）與解碼失敗跳過（`undecodable`）的檔案仍在 `files` 內
+ *   （掃描不讀內容，無法事先知道），因此由 `processFile` 自己清除（見 `purgeChunks`），
+ *   結果同樣不保留索引。
  * - 可取消（`signal`：掃描期間於每個目錄／檔案迭代前檢查，worker 池於每個檔案開始前與嵌入前檢查）。
  *   限併發（`concurrency`，預設 2；embedder 宣告 `runtimeStatus.serializedInference` 時固定為 1）。
  * - **單檔失敗不中斷整輪**：`processFile` 的錯誤被記入 `failedFiles`（原因只留短標籤），
  *   其餘檔案照常處理；失敗檔的既有索引資料保留，下一輪重試（成功即自癒）。
+ *   例外：「解不開的媒體檔」不算失敗，記 `skipped(undecodable)`（見 `isMediaDecodeError`）。
  * - 進度：檔案級計數（`processed`／`skippedUnchanged`／`skipped`／`failed`）整輪可對帳
  *   （四者相加 === `total`）；另有 chunk 級資訊（`processedChunks`／`estimatedChunks`），
  *   後者是逐檔切塊後累加的下界，只增不減（單一大檔的嵌入是單次批次呼叫，檔內不會有中間值）。

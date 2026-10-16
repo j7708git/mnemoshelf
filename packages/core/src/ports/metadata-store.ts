@@ -8,6 +8,7 @@ import type {
   NewRoot,
   RankedHit,
   Root,
+  RootPatch,
   SearchFilter,
 } from "./types.js";
 
@@ -57,6 +58,17 @@ export interface MetadataStore {
   addRoot(r: NewRoot): Promise<Root>;
   getRoot(id: number): Promise<Root | null>;
   listRoots(): Promise<Root[]>;
+
+  /**
+   * 更新 root 的可變設定（見 `RootPatch`；目前只有 `modalities`）。
+   *
+   * - 回傳**更新後**的 root，讓呼叫端不必再讀一次；
+   * - id 不存在時回 `null`（呼叫端據此回 404；本方法自己不拋錯，
+   *   與 `setMemoryPinned` 對不存在 id 的「不拋錯」風格一致）；
+   * - 只改設定，**不動**任何 chunk／向量：模態要在下一次 `indexRoot` 才會生效
+   *   （關掉模態不會立刻釋放既有向量，重新索引時才由清理迴圈清掉）。
+   */
+  updateRoot(id: number, patch: RootPatch): Promise<Root | null>;
 
   /**
    * 移除 root。

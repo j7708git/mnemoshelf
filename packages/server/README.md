@@ -68,8 +68,9 @@ loopback、並對連線來源再做 `requireLoopback` 檢查。需要更嚴格�
 | `GET /health` | 探活（免 token） |
 | `POST /roots` | 加入 root：`{path, mode?, modalities?, include?, exclude?, respectGitignore?, maxFileBytes?}`；`maxFileBytes` **只存活於本次行程**（見下） |
 | `GET /roots`、`GET /roots/:id` | 列出／取得 root |
+| `PATCH /roots/:id` | 更新可變設定：`{modalities}`（必填；`text／code／image／audio／video` 的子集，空陣列＝全關）。成功回 `200`＋更新後的 root；欄位缺漏或非法 → `400`；未知 root → `404`。**只改設定，不自動重新索引**（下一次索引才生效；關掉模態不會立刻釋放既有向量） |
 | `DELETE /roots/:id?deleteData=1` | 移除 root；`deleteData=1` 時一併刪除 chunk 與向量 |
-| `POST /roots/:id/preview` | 乾跑統計（不寫入任何狀態） |
+| `POST /roots/:id/preview` | 乾跑統計（不寫入任何狀態）：`{totalFiles, totalBytes, byKind, skipped, estimatedChunks, estimatedSeconds, estimated}`。`estimated` 是估時分解（`textSeconds／imageSeconds／otherSeconds／seconds`，三者相加＝`estimatedSeconds`）；模型保守、常數與依據見 `@mnemoshelf/core` 的 `preview.ts` 註解 |
 | `POST /roots/:id/index` | 觸發索引；同一 root 索引進行中再呼叫 → `409`。**會等整個索引跑完才回應**；被取消時回 `200`＋`{rootId, durationMs, cancelled:true}`（不是錯誤） |
 | `POST /roots/:id/index/cancel` | 取消**該 root 自己**進行中的索引：`{rootId, cancelled:true}`。沒有進行中的索引（或 root 不存在）→ `404`。取消後可再次索引（失敗／被中止的檔案下一輪重做） |
 | `GET /roots/:id/index/status` | 輪詢索引进度：`{state: idle\|running\|completed\|failed\|cancelled, runSeq, progress, startedAt, finishedAt, durationMs, error, result}`（行程內記憶體；**重啟後回 `idle`**，不引入 SSE／WebSocket）。`runSeq` 為**單調遞增的輪次序號**（每次 `begin()` 加一；`idle` 為 `null`），client 用它分辨「本輪終態」與「上一輪殘留的終態」。`progress` 為檔案級計數（`processed`／`total`／`skippedUnchanged`／`skipped`／`failed`，四者相加 === `total`）＋ chunk 級資訊（`processedChunks`／`estimatedChunks`）；`result` 另帶 `skippedFiles`／`failedFiles` |
@@ -133,6 +134,12 @@ keyword 那一路**，因此預設 `vector` 不含記憶命中；要搜尋記憶
 - **單檔失敗不中斷整輪**：讀取／嵌入／寫入拋錯只記入 `result.failedFiles`（`{relPath, reason}`，
   `reason` 是短標籤如 `EACCES`，**不含絕對路徑**），其餘檔案照常完成。失敗檔的既有索引資料保留，
   下一輪索引會重試它（成功即自癒）。
+- **解不開的媒體檔不算失敗（2026-10-16）**：已知的解碼失敗（例如 sharp prebuilt 不支援的
+  HEIC／BMP／ICO、灰階＋alpha 的 2 通道圖、0 byte 的圖片佔位檔）記入
+  `result.skippedFiles` 的 `undecodable`（不是 `failedFiles`），整輪照常完成、重跑結果一致。
+  判準刻意窄（只認得已知的解碼失敗措辭，見 `@mnemoshelf/core` 的 `isMediaDecodeError`）：
+  其他任何錯誤仍走 `failedFiles`，避免把真正的失敗靜默降級。這類檔案的既有索引資料會清除
+  （與 `binary-content` 同一條規則：被跳過者不得保留索引）。
 - **取消**：`POST /roots/:id/index/cancel` 觸發該 root 的 `AbortSignal`。中止時整輪結束、
   狀態為 `cancelled`（不是 `failed`，`error` 為 null）；進行中的檔案**不寫入任何資料**，
   因此下一輪會重做，已完成的檔案則維持一致。取消後可立刻再索引。

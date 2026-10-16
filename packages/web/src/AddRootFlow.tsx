@@ -17,6 +17,7 @@ import {
   previewRoot,
   removeRoot,
   startIndex,
+  updateRootModalities,
   type IndexStatus,
   type PollBaseline,
   type PollTrack,
@@ -36,6 +37,12 @@ export interface AddRootFlowProps {
    * 讓外層可以刷新側欄的 roots 清單，並把新 root 定入畫面；流程本身**不會**被關閉。
    */
   onRootCreated?: (root: Root) => void;
+  /**
+   * 流程中途改了 root 設定（例如在預覽頁開關「含圖片」）後回呼。
+   *
+   * 用途與 `onRootCreated` 相同：讓側欄的 roots 清單（模態標示）不要顯示過期狀態。
+   */
+  onRootChanged?: (root: Root) => void;
 }
 
 type Step = "input" | "preview" | "preview-failed" | "indexing" | "cancelled" | "done" | "failed";
@@ -53,6 +60,8 @@ const SKIP_REASON_LABEL: Record<string, string> = {
   "unresolved-symlink": "無法解析的連結",
   "symlink-dir": "符號連結目錄",
   "not-a-file": "非一般檔案",
+  "binary-content": "內容像二進位檔",
+  undecodable: "無法解碼（不支援的圖片格式）",
 };
 
 /** 模態 → 中文標籤。 */
@@ -64,14 +73,30 @@ const MODALITY_LABEL: Record<string, string> = {
   video: "影片",
 };
 
+/**
+ * 由「是否含圖片」組出要寫入 root 的模態清單。
+ *
+ * 勾了圖片＝`text`／`code`／`image`；沒勾則維持 v0.1.2 的預設（不加圖片）。
+ * 只有這三個模態有 UI 入口（音訊／影片尚未支援）。
+ */
+export function modalitiesForImages(enabled: boolean): string[] {
+  return enabled ? ["text", "code", "image"] : ["text", "code"];
+}
+
 function skipSummary(skipped: RootPreview["skipped"]): { reason: string; count: number }[] {
   const counts = new Map<string, number>();
   for (const item of skipped) counts.set(item.reason, (counts.get(item.reason) ?? 0) + 1);
   return [...counts.entries()].map(([reason, count]) => ({ reason, count }));
 }
 
-export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProps) {
+export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: AddRootFlowProps) {
   const [pathInput, setPathInput] = useState("");
+  /**
+   * 這個資料夾含照片嗎？（**預設關**：文字／程式碼照舊，照片索引較慢不要嚇到人）
+   *
+   * 加入時就決定第一次 `POST /roots` 的模態；加入後在預覽頁改成 PATCH（見 `setImagesEnabled`）。
+   */
+  const [includeImages, setIncludeImages] = useState(false);
   const [step, setStep] = useState<Step>("input");
   const [root, setRoot] = useState<Root | null>(null);
   const [preview, setPreview] = useState<RootPreview | null>(null);
@@ -121,6 +146,8 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
   onDoneRef.current = onDone;
   const onRootCreatedRef = useRef(onRootCreated);
   onRootCreatedRef.current = onRootCreated;
+  const onRootChangedRef = useRef(onRootChanged);
+  onRootChangedRef.current = onRootChanged;
 
   /** 對已加入的 root 做乾跑預覽；失敗時停在可重試的 `preview-failed`，不再回到輸入步驟。 */
   const loadPreview = async (target: Root): Promise<void> => {
@@ -138,6 +165,33 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
     }
   };
 
+  /**
+   * 切換「這個資料夾含照片」（root 已存在時走 `PATCH /roots/:id`）。
+   *
+   * 為什麼在預覽頁也要能改：常常是「加入之後才看到裡面有幾千張照片」（或反之），
+   * 而模態本來就可以改——就在看得到張數與預估時間的這一頁讓使用者改，改完立刻重跑預覽。
+   * 失敗時把開關回復原狀（不要讓畫面顯示一個沒生效的狀態）。
+   */
+  const setImagesEnabled = async (enabled: boolean): Promise<void> => {
+    if (root === null || busy) return;
+    setIncludeImages(enabled);
+    setError(null);
+    setBusy(true);
+    let updated: Root | null = null;
+    try {
+      updated = await updateRootModalities(root.id, modalitiesForImages(enabled));
+    } catch (patchError) {
+      setIncludeImages(!enabled);
+      setError(patchError instanceof Error ? patchError.message : "更新資料夾設定失敗");
+      setBusy(false);
+      return;
+    }
+    setRoot(updated);
+    setBusy(false);
+    onRootChangedRef.current?.(updated);
+    await loadPreview(updated);
+  };
+
   const submitPath = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     const target = pathInput.trim();
@@ -146,7 +200,8 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
     setBusy(true);
     let created: Root | null = null;
     try {
-      created = await addRoot({ path: target });
+      // 勾了「含圖片」才帶 image 模態；沒勾與 v0.1.2 完全相同（服務端預設 text／code）。
+      created = await addRoot({ path: target, modalities: modalitiesForImages(includeImages) });
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "加入資料夾失敗");
     }
@@ -342,6 +397,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
           <p className="text-xs text-muted">
             服務只會讀取這個資料夾；家目錄本身與檔案系統根目錄會被拒絕。加入後會先顯示統計，確認才開始索引。
           </p>
+          <ImagesToggle checked={includeImages} onChange={setIncludeImages} />
           {error !== null && (
             <p role="alert" className="text-sm text-red-600">
               {error}
@@ -361,12 +417,26 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated }: AddRootFlowProp
         <div className="space-y-4">
           <p className="break-all font-mono text-xs text-muted">{root.path}</p>
 
+          <ImagesToggle
+            checked={includeImages}
+            disabled={busy}
+            onChange={(next) => void setImagesEnabled(next)}
+          />
+
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <Stat label="檔案數" value={String(preview.totalFiles)} />
             <Stat label="總大小" value={formatBytes(preview.totalBytes)} />
             <Stat label="預估索引量" value={`${preview.estimatedChunks} 塊`} />
             <Stat label="預估時間" value={`約 ${preview.estimatedSeconds} 秒`} />
           </div>
+
+          {preview.estimated !== undefined && (
+            <p className="text-xs text-muted">
+              時間組成（粗估）：文字 {preview.estimated.textSeconds} 秒、圖片 {preview.estimated.imageSeconds} 秒
+              {preview.estimated.otherSeconds > 0 ? `、其他媒體 ${preview.estimated.otherSeconds} 秒` : ""}。
+              單張照片約數秒；沒勾「含照片」時圖片會列在下面的「未開啟的模態」被跳過。
+            </p>
+          )}
 
           <div>
             <h3 className="text-sm font-medium text-ink">類型分佈</h3>
@@ -529,6 +599,39 @@ function Stat({ label, value }: { label: string; value: string }) {
       <p className="text-xs text-muted">{label}</p>
       <p className="mt-0.5 text-sm font-medium text-ink">{value}</p>
     </div>
+  );
+}
+
+/**
+ * 「這個資料夾含照片，一起索引」開關（加入前與預覽頁共用同一個控制項）。
+ *
+ * 標籤刻意用白話（不寫「image 模態」），並在同一行說明代價與「改完要重新索引才生效」。
+ */
+function ImagesToggle({
+  checked,
+  disabled,
+  onChange,
+}: {
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (next: boolean) => void;
+}) {
+  return (
+    <label className="flex items-start gap-2 text-sm text-ink">
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled ?? false}
+        onChange={(event) => onChange(event.target.checked)}
+        className="mt-0.5"
+      />
+      <span>
+        這個資料夾含照片，一起索引
+        <span className="mt-0.5 block text-xs text-muted">
+          照片索引比文字慢很多（每張約數秒）。之後可以隨時關閉；改變設定後要重新索引才會生效。
+        </span>
+      </span>
+    </label>
   );
 }
 

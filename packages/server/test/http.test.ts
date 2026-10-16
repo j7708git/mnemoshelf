@@ -294,6 +294,132 @@ describe("REST：錯誤語意", () => {
   });
 });
 
+describe("REST：PATCH /roots/:id（更新 modalities）", () => {
+  it("加入時未帶 modalities → 預設只有 text／code；圖片以 modality-off 跳過（與 v0.1.2 相同）", async () => {
+    server = await startTestServer();
+    const dir = await fixture();
+
+    const created = await api(server.instance, "POST", "/roots", { body: { path: dir } });
+    expect(created.status).toBe(201);
+    const root = created.body as { id: number; modalities: string[] };
+    expect(root.modalities).toEqual(["text", "code"]);
+
+    const preview = await api(server.instance, "POST", `/roots/${root.id}/preview`);
+    expect((preview.body as RootPreview).skipped).toContainEqual({ relPath: "pic.png", reason: "modality-off" });
+    expect((preview.body as RootPreview).byKind.image.count).toBe(0);
+
+    const indexed = await api(server.instance, "POST", `/roots/${root.id}/index`);
+    expect(indexed.status).toBe(200);
+    const result = indexed.body as IndexRootResponse;
+    // 掃描階段就跳過的檔案不會進 `skippedFiles`（那是索引階段的守衛／內容判定），
+    // 而是根本不納入本輪：total 只算 2 個檔案，圖片不在其中。
+    expect(result.total).toBe(2);
+    expect(result.skippedFiles).toEqual([]);
+    expect(result.failedFiles).toEqual([]);
+    expect(result.processed).toBe(2);
+  });
+
+  it("PATCH 開圖片：200、回傳更新後的 root、GET 與 preview 都反映，且不自動觸發重索引", async () => {
+    server = await startTestServer();
+    const dir = await fixture();
+    const created = await api(server.instance, "POST", "/roots", { body: { path: dir } });
+    const root = created.body as { id: number };
+
+    const patched = await api(server.instance, "PATCH", `/roots/${root.id}`, {
+      body: { modalities: ["text", "code", "image"] },
+    });
+    expect(patched.status).toBe(200);
+    const updated = patched.body as { id: number; modalities: string[]; path: string; mode: string };
+    expect(updated.id).toBe(root.id);
+    expect(updated.modalities).toEqual(["text", "code", "image"]);
+    expect(updated.mode).toBe("index");
+
+    const got = await api(server.instance, "GET", `/roots/${root.id}`);
+    expect((got.body as { modalities: string[] }).modalities).toEqual(["text", "code", "image"]);
+
+    // preview 立刻反映新模態：圖片不再被 modality-off 跳過。
+    const preview = await api(server.instance, "POST", `/roots/${root.id}/preview`);
+    const stats = preview.body as RootPreview;
+    expect(stats.byKind.image.count).toBe(1);
+    expect(stats.skipped.some((entry) => entry.relPath === "pic.png")).toBe(false);
+
+    // **不自動觸發重新索引**：狀態仍停在 idle。
+    const status = await api(server.instance, "GET", `/roots/${root.id}/index/status`);
+    expect((status.body as { state: string }).state).toBe("idle");
+
+    // 關掉圖片（空陣列＝全關）也合法。
+    const cleared = await api(server.instance, "PATCH", `/roots/${root.id}`, { body: { modalities: [] } });
+    expect(cleared.status).toBe(200);
+    expect((cleared.body as { modalities: string[] }).modalities).toEqual([]);
+  });
+
+  it("PATCH 改模態後，重新索引才會把圖片納入（不自動觸發）", async () => {
+    server = await startTestServer();
+    const dir = await fixture();
+    const created = await api(server.instance, "POST", "/roots", { body: { path: dir } });
+    const root = created.body as { id: number };
+
+    // 尚未開圖片：索引後圖片沒有 chunk。
+    const before = await api(server.instance, "POST", `/roots/${root.id}/index`);
+    expect((before.body as IndexRootResponse).processed).toBe(2);
+
+    // 開圖片 → 重新索引：pic.png 被處理。
+    const patched = await api(server.instance, "PATCH", `/roots/${root.id}`, {
+      body: { modalities: ["text", "code", "image"] },
+    });
+    expect(patched.status).toBe(200);
+
+    const after = await api(server.instance, "POST", `/roots/${root.id}/index`);
+    expect(after.status).toBe(200);
+    const result = after.body as IndexRootResponse;
+    expect(result.processed).toBe(1); // 只有圖片是新處理的
+    expect(result.skippedUnchanged).toBe(2);
+    expect(result.failedFiles).toEqual([]);
+  });
+
+  it("請求內容不合法 → 400 ValidationError", async () => {
+    server = await startTestServer();
+    const dir = await fixture();
+    const created = await api(server.instance, "POST", "/roots", { body: { path: dir } });
+    const root = created.body as { id: number };
+
+    const cases: unknown[] = [
+      {}, // 缺 modalities（本端點只改這個欄位）
+      { modalities: "image" },
+      { modalities: ["nope"] },
+      { modalities: [1] },
+      { modalities: { image: true } },
+      { modalities: null },
+    ];
+    for (const body of cases) {
+      const response = await api(server.instance, "PATCH", `/roots/${root.id}`, { body });
+      expect(response.status).toBe(400);
+      expect(errorName(response.body)).toBe("ValidationError");
+    }
+
+    // 失敗的請求不得改動資料。
+    const got = await api(server.instance, "GET", `/roots/${root.id}`);
+    expect((got.body as { modalities: string[] }).modalities).toEqual(["text", "code"]);
+  });
+
+  it("未知 root → 404；方法不支援 → 405（Allow 帶 PATCH）", async () => {
+    server = await startTestServer();
+    const unknown = await api(server.instance, "PATCH", "/roots/987654", { body: { modalities: ["image"] } });
+    expect(unknown.status).toBe(404);
+    expect(errorName(unknown.body)).toBe("NotFoundError");
+
+    const badId = await api(server.instance, "PATCH", "/roots/not-a-number", { body: { modalities: ["image"] } });
+    expect(badId.status).toBe(404);
+
+    const dir = await fixture();
+    const created = await api(server.instance, "POST", "/roots", { body: { path: dir } });
+    const root = created.body as { id: number };
+    const notAllowed = await api(server.instance, "PUT", `/roots/${root.id}`);
+    expect(notAllowed.status).toBe(405);
+    expect(notAllowed.headers.get("allow")).toBe("GET, PATCH, DELETE");
+  });
+});
+
 describe("REST：記憶", () => {
   it("寫入記憶 → 關鍵字搜尋找得到（帶 agent 來源）→ 軟刪除後搜不到", async () => {
     server = await startTestServer();

@@ -12,11 +12,14 @@ export const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
 
 /**
  * 跳過的原因。除了任務卡明列的 `blocked`／`excluded`／`modality-off`／`too-large`／
- * `unresolved-symlink`，另補四個由本實作決定的具名原因（見下方各處註解）：
- * `symlink-dir`、`unsupported-type`（含系統／垃圾檔）、`binary-content`、`not-a-file`。
+ * `unresolved-symlink`，另補五個由本實作決定的具名原因（見下方各處註解）：
+ * `symlink-dir`、`unsupported-type`（含系統／垃圾檔）、`binary-content`、`not-a-file`、
+ * `undecodable`。
  *
  * `binary-content` 不由掃描產生：掃描**只列舉、不讀內容**，因此它是在索引階段
  * （`indexer.processFile`）讀入後才判定的（見 `docs/roots-and-privacy.md` 的兩道防線）。
+ * 同理，`undecodable` 也不由掃描產生：要在真的把位元組交給 embedder 之後才知道
+ * （見 `indexer.isMediaDecodeError`），預覽階段看不到這個原因。
  */
 export type SkipReason =
   | "blocked"
@@ -27,7 +30,8 @@ export type SkipReason =
   | "symlink-dir"
   | "unsupported-type"
   | "binary-content"
-  | "not-a-file";
+  | "not-a-file"
+  | "undecodable";
 
 /** 一個會納入索引的檔案（不含內容）。 */
 export interface ScanEntry {

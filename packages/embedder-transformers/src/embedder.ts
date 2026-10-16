@@ -11,6 +11,8 @@
  * 執行裝置（`device` 選項／`MNEMOSHELF_EMBED_DEVICE`）：
  *   - `auto`（預設）：**只在 Windows** 嘗試 DirectML GPU（`dml`），其他平台維持現狀 CPU。
  *   - `dml` 載入或推論失敗時**自動退回 CPU**，不中斷；原因可在 `runtimeStatus.fallbackReason` 讀到。
+ *   - **例外：解碼／輸入類失敗不退**（`EmbedderInputError`／`code:"undecodable"`）。一張壞圖
+ *     不該讓整場永久失去 GPU；這類錯誤照常往上拋，由 core 記成 `skipped(undecodable)`。
  *   - 批次視窗依裝置：DML 32、CPU 16（見 `device.ts` 的實測依據）。
  *   - 換裝置**不改變** `info.id`（只吃 model id 與 dtype）：向量兩者等值，既有索引不需重建。
  *
@@ -44,6 +46,7 @@ import {
   type EmbedDeviceOption,
 } from "./device.js";
 import {
+  EmbedderInputError,
   EmptyImageInputError,
   InvalidEmbedderOptionError,
   ModelInferenceError,
@@ -247,6 +250,29 @@ async function runModel(modelId: string, model: GemmaModel, inputs: unknown): Pr
   throw new ModelInferenceError(modelId, lastMessage);
 }
 
+/** 取消錯誤的名稱（與 `throwIfAborted` 的慣例一致）。 */
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+/**
+ * 把「圖片解碼／前處理」階段的失敗轉成可辨識的 `EmbedderInputError`。
+ *
+ * 為什麼是**整個階段**而不是逐一比對訊息措辭：`load_image`（transformers.js → sharp／libvips）
+ * 與圖片前處理（`RawImage.rgb()` 的通道轉換）**都不碰 ONNX session**，這一階段沒有任何裝置
+ * 或模型推論工作，因此這裡的失敗在結構上就是「輸入無法處理」。用結構分類比比對解碼器訊息
+ * 更耐用（措辭會隨 sharp／transformers.js 版本變動；core 現行的措辭清單只是給**其他**
+ * embedder 實作當後備）。
+ *
+ * - 取消（`AbortError`）原樣拋出：取消不是「輸入壞掉」。
+ * - 已是 `EmbedderInputError` 者原樣拋出，不重複包裝。
+ * - 其餘包成 `EmbedderInputError`，底層摘要（已去識別化）放進訊息與 `cause`，方便診斷。
+ */
+function asImageInputError(error: unknown): EmbedderInputError {
+  if (error instanceof EmbedderInputError) return error;
+  return new EmbedderInputError(`圖片解碼／前處理失敗：${summarizeFailure(error)}`, { cause: error });
+}
+
 /**
  * 多模態 embedder（真實模型）。
  *
@@ -258,6 +284,8 @@ async function runModel(modelId: string, model: GemmaModel, inputs: unknown): Pr
  * - 計畫裝置為 `dml` 時，載入或推論失敗**自動退回 CPU 並重試一次**（同一實例只退一次、退回後不再
  *   嘗試 `dml`），不讓整輪索引因此中斷；原因記在 `runtimeStatus.fallbackReason`。
  * - 取消（`AbortError`／`signal.aborted`）不算裝置失敗，一律原樣拋出。
+ * - **輸入類失敗**（`EmbedderInputError`，例如解不開的圖）也不算裝置失敗：與裝置無關，
+ *   不退回、不在同窗重試，原樣往上拋給 core 判定 `skipped(undecodable)`（見 `shouldFallBack`）。
  *
  * 序列推論（DirectML 的硬性限制）：
  * - `dml` 的同一 session 不支援並發 `Run`，而並發來源不止索引器（多個 root 同時索引、
@@ -409,11 +437,24 @@ export class TransformersEmbedder implements Embedder {
     const blob = new Blob([bytes], { type: image.mimeType ?? "application/octet-stream" });
 
     const rows = await this.runWithFallback(async ({ processor, model }) => {
-      const rawImage = await load_image(blob);
-      const inputs = await processor(null, [[rawImage]]);
+      // 解碼與圖片前處理都不碰 ONNX session：這一段的失敗一律標成 EmbedderInputError
+      // （見 asImageInputError），因此不會被 shouldFallBack 當成裝置失敗。真正的推論
+      // 錯誤發生在下面的 runModel，維持原本「dml 失敗即退回」的判定。
+      const rawImage = await this.inImageInputPhase(() => load_image(blob));
+      const inputs = await this.inImageInputPhase(() => processor(null, [[rawImage]]));
       return await runModel(this.modelId, model, inputs);
     }, undefined);
     return this.toVector(rows);
+  }
+
+  /** 執行一段「只碰輸入位元組、不碰裝置」的圖片解碼／前處理，失敗一律分類成輸入錯誤。 */
+  private async inImageInputPhase<T>(run: () => Promise<T>): Promise<T> {
+    try {
+      return await run();
+    } catch (error) {
+      if (isAbortError(error)) throw error;
+      throw asImageInputError(error);
+    }
   }
 
   async probe(): Promise<ProbeResult> {
@@ -483,7 +524,8 @@ export class TransformersEmbedder implements Embedder {
    * 不能與另一個正在使用舊 session 的呼叫重疊。
    *
    * 退回只做一次、且只針對 `dml`：`fallBackToCpu` 會把 `this.device` 改成 `cpu`，之後的呼叫
-   * 走的就是 CPU 路徑。取消（`AbortError`／`signal.aborted`）不算裝置失敗，原樣拋出。
+   * 走的就是 CPU 路徑。取消（`AbortError`／`signal.aborted`）與輸入類錯誤
+   * （`EmbedderInputError`）不算裝置失敗，原樣拋出（見 `shouldFallBack`）。
    */
   private async runWithFallback<T>(
     operation: (loaded: LoadedModel) => Promise<T>,
@@ -563,11 +605,19 @@ export class TransformersEmbedder implements Embedder {
     next.grant(() => this.releaseLock());
   }
 
-  /** 這個失敗是否該退回 CPU（只有 dml、且不是取消）。 */
+  /**
+   * 這個失敗是否該退回 CPU。只有 `dml`、且是「裝置／模型類」的失敗才退回。
+   *
+   * - 取消（`AbortError`／`signal.aborted`）不算裝置失敗。
+   * - **輸入類錯誤**（`EmbedderInputError`：解不開的圖、前處理失敗）也不算：換裝置、
+   *   重試同一份位元組結果一樣，退回只會讓整場永久失去 GPU，卻什麼都沒換到。照常往上拋，
+   *   由 core 認標記後記成 `skipped(undecodable)`。
+   */
   private shouldFallBack(signal: AbortSignal | undefined, error: unknown): boolean {
     if (this.device !== "dml") return false;
     if (signal?.aborted === true) return false;
-    if (error instanceof Error && error.name === "AbortError") return false;
+    if (isAbortError(error)) return false;
+    if (error instanceof EmbedderInputError) return false;
     return true;
   }
 

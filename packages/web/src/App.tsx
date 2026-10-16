@@ -9,9 +9,10 @@ import {
   setToken,
   UNAUTHORIZED_EVENT,
   UnauthorizedApiError,
+  updateRootModalities,
   type Root,
 } from "./api";
-import { AddRootFlow } from "./AddRootFlow";
+import { AddRootFlow, modalitiesForImages } from "./AddRootFlow";
 import { BootstrapScreen } from "./BootstrapScreen";
 import { ExplorerPanel } from "./ExplorerPanel";
 import { MemoriesPanel } from "./MemoriesPanel";
@@ -56,6 +57,10 @@ export function App() {
   const [mode, setMode] = useState<"explorer" | "add-root">("explorer");
   /** 遞增以強制目錄樹與狀態重新載入。 */
   const [refreshKey, setRefreshKey] = useState(0);
+  /** 正在更新「含照片」設定的 root id（避免重複送出）。 */
+  const [imagesBusyRootId, setImagesBusyRootId] = useState<number | null>(null);
+  /** 側欄的設定更新錯誤訊息（不切換整個畫面）。 */
+  const [rootsError, setRootsError] = useState<string | null>(null);
 
   /** 桌面殼的模型下載狀態（瀏覽器模式永遠是 null）。 */
   const [bootstrap, setBootstrap] = useState<DesktopBootstrapState | null>(null);
@@ -263,6 +268,28 @@ export function App() {
     }
   };
 
+  /**
+   * 切換某個已加入 root 的「含照片」（`PATCH /roots/:id`）。
+   *
+   * 只改設定、**不自動重新索引**（服務端語意）：畫面會用文字提醒要重新索引才生效，
+   * 不偷偷幫使用者觸發一輪可能跑好幾小時的索引。
+   * 失敗時不切換整個畫面（那只是一個開關），改在側欄顯示一行錯誤並把清單刷新回真實狀態。
+   */
+  const onToggleImages = async (root: Root, enabled: boolean): Promise<void> => {
+    setImagesBusyRootId(root.id);
+    setRootsError(null);
+    try {
+      await updateRootModalities(root.id, modalitiesForImages(enabled));
+      await refreshRoots();
+    } catch (error) {
+      setRootsError(error instanceof Error ? error.message : "更新資料夾設定失敗");
+      // 伺服器狀態才是真的：刷新清單讓開關回到實際值。
+      await refreshRoots();
+    } finally {
+      setImagesBusyRootId(null);
+    }
+  };
+
   const selectedRoot =
     state.kind === "ready"
       ? (state.roots.find((root) => root.id === selectedRootId) ?? state.roots[0] ?? null)
@@ -416,7 +443,14 @@ export function App() {
                     setMode("explorer");
                   }}
                   onRemove={(root) => void onRemoveRoot(root)}
+                  onToggleImages={(root, enabled) => void onToggleImages(root, enabled)}
+                  imagesBusyRootId={imagesBusyRootId}
                 />
+                {rootsError !== null && (
+                  <p role="alert" className="text-xs text-red-600">
+                    {rootsError}
+                  </p>
+                )}
               </aside>
 
               <main className="min-w-0">
@@ -431,6 +465,10 @@ export function App() {
                     onRootCreated={(root) => {
                       // 加入成功後立即把 root 定入流程狀態並刷新側欄（不切 loading，流程不中斷）。
                       setSelectedRootId(root.id);
+                      void refreshRoots();
+                    }}
+                    onRootChanged={() => {
+                      // 流程中途改了模態（預覽頁的「含圖片」）：側欄的模態標示要跟著更新。
                       void refreshRoots();
                     }}
                   />

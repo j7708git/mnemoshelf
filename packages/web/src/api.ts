@@ -132,6 +132,17 @@ export interface RootPreview {
   skipped: { relPath: string; reason: string }[];
   estimatedChunks: number;
   estimatedSeconds: number;
+  /**
+   * 估時分解（文字與圖片分開；三者相加＝`estimatedSeconds`）。
+   *
+   * 舊版服務沒有這個欄位，因此標為可選：UI 缺值時只顯示總秒數。
+   */
+  estimated?: {
+    textSeconds: number;
+    imageSeconds: number;
+    otherSeconds: number;
+    seconds: number;
+  };
 }
 
 /** 文字預覽的回應主體。 */
@@ -189,14 +200,39 @@ export async function readErrorMessage(response: Response, fallback: string): Pr
   return `${fallback}（HTTP ${response.status}）`;
 }
 
-/** 加入一個資料夾（root）。錯誤時丟出帶中文訊息的 `Error`。 */
-export async function addRoot(input: { path: string; mode?: "browse" | "index" }): Promise<Root> {
+/**
+ * 加入一個資料夾（root）。錯誤時丟出帶中文訊息的 `Error`。
+ *
+ * `modalities` 省略時由服務端套預設（`text`／`code`）——**加入含照片的資料夾時必須明帶
+ * `image`**，否則圖片會在掃描階段被記成 `modality-off` 跳過（見 UI 的「含圖片」勾選）。
+ */
+export async function addRoot(input: {
+  path: string;
+  mode?: "browse" | "index";
+  modalities?: string[];
+}): Promise<Root> {
   const response = await apiFetch("/roots", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ mode: "index", ...input }),
   });
   if (!response.ok) throw new Error(await readErrorMessage(response, "加入資料夾失敗"));
+  return (await response.json()) as Root;
+}
+
+/**
+ * 更新已加入 root 的可變設定（`PATCH /roots/:id`；目前只有 `modalities`）。
+ *
+ * **只改設定，不會自動重新索引**：新模態要等下一次索引才會生效，因此呼叫端要自己提示
+ * 使用者「重新索引」。
+ */
+export async function updateRootModalities(rootId: number, modalities: string[]): Promise<Root> {
+  const response = await apiFetch(`/roots/${rootId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ modalities }),
+  });
+  if (!response.ok) throw new Error(await readErrorMessage(response, "更新資料夾設定失敗"));
   return (await response.json()) as Root;
 }
 
