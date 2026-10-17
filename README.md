@@ -1,6 +1,6 @@
 # Mnemoshelf
 
-> 狀態：開發進行中，功能仍可能變動；桌面版安裝檔與版本請見 GitHub Releases。
+> 狀態：v0.2.0（開發進行中，功能仍可能變動）。本版重點＝裝置偵測＋Mac 內建自我測試（自動測 CoreML，失敗自動回 CPU）；桌面版安裝檔與版本請見 GitHub Releases。
 
 Mnemoshelf 是一個本機桌面應用程式，目標有兩個：
 
