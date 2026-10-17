@@ -61,8 +61,15 @@ jobs:
       - name: 型別檢查
         run: pnpm typecheck
 
+      # 關閉顏色：GitHub Actions 預設 CI=true，而 vitest 使用的著色函式庫（tinyrainbow）在
+      # 「環境變數 CI 存在」時，即使輸出被導向管線仍會上色——控制字元（`\e[2m`／`\e[32m` 等）
+      # 會寫進 test-output.txt，再被摘進 Release 說明。NO_COLOR 一旦存在即關閉著色；
+      # 注意不可改用 FORCE_COLOR=0：tinyrainbow 只檢查該變數是否「存在」（不看值），
+      # 設 0 反而會開啟顏色（實測 FORCE_COLOR=0 仍會輸出 ANSI）。
       - name: 測試
         shell: bash
+        env:
+          NO_COLOR: "1"
         run: |
           set -o pipefail
           pnpm test 2>&1 | tee test-output.txt
@@ -71,10 +78,15 @@ jobs:
         if: always()
         shell: bash
         run: |
+          # 雙重保險：即使上游仍帶控制字元（例如 NO_COLOR 未生效），這裡再清一次 ANSI
+          # （SGR 色碼等 CSI 序列）。本步驟只在 ubuntu-latest 執行，GNU sed 支援 \x1b。
+          # 保留 set -o pipefail：否則 grep 找不到摘要時，管線退出碼會是 sed 的 0，
+          # 後備訊息就不會出現（語意退化）。
+          set -o pipefail
           {
             echo "pnpm install --frozen-lockfile / pnpm build / pnpm typecheck：完成"
             echo "pnpm test 摘要（Test Files／Tests 行）："
-            grep -E "Test Files|Tests " test-output.txt || echo "(沒有擷取到摘要，請見本次 run 的 verify job 記錄)"
+            grep -E "Test Files|Tests " test-output.txt | sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' || echo "(沒有擷取到摘要，請見本次 run 的 verify job 記錄)"
           } > test-summary.txt
 
       - name: 上傳測試基準
@@ -245,7 +257,9 @@ jobs:
             echo "- 測試：pnpm install --frozen-lockfile、pnpm typecheck、pnpm build、pnpm test 全綠（verify job）。"
             echo
             echo '```'
-            cat test-baseline/test-summary.txt 2>/dev/null || echo "(測試摘要請見本次 run 的 verify job 記錄)"
+            # 摘要 artifact 可能來自先前的 run（此步驟 continue-on-error）：最後再清一次 ANSI，
+            # 確保 Release 頁面的「建置與測試基準」為純文字。
+            cat test-baseline/test-summary.txt 2>/dev/null | sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' || echo "(測試摘要請見本次 run 的 verify job 記錄)"
             echo '```'
             echo
             echo "## 附件"
