@@ -170,6 +170,23 @@ export function runEmbedderContract(name: string, factory: EmbedderFactory): voi
       expect(second.map((vec) => Array.from(vec))).toEqual(first.map((vec) => Array.from(vec)));
     });
 
+    it("遠超單筆上限的輸入必須被拒絕（輸入類錯誤），不得回傳被截斷的向量", async () => {
+      // 20 萬字元遠超過模型上下文（8192 token）：實作**必須**拒絕，不得自行截斷後照常回傳。
+      // 以**錯誤名稱**判定類別（core 不得 import embedder 套件，故契約以名稱／碼為準），
+      // 並要求穩定錯誤碼 `input-too-long`。FakeEmbedder 以字元數近似同一條上限。
+      const huge = "字".repeat(200_000);
+      for (const attempt of [() => embedder.embedQuery(huge), () => embedder.embedDocument(huge)]) {
+        await expect(attempt()).rejects.toMatchObject({
+          name: "EmbedderInputError",
+          code: "input-too-long",
+        });
+      }
+      await expect(embedder.embedDocuments([{ text: huge, title: "超大文件" }])).rejects.toMatchObject({
+        name: "EmbedderInputError",
+        code: "input-too-long",
+      });
+    });
+
     it("probe() 回傳成功", async () => {
       const result = await embedder.probe();
       expect(result.ok).toBe(true);

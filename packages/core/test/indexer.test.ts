@@ -603,6 +603,45 @@ describe("indexRoot", () => {
     }
   });
 
+  it("單筆輸入過長（code input-too-long）的文字檔 → 進該檔 failedFiles、整輪續跑完成（不是 skipped）", async () => {
+    // 真實 embedder 對超長單筆輸入拋 `EmbedderInputError`（`code:"input-too-long"`）。
+    // 它與 `undecodable` 同一類（與裝置無關、重試無用），但**只在媒體檔**才降級成
+    // `skipped`；文字檔照 core 既有規則記在該檔的 `failedFiles`，整輪不受影響。
+    const marker = "MNEMO-TOO-LONG";
+    const harnessWithOversize = await makeHarness({
+      "huge.md": `# 標題\n\n${marker}\n`,
+      "notes.md": "# 筆記\n\n正常文字檔\n",
+    });
+    try {
+      harnessWithOversize.embedder = new UndecodableTextEmbedder(
+        Object.assign(new Error("單筆輸入 9000 token 超過上限 8192（MAX_INPUT_TOKENS）"), {
+          name: "EmbedderInputError",
+          code: "input-too-long",
+        }),
+        marker,
+      );
+
+      const result = await indexRoot(harnessWithOversize.root, options(harnessWithOversize));
+
+      // 整輪完成：好檔照常處理，超限檔只是這一輪失敗（計數對帳）。
+      expect(result.total).toBe(2);
+      expect(result.processed).toBe(1);
+      expect(result.skippedUnchanged).toBe(0);
+      expect(result.skippedFiles).toEqual([]);
+      expect(result.failedFiles).toEqual([{ relPath: "huge.md", reason: "input-too-long" }]);
+      expect(result.processed + result.skippedUnchanged + result.skippedFiles.length + result.failedFiles.length).toBe(
+        result.total,
+      );
+
+      // 好檔寫入索引；失敗檔沒有（既有索引保留、下一輪重試）。
+      expect((await harnessWithOversize.store.listChunksByPath(harnessWithOversize.root.id, "notes.md")).length)
+        .toBeGreaterThan(0);
+      expect(await harnessWithOversize.store.listChunksByPath(harnessWithOversize.root.id, "huge.md")).toEqual([]);
+    } finally {
+      await fs.rm(harnessWithOversize.dir, { recursive: true, force: true });
+    }
+  });
+
   it("對照組：同一組錯誤在媒體檔上確實降級成 skipped(undecodable)", async () => {
     const media = await makeHarness(
       { "photo.heic": Buffer.from("MNEMO-BAD-IMAGE"), "notes.md": "# 筆記\n\n正常文字檔" },

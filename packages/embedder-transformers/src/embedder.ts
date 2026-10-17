@@ -131,17 +131,26 @@ export const MAX_BATCH_SIZE = CPU_BATCH_SIZE;
  *
  * 為什麼需要這條上限：一窗的 token 預算（`BATCH_TOKEN_BUDGET`）**只能在視窗內有多筆時**
  * 靠縮窗降下來；`embedDocuments` 的單筆視窗（`window.length === 1`）與單筆文字入口
- * （`embedQuery`／`embedDocument`，記憶寫入也走這條）先前**完全沒有上限**——一個超長輸入
+ * （`embedQuery`／`embedDocument`；生產路徑見下）先前**完全沒有上限**——一個超長輸入
  * 就是護欄的破口（見 `docs/embedder-contract.md`）。
  *
  * 為什麼取 8192：
  * - **不窄化任何原本合法的輸入**：8192 正是契約載明的模型上下文；超過的輸入本來就處理不了
- *   （會被 tokenizer 截斷或讓推論形狀失控）。正常切塊（512 估算 token ⇒ 約 ≤2048 真實
- *   token）不可能觸及，這是安全網而非常態路徑。
+ *   （tokenizer **不會截斷**：`truncation` 預設 `null`；處理器雖傳 `padding: true`，但單筆時
+ *   會夾成該筆自身長度、形同 no-op；且快取內的 `model_max_length` 實質無上限，超長序列會
+ *   **原樣**送進模型，推論張量形狀與配置隨長度成長）。正常切塊（512 估算 token ⇒ 約 ≤2048
+ *   真實 token）不可能觸及，這是安全網而非常態路徑。
  * - **pattern 關閉後最壞的單筆配置仍有界**：注意力類 `[1,4,8192,8192]` fp32 ≈ 1.07 GB、
  *   per-token 類 ≈ `T×49,152 B`（T=8192）≈ 0.41 GB，**確定性**地低於 Chromium
  *   PartitionAlloc 的單一配置上限 `2 GiB − 2 MiB` = 2,145,386,496 B（越過即
  *   `PA_IMMEDIATE_CRASH`，整個 app 死）。
+ *
+ * **這條上限與 `BATCH_TOKEN_BUDGET` 都不是記憶體配置的護欄**，真正的配置護欄是 session
+ * options：`enableMemPattern: false`（關掉 memory-pattern 的聚合大區塊）與
+ * `enableCpuMemArena: false`（一併關閉 arena）。實測 `5×1529`（1.97 GiB）與
+ * `4×1985`（2.28 GiB）**都落在 `BATCH_TOKEN_BUDGET`（8192）之內**，而後者已達 PartitionAlloc
+ * 上限的 113.9%（在 Electron 內必死）；連**超出**預算的 `16×522`（T=8,352）也有 1.60 GiB
+ * ——可見 token 預算並不保證配置低於上限；日後若要為效能把 pattern 打開，不可拿預算當安全論證。
  *
  * 超過時的語意：拋 `EmbedderInputError`（穩定錯誤碼 `code:"input-too-long"`）——輸入類失敗，
  * 與執行裝置無關、重試無用。core 以錯誤**名稱**把這類錯誤歸成「可跳過的輸入類失敗」，
@@ -402,7 +411,9 @@ function promptTokens(processed: Record<string, unknown>): number | null {
  *
  * 呼叫端必須保證「這一窗就是一筆」：
  * - `embedDocuments` 在 `window.length === 1` 時呼叫（那時 `tokens` 恰為該筆的 token 數）。
- * - `embedText`（`embedQuery`／`embedDocument`／記憶寫入）以單筆送入時呼叫。
+ * - `embedText`（單筆文字入口：`embedQuery`／`embedDocument`／`probe()`）以單筆送入時呼叫。
+ *   生產路徑目前只有兩處：`/search` 的 `embedQuery` 與 desktop 模型驗證的短字串
+ *   （`embedDocument` 是介面方法，目前非熱路徑；記憶寫入 `POST /memories` 不經 embedder）。
  *
  * 形狀取不到（`promptTokens` 回 `null`）時不判定：寧可放行也不要對畸形輸出誤判，
  * 這種情況另有「模型輸出形狀不符」的檢查擋著。
@@ -709,8 +720,8 @@ export class TransformersEmbedder implements Embedder {
   private async embedText(prefixed: string): Promise<Float32Array> {
     const rows = await this.runWithFallback(async ({ processor, model }) => {
       const inputs = await processor([prefixed]);
-      // 單筆文字入口（查詢、記憶寫入與探測都走這裡）受同一條硬上限約束：這裡的
-      // `promptTokens` 就是這一筆的實際 token 數（batch 1，沒有 padding）。
+      // 單筆文字入口（生產路徑為 `/search` 的查詢、desktop 的模型驗證與啟動探測）受同一條
+      // 硬上限約束：這裡的 `promptTokens` 就是這一筆的實際 token 數（batch 1，沒有 padding）。
       assertWithinInputLimit(promptTokens(inputs));
       return await runModel(this.modelId, model, inputs);
     }, undefined);

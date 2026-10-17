@@ -10,7 +10,7 @@
  *   `GET /roots/:id/thumb?path=`（縮圖）、`GET /roots/:id/index/status`（索引进度輪詢）
  * - `GET  /diagnostics`（除錯資訊匯出：版本、平台、embedder（含執行裝置與退回原因）、每 root 統計；
  *   家目錄前綴遮罩成 `~`）
- * - `POST /search`
+ * - `POST /search`（`query` 超過模型單筆輸入上限時 → `400 InputTooLongError`，見 `toHttpError`）
  * - `POST /memories`、`GET /memories`、`POST /memories/:id/pin`、`DELETE /memories/:id`
  *
  * 行為規則：
@@ -387,6 +387,19 @@ function sendBytes(
 }
 
 /**
+ * 從未知錯誤取出穩定錯誤碼（duck-typing）。
+ *
+ * `server` **不得** import embedder 套件（依賴方向相反），因此不判 `instanceof`，
+ * 只看錯誤物件上有沒有一個字串 `code`——這正是 embedder 契約的跨套件標記
+ * （見 `docs/embedder-contract.md` §無法解碼／處理的輸入；core 以同樣方式判 `undecodable`）。
+ */
+function errorCodeOf(error: unknown): string | null {
+  if (typeof error !== "object" || error === null) return null;
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" ? code : null;
+}
+
+/**
  * 把錯誤映射成 HTTP 狀態碼與回應主體。
  *
  * 訊息**逐一由各錯誤型別決定**（這些訊息本身不含本機絕對路徑）；
@@ -408,6 +421,18 @@ export function toHttpError(error: unknown): { status: number; body: ErrorRespon
   if (error instanceof RootNotIndexableError) return { status: 400, body: named(error.name, error.message), headers: {} };
   if (error instanceof NotFoundError) return { status: 404, body: named(error.name, error.message), headers: {} };
   if (error instanceof ValidationError) return { status: 400, body: named(error.name, error.message), headers: {} };
+  // embedder 的輸入類失敗（穩定錯誤碼，見 docs/embedder-contract.md §無法解碼／處理的輸入）。
+  // `/search` 的 `query` 沒有長度上限：一份超過模型單筆上限的查詢會讓 `embedQuery` 拋
+  // `input-too-long`，那是一個**使用者可修正的輸入問題**，不該變成 500「伺服器內部錯誤」。
+  // server **不得** import embedder 套件，故以 duck-typing 判 `code`（沿用 repo 既有
+  // 「以穩定碼／名稱辨識」的跨套件慣例；core 的 `isMediaDecodeError` 同款）。
+  if (errorCodeOf(error) === "input-too-long") {
+    return {
+      status: 400,
+      body: named("InputTooLongError", "輸入超過模型的單筆輸入上限（token 數過多），請縮短後再試"),
+      headers: {},
+    };
+  }
   if (error instanceof IndexInProgressError) return { status: 409, body: named(error.name, error.message), headers: {} };
   if (error instanceof PayloadTooLargeError) return { status: 413, body: named(error.name, error.message), headers: {} };
   if (error instanceof FileTooLargeError) return { status: 413, body: named(error.name, error.message), headers: {} };

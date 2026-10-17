@@ -244,19 +244,32 @@ interface EmbedDocumentsOptions {
 涵蓋範圍：
 
 - `embedDocuments` 的**單筆視窗**：`inputs` 只有一筆，或批次視窗因預算縮窗縮到剩一筆時。
-- 單筆文字入口：`embedQuery`／`embedDocument`（記憶寫入也走這條）。
+- 單筆文字入口：`embedQuery`／`embedDocument`。生產路徑目前只有兩處：`/search` 的
+  `embedQuery` 查詢，以及 desktop 啟動時的模型驗證短字串；`embedDocument` 是介面方法，
+  目前非熱路徑（索引走批次方法 `embedDocuments`）。**記憶寫入（`POST /memories`）不經
+  embedder**：它只寫 metadata store，不產生向量、不進索引，因此不受這條上限保護。
 - **不涵蓋圖片**：影像前處理的 token 數由模型設定自然有界（本專案實測 `pixel_values`
   一律 `[1,630,768]`，與圖尺寸無關），因此圖片路徑沒有這條上限。
 
 為什麼是 8192：**等同模型契約載明的上下文長度**（見「EmbeddingGemma 2 的使用要點」），
-超過本來就處理不了，因此**不窄化任何原本合法的輸入**；正常切塊（512 估算 token ≈ 最多
-約 2,048 真實 token）離這個值很遠，這是安全網而非常態路徑。
+超過本來就處理不了（tokenizer **不會截斷**——`truncation` 預設 `null`；處理器雖傳 `padding: true`，
+但單筆時會夾成該筆自身長度、形同 no-op；且快取內的 `model_max_length` 實質無上限，故超長序列
+會**原樣**進模型），因此**不窄化任何原本合法的輸入**；正常切塊（512 估算
+token ≈ 最多約 2,048 真實 token）離這個值很遠，這是安全網而非常態路徑。
 
 為什麼要有數值上的硬界線：推論的單一配置大小隨輸入形狀成長，而 Electron 的底層配置器
 （Chromium PartitionAlloc）對**單一配置**有硬上限，越過即**直接終止整個行程**
 （`MaxAllocationSize()` 故意設在 2 GiB 以下：2 GiB − 2 MiB = 2,145,386,496 B）。以 8192 為界時，
 最壞的單筆配置仍有界（注意力類 `[1,4,8192,8192]` fp32 ≈ 1.07 GB、per-token 類
 `T×49,152 B`（T=8192）≈ 0.41 GB），**確定性**地低於該上限。
+
+**但這條上限（與批次 token 預算 `BATCH_TOKEN_BUDGET`）都不是記憶體配置的護欄。** 真正的
+配置護欄是 session options 的 `enableMemPattern: false`（關掉 memory-pattern 的聚合大區塊；
+`enableCpuMemArena: false` 一併關閉 arena）。實測 `5×1529`（1.97 GiB）與 `4×1985`（2.28 GiB）
+**都落在 `BATCH_TOKEN_BUDGET`（8192）之內**，而後者已達 PartitionAlloc 上限的 **113.9%**
+（在 Electron 內必死）；連**超出**預算的 `16×522`（T=8,352）也有 1.60 GiB——可見 token 預算
+並不保證配置低於 PartitionAlloc 的單一配置上限。**不要**因為預算「看起來夠小」就把 pattern 打開：
+那條路正是 macOS 索引閃退的成因。
 
 ## 啟動探測（probe）
 
@@ -301,7 +314,9 @@ embedder 可能收到**永遠處理不了**的輸入，最典型的是解不開�
 它與 `undecodable` 屬同一類（**與執行裝置無關**、重試同一份輸入結果相同），差別只在原因；
 因此同樣**不觸發** GPU→CPU 退回、不改變 `runtimeStatus.fallbackReason`。
 core 目前以錯誤**名稱**（`EmbedderInputError`／`EmptyImageInputError`）歸類，故錯誤名稱不變
-即可被認成同一類；`input-too-long` 這個碼是給診斷與測試比對用的，不影響歸類。
+即可被認成同一類。**但 `input-too-long` 這個碼不是選配**：共用契約測試會要求它，且 server 端
+就是靠這個碼把這類失敗回應成 **4xx（不是 500）**；只帶名稱而不帶這個碼的實作，會過得了
+core 的歸類、卻過不了契約測試與 HTTP 分級。
 
 **索引路徑的行為＝不讓整輪失敗。** 這一類錯誤在索引路徑上屬「可跳過的輸入類失敗」，
 **不會**讓整輪索引中斷：該筆不會被嵌入，該檔依 core 既有的輸入類規則處置

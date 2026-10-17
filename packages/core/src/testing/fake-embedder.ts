@@ -11,6 +11,39 @@ import type {
 /** FakeEmbedder 的固定維度（與預設 embedder 的截斷維度一致）。 */
 export const FAKE_EMBEDDER_DIM = 512;
 
+/**
+ * FakeEmbedder 的單筆輸入上限（**近似**真實 embedder 的 `MAX_INPUT_TOKENS`）。
+ *
+ * FakeEmbedder 沒有 tokenizer，量不到真實 token 數，因此以**字元數**近似，並取
+ * 「一個 token 最多 4 個字元」的**寬鬆**上界：8192 × 4 = 32,768 字元。
+ *
+ * 為什麼刻意寬鬆：契約只要求「**遠超**上限的單筆輸入必須被拒絕」（見
+ * `docs/embedder-contract.md` §批次方法）。FakeEmbedder 沒有語意、也不該比真實實作
+ * 更容易誤拒合法輸入；取 4 字元/token 只可能讓它**更常放行**（真實實作以實際 token
+ * 判定）。索引端正常切塊遠小於這個值（每塊 ≤ 1200 字元），因此既有流程不受影響。
+ */
+export const FAKE_EMBEDDER_MAX_INPUT_CHARS = 32_768;
+
+/**
+ * 產生與真實 embedder 同形的「單筆輸入過長」錯誤。
+ *
+ * core **不得** import embedder 套件（依賴方向相反），因此這裡不 import
+ * `EmbedderInputError`，只複製它的**結構**：錯誤**名稱**（core 以名稱歸類輸入類失敗）
+ * ＋穩定錯誤碼 `code:"input-too-long"`（見 indexer 的 `isMediaDecodeError` 與
+ * `packages/embedder-transformers/src/errors.ts`）。
+ */
+function inputTooLongError(length: number): Error {
+  return Object.assign(new Error(`單筆輸入 ${length} 字超過上限 ${FAKE_EMBEDDER_MAX_INPUT_CHARS} 字`), {
+    name: "EmbedderInputError",
+    code: "input-too-long",
+  });
+}
+
+/** 單筆文字輸入的硬上限檢查（與真實 embedder 同語意；見 `FAKE_EMBEDDER_MAX_INPUT_CHARS`）。 */
+function assertFakeInputLimit(text: string): void {
+  if (text.length > FAKE_EMBEDDER_MAX_INPUT_CHARS) throw inputTooLongError(text.length);
+}
+
 /** 取消檢查（沿用 indexer 的 `throwIfAborted` 慣例）。 */
 function throwIfAborted(signal: AbortSignal | undefined): void {
   if (signal === undefined) return;
@@ -43,15 +76,18 @@ export class FakeEmbedder implements Embedder {
   };
 
   async embedQuery(text: string): Promise<Float32Array> {
+    assertFakeInputLimit(text);
     return hashToVector(this.hash(`query:${text}`));
   }
 
   async embedDocument(text: string, title?: string): Promise<Float32Array> {
+    assertFakeInputLimit(text);
     return hashToVector(this.hash(`document:${title ?? "none"}:${text}`));
   }
 
   /**
-   * 逐項委派 `embedDocument`，因此批次向量與單筆完全相同（順序對應）。
+   * 逐項委派 `embedDocument`，因此批次向量與單筆完全相同（順序對應），
+   * 單筆上限也一併沿用（超過上限的那一筆拋輸入類錯誤，整批失敗）。
    * 只額外支援取消：開始前檢查一次 `signal`。
    */
   async embedDocuments(

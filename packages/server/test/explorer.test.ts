@@ -43,7 +43,7 @@ async function makeExplorerFixture(): Promise<string> {
   await fs.writeFile(path.join(dir, "notes.md"), "# 筆記\n\n給文字預覽用的內容。\n", "utf8");
   await fs.writeFile(path.join(dir, "sub", "inner.txt"), "子目錄裡的文字檔。\n", "utf8");
   await fs.writeFile(path.join(dir, "code", "app.ts"), "export const answer = 42;\n", "utf8");
-  await fs.writeFile(path.join(dir, ".env"), "SECRET=should-never-be-returned\n", "utf8"); // 黑名單檔
+  await fs.writeFile(path.join(dir, ".env"), "MNEMO_FIXTURE_CONTENT=FIXTURE-BLOCKLIST-CONTENT\n", "utf8"); // 黑名單檔（合成內容）
   await fs.writeFile(path.join(dir, "archive.zip"), Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00])); // 二進位
   // 真實 PNG（由 sharp 產生，非手寫魔術位元組）。
   const png = await sharp({ create: { width: 640, height: 480, channels: 3, background: { r: 20, g: 120, b: 200 } } })
@@ -245,8 +245,9 @@ describe("GET /roots/:id/file：文字預覽與圖片位元組", () => {
     const response = await api(server.instance, "GET", `/roots/${rootId}/file?path=${encodeURIComponent(".env")}`);
     expect(response.status).toBe(403);
     expect(errorName(response.body)).toBe("PathBlockedError");
-    expect(JSON.stringify(response.body)).not.toContain("SECRET");
-    expect(JSON.stringify(response.body)).not.toContain("should-never-be-returned");
+    // 測試意圖不變：`.env` 的內容一律不得出現在回應中（改用不含憑證字樣樣式的合成值）。
+    expect(JSON.stringify(response.body)).not.toContain("MNEMO_FIXTURE_CONTENT");
+    expect(JSON.stringify(response.body)).not.toContain("FIXTURE-BLOCKLIST-CONTENT");
   });
 
   it("path 逃出 root（`..` 與絕對路徑）→ 拒絕，無內容", async () => {

@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { RootNotIndexableError } from "@mnemoshelf/core";
+import { FAKE_EMBEDDER_MAX_INPUT_CHARS } from "@mnemoshelf/core/testing";
 import {
   api,
   errorName,
@@ -291,6 +292,21 @@ describe("REST：錯誤語意", () => {
     expect(badSearch.status).toBe(400);
     const badRootIds = await api(server.instance, "POST", "/search", { body: { query: "x", rootIds: [] } });
     expect(badRootIds.status).toBe(400);
+  });
+
+  it("超長查詢（超過模型的單筆輸入上限）→ 400，不是 500", async () => {
+    // `/search` 對 `query` 沒有長度上限：一份遠超模型單筆上限的查詢會讓 `embedQuery` 拋出
+    // 輸入類失敗（穩定錯誤碼 `input-too-long`）。那是**使用者可修正的輸入問題**，必須映射成
+    // 400 並帶可辨識的錯誤名，不能落到最後的 500「伺服器內部錯誤」。
+    // FakeEmbedder 以字元數近似同一條上限（見 core 的 FAKE_EMBEDDER_MAX_INPUT_CHARS）。
+    server = await startTestServer();
+    const huge = "字".repeat(FAKE_EMBEDDER_MAX_INPUT_CHARS + 1);
+
+    const response = await api(server.instance, "POST", "/search", { body: { query: huge } });
+
+    expect(response.status).toBe(400);
+    expect(errorName(response.body)).toBe("InputTooLongError");
+    expect((response.body as { error: { message: string } }).error.message).toContain("縮短");
   });
 });
 
