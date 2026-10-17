@@ -56,24 +56,37 @@ export class ModelLoadError extends Error {
 }
 
 /**
- * 輸入本身無法處理（圖片解不開、格式不支援、通道數不符…）。
+ * 輸入本身無法處理（圖片解不開、格式不支援、通道數不符、單筆輸入過長…）。
  *
  * 這一類錯誤**與執行裝置無關**：換 CPU 或重試同一份位元組結果一樣，因此呼叫端應該
  * 跳過這個檔案，而不是退回裝置或重試。屬「輸入類」而非「裝置／模型類」失敗。
  *
  * 與 `@mnemoshelf/core` 的跨套件契約（core 不得 import 本套件）：本錯誤以**穩定錯誤碼**
- * `code:"undecodable"` 標記（同名於 core 的 `SkipReason`）。core 的
+ * 標記，預設 `code:"undecodable"`（同名於 core 的 `SkipReason`）。core 的
  * `isMediaDecodeError` 以這個碼為主要判準，不必解析訊息文字——訊息措辭會隨 sharp／
  * transformers.js 版本變動。其他 embedder 實作只要照樣帶這個 `code`（或沿用已知的
  * 訊息措辭）即可被 core 認成同一類。
+ *
+ * `code` 可覆寫，用來區分**同一類但不同原因**的輸入失敗：
+ *
+ * - `"undecodable"`（預設）：位元組永遠解不開（格式不支援、標頭損毀、0 byte…）。
+ * - `"input-too-long"`：單筆輸入的實際 token 數超過 `MAX_INPUT_TOKENS`
+ *   （見 `embedder.ts`）。同樣是「重試無用」的輸入類失敗，但原因不同，值得用不同的碼
+ *   區分（診斷與測試都比對得到）。core 目前以錯誤**名稱**歸類（名稱仍是
+ *   `EmbedderInputError`），因此這個碼不會被當成別的失敗類別，也不會被當成裝置失敗。
  */
 export class EmbedderInputError extends Error {
-  /** 穩定錯誤碼：讓 core 以結構化標記辨識「解不開」，不依賴訊息文字。 */
-  readonly code = "undecodable";
+  /**
+   * 穩定錯誤碼：讓 core 以結構化標記辨識「輸入壞掉」，不依賴訊息文字。
+   *
+   * 預設 `"undecodable"`（解不開）；建構子可覆寫成其他輸入類原因的碼。
+   */
+  readonly code: string;
 
-  constructor(message: string, options?: { cause?: unknown }) {
+  constructor(message: string, options?: { cause?: unknown; code?: string }) {
     super(message, options?.cause !== undefined ? { cause: options.cause } : undefined);
     this.name = "EmbedderInputError";
+    this.code = options?.code ?? "undecodable";
   }
 }
 

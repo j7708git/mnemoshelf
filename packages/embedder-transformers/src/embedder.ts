@@ -27,7 +27,16 @@
  *     chunk 以 2 的冪次往上翻，一次超過 1 GiB 的請求因而變成 ≥2 GiB 的單一配置；這個大小
  *     在 Chromium／Electron 內會被 PartitionAlloc **直接終止行程**（整個 app 閃退）。
  *     關掉即整條路移除，並大幅降低 RSS（代價：同工作負載約 +5% 時間，實測在噪聲範圍內）。
+ *   - `enableMemPattern: false`：關閉 ORT 的 memory pattern。arena 關掉之後，**聚合的
+ *     pattern 大區塊**成了同一條死路的殘餘配置點：pattern 命中時 ORT 於 `ExecutionFrame`
+ *     建構子一次配置「整個 graph 中間張量的峰值總和」，實測該值隨單塊長度成長，8k token
+ *     的窗可到 2.28 GiB（> PartitionAlloc 的單一配置上限 2 GiB − 2 MiB）。
+ *     關掉後配置退回個別 tensor，護欄內最大單一 tensor 實測 ≈ `T×49,152 B`。
  *   - 選填 `logSeverityLevel`（環境變數 `MNEMOSHELF_EMBED_ORT_LOG`，診斷用，預設不開）。
+ *   - 文字與視覺 session **共用同一組 options**：transformers.js 對每個 session
+ *     （`model`／`vision_encoder`）各複製一份 `session_options`（`constructSessions` 逐一
+ *     呼叫 `getSession`，每次都 `{ ...options.session_options }`），因此寫在一處即涵蓋兩者。
+ *   - **單筆輸入的硬上限**（`MAX_INPUT_TOKENS`）：token 數超過模型上下文就拒絕，不送進模型。
  *
  * 文字 prefix：查詢 `task: search result | query: {q}`；文件 `title: {title} | text: {content}`
  * （無標題用 `title: none`）。**圖片不加 prefix**。
@@ -116,6 +125,29 @@ export const DEFAULT_MAX_SOFT_TOKENS = 70;
  * 另外，一窗的 token 總量若超過 `BATCH_TOKEN_BUDGET`，視窗會再自動縮小。
  */
 export const MAX_BATCH_SIZE = CPU_BATCH_SIZE;
+
+/**
+ * 單筆輸入的 **token 數硬上限**（＝8192，等同模型的上下文長度）。
+ *
+ * 為什麼需要這條上限：一窗的 token 預算（`BATCH_TOKEN_BUDGET`）**只能在視窗內有多筆時**
+ * 靠縮窗降下來；`embedDocuments` 的單筆視窗（`window.length === 1`）與單筆文字入口
+ * （`embedQuery`／`embedDocument`，記憶寫入也走這條）先前**完全沒有上限**——一個超長輸入
+ * 就是護欄的破口（見 `docs/embedder-contract.md`）。
+ *
+ * 為什麼取 8192：
+ * - **不窄化任何原本合法的輸入**：8192 正是契約載明的模型上下文；超過的輸入本來就處理不了
+ *   （會被 tokenizer 截斷或讓推論形狀失控）。正常切塊（512 估算 token ⇒ 約 ≤2048 真實
+ *   token）不可能觸及，這是安全網而非常態路徑。
+ * - **pattern 關閉後最壞的單筆配置仍有界**：注意力類 `[1,4,8192,8192]` fp32 ≈ 1.07 GB、
+ *   per-token 類 ≈ `T×49,152 B`（T=8192）≈ 0.41 GB，**確定性**地低於 Chromium
+ *   PartitionAlloc 的單一配置上限 `2 GiB − 2 MiB` = 2,145,386,496 B（越過即
+ *   `PA_IMMEDIATE_CRASH`，整個 app 死）。
+ *
+ * 超過時的語意：拋 `EmbedderInputError`（穩定錯誤碼 `code:"input-too-long"`）——輸入類失敗，
+ * 與執行裝置無關、重試無用。core 以錯誤**名稱**把這類錯誤歸成「可跳過的輸入類失敗」，
+ * 索引路徑不會因這一筆而中斷整輪（見 `docs/embedder-contract.md` 的兩節）。
+ */
+export const MAX_INPUT_TOKENS = 8192;
 
 /** 本套件允許的 dtype（官方模型卡有 fp16，但契約明示不可用 fp16）。 */
 export const SUPPORTED_DTYPES = ["fp32", "q8", "q4", "q4f16"] as const;
@@ -366,6 +398,24 @@ function promptTokens(processed: Record<string, unknown>): number | null {
 }
 
 /**
+ * 單筆輸入的硬上限檢查（`MAX_INPUT_TOKENS`；量法沿用 `promptTokens` 的**實際** token 數）。
+ *
+ * 呼叫端必須保證「這一窗就是一筆」：
+ * - `embedDocuments` 在 `window.length === 1` 時呼叫（那時 `tokens` 恰為該筆的 token 數）。
+ * - `embedText`（`embedQuery`／`embedDocument`／記憶寫入）以單筆送入時呼叫。
+ *
+ * 形狀取不到（`promptTokens` 回 `null`）時不判定：寧可放行也不要對畸形輸出誤判，
+ * 這種情況另有「模型輸出形狀不符」的檢查擋著。
+ */
+function assertWithinInputLimit(tokens: number | null): void {
+  if (tokens === null || tokens <= MAX_INPUT_TOKENS) return;
+  throw new EmbedderInputError(
+    `單筆輸入 ${tokens} token 超過上限 ${MAX_INPUT_TOKENS}（MAX_INPUT_TOKENS）`,
+    { code: "input-too-long" },
+  );
+}
+
+/**
  * 多模態 embedder（真實模型）。
  *
  * lazy 載入：建構子不載模型；第一次 `embed*`／`probe()` 才載。`info` 不依賴模型，建構後即可同步讀取。
@@ -536,6 +586,11 @@ export class TransformersEmbedder implements Embedder {
    *   顯示這一窗的 token 總量超過預算時，會**縮小視窗重試**（依超出比例按比例縮減、
    *   至少減 1 筆，直到單筆為止）。這一層保護的是「一窗的總量」；單一輸入的長度由切塊端的
    *   `CHUNK_MAX_TOKENS` 控制，這裡**不切分單一輸入**（輸出必須與輸入一一對應）。
+   * - **單筆輸入另有硬上限**（`MAX_INPUT_TOKENS`）：縮到單筆（`window.length === 1`）時
+   *   這一窗就是那一筆，token 數仍超過上限即拋 `EmbedderInputError`
+   *   （`code:"input-too-long"`），**不送進模型**。這是「預算只在多筆時生效」的破口補丁
+   *   （見 `MAX_INPUT_TOKENS` 的理由）；超限的那一筆在索引路徑上屬輸入類失敗，
+   *   不會讓整輪失敗。
    * - **視窗在每次嘗試時才切**：若某個視窗在 `dml` 上失敗而退回 CPU，該位置會以 CPU 的
    *   視窗大小（16）**重新切窗**再重試，後續視窗也用 CPU 大小。
    * - 任一視窗失敗（模型輸出形狀不符、取消）即整批拋錯，不回傳部分結果；若失敗發生在
@@ -560,10 +615,14 @@ export class TransformersEmbedder implements Embedder {
           const window = inputs.slice(windowStart, windowStart + windowSize);
           const prefixed = window.map((input) => this.documentPrefix(input.text, input.title));
           const processed = await processor(prefixed);
-          // token 預算護欄：超過即以「按比例縮小」重試（至少減 1 筆，保證收斂）。
-          // 單筆仍超預算時無處可退：輸出必須與輸入一一對應，這裡不切分單一輸入
-          // （單塊長度由切塊端的 CHUNK_MAX_TOKENS 控制），照常送給模型。
+          // token 護欄（兩層，順序有意義）：
+          // 1. 單筆硬上限：`window.length === 1` 時這一窗就是那一筆，`tokens` 即該筆的
+          //    實際 token 數；超過 `MAX_INPUT_TOKENS` 即拒絕、**不送進模型**。
+          //    （舊版在這個分支「照常送給模型」——那正是單筆輸入無上限的破口。）
+          // 2. 一窗總量預算：多筆時超過 `BATCH_TOKEN_BUDGET` 就以「按比例縮小」重試
+          //    （至少減 1 筆，收斂到單筆後由第 1 層接手）。
           const tokens = promptTokens(processed);
+          if (window.length === 1) assertWithinInputLimit(tokens);
           if (tokens !== null && tokens > BATCH_TOKEN_BUDGET && window.length > 1) {
             const scaled = Math.floor((BATCH_TOKEN_BUDGET * window.length) / tokens);
             windowSize = Math.max(1, Math.min(window.length - 1, scaled));
@@ -650,6 +709,9 @@ export class TransformersEmbedder implements Embedder {
   private async embedText(prefixed: string): Promise<Float32Array> {
     const rows = await this.runWithFallback(async ({ processor, model }) => {
       const inputs = await processor([prefixed]);
+      // 單筆文字入口（查詢、記憶寫入與探測都走這裡）受同一條硬上限約束：這裡的
+      // `promptTokens` 就是這一筆的實際 token 數（batch 1，沒有 padding）。
+      assertWithinInputLimit(promptTokens(inputs));
       return await runModel(this.modelId, model, inputs);
     }, undefined);
     return this.toVector(rows);
@@ -965,6 +1027,11 @@ export class TransformersEmbedder implements Embedder {
   /**
    * 建立指定裝置的模型 session；DML 另外指定 EP 與 adapter（沿用 `spikes/dml-bench` 的作法）。
    *
+   * **這個 options 物件同時涵蓋文字與視覺兩個 session**：`AutoModel.from_pretrained` 內部由
+   * transformers.js 的 `constructSessions` 對每個 session 名稱各複製一份
+   * （`getSession` 做 `{ ...options.session_options }`），因此寫在一處即兩個 session 都吃到
+   * （測試以 mock 記錄 `from_pretrained` 的參數釘住這一點）。
+   *
    * `session_options.enableCpuMemArena = false`（**所有平台、兩個裝置路徑都帶**）：
    * ORT 的 CPU arena 在擴張時會把 chunk 翻倍（`BFCArena::Extend` 的 `while … *= 2`），
    * 當單一配置請求超過 1 GiB 時會直接翻成 2 GiB 的單一配置；這個大小的配置在
@@ -972,8 +1039,19 @@ export class TransformersEmbedder implements Embedder {
    * 關掉 arena 等於整條路移除，並附帶大幅降低 RSS（同工作負載實測 4.8 GB → 0.7 GB），
    * 代價是同工作負載的執行時間約 +5%。
    *
+   * `session_options.enableMemPattern = false`（同樣全平台、所有裝置路徑）：
+   * arena 關掉後，**聚合的 pattern 大區塊**是同一族死路的殘餘配置點。ORT 的 memory pattern
+   * 會在該輸入形狀已有快取 pattern 時，於 `ExecutionFrame` 建構子**一次**配置
+   * 「整個 graph 中間張量的峰值總和」（`alloc->Alloc(peak_size)`）；arena 關閉後沒有冪次
+   * 加倍，**請求值就是 peak 值本身**。實測這個聚合值隨「單塊長度」成長（8k token 的窗：
+   * `16×522` 1.60 GiB、`5×1529` 1.97 GiB、`4×1985` **2.28 GiB**），越過 PartitionAlloc 的
+   * 單一配置上限（`MaxAllocationSize()` = 2 GiB − 2 MiB = 2,145,386,496 B）即
+   * `PartitionExcessiveAllocationSize` → `PA_IMMEDIATE_CRASH`（`brk #0`）→ 整個 app 閃退。
+   * 關掉 pattern 後配置退回個別 tensor，在護欄（`BATCH_TOKEN_BUDGET`／`MAX_INPUT_TOKENS`）
+   * 內最大單一 tensor 實測 ≈ `T×49,152 B`（T=8192 ⇒ 約 0.41 GB），遠離上限。
+   *
    * 為什麼全平台而不是只有 darwin：
-   * 1. 這條路徑是「arena 擴張 × 底層配置器上限」的組合問題，與平台無關；PA 在
+   * 1. 這兩條路徑都是「ORT 配置策略 × 底層配置器上限」的組合問題，與平台無關；PA 在
    *    Chromium 的 Linux 版同樣啟用，本專案沒有實測證據說 Linux 免疫。
    * 2. 兩個裝置（cpu／dml）共用同一組 options，避免「其中一條路徑忘了帶」這種
    *    最難查的落差（本 bug 原本就只加在 dml 分支）。
@@ -1002,8 +1080,10 @@ export class TransformersEmbedder implements Embedder {
         device,
         dtype: this.dtype,
         session_options: {
-          // 見上方說明：所有平台、所有裝置路徑都關閉 CPU arena。
+          // 見上方說明：所有平台、所有裝置路徑、文字與視覺兩個 session 都關閉
+          // CPU arena 與 memory pattern（單一配置不得逼近 2 GiB）。
           enableCpuMemArena: false,
+          enableMemPattern: false,
           ...(device === "dml"
             ? { executionProviders: [{ name: "dml", deviceId: this.dmlDeviceId }] }
             : {}),

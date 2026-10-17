@@ -22,3 +22,7 @@ out/
 *.db-wal
 *.db-shm
 models/
+
+# 實機崩潰報告與診斷檔（使用者從 Mac／Windows 上傳的證據，一律不進版控）
+*.ips
+mac_report/

@@ -14,6 +14,13 @@
  * 的「下載後驗證」階段就可能踩到與索引時同一個崩潰；而且兩個時期的 options 不一致
  * 會讓之後的診斷更難（同一顆地雷時有時無）。
  *
+ * `session_options.enableMemPattern = false` 同理，而且是**同一族死路的殘餘配置點**：
+ * arena 關掉之後，ORT 的 memory pattern 仍會在 `ExecutionFrame` 建構子**一次**配置
+ * 「整個 graph 中間張量的峰值總和」；該聚合值隨單塊長度成長，8k token 的窗實測可到
+ * 2.28 GiB，越過 PartitionAlloc 的單一配置上限（2 GiB − 2 MiB）即整個 app 閃退。
+ * 兩個開關都必須與 embedder 的 `createBackend()` 一模一樣。
+ * （`AutoModel.from_pretrained` 會把同一組 options 複製給每個 session——文字與視覺都吃到。）
+ *
  * 為什麼不在 embedder 上加進度回呼：本卡的允許修改範圍不含 `packages/embedder-transformers`
  * （那是既有套件），因此進度整合放在桌面殼這一側。
  */
@@ -42,7 +49,10 @@ interface DisposableModel {
  * 這個模組目前只有一個建立點，之後若多出第二個（例如分開啟用視覺編碼器），
  * 沿用同一個常數即可，不會再出現「其中一條路徑忘了帶」的落差。
  */
-export const MODEL_SESSION_OPTIONS = { enableCpuMemArena: false } as const;
+export const MODEL_SESSION_OPTIONS = {
+  enableCpuMemArena: false,
+  enableMemPattern: false,
+} as const;
 
 /**
  * 抓齊模型檔案。**不**回傳模型：載入一次只為了把檔案抓下來，之後立刻釋放，

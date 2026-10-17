@@ -2,10 +2,10 @@
  * `downloadModelFiles()` 的 session options 驗證（以 mock 取代 `@huggingface/transformers`）。
  *
  * 這裡建的 session 會**真的跑一次推論**（下載後驗證模型可用），因此它與 embedder 的
- * `createBackend()` 必須帶同一組 ONNX Runtime options——尤其是
- * `enableCpuMemArena: false`：ORT 的 CPU arena 擴張會產生 ≥2 GiB 的單一配置，
- * 在 Electron 內會被 Chromium 的 PartitionAlloc 直接終止行程（整個 app 閃退）。
- * 少了它，全新安裝在 macOS 的「下載後驗證」階段就會踩到與索引時同一顆地雷。
+ * `createBackend()` 必須帶同一組 ONNX Runtime options——尤其是 `enableCpuMemArena: false`
+ * 與 `enableMemPattern: false`：兩者都會讓單一配置逼近或越過 ≥2 GiB，在 Electron 內會被
+ * Chromium 的 PartitionAlloc 直接終止行程（整個 app 閃退）。少了它們，全新安裝在 macOS
+ * 的「下載後驗證」階段就會踩到與索引時同一顆地雷。
  *
  * 測試不連網、不載入模型：只驗證傳給 `from_pretrained()` 的參數與收尾的 dispose。
  */
@@ -72,7 +72,7 @@ vi.mock("@huggingface/transformers", () => ({
 }));
 
 describe("downloadModelFiles（下載後的驗證 session）", () => {
-  it("建立 session 時帶 enableCpuMemArena:false，與 embedder 的 options 一致", async () => {
+  it("建立 session 時帶 enableCpuMemArena:false 與 enableMemPattern:false，與 embedder 的 options 一致", async () => {
     await downloadModelFiles({
       profile: MODEL_PROFILE,
       modelDir: "cache-dir",
@@ -85,8 +85,8 @@ describe("downloadModelFiles（下載後的驗證 session）", () => {
     expect(options.device).toBe("cpu");
     expect(options.dtype).toEqual(MODEL_PROFILE.dtype);
     // 精確比對：少了開關（或多了未預期的欄位）都要失敗。
-    expect(options.session_options).toEqual({ enableCpuMemArena: false });
-    expect(MODEL_SESSION_OPTIONS).toEqual({ enableCpuMemArena: false });
+    expect(options.session_options).toEqual({ enableCpuMemArena: false, enableMemPattern: false });
+    expect(MODEL_SESSION_OPTIONS).toEqual({ enableCpuMemArena: false, enableMemPattern: false });
     // 進度回呼仍照原樣轉送。
     expect(state.progressEvents).toBe(1);
   });
@@ -111,7 +111,7 @@ describe("downloadModelFiles（下載後的驗證 session）", () => {
     state.mutateSessionOptions = true;
     try {
       await downloadModelFiles({ profile: MODEL_PROFILE, modelDir: "cache-dir", onProgress: () => {} });
-      expect(MODEL_SESSION_OPTIONS).toEqual({ enableCpuMemArena: false });
+      expect(MODEL_SESSION_OPTIONS).toEqual({ enableCpuMemArena: false, enableMemPattern: false });
     } finally {
       state.mutateSessionOptions = false;
     }

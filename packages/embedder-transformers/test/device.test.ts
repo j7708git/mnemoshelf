@@ -506,8 +506,10 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
     expect(mocks.modelOptions).toHaveLength(1);
     expect(mocks.modelOptions[0]!.device).toBe("dml");
     expect(mocks.modelOptions[0]!.session_options).toEqual({
-      // 所有裝置路徑都關閉 CPU arena（單一配置不得逼近 2 GiB；見 createBackend 的說明）。
+      // 所有裝置路徑都關閉 CPU arena 與 memory pattern（單一配置不得逼近 2 GiB；
+      // 見 createBackend 的說明）。
       enableCpuMemArena: false,
+      enableMemPattern: false,
       executionProviders: [{ name: "dml", deviceId: 0 }],
     });
 
@@ -593,8 +595,12 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
     await embedder.embedDocuments(documents(2));
     expect(mocks.modelOptions).toHaveLength(1);
     expect(mocks.modelOptions[0]!.device).toBe("cpu");
-    // CPU 路徑也帶 CPU arena 開關（不再是 undefined：那正是原本只加在 dml 分支的落差）。
-    expect(mocks.modelOptions[0]!.session_options).toEqual({ enableCpuMemArena: false });
+    // CPU 路徑也帶 CPU arena 與 memory pattern 開關（不再是 undefined：那正是原本只加在
+    // dml 分支的落差；pattern 則是 arena 關閉後同一族死路的殘餘配置點）。
+    expect(mocks.modelOptions[0]!.session_options).toEqual({
+      enableCpuMemArena: false,
+      enableMemPattern: false,
+    });
     expect(embedder.runtimeStatus.serializedInference).toBe(false);
 
     await embedder.dispose();
@@ -669,6 +675,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
     expect(mocks.modelOptions[0]!.device).toBe("dml");
     expect(mocks.modelOptions[0]!.session_options).toEqual({
       enableCpuMemArena: false,
+      enableMemPattern: false,
       executionProviders: [{ name: "dml", deviceId: 1 }],
     });
     expect(embedder.runtimeStatus.dmlDeviceId).toBe(1);
@@ -681,8 +688,10 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
     await embedder.embedDocuments(documents(1));
     expect(embedder.runtimeStatus.dmlDeviceId).toBe(DEFAULT_DML_DEVICE_ID);
     expect(mocks.modelOptions[0]!.session_options).toEqual({
-      // 所有裝置路徑都關閉 CPU arena（單一配置不得逼近 2 GiB；見 createBackend 的說明）。
+      // 所有裝置路徑都關閉 CPU arena 與 memory pattern（單一配置不得逼近 2 GiB；
+      // 見 createBackend 的說明）。
       enableCpuMemArena: false,
+      enableMemPattern: false,
       executionProviders: [{ name: "dml", deviceId: 0 }],
     });
     await embedder.dispose();
@@ -985,6 +994,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
     expect(mocks.modelOptions.map((options) => options.device)).toEqual(["cpu", "coreml"]);
     expect(mocks.modelOptions[1]!.session_options).toEqual({
       enableCpuMemArena: false,
+      enableMemPattern: false,
       executionProviders: [{ name: "coreml", coreMlFlags: COREML_MLPROGRAM_FLAG }],
     });
 
@@ -1418,6 +1428,7 @@ describe("非 macOS／非 Windows 平台：不碰 CoreML，也不碰裝置決定
     expect(mocks.modelOptions.map((options) => options.device)).toEqual(["dml"]);
     expect(mocks.modelOptions[0]!.session_options).toEqual({
       enableCpuMemArena: false,
+      enableMemPattern: false,
       executionProviders: [{ name: "dml", deviceId: DEFAULT_DML_DEVICE_ID }],
     });
     expect(readdirSync(dir)).toEqual([]);

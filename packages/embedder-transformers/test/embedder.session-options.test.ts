@@ -1,9 +1,9 @@
 /**
  * Session options 的驗證（以 mock 取代 `@huggingface/transformers`，不載入模型、不連網）：
  *
- * 1. CPU 與 DirectML **兩條路徑**建立 session 時都帶 `enableCpuMemArena: false`
- *    （關閉 ORT 的 CPU arena：arena 擴張會產生 2 GiB 的單一配置，在 Electron 內會被
- *    Chromium 的 PartitionAlloc 直接終止行程）。
+ * 1. CPU 與 DirectML **兩條路徑**建立 session 時都帶 `enableCpuMemArena: false` 與
+ *    `enableMemPattern: false`（關閉 ORT 的 CPU arena 與 memory pattern：兩者都會產生
+ *    ≥2 GiB 的單一配置，在 Electron 內會被 Chromium 的 PartitionAlloc 直接終止行程）。
  * 2. DML 路徑另外帶 `executionProviders`（含 adapter 索引）。
  * 3. 診斷用的 `logSeverityLevel` 只在環境變數明確設定時才帶。
  * 4. 這一窗的 token 預算（`BATCH_TOKEN_BUDGET`）超過時會縮小視窗。
@@ -89,14 +89,18 @@ afterEach(() => {
 });
 
 describe("session options（CPU 路徑）", () => {
-  it("建立 session 時帶 enableCpuMemArena:false，且沒有 executionProviders", async () => {
+  it("建立 session 時帶 enableCpuMemArena:false 與 enableMemPattern:false，且沒有 executionProviders", async () => {
     const embedder = new TransformersEmbedder({ platform: "linux", cacheDir: "unused" });
     await embedder.embedQuery("測試");
 
     expect(state.modelOptions).toHaveLength(1);
     const options = state.modelOptions[0]!;
     expect(options.device).toBe("cpu");
-    expect(options.session_options).toMatchObject({ enableCpuMemArena: false });
+    // 精確比對（不是 toMatchObject）：兩個關閉配置都要在，且不得多出未預期的欄位。
+    expect(options.session_options).toEqual({
+      enableCpuMemArena: false,
+      enableMemPattern: false,
+    });
     expect(options.session_options).not.toHaveProperty("executionProviders");
     // 診斷用的 log 等級預設不覆寫（由 transformers.js 依 env.logLevel 決定）。
     expect(options.session_options).not.toHaveProperty("logSeverityLevel");
@@ -104,7 +108,7 @@ describe("session options（CPU 路徑）", () => {
 });
 
 describe("session options（DirectML 路徑）", () => {
-  it("建立 session 時同樣帶 enableCpuMemArena:false，並保留 DML 的 executionProviders", async () => {
+  it("建立 session 時同樣帶兩個開關，並保留 DML 的 executionProviders", async () => {
     process.env.MNEMOSHELF_EMBED_DML_DEVICE_ID = "2";
     const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: "unused" });
     await embedder.embedQuery("測試");
@@ -113,23 +117,27 @@ describe("session options（DirectML 路徑）", () => {
     expect(state.modelOptions).toHaveLength(1);
     const options = state.modelOptions[0]!;
     expect(options.device).toBe("dml");
-    expect(options.session_options).toMatchObject({
+    expect(options.session_options).toEqual({
       enableCpuMemArena: false,
+      enableMemPattern: false,
       executionProviders: [{ name: "dml", deviceId: 2 }],
     });
   });
 
-  it("從 dml 退回 CPU 後，重新建立的 session 也帶同一個開關", async () => {
+  it("從 dml 退回 CPU 後，重新建立的 session 也帶同一組開關", async () => {
     state.failInferenceOnDml = true;
     const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: "unused" });
     await embedder.embedQuery("測試");
 
     expect(embedder.runtimeStatus.device).toBe("cpu");
     expect(embedder.runtimeStatus.fallbackReason?.code).toBe("inference-failed");
-    // 兩次載入（dml 與退回後的 cpu）都必須帶 enableCpuMemArena:false。
+    // 兩次載入（dml 與退回後的 cpu）都必須帶同一組關閉配置的開關。
     expect(state.modelOptions.map((option) => option.device)).toEqual(["dml", "cpu"]);
     for (const option of state.modelOptions) {
-      expect(option.session_options).toMatchObject({ enableCpuMemArena: false });
+      expect(option.session_options).toMatchObject({
+        enableCpuMemArena: false,
+        enableMemPattern: false,
+      });
     }
   });
 });
@@ -140,8 +148,9 @@ describe("ORT log 等級（診斷開關）", () => {
     const embedder = new TransformersEmbedder({ platform: "linux", cacheDir: "unused" });
     await embedder.embedQuery("測試");
 
-    expect(state.modelOptions[0]!.session_options).toMatchObject({
+    expect(state.modelOptions[0]!.session_options).toEqual({
       enableCpuMemArena: false,
+      enableMemPattern: false,
       logSeverityLevel: 0,
     });
   });

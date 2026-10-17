@@ -8,6 +8,7 @@ export {
   DEFAULT_MAX_SOFT_TOKENS,
   DEFAULT_MODEL_ID,
   MAX_BATCH_SIZE,
+  MAX_INPUT_TOKENS,
   SUPPORTED_DTYPES,
   TransformersEmbedder,
   defaultDeviceDecisionPath,
