@@ -8,6 +8,7 @@
  * | `MNEMOSHELF_MODEL_DIR` | 模型快取目錄（交給 embedder） | embedder 自己的預設（OS 使用者資料目錄） |
  * | `MNEMOSHELF_PORT` | 監聽埠 | `0`（隨機埠） |
  * | `MNEMOSHELF_WEB_DIR` | Web UI 靜態檔目錄 | 本 repo 的 `packages/web/dist` |
+ * | `MNEMOSHELF_MEMORY_BACKFILL` | 啟動時是否回填既有記憶向量（`on`／`off`） | `on` |
  *
  * MCP stdio 入口（`loadMcpConfig`）另有自己的三個變數：`MNEMOSHELF_URL`、`MNEMOSHELF_TOKEN`
  * （皆必填）與 `MNEMOSHELF_PROJECT`（選配的預設專案名稱；供 `remember` 在工具參數沒帶
@@ -45,6 +46,13 @@ export interface ServerConfig {
   port: number;
   /** Web UI 靜態檔目錄（已解析為絕對路徑；不存在時 API 仍正常，靜態路徑回 404）。 */
   webDir: string;
+  /**
+   * 啟動時是否回填既有記憶向量（`MNEMOSHELF_MEMORY_BACKFILL=on|off`，預設 `on`）。
+   *
+   * `off` 只停**啟動回填**：新寫入的記憶仍會在建立後 enqueue 嵌入；既有 pending／failed／stale
+   * 資料留到下一次以 `on` 啟動時才回填。
+   */
+  memoryBackfill: boolean;
 }
 
 /**
@@ -98,7 +106,18 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
   const webDir =
     webDirSetting !== undefined && webDirSetting.trim() !== "" ? path.resolve(webDirSetting) : defaultWebDir();
 
-  return { dataDir, dbPath: path.join(dataDir, "mnemoshelf.db"), token, modelDir, port, webDir };
+  // 啟動回填 opt-out（預設 on）。只接受 on／off（大小寫不拘）；其他值直接拒絕啟動。
+  const backfillSetting = env.MNEMOSHELF_MEMORY_BACKFILL;
+  let memoryBackfill = true;
+  if (backfillSetting !== undefined && backfillSetting.trim() !== "") {
+    const normalized = backfillSetting.trim().toLowerCase();
+    if (normalized !== "on" && normalized !== "off") {
+      throw new ValidationError("MNEMOSHELF_MEMORY_BACKFILL", "必須是 on 或 off");
+    }
+    memoryBackfill = normalized === "on";
+  }
+
+  return { dataDir, dbPath: path.join(dataDir, "mnemoshelf.db"), token, modelDir, port, webDir, memoryBackfill };
 }
 
 /** MCP stdio 入口的連線設定（`MNEMOSHELF_URL` + `MNEMOSHELF_TOKEN`）。 */

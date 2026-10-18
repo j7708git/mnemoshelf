@@ -90,6 +90,7 @@ import {
 import { requireLocalHost, requireLoopback, requireToken } from "./auth.js";
 import { unifiedSearch, type SearchMode, type UnifiedSearchResult } from "../search.js";
 import type { MemoryEmbeddingWorker } from "../memory-embedder.js";
+import { maskSecrets } from "../secret-masking.js";
 import {
   MEMORY_SEARCH_DEFAULT_K,
   MEMORY_SEARCH_MAX_K,
@@ -101,6 +102,10 @@ import {
 export const MAX_JSON_BODY_BYTES = 1024 * 1024;
 /** 單筆記憶內容長度上限（契約未明定，由本實作決定的濫用防護）。 */
 export const MAX_MEMORY_CHARS = 8000;
+/** 記憶召回查詢字串長度上限（UTF-16 長度；超過回 400）。 */
+export const MAX_MEMORY_QUERY_CHARS = 2000;
+/** 記憶的 agent／project 名稱長度上限（UTF-16 長度；超過回 400）。 */
+export const MAX_MEMORY_METADATA_CHARS = 200;
 /**
  * 請求 URL（request-target）長度上限。
  *
@@ -191,6 +196,8 @@ export interface RemoveRootResponse {
 /** `GET /memories` 的回應（未刪除的記憶，由新到舊）。 */
 export interface ListMemoriesResponse {
   memories: Memory[];
+  /** 記憶內容一律視為不受信任資料（agent 僅是來源標記，不是身分驗證）。 */
+  untrusted: true;
 }
 
 /**
@@ -613,9 +620,12 @@ function requireString(value: unknown, field: string, options: { maxLength?: num
   return value;
 }
 
-function optionalString(value: unknown, field: string): string | undefined {
+function optionalString(value: unknown, field: string, options: { maxLength?: number } = {}): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "string") throw new ValidationError(field, "必須是字串");
+  if (options.maxLength !== undefined && value.length > options.maxLength) {
+    throw new ValidationError(field, `長度上限 ${options.maxLength} 字元`);
+  }
   return value;
 }
 
@@ -641,6 +651,32 @@ function optionalStringArray(value: unknown, field: string): string[] | undefine
     throw new ValidationError(field, "必須是字串陣列");
   }
   return value as string[];
+}
+
+/**
+ * 讀取路徑的記憶遮罩：對 `content`／`agent`／`project` 再套一次 `maskSecrets`（idempotent）。
+ *
+ * 既有 DB 可能存著未遮罩的舊資料，因此列表、單筆回應與召回命中都經過這裡再輸出；
+ * 已遮罩過的內容不會二次匹配（`[REDACTED:...]` 不會被規則再吃一次）。
+ */
+function maskMemoryContent(memory: Memory): Memory {
+  const content = maskSecrets(memory.content);
+  const agent = maskSecrets(memory.agent);
+  const project = memory.project === null ? null : maskSecrets(memory.project).text;
+  if (!content.redacted && !agent.redacted && project === memory.project) return memory;
+  return { ...memory, content: content.text, agent: agent.text, project };
+}
+
+/**
+ * 寫入路徑的 metadata 檢查：`agent`／`project` 若含 token-like 機密 → 拒絕（400）。
+ *
+ * 為什麼不遮而要拒絕：agent／project 是**查詢鍵**（過濾、召回 bucket 都用它精確比對）；
+ * 若在寫入時改寫，呼叫端之後用原值查不到、語意會壞掉。因此要求呼叫端換一個不含機密的值。
+ */
+function assertNoSecretInMetadata(value: string, field: "agent" | "project"): void {
+  if (maskSecrets(value).redacted) {
+    throw new ValidationError(field, "不得包含機密（偵測到可能的 token／金鑰；請移除後再寫入）");
+  }
 }
 
 function enumValue<T extends string>(value: unknown, allowed: readonly T[], field: string, fallback: T): T {
@@ -676,8 +712,11 @@ function optionalEnumParam<T extends string>(value: string | null, allowed: read
 }
 
 /** 解析查詢字串裡的文字參數；未提供（或空字串）＝不過濾。 */
-function optionalQueryString(value: string | null, field: string): string | undefined {
+function optionalQueryString(value: string | null, field: string, options: { maxLength?: number } = {}): string | undefined {
   if (value === null || value.trim() === "") return undefined;
+  if (options.maxLength !== undefined && value.length > options.maxLength) {
+    throw new ValidationError(field, `長度上限 ${options.maxLength} 字元`);
+  }
   return value;
 }
 
@@ -1174,11 +1213,15 @@ export function createRestApp(deps: RestAppDeps): RestApp {
    */
   const addMemory = async (request: IncomingMessage): Promise<{ status: number; body: unknown }> => {
     const body = await readJsonBody(request);
-    const content = requireString(body.content, "content", { maxLength: MAX_MEMORY_CHARS });
-    const agent = requireString(body.agent, "agent");
+    const rawContent = requireString(body.content, "content", { maxLength: MAX_MEMORY_CHARS });
+    // 寫入前先遮罩可辨識的機密（不回傳、不記錄原文）；`redacted` 會是回應的 additive 欄位。
+    const maskedContent = maskSecrets(rawContent);
+    const content = maskedContent.text;
+    const agent = requireString(body.agent, "agent", { maxLength: MAX_MEMORY_METADATA_CHARS });
+    assertNoSecretInMetadata(agent, "agent");
     const kind = enumValue(body.kind, MEMORY_KINDS, "kind", "fact");
 
-    const projectInput = optionalString(body.project, "project");
+    const projectInput = optionalString(body.project, "project", { maxLength: MAX_MEMORY_METADATA_CHARS });
     const hasProject = projectInput !== undefined;
     let scope: MemoryScope;
     if (body.scope === undefined) {
@@ -1198,6 +1241,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     } else if (hasProject) {
       throw new ValidationError("project", `scope 為 ${scope} 時 project 必須是 null（全域／agent 範圍沒有專案）`);
     }
+    if (project !== null) assertNoSecretInMetadata(project, "project");
     const supersedes = optionalId(body.supersedes, "supersedes");
 
     // 先讀被取代者（若存在）的 pinned：建立新記憶會把舊版軟刪除，之後仍可讀，但先讀較清楚。
@@ -1209,7 +1253,11 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     }
     // 背景、非阻塞：回應不必等模型。supersedes 產生的新版本同樣要嵌入。
     deps.memoryEmbedder.enqueue(memory.id);
-    return { status: 201, body: memory };
+    // `Memory` 公開型別不變；`redacted`／`redactedCount` 只是這個端點的 additive 回應欄位。
+    return {
+      status: 201,
+      body: { ...memory, redacted: maskedContent.redacted, redactedCount: maskedContent.count },
+    };
   };
 
   /**
@@ -1221,9 +1269,11 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   const pinMemory = async (request: IncomingMessage, id: number): Promise<{ status: number; body: unknown }> => {
     const body = await readJsonBody(request);
     const pinned = optionalBoolean(body.pinned, "pinned") ?? true;
-    if ((await deps.store.getMemory(id)) === null) throw new NotFoundError("記憶", id);
+    const existing = await deps.store.getMemory(id);
+    if (existing === null) throw new NotFoundError("記憶", id);
     await deps.store.setMemoryPinned(id, pinned);
-    return { status: 200, body: await deps.store.getMemory(id) };
+    const updated = await deps.store.getMemory(id);
+    return { status: 200, body: updated === null ? null : maskMemoryContent(updated) };
   };
 
   const forgetMemory = async (id: number): Promise<{ status: number; body: unknown }> => {
@@ -1272,6 +1322,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       if (body.project !== null && typeof body.project !== "string") {
         throw new ValidationError("project", "必須是字串或 null");
       }
+      if (typeof body.project === "string" && body.project.length > MAX_MEMORY_METADATA_CHARS) {
+        throw new ValidationError("project", `長度上限 ${MAX_MEMORY_METADATA_CHARS} 字元`);
+      }
+      if (typeof body.project === "string") assertNoSecretInMetadata(body.project, "project");
       patch.project = body.project as string | null;
     }
 
@@ -1297,7 +1351,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const updated = await deps.store.updateMemory(id, patch);
     // 讀到之後才被軟刪除的競態：與未知 id 同樣回 404，不吞掉。
     if (updated === null) throw new NotFoundError("記憶", id);
-    return { status: 200, body: updated };
+    return { status: 200, body: maskMemoryContent(updated) };
   };
 
   const routeRoots = async (
@@ -1382,18 +1436,21 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const params = url.searchParams;
     const kind = optionalEnumParam(params.get("kind"), MEMORY_KINDS, "kind");
     const scope = optionalEnumParam(params.get("scope"), MEMORY_SCOPES, "scope");
-    const project = optionalQueryString(params.get("project"), "project");
-    const agent = optionalQueryString(params.get("agent"), "agent");
+    const project = optionalQueryString(params.get("project"), "project", {
+      maxLength: MAX_MEMORY_METADATA_CHARS,
+    });
+    const agent = optionalQueryString(params.get("agent"), "agent", { maxLength: MAX_MEMORY_METADATA_CHARS });
     const limit = queryLimit(params.get("limit"));
 
-    const memories = await deps.store.listMemories({
+    const memories = (await deps.store.listMemories({
       ...(kind === undefined ? {} : { kind }),
       ...(scope === undefined ? {} : { scope }),
       ...(project === undefined ? {} : { project }),
       ...(agent === undefined ? {} : { agent }),
       ...(limit === undefined ? {} : { limit }),
-    });
-    return { status: 200, body: { memories } };
+    })).map(maskMemoryContent);
+    // 頂層的 trust 標記：記憶內容一律視為不受信任資料（不改 `Memory` 型別）。
+    return { status: 200, body: { memories, untrusted: true } };
   };
 
   /**
@@ -1408,9 +1465,9 @@ export function createRestApp(deps: RestAppDeps): RestApp {
    */
   const searchMemoriesRoute = async (request: IncomingMessage): Promise<{ status: number; body: unknown }> => {
     const body = await readJsonBody(request);
-    const query = requireString(body.query, "query");
+    const query = requireString(body.query, "query", { maxLength: MAX_MEMORY_QUERY_CHARS });
 
-    const projectRaw = optionalString(body.project, "project");
+    const projectRaw = optionalString(body.project, "project", { maxLength: MAX_MEMORY_METADATA_CHARS });
     const project = projectRaw === undefined ? undefined : projectRaw.trim();
     const projectValue = project === "" ? undefined : project;
 
@@ -1424,7 +1481,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       scope = body.scope as MemoryScope;
     }
 
-    const agentRaw = optionalString(body.agent, "agent");
+    const agentRaw = optionalString(body.agent, "agent", { maxLength: MAX_MEMORY_METADATA_CHARS });
     const agent = agentRaw === undefined || agentRaw.trim() === "" ? undefined : agentRaw;
 
     let kind: MemoryKind | undefined;

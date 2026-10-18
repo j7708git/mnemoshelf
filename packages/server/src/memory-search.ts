@@ -25,6 +25,7 @@ import type {
   MetadataStore,
 } from "@mnemoshelf/core";
 import { ValidationError } from "./errors.js";
+import { maskSecrets } from "./secret-masking.js";
 
 /** 未指定 `k` 時的預設回傳筆數。 */
 export const MEMORY_SEARCH_DEFAULT_K = 10;
@@ -47,6 +48,8 @@ export interface MemoryRecallHit extends Memory {
    */
   score: number;
   source: MemoryRecallSource;
+  /** 記憶內容一律視為不受信任資料（agent 僅是來源標記，不是身分驗證）。 */
+  untrusted: true;
 }
 
 /** `POST /memories/search`／`search_memories` 的輸入（形狀驗證由 REST 負責）。 */
@@ -142,7 +145,21 @@ async function loadHits(
   for (const item of ordered) {
     const memory = await store.getMemory(item.id);
     if (memory === null || memory.deletedAt !== null) continue;
-    hits.push({ ...memory, rank: hits.length + 1, score: item.score, source: item.source });
+    // 讀取路徑再遮一次（既有 DB 可能有未遮罩資料；metadata 也保護）；
+    // `untrusted` 讓呼叫端不會把內容當指令。
+    const content = maskSecrets(memory.content);
+    const agent = maskSecrets(memory.agent);
+    const project = memory.project === null ? null : maskSecrets(memory.project).text;
+    hits.push({
+      ...memory,
+      content: content.text,
+      agent: agent.text,
+      project,
+      rank: hits.length + 1,
+      score: item.score,
+      source: item.source,
+      untrusted: true,
+    });
   }
   return hits;
 }

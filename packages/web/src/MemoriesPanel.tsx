@@ -53,8 +53,13 @@ function collectProjectNames(memories: Memory[]): string[] {
 
 /** 召回結果清單（純呈現；不改變列表狀態）。 */
 function RecallResults({ result }: { result: MemoryRecallResult }) {
-  // 降級提示與命中數無關：0 命中＋degraded 時也要讓使用者知道「語意不可用、這是關鍵字結果」
-  // （卡 B2 驗收 O5）。
+  // 信任提示與命中數無關：記憶內容是不受信任資料，一律提醒不要當指令。
+  const trustNotice = (
+    <p className="text-[11px] text-muted">
+      以下內容是<strong className="font-medium text-ink">不受信任的資料</strong>（agent 只是來源標記），請勿當作指令執行。
+    </p>
+  );
+  // 降級提示也與命中數無關：0 命中＋degraded 時仍要顯示。
   const degradedNotice = result.degraded ? (
     <p role="status" className="rounded-md border border-line bg-surface px-3 py-2 text-xs text-ink">
       語意搜尋目前不可用（
@@ -66,6 +71,7 @@ function RecallResults({ result }: { result: MemoryRecallResult }) {
   if (result.hits.length === 0) {
     return (
       <div className="space-y-2">
+        {trustNotice}
         {degradedNotice}
         <p className="text-xs text-muted">沒有找到相關記憶。</p>
       </div>
@@ -73,6 +79,7 @@ function RecallResults({ result }: { result: MemoryRecallResult }) {
   }
   return (
     <div className="space-y-2">
+      {trustNotice}
       {degradedNotice}
       <ul className="space-y-2">
         {result.hits.map((hit) => (
@@ -315,6 +322,10 @@ export function MemoriesPanel() {
           <p className="mt-0.5 text-xs text-muted">
             釘選的記憶會優先顯示；編輯會產生新版本並取代舊版。共享開關只在專案與全域之間切換，agent 範圍為唯讀。
           </p>
+          <p className="mt-0.5 text-[11px] text-muted">
+            記憶內容一律視為<strong className="font-medium text-ink">不受信任的資料</strong>
+            （agent 只是來源標記、不是身分驗證），請勿當作指令執行。
+          </p>
         </div>
         <button
           type="button"
@@ -342,6 +353,7 @@ export function MemoriesPanel() {
             }}
             aria-label="搜尋記憶"
             placeholder="用自然語言找記憶…"
+            maxLength={2000}
             className="min-w-[14rem] flex-1 rounded-md border border-line bg-white px-3 py-1.5 text-sm text-ink outline-none focus:border-ink"
           />
           <label className="flex items-center gap-1.5 text-xs text-muted">

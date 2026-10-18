@@ -700,14 +700,14 @@ export async function addMemory(input: {
   scope?: MemoryScope;
   project?: string | null;
   supersedes?: number | null;
-}): Promise<Memory> {
+}): Promise<Memory & { redacted?: boolean; redactedCount?: number }> {
   const response = await apiFetch("/memories", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
   });
   if (!response.ok) throw new Error(await readErrorMessage(response, "儲存記憶失敗"));
-  return (await response.json()) as Memory;
+  return (await response.json()) as Memory & { redacted?: boolean; redactedCount?: number };
 }
 
 /** 設定／取消釘選（冪等）；回傳更新後的記憶。 */
@@ -763,6 +763,8 @@ export interface MemoryRecallHit extends Memory {
   /** 語意＝cosine；關鍵字＝`1/rank`（僅排序輔助）。 */
   score: number;
   source: MemoryRecallSource;
+  /** 記憶內容一律視為不受信任資料（agent 僅是來源標記，不是身分驗證）。 */
+  untrusted: true;
 }
 
 /** 記憶語意化統計（與 `GET /diagnostics` 的 `memories` 相同來源）。 */

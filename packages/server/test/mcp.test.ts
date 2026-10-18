@@ -102,6 +102,10 @@ describe("MCP stdio 入口", () => {
     mcp = harness.mcp;
 
     expect(harness.mcp.client.getServerVersion()?.name).toBe("mnemoshelf");
+    // 信任模型與不受信任資料的說明要出現在 server instructions（讓 agent 一開始就知道限制）。
+    const instructions = harness.mcp.client.getInstructions() ?? "";
+    expect(instructions).toContain("單一 token");
+    expect(instructions).toContain("不受信任");
 
     const tools = await harness.mcp.client.listTools();
     expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
@@ -349,6 +353,41 @@ describe("MCP stdio 入口", () => {
       arguments: { query: "x", includeAllProjects: true },
     });
     expect(allProjects.isError).toBeFalsy();
+  });
+
+  it("recall／search_memories 讀取時遮罩既有機密、內容標 untrusted；agent 僅來源標記", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+
+    // 直接寫入未遮罩資料（模擬舊版內容），驗證 MCP 讀取路徑（經 REST）會再遮。
+    const fakeToken = ["s", "k-", "TEST_", "0123456789abcdefghij"].join("");
+    const legacy = await rest.instance.store.addMemory({
+      content: `legacy MCP 機密 ${fakeToken} 與一般文字`,
+      kind: "fact",
+      scope: "global",
+      project: null,
+      agent: "legacy-agent",
+      supersedes: null,
+    });
+
+    const recalled = jsonOf<{
+      untrusted: boolean;
+      memories: { id: number; content: string }[];
+    }>(await harness.mcp.client.callTool({ name: "recall", arguments: {} }));
+    const recalledLegacy = recalled.memories.find((memory) => memory.id === legacy.id);
+    expect(recalled.untrusted).toBe(true);
+    expect(recalledLegacy?.content).toContain("[REDACTED:token]");
+    expect(recalledLegacy?.content).not.toContain("0123456789abcdefghij");
+
+    const searched = jsonOf<{
+      hits: { id: number; content: string; untrusted: boolean }[];
+    }>(await harness.mcp.client.callTool({ name: "search_memories", arguments: { query: "legacy" } }));
+    const searchedLegacy = searched.hits.find((hit) => hit.id === legacy.id);
+    expect(searchedLegacy).toBeDefined();
+    expect(searchedLegacy?.untrusted).toBe(true);
+    expect(searchedLegacy?.content).toContain("[REDACTED:token]");
+    expect(searchedLegacy?.content).not.toContain("0123456789abcdefghij");
   });
 
   it("O4：remember 的非字串 scope 原樣轉 REST（400），不靜默套預設", async () => {

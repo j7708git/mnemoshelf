@@ -42,7 +42,10 @@ export interface CreateServerOptions {
    * 記憶嵌入 worker 的調校（卡 B1；測試可把重試延遲設 0）。
    * `store`／`embedder` 由 `createServer` 自己注入，這裡只接受調校欄位。
    */
-  memoryEmbedding?: Pick<MemoryEmbeddingWorkerOptions, "batchSize" | "retryAttempts" | "retryDelayMs">;
+  memoryEmbedding?: Pick<
+    MemoryEmbeddingWorkerOptions,
+    "batchSize" | "retryAttempts" | "retryDelayMs" | "backfillOnStart"
+  >;
 }
 
 export interface MnemoshelfServer {
@@ -62,6 +65,29 @@ export interface MnemoshelfServer {
   app: RestApp;
   /** 關閉 HTTP、等背景工作結束、釋放 embedder 與資料庫。 */
   close(): Promise<void>;
+}
+
+/**
+ * 收緊資料目錄與 DB 檔的權限（POSIX：目錄 `700`、DB／WAL／SHM `600`）。
+ *
+ * **best-effort**：Windows 沒有 POSIX mode，直接略過；chmod 失敗只記錄、不中斷啟動
+ * （磁碟格式／權限模型差異可能讓 chmod 無效，但不該讓服務開不起來）。
+ */
+async function restrictDataPermissions(dataDir: string, dbPath: string): Promise<void> {
+  if (process.platform === "win32") return;
+  const chmod = async (target: string, mode: number, ignoreMissing: boolean): Promise<void> => {
+    try {
+      await fs.chmod(target, mode);
+    } catch (error) {
+      if (ignoreMissing && (error as { code?: unknown }).code === "ENOENT") return;
+      console.error("[mnemoshelf] 無法收緊資料權限：", error instanceof Error ? error.message : String(error));
+    }
+  };
+  await chmod(dataDir, 0o700, false);
+  await chmod(dbPath, 0o600, false);
+  // WAL／SHM 是 SQLite 依需要建立的附屬檔；不存在是正常情況。
+  await chmod(`${dbPath}-wal`, 0o600, true);
+  await chmod(`${dbPath}-shm`, 0o600, true);
 }
 
 /** 監聽指定的 loopback 埠。 */
@@ -99,6 +125,8 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
   const db: SqliteDatabase = openDatabase(config.dbPath);
   const store: MetadataStore = new SqliteMetadataStore(db);
   await store.migrate();
+  // 資料庫與其 WAL 檔可能含敏感記憶內容：建立後立刻收緊權限（best-effort、POSIX only）。
+  await restrictDataPermissions(config.dataDir, config.dbPath);
 
   const embedder: Embedder =
     options.embedder ??
@@ -115,6 +143,8 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     store,
     embedder,
     ...(options.memoryEmbedding ?? {}),
+    // 設定檔的 `MNEMOSHELF_MEMORY_BACKFILL` 決定啟動回填；測試可用 options 覆寫。
+    backfillOnStart: options.memoryEmbedding?.backfillOnStart ?? config.memoryBackfill,
   });
 
   const app = createRestApp({
@@ -213,6 +243,8 @@ export {
   maskHomePath,
   MAX_JSON_BODY_BYTES,
   MAX_MEMORY_CHARS,
+  MAX_MEMORY_METADATA_CHARS,
+  MAX_MEMORY_QUERY_CHARS,
   MAX_REQUEST_URL_LENGTH,
   parseRequestTarget,
   STATIC_CSP,
@@ -262,6 +294,8 @@ export type {
   UnifiedSearchResult,
 } from "./search.js";
 export { createMcpServer, MCP_TOOLS, resolveProjectName, runStdio, UNTRUSTED_DATA_WARNING } from "./mcp/stdio.js";
+export { containsRedacted, maskSecrets, REDACTED_PREFIX } from "./secret-masking.js";
+export type { MaskSecretsResult, SecretKind } from "./secret-masking.js";
 export type { McpServerOptions, ProjectResolution, ResolveProjectOptions } from "./mcp/stdio.js";
 export {
   buildMemorySearchBuckets,

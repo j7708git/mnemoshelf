@@ -44,6 +44,11 @@ export interface MemoryEmbeddingWorkerOptions {
   retryAttempts?: number;
   /** 重試之間的延遲毫秒；預設 200。測試可設 0。 */
   retryDelayMs?: number;
+  /**
+   * 啟動時是否回填既有記憶（預設 `true`）。`false` 只停**啟動回填**——`enqueue()` 進來的新寫入
+   * 仍會正常嵌入；既有 pending／failed／stale 留待下次以 `true` 啟動（`MNEMOSHELF_MEMORY_BACKFILL`）。
+   */
+  backfillOnStart?: boolean;
 }
 
 /** 回填預設每批筆數。 */
@@ -87,6 +92,7 @@ export class MemoryEmbeddingWorker {
   private readonly batchSize: number;
   private readonly retryAttempts: number;
   private readonly retryDelayMs: number;
+  private readonly backfillOnStart: boolean;
 
   /** FIFO 佇列（元素是記憶 id）。 */
   private readonly queue: number[] = [];
@@ -115,6 +121,7 @@ export class MemoryEmbeddingWorker {
     this.batchSize = positiveInteger(options.batchSize, MEMORY_EMBEDDING_DEFAULT_BATCH_SIZE);
     this.retryAttempts = nonNegativeInteger(options.retryAttempts, MEMORY_EMBEDDING_DEFAULT_RETRY_ATTEMPTS);
     this.retryDelayMs = nonNegativeInteger(options.retryDelayMs, MEMORY_EMBEDDING_DEFAULT_RETRY_DELAY_MS);
+    this.backfillOnStart = options.backfillOnStart !== false;
   }
 
   /** 啟動背景回填（非阻塞）。重複呼叫是 no-op；`close()` 之後不會再啟動。 */
@@ -165,7 +172,10 @@ export class MemoryEmbeddingWorker {
     await pending;
   }
 
-  /** 主迴圈：有工作就處理；佇列空了就補一批回填；沒得補就等 `enqueue()`／`close()`。 */
+  /**
+   * 主迴圈：有工作就處理；佇列空了就（在 `backfillOnStart` 時）補一批回填；沒得補就等
+   * `enqueue()`／`close()`。關閉啟動回填時，`POST /memories` 的 enqueue 仍照常被處理。
+   */
   private async loop(): Promise<void> {
     try {
       while (!this.closed) {
@@ -184,8 +194,8 @@ export class MemoryEmbeddingWorker {
           }
           continue;
         }
-        // 佇列空了：嘗試從 DB 補一批（新到舊）。補到就繼續處理，補不到就等待喚醒。
-        if (await this.enqueueBackfillBatch()) continue;
+        // 佇列空了：若啟用啟動回填，從 DB 補一批（新到舊）；否則只等 enqueue 的新工作。
+        if (this.backfillOnStart && (await this.enqueueBackfillBatch())) continue;
         // `enqueue()` 可能在回填查詢期間到達（當下 `wakeLoop` 還是 null，喚醒會是 no-op）：
         // 先再確認佇列，否則會帶著新工作去睡，直到下一次 enqueue／close 才醒（生產環境會卡住）。
         if (this.queue.length > 0) continue;

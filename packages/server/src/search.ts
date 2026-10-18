@@ -25,6 +25,7 @@ import {
   type VectorIndex,
 } from "@mnemoshelf/core";
 import { ValidationError } from "./errors.js";
+import { maskSecrets } from "./secret-masking.js";
 
 /** 支援的搜尋模式。 */
 export const SEARCH_MODES = ["keyword", "vector", "hybrid"] as const;
@@ -253,7 +254,11 @@ export async function unifiedSearch(
     if (memory === null || memory.deletedAt !== null) continue;
     const fusedHit = memoryRanks.get(memoryId);
     if (fusedHit === undefined) continue;
-    const text = snippet(memory.content);
+    // 讀取路徑再遮一次：既有 DB 可能存著未遮罩的內容；先遮全文再切片段，
+    // 避免片段邊界剛好切在機密中間而漏掉。metadata（agent／project）也一併保護。
+    const text = snippet(maskSecrets(memory.content).text);
+    const maskedAgent = maskSecrets(memory.agent).text;
+    const maskedProject = memory.project === null ? null : maskSecrets(memory.project).text;
     hits.push({
       type: "memory",
       key: fusedHit.key,
@@ -262,8 +267,8 @@ export async function unifiedSearch(
       id: memory.id,
       kind: memory.kind,
       scope: memory.scope,
-      project: memory.project,
-      agent: memory.agent,
+      project: maskedProject,
+      agent: maskedAgent,
       text: text.text,
       textTruncated: text.textTruncated,
     });

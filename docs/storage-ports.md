@@ -12,16 +12,16 @@
 > 2026-10-16 新增 §root 設定的更新：`MetadataStore.updateRoot(id, patch)` 與 `RootPatch`
 > 型別（目前僅 `modalities`）——兩後端皆實作、通過同一組契約測試。
 >
-> 2026-10-18（卡 A）新增 §記憶的範圍更新：`MetadataStore.updateMemory(id, patch)` 與
+> 2026-10-18 新增 §記憶的範圍更新：`MetadataStore.updateMemory(id, patch)` 與
 > `MemoryPatch` 型別（僅 `scope`／`project`）——兩後端皆實作、通過同一組契約測試；
 > 既有的記憶方法（新增、釘選、軟刪除、列舉、關鍵字搜尋）與排序語意不變。
 >
-> 2026-10-18（卡 B1）新增 §記憶的語意化：`memories` 的向量欄位、`MemoryEmbeddingState`
+> 2026-10-18 新增 §記憶的語意化：`memories` 的向量欄位、`MemoryEmbeddingState`
 > 與 `MetadataStore` 的四個記憶向量方法（`markMemoryEmbedded`、`markMemoryEmbeddingFailed`、
 > `listMemoriesNeedingEmbedding`、`memoryEmbeddingStats`）——兩後端皆實作、通過同一組契約測試；
 > `Memory` 公開型別、`VectorIndex`、`/search` 與召回 API 都不變。
 >
-> 2026-10-18（卡 B2）新增 §記憶檢索：`MemorySearchBucket`／`MemorySearchFilter` 與
+> 2026-10-18 新增 §記憶檢索：`MemorySearchBucket`／`MemorySearchFilter` 與
 > `MetadataStore.searchMemoriesByVector`／`searchMemoriesKeyword`（**先過濾再排名**）——兩後端皆實作、
 > 通過同一組契約測試；`/search`、`VectorIndex` 與檔案索引管線不變。
 
@@ -49,6 +49,7 @@
 4. **單一寫入者。** 只有核心服務行程寫入資料庫；MCP、CLI、UI 都經由本機 HTTP。
 5. **契約測試。** 同一組測試套件對每個實作都要通過；新增後端就是讓它通過同一組測試。
 6. **中立的匯出格式。** 提供匯出與匯入（JSON Lines 加上向量檔），用於跨後端搬遷。
+   **現況：尚未實作，列後續。**
 
 ## 搜尋模式與預設（M2 修訂）
 
@@ -160,17 +161,17 @@ updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null>;
   SQLite 與 PostgreSQL 兩個後端都必須通過同一組測試。
 - REST 對應：`PATCH /memories/:id`（語意見 `docs/roots-and-privacy.md` §記憶的範圍與共享）。
 
-## 記憶的語意化（2026-10-18／卡 B1）
+## 記憶的語意化（2026-10-18）
 
 記憶內容用**同一個多模態 embedder 的文字路徑**（`embedDocument`）產生向量，存在記憶自己的欄位。
-本節只定義「產生與維護向量」；召回 API、跨專案過濾與排名屬卡 B2，不在本節。
+本節只定義「產生與維護向量」；召回 API、跨專案過濾與排名見 §記憶檢索。
 
 ### 為什麼不放在 `VectorIndex`
 
 `VectorIndex`（sqlite-vec 的 `vectors` 表）的 `root_id is null` 與 `key like 'm:%'` 都是
 **KNN 之後才過濾**（post-filter）：鄰近的 chunk 向量一多，只查記憶的 top-k 可能回不到該有的記憶。
 記憶召回最需要的是**先依 scope／project 精確過濾再排名**，因此改存 `memories` 自己的欄位，
-讓卡 B2 能在同一個 SQL 過濾後再算相似度（SQLite 在應用層算 cosine、PostgreSQL 用 pgvector `<=>`）。
+讓召回端能在同一個 SQL 過濾後再算相似度（SQLite 在應用層算 cosine、PostgreSQL 用 pgvector `<=>`）。
 `VectorIndex`、`vectors` 表與 `/search` 都**不變**。
 
 ### 欄位與狀態機
@@ -244,7 +245,7 @@ memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats>;
 - **回填**：佇列空了就從 DB 抓一批需要嵌入的記憶（新到舊、每次 `batchSize`＝100 筆）。
   **同一次 `start()` 內**以 attempted 集合去重：已嘗試過的 id（含 `failed`）不會在同一輪被重抓，
   避免無限迴圈；因此 `failed` **只會在下一次 `start()`**（下一次服務啟動）再試，同一次執行內不回填。
-- **回填的已知限制（F2，本卡只揭露、未修正）**：每次只取「新到舊」的前 `batchSize` 筆；若這一整批
+- **回填的已知限制（尚未修正，列後續）**：每次只取「新到舊」的前 `batchSize` 筆；若這一整批
   都在同輪失敗（或都已被 attempted 跳過），較舊的 `pending` 記憶在同一次執行內不會被嘗試，要等
   下一次 `start()` 才可能被回填。正常情況（同輪失敗筆數少於 `batchSize`）不受影響；stale 重嵌
   同受此每次 batch 的限制。修正列後續卡。
@@ -265,12 +266,12 @@ memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats>;
 
   狀態數來自 `memoryEmbeddingStats`；`worker` 是本行程累計（重啟歸零）。
   `POST /memories` 的 scope／project 正規化（省略 scope 帶 project → `project`；矛盾組合 `400`）
-  也一併在本卡完成，既有呼叫端行為不回歸。
+  也在同一次實作完成，既有呼叫端行為不回歸。
 
-**召回端的界線**：本卡只負責「產生、保存、重試與診斷」向量；召回端點（REST／MCP）與
+**召回端的界線**：這一節只負責「產生、保存、重試與診斷」向量；召回端點（REST／MCP）與
 scope／project 的過濾排名見 §記憶檢索，且不影響 `/search` 的既有語意。
 
-## 記憶檢索（2026-10-18／卡 B2）
+## 記憶檢索（2026-10-18）
 
 記憶召回**不經過** `VectorIndex`（`vectors` 表），也不改 `/search`；語意與關鍵字都在
 `MetadataStore` 對 `memories` 表操作，**先過濾再排名**。原因見 §記憶的語意化
@@ -346,21 +347,21 @@ searchMemoriesKeyword(query: string, filter: MemorySearchFilter, k: number): Pro
 - **預設範圍（未指定 `scope`）**：本專案＋`global`（＋呼叫端明確提供的 agent）；未提供 `project`
   且未 `includeAllProjects` → `400`（避免不明確的召回範圍）。`includeAllProjects=true` →
   `global`＋所有專案（＋明確提供的 agent）。
-- **明確指定 `scope` 時只回該 scope**（卡 B2 驗收 F1）：`global` → 只 global；`agent` → 只 agent
+- **明確指定 `scope` 時只回該 scope**：`global` → 只 global；`agent` → 只 agent
   （必須提供 agent）；`project` → 只 project（以 `project` 指定，或 `includeAllProjects=true`
   代表所有專案）——**不包含 `global`，也不包含自己的 agent**。`scope=project` 同時帶 `project`
-  與 `includeAllProjects=true` 時 **`project` 優先**（`includeAllProjects` 被忽略；卡 B2 驗收 O3）。
+  與 `includeAllProjects=true` 時 **`project` 優先**（`includeAllProjects` 被忽略）。
 - **語意優先**：以 `embedder.embedQuery`＋`searchMemoriesByVector` 取得語意結果並依 cosine 排序；
   `minScore`（0..1）只過濾語意結果。只有語意結果不足 `k` 時才以 `searchMemoriesKeyword` **補足**
   （以 id 去重、附加在後、**不重排**語意結果）。
-- **降級**（卡 B2 驗收 O2／O4）：以「**可用 ready＝`ready − stale`**」判斷；`<= 0` →
+- **降級**：以「**可用 ready＝`ready − stale`**」判斷；`<= 0` →
   `degraded: true`＋`degradedReason: "no-embeddings"`（換 embedder 後、回填完成前全部 ready 都是
   stale 也算，此時連模型都不載入）。有可用向量但 `embedQuery` 失敗（**包含查詢過長的
   `input-too-long`**）→ `degraded: true`＋`degradedReason: "embedder-unavailable"`；兩者都改用
   關鍵字結果。這與 `/search` 不同：`/search` 對 `input-too-long` 回 `400`，召回有降級路徑因此回 `200`。
 - 命中回傳完整記憶欄位（與 `GET /memories` 一致）＋`rank`／`score`／`source`（`semantic`／`keyword`；
   關鍵字以 `1/rank` 當排序輔助分數）。`k` 預設 10；**大於 100 會靜默夾到 100**（不是 `400`；
-  REST／MCP；store 層上限 500；卡 B2 驗收 O6）。
+  REST／MCP；store 層上限 500）。
 - 不變更 `/search`、`VectorIndex`、檔案索引管線與記憶寫入路徑。
 
 ## 全文檢索與中文

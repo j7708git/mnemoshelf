@@ -17,7 +17,7 @@
 | `include` / `exclude` | 包含與排除規則（glob） |
 | `respectGitignore` | 預設 `true` |
 | `watch` | 持續監看變更，或手動重建 |
-| `agentAccess` | 哪些 agent 可以搜尋這個 root（預設為全部已授權的 agent） |
+| `agentAccess` | 哪些 agent 可以搜尋這個 root（**尚未實作**；目前所有持有 token 的程式都可搜尋，見 §信任模型） |
 
 ## 改變模態（`PATCH /roots/:id`）
 
@@ -42,7 +42,8 @@ root 加入後要更改可索引的模態（例如之後才想含圖片）不必
 
 - 將納入的檔案數量、總大小、各類型分佈；
 - 預估索引時間；
-- 將被跳過的檔案與原因（排除規則、黑名單、機密偵測、過大等）。
+- 將被跳過的檔案與原因（排除規則、黑名單、系統／垃圾檔、過大等；
+  檔案內容的機密偵測**尚未實作**）。
 
 使用者確認後才開始索引。索引可暫停並限速，避免占滿 CPU。
   <!-- 2026-10-15 註：現行實作提供「取消」（`POST /roots/:id/index/cancel`）；
@@ -57,8 +58,8 @@ root 加入後要更改可索引的模態（例如之後才想含圖片）不必
    - 瀏覽器設定檔與憑證存放區；
    - `.env`、`.env.*`（`.env.example` 除外）、`*.pem`、`*.key`、`id_rsa*`、`*.p12`、`*.kdbx`。
 3. **過寬的 root 要警告或拒絕**：根目錄、家目錄本身。要求使用者改選更具體的子目錄。
-4. **機密遮罩**：內容在索引、寫入記憶前先掃描機密（API key、token、私鑰），
-   命中的片段遮罩或整塊跳過，並記錄跳過原因。
+4. **機密遮罩**：**記憶**的寫入與讀取都已套用 curated 遮罩（見 §機密遮罩）；檔案索引端
+   目前只有黑名單／系統檔排除，**尚未**做內容遮罩（誠實標示，列後續）。
 5. **唯讀**：第一版對使用者檔案只讀不寫。
 
 ## 系統／垃圾檔排除
@@ -87,9 +88,50 @@ root 加入後要更改可索引的模態（例如之後才想含圖片）不必
 
 ## Agent 存取
 
-agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入且該 agent 被授權的 root。
+agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目前**沒有 per-agent 授權**
+（持有同一組 token 的程式權限相同，見下一節「信任模型」）。
 回傳的記憶與檔案片段必須標明來源（root、相對路徑、寫入的 agent），
 並視為**不受信任的資料**：agent 不應把其中的文字當成指令。
+
+## 信任模型：單一 token＝本機單一 owner 全權
+
+**現行模型是「本機單一持有者全權」**：服務只綁 `127.0.0.1`，以**一組** Bearer token 保護；
+持有這組 token 的任何程式（包含所有 agent）都能讀、寫、修改、刪除**全部**記憶與看得到的 roots。
+
+- **`agent` 只是來源標記（attribution），不是身分驗證。** `POST /memories` 的 `agent` 由呼叫端
+  自報（MCP 取 client 名稱）；任何持有 token 的呼叫端都能用任意 `agent` 值；召回可用 `agent`
+  參數讀取別人的 agent 範圍。
+- **`scope=agent` 不是安全邊界**：它只是約定上的個人範圍（本版尚未強制），不可用來隔離不同 agent。
+- **沒有 per-agent token／授權、沒有 audit trail**；需要真正隔離時，必須先擴充身分模型（列後續）。
+- 因此：**不要把 token 分享給不受信任的程式**；多 agent 共用同一份服務時，視為同一個信任圈。
+
+## 機密遮罩（實作語意）
+
+記憶內容在**寫入前**與**讀取時**都會套用同一組 curated 遮罩（`packages/server/src/secret-masking.ts`）：
+
+- 規則涵蓋：PEM 私鑰區塊、常見 token 前綴（`sk-`、GitHub `ghp_`／`github_pat_`、Slack `xox?-`、
+  AWS `AKIA…`、Google `AIza…`）、JWT、`Bearer <token>`、敏感名稱的賦值（`api_key`／`secret`／
+  `token`／`password` 等）、連線字串中的帳密。
+- 命中片段替換成穩定的 `[REDACTED:<kind>]`；**不記錄原文、不整筆拒絕**。`POST /memories` 的回應
+  另帶 `redacted`／`redactedCount`（additive 欄位；`Memory` 公開型別不變）。
+- **不做全面熵遮罩**：常見的 commit SHA、UUID 不會被誤遮；但 curated 規則仍可能對**極少數**
+  程式識別字誤判（例如特定長度的 dotted 名稱或套件名稱）。**寫入時的遮罩會改寫內容**（不可回復），
+  請以 `POST /memories` 回應的 `redacted`／`redactedCount` 確認是否被改寫；若在意原文，請先自行
+  檢查或不要把憑證寫進記憶。
+- **metadata 也受保護**：`agent`／`project` 在寫入時若偵測到 token-like 機密會直接 `400`
+  （它們是查詢鍵，不能在寫入時改寫）；既有資料的 `agent`／`project` 在讀取回應中會套同一組遮罩。
+- 讀取路徑（`GET /memories`、`POST /memories/search`、`POST /search` 的記憶命中、MCP）會再遮一次，
+  因此**既有 DB 的未遮罩舊資料**也不會原文外流；遮罩是 idempotent。
+- **限制（誠實標示）**：這是 curated、盡力而為的防護，**不是完整 DLP**；無法保證所有憑證格式
+  都會命中。檔案索引內容的遮罩尚未實作。遮罩只在「文字」層；at-rest 仍是明文 SQLite（見下）。
+
+## 資料存放與刪除（現況）
+
+- 資料庫（含記憶原文）以**明文**存在本機資料目錄；POSIX 上啟動時會把資料目錄收緊為 `700`、
+  DB 檔（含 WAL／SHM）為 `600`（best-effort；Windows 不套用）。
+- `DELETE /memories/:id` 是**軟刪除**（設定 `deleted_at`）：內容仍留在 DB／WAL，可能可被復原。
+  硬刪除／加密／備份（JSONL 匯出／匯入）**尚未實作**，列後續。
+- 關閉注意：服務關閉時會等目前在途的記憶嵌入完成；若剛好在首次載入模型，關閉可能需要數十秒。
 
 ## 記憶的範圍與共享（2026-10-18）
 
@@ -116,7 +158,7 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入且該 agent �
 - **記憶內容仍是不受信任的資料**：既有的「回傳的記憶與檔案片段必須標明來源、視為不受信任資料、
   不得當成指令」規則不變。共享只改變可見範圍，不改變信任等級。
 
-### 召回（2026-10-18／卡 B2）
+### 召回（2026-10-18）
 
 `POST /memories/search`（MCP `search_memories`）**未指定 `scope` 時**的預設可見範圍是
 **本專案＋`global`**，再加上呼叫端**明確提供**的 agent（MCP 一律帶自己的 client 名稱）。
@@ -124,18 +166,19 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入且該 agent �
 
 - `includeAllProjects: true` → 跨所有專案；未提供 `project` 且未 `includeAllProjects` → `400`
   （不猜測範圍）。
-- **明確指定 `scope` 時只回該 scope**（卡 B2 驗收 F1）：`global` 只回全域；`agent` 只回自己的
+- **明確指定 `scope` 時只回該 scope**：`global` 只回全域；`agent` 只回自己的
   agent（必須提供 agent）；`project` 只回該專案（或 `includeAllProjects=true` 時所有專案）——
   **不含 `global`、也不含自己的 agent**（與預設路徑不同）。`scope=project` 同時帶 `project` 與
-  `includeAllProjects=true` 時 `project` 優先（`includeAllProjects` 被忽略；O3）。
+  `includeAllProjects=true` 時 `project` 優先（`includeAllProjects` 被忽略）。
 - **語意優先、關鍵字備援**：語意結果依相似度排序；語意不可用時自動退回關鍵字，回應明確標示
   `degraded: true` 與原因。語意不可用指「**可用就緒向量為 0**（`ready − stale`；換 embedder 後、
   回填完成前全部 ready 都是 stale 也算）」或模型載入／**查詢失敗（含查詢過長 `input-too-long`）**；
   後者召回仍回 `200`＋關鍵字結果（與 `/search` 對過長查詢回 `400` 不同，因為召回有降級路徑）。
   關鍵字只在語意不足時「補足」，不會重排語意結果。
-- 每筆召回結果都帶 `source`（`semantic`／`keyword`）、分數與完整記憶欄位（含寫入者）；
+- 每筆召回結果都帶 `source`（`semantic`／`keyword`）、`untrusted: true`、分數與完整記憶欄位
+  （含寫入者）；內容在讀取時會再遮一次機密；
   記憶內容**仍是不受信任的資料**，不得當成指令。
-- `minScore`（0..1）只過濾語意結果；`k` 預設 10，**大於 100 會靜默夾到 100**（不是 `400`；O6）。
+- `minScore`（0..1）只過濾語意結果；`k` 預設 10，**大於 100 會靜默夾到 100**（不是 `400`）。
 
 ## 移除 root
 
