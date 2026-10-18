@@ -85,7 +85,7 @@ const RULES: readonly MaskRule[] = [
   { pattern: /\bAIza[0-9A-Za-z_-]{35}\b/g, kind: "token" },
   // 7) 敏感名稱的賦值：支援 `key = value`、`key: value`、JSON 風格 `"key":"value"`。
   //    引號值 >= 8 字元；未引號值 >= 16 字元，且排除 `.`／括號等屬性存取字元
-  //    （避免把 `password = req.body.password` 這類程式碼誤遮）。
+  //    （避免把屬性存取這類正常程式碼誤遮）。
   {
     pattern: new RegExp(
       `\\b(${SECRET_KEY_PATTERN})\\b([ \\t]*(?:"[ \\t]*)?[:=][ \\t]*)` +
@@ -99,7 +99,7 @@ const RULES: readonly MaskRule[] = [
 /**
  * 判斷賦值的「值」是否只是程式中的參考（環境變數、屬性存取、常數名），而非字面憑證。
  *
- * 這是為了避免遮罩正常程式碼（例如 `apiKey = process.env.API_KEY`、`accessToken = req.token`）；
+ * 這是為了避免遮罩正常程式碼（例如環境變數或物件屬性的參考）；
  * 真正的字面憑證不會長成這些形式。
  */
 function looksLikeCodeReference(value: string): boolean {

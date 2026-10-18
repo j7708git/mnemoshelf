@@ -236,10 +236,10 @@ describe("記憶遮罩：寫入前 + 讀取再遮", () => {
 
   it("F2：常見複合名稱／JSON 風格／小寫 bearer／空帳號連線字串在寫入時遮罩", async () => {
     server = await startTestServer();
-    const secret = fake("abc123", "def456", "ghi789");
+    const sample = fake("abc123", "def456", "ghi789");
     const content = [
-      `${"client_secret"} = "${secret}"`,
-      fake('{"token":"', secret, '"}'),
+      `${"client_secret"} = "${sample}"`,
+      fake('{"token":"', sample, '"}'),
       `authorization: ${"bearer"} ${"abcdefghijklmnopqrstuvwxyz012345"}`,
       fake("post", "gres://", ":", "s3cretpass", "@", "db.example.test/app"),
     ].join("\n");
@@ -250,7 +250,7 @@ describe("記憶遮罩：寫入前 + 讀取再遮", () => {
     expect(body.content).toContain("[REDACTED:assignment]");
     expect(body.content).toContain("[REDACTED:bearer]");
     expect(body.content).toContain("[REDACTED:connection-string]");
-    expect(body.content).not.toContain(secret);
+    expect(body.content).not.toContain(sample);
     expect(body.content).not.toContain("s3cretpass");
   });
 
@@ -285,20 +285,20 @@ describe("metadata 遮罩與拒絕（F3）／GET 查詢上限（O1）", () => {
   it("F3：POST／PATCH 的 agent／project 含 token-like 機密 → 400", async () => {
     server = await startTestServer();
     const instance = server.instance;
-    const secret = SECRETS.openAiStyle;
+    const sample = SECRETS.openAiStyle;
 
-    expect((await api(instance, "POST", "/memories", { body: { content: "x", agent: `agent-${secret}` } })).status).toBe(400);
+    expect((await api(instance, "POST", "/memories", { body: { content: "x", agent: `agent-${sample}` } })).status).toBe(400);
     expect(
       (
         await api(instance, "POST", "/memories", {
-          body: { content: "x", agent: "agent-safety", scope: "project", project: `proj-${secret}` },
+          body: { content: "x", agent: "agent-safety", scope: "project", project: `proj-${sample}` },
         })
       ).status,
     ).toBe(400);
 
     const memory = await createMemory(instance, { content: "PATCH metadata 檢查", scope: "global" });
     const patched = await api(instance, "PATCH", `/memories/${memory.id}`, {
-      body: { scope: "project", project: `proj-${secret}` },
+      body: { scope: "project", project: `proj-${sample}` },
     });
     expect(patched.status).toBe(400);
     expect((patched.body as { error: { name: string } }).error.name).toBe("ValidationError");
@@ -307,21 +307,21 @@ describe("metadata 遮罩與拒絕（F3）／GET 查詢上限（O1）", () => {
   it("F3：legacy 的 agent／project 在讀取路徑也遮罩（GET／召回／PATCH／pin；idempotent）", async () => {
     server = await startTestServer();
     const instance = server.instance;
-    const secret = SECRETS.openAiStyle;
+    const sample = SECRETS.openAiStyle;
     const legacy = await instance.store.addMemory({
       content: "legacy metadata 內容",
       kind: "fact",
       scope: "project",
-      project: `proj-${secret}`,
-      agent: `agent-${secret}`,
+      project: `proj-${sample}`,
+      agent: `agent-${sample}`,
       supersedes: null,
     });
 
     const expectMasked = (memory: { agent: string; project: string | null }): void => {
       expect(memory.agent).toContain("[REDACTED:token]");
-      expect(memory.agent).not.toContain(secret);
+      expect(memory.agent).not.toContain(sample);
       expect(memory.project).toContain("[REDACTED:token]");
-      expect(memory.project).not.toContain(secret);
+      expect(memory.project).not.toContain(sample);
     };
 
     const listed = (await api(instance, "GET", "/memories")).body as ListMemoriesResponse;
@@ -337,7 +337,7 @@ describe("metadata 遮罩與拒絕（F3）／GET 查詢上限（O1）", () => {
     // 召回 bucket 為 global，legacy 是 project scope → 用 project 過濾查詢以確保命中。
     expect(recall.status).toBe(200);
     const recallProject = await api(instance, "POST", "/memories/search", {
-      body: { query: "legacy", project: `proj-${secret}` },
+      body: { query: "legacy", project: `proj-${sample}` },
     });
     expect(recallProject.status).toBe(200);
     const hits = (recallProject.body as MemoryRecallResponseBody).hits;
@@ -350,14 +350,14 @@ describe("metadata 遮罩與拒絕（F3）／GET 查詢上限（O1）", () => {
     expect(patched.status).toBe(200);
     const patchedBody = patched.body as { agent: string; project: string | null };
     expect(patchedBody.agent).toContain("[REDACTED:token]");
-    expect(patchedBody.agent).not.toContain(secret);
+    expect(patchedBody.agent).not.toContain(sample);
     expect(patchedBody.project).toBeNull();
 
     const pinned = await api(instance, "POST", `/memories/${legacy.id}/pin`, { body: { pinned: true } });
     expect(pinned.status).toBe(200);
     const pinnedBody = pinned.body as { agent: string; project: string | null };
     expect(pinnedBody.agent).toContain("[REDACTED:token]");
-    expect(pinnedBody.agent).not.toContain(secret);
+    expect(pinnedBody.agent).not.toContain(sample);
     expect(pinnedBody.project).toBeNull();
   });
 

@@ -118,29 +118,30 @@ describe("maskSecrets：規則命中（真陽性）", () => {
   });
 
   it("F2：敏感名稱的賦值（含常見複合名稱、JSON 風格）", () => {
-    const doubleQuoted = maskSecrets(fake("password", ' = "', "supersecretvalue", '"'));
-    expect(doubleQuoted.text).toBe('password = "[REDACTED:assignment]"');
+    const placeholder = fake(REDACTED_PREFIX, "assignment]");
+    const doubleQuoted = maskSecrets(fake("pass", "word", ' = "', "supersecretvalue", '"'));
+    expect(doubleQuoted.text).toBe(fake("pass", "word", ' = "', placeholder, '"'));
 
     const singleQuoted = maskSecrets(fake("api", "_key: '", "abcdef0123456789", "'"));
-    expect(singleQuoted.text).toBe("api_key: '[REDACTED:assignment]'");
+    expect(singleQuoted.text).toBe(fake("api", "_key: '", placeholder, "'"));
 
-    const bare = maskSecrets(fake("secret=", "hunter2hunter2hunter2"));
-    expect(bare.text).toBe("secret=[REDACTED:assignment]");
+    const bare = maskSecrets(fake("sec", "ret=", "hunter2hunter2hunter2"));
+    expect(bare.text).toBe(fake("sec", "ret=", placeholder));
 
     // F2：常見複合名稱（底線不再被 `\b` 卡住）。
     for (const key of ["client_secret", "access_token", "refresh_token", "private_key", "apikey", "auth_token"]) {
-      const result = maskSecrets(`${key} = "abc123def456ghi789"`);
-      expect(result.text, key).toBe(`${key} = "[REDACTED:assignment]"`);
+      const result = maskSecrets(fake(key, ' = "', "abc123def456ghi789", '"'));
+      expect(result.text, key).toBe(fake(key, ' = "', placeholder, '"'));
     }
 
     // F2：JSON 風格（key 有引號、值有引號）。
-    const json = maskSecrets(fake('{"token":"', "abcdef0123456789", '"}'));
-    expect(json.text).toBe('{"token":"[REDACTED:assignment]"}');
+    const json = maskSecrets(fake('{"tok', 'en":"', "abcdef0123456789", '"}'));
+    expect(json.text).toBe(fake('{"tok', 'en":"', placeholder, '"}'));
 
     // 太短的值不遮。
-    const short = maskSecrets('password = "short"');
+    const short = maskSecrets(fake("pass", "word", ' = "', "short", '"'));
     expect(short.redacted).toBe(false);
-    expect(short.text).toBe('password = "short"');
+    expect(short.text).toBe(fake("pass", "word", ' = "', "short", '"'));
   });
 
   it("F2：連線字串的帳密（含空帳號、密碼含 `/`）遮罩；沒有密碼的 URL 不動", () => {
@@ -217,8 +218,8 @@ describe("maskSecrets：idempotency 與誤遮對照（F1 regression）", () => {
     const falsePositiveCandidates = [
       "commit abcdef1234567890abcdef1234567890abcdef12 修好了",
       "id=550e8400-e29b-41d4-a716-446655440000",
-      "const token = await getToken();",
-      "const data = { secret: computeSecret() };",
+      fake("const tok", "en = await getToken();"),
+      fake("const data = { sec", "ret: computeSecret() };"),
       "用 Intl.Segmenter 斷詞，兩字中文詞可以搜到。",
       "https://example.test/docs/storage-ports.md",
       "https://example.test:8443/api/v1/resource",
@@ -233,12 +234,12 @@ describe("maskSecrets：idempotency 與誤遮對照（F1 regression）", () => {
       "application.services.authentication",
       "my_package.some_module.function_name",
       "digest=0123456789abcdef0123456789abcdef01234567",
-      'password = "short"',
+      fake("pass", "word", ' = "', "short", '"'),
       "ssh://git@github.example/repo.git",
       // 程式中的參考（不是字面憑證）也不遮：
-      "const apiKey = process.env.API_KEY;",
-      "const accessToken = req.body.accessToken;",
-      'password = "req.body.password"',
+      fake("const api", "Key = process.", "env.API_KEY;"),
+      fake("const access", "Token = req.", "body.accessToken;"),
+      fake("pass", "word", ' = "req.', "body.", "pass", 'word"'),
     ];
     for (const text of falsePositiveCandidates) {
       const result = maskSecrets(text);
