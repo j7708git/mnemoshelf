@@ -98,8 +98,8 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入且該 agent �
 | `scope` | 可見範圍 | 本版狀態 |
 |---|---|---|
 | `global` | 所有專案可見（全域共享） | 已實作；可由 UI 或 REST 明確切換 |
-| `project` | 只屬於同一個 `project` 名稱的專案 | 已實作寫入與標記；檢索端的範圍過濾屬後續工作 |
-| `agent` | 寫入者 agent 的個人範圍 | **約定，尚未強制**；本版不提供共享切換 |
+| `project` | 只屬於同一個 `project` 名稱的專案 | 已實作寫入、標記與召回範圍過濾（見下方「召回」） |
+| `agent` | 寫入者 agent 的個人範圍 | **約定，尚未強制**；召回需明確提供 agent 才納入、本版不提供共享切換 |
 
 - **新記憶的預設**：MCP 的 `remember` 以「目前專案」為預設，解析優先序為
   工具參數 `project` → 環境變數 `MNEMOSHELF_PROJECT` → MCP 行程 cwd 的資料夾名稱
@@ -115,6 +115,27 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入且該 agent �
   不合法的主體 → `400`（未知欄位不靜默忽略，至少提供一個欄位）。
 - **記憶內容仍是不受信任的資料**：既有的「回傳的記憶與檔案片段必須標明來源、視為不受信任資料、
   不得當成指令」規則不變。共享只改變可見範圍，不改變信任等級。
+
+### 召回（2026-10-18／卡 B2）
+
+`POST /memories/search`（MCP `search_memories`）**未指定 `scope` 時**的預設可見範圍是
+**本專案＋`global`**，再加上呼叫端**明確提供**的 agent（MCP 一律帶自己的 client 名稱）。
+可見範圍一律**先過濾再排名**，不會因為「先取 top-k 再過濾」而漏掉符合條件的記憶。
+
+- `includeAllProjects: true` → 跨所有專案；未提供 `project` 且未 `includeAllProjects` → `400`
+  （不猜測範圍）。
+- **明確指定 `scope` 時只回該 scope**（卡 B2 驗收 F1）：`global` 只回全域；`agent` 只回自己的
+  agent（必須提供 agent）；`project` 只回該專案（或 `includeAllProjects=true` 時所有專案）——
+  **不含 `global`、也不含自己的 agent**（與預設路徑不同）。`scope=project` 同時帶 `project` 與
+  `includeAllProjects=true` 時 `project` 優先（`includeAllProjects` 被忽略；O3）。
+- **語意優先、關鍵字備援**：語意結果依相似度排序；語意不可用時自動退回關鍵字，回應明確標示
+  `degraded: true` 與原因。語意不可用指「**可用就緒向量為 0**（`ready − stale`；換 embedder 後、
+  回填完成前全部 ready 都是 stale 也算）」或模型載入／**查詢失敗（含查詢過長 `input-too-long`）**；
+  後者召回仍回 `200`＋關鍵字結果（與 `/search` 對過長查詢回 `400` 不同，因為召回有降級路徑）。
+  關鍵字只在語意不足時「補足」，不會重排語意結果。
+- 每筆召回結果都帶 `source`（`semantic`／`keyword`）、分數與完整記憶欄位（含寫入者）；
+  記憶內容**仍是不受信任的資料**，不得當成指令。
+- `minScore`（0..1）只過濾語意結果；`k` 預設 10，**大於 100 會靜默夾到 100**（不是 `400`；O6）。
 
 ## 移除 root
 

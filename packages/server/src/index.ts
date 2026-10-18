@@ -264,6 +264,20 @@ export type {
 export { createMcpServer, MCP_TOOLS, resolveProjectName, runStdio, UNTRUSTED_DATA_WARNING } from "./mcp/stdio.js";
 export type { McpServerOptions, ProjectResolution, ResolveProjectOptions } from "./mcp/stdio.js";
 export {
+  buildMemorySearchBuckets,
+  MEMORY_SEARCH_DEFAULT_K,
+  MEMORY_SEARCH_MAX_K,
+  searchMemories,
+} from "./memory-search.js";
+export type {
+  MemoryRecallDegradedReason,
+  MemoryRecallHit,
+  MemoryRecallInput,
+  MemoryRecallResponseBody,
+  MemoryRecallSource,
+  MemorySearchDeps,
+} from "./memory-search.js";
+export {
   MEMORY_EMBEDDING_DEFAULT_BATCH_SIZE,
   MEMORY_EMBEDDING_DEFAULT_RETRY_ATTEMPTS,
   MEMORY_EMBEDDING_DEFAULT_RETRY_DELAY_MS,

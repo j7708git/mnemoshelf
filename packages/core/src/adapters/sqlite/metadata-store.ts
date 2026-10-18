@@ -2,12 +2,20 @@ import { DuplicateRootError } from "../../errors.js";
 import {
   assertMemoryEmbeddingFailure,
   assertMemoryEmbeddingInput,
+  assertMemoryQueryVector,
+  cosineSimilarity,
   normalizeMemoryLimit,
   normalizeMemoryPatch,
+  normalizeMemorySearchFilter,
+  normalizeMemorySearchK,
   type MemoryEmbeddingFailure,
   type MemoryEmbeddingStats,
   type MemoryFilter,
+  type MemoryKeywordHit,
+  type MemorySearchFilter,
+  type MemoryVectorHit,
   type MetadataStore,
+  type NormalizedMemorySearchFilter,
 } from "../../ports/metadata-store.js";
 import type {
   Chunk,
@@ -90,6 +98,67 @@ function rowToMemory(row: Record<string, unknown>): Memory {
  */
 function encodeEmbedding(vector: Float32Array): Buffer {
   return Buffer.from(new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength));
+}
+
+/**
+ * 解碼 SQLite BLOB 回 `Float32Array`（`encodeEmbedding` 的對稱操作）。
+ *
+ * `better-sqlite3` 回傳的 `Buffer` 是 `Uint8Array` 的子類，但它的位元組偏移不保證是 4 的倍數；
+ * 這裡先**複製**成新的 `Uint8Array` 再建立 `Float32Array`，避免未對齊的 view 在某些平台出錯。
+ * `NULL`／空值回 `null`；位元組長度不是 4 的倍數＝資料損毀 → 拋 `TypeError`。
+ */
+function decodeEmbedding(value: unknown): Float32Array | null {
+  if (!(value instanceof Uint8Array) || value.byteLength === 0) return null;
+  if (value.byteLength % 4 !== 0) throw new TypeError("記憶向量資料損毀（位元組長度不是 4 的倍數）");
+  const bytes = new Uint8Array(value);
+  return new Float32Array(bytes.buffer, 0, bytes.byteLength / 4);
+}
+
+/** SQLite 的記憶檢索 WHERE（`m` 是 memories 的別名；**先過濾、後排名**）。 */
+interface MemorySearchWhere {
+  clause: string;
+  params: unknown[];
+}
+
+/**
+ * 把正規化後的 `MemorySearchFilter` 組成 SQLite WHERE 子句（卡 B2；兩方法共用）。
+ *
+ * 參數綁定順序與 SQL 中的 `?` 出現順序一致；bucket 之間是 OR、`kind` 與 bucket 群組是 AND。
+ */
+function buildMemorySearchWhere(filter: NormalizedMemorySearchFilter): MemorySearchWhere {
+  const conditions = ["m.deleted_at is null"];
+  const params: unknown[] = [];
+
+  if (filter.kind !== undefined) {
+    conditions.push("m.kind = ?");
+    params.push(filter.kind);
+  }
+
+  const buckets = filter.buckets;
+  if (buckets !== undefined) {
+    const parts: string[] = [];
+    for (const bucket of buckets) {
+      if (bucket.scope === "global") {
+        parts.push("m.scope = 'global'");
+        continue;
+      }
+      if (bucket.scope === "project") {
+        if (bucket.project === undefined) {
+          parts.push("m.scope = 'project'");
+          continue;
+        }
+        params.push(bucket.project);
+        parts.push("(m.scope = 'project' and m.project = ?)");
+        continue;
+      }
+      // scope === "agent"（正規化時已保證 agent 非空）
+      params.push(bucket.agent);
+      parts.push("(m.scope = 'agent' and m.agent = ?)");
+    }
+    conditions.push(`(${parts.join(" or ")})`);
+  }
+
+  return { clause: conditions.join(" and "), params };
 }
 
 /**
@@ -414,6 +483,80 @@ export class SqliteMetadataStore implements MetadataStore {
       tooLong: count(row?.too_long),
       stale: count(row?.stale),
     };
+  }
+
+  /**
+   * 記憶語意檢索（見 `MetadataStore.searchMemoriesByVector`）。
+   *
+   * SQL 先套 filter 與 `ready`／embedder 身分條件，**再**在 JS 算 cosine（精確、O(n)）——
+   * 不會出現「先取 top-k 再過濾」而少給結果的問題。`linear scan` 對千～萬筆記憶可接受（卡 B2 的取捨）。
+   */
+  async searchMemoriesByVector(
+    queryVec: Float32Array,
+    embedderId: string,
+    filter: MemorySearchFilter,
+    k: number,
+  ): Promise<MemoryVectorHit[]> {
+    assertMemoryQueryVector(queryVec);
+    if (typeof embedderId !== "string" || embedderId.trim() === "") {
+      throw new TypeError("embedderId 必須是非空字串");
+    }
+    const limit = normalizeMemorySearchK(k);
+    if (limit === 0) return [];
+
+    const normalized = normalizeMemorySearchFilter(filter);
+    if (normalized.buckets !== undefined && normalized.buckets.length === 0) return [];
+    const where = buildMemorySearchWhere(normalized);
+
+    const rows = selectRows(
+      this.db,
+      `select m.id as id, m.embedding as embedding
+         from memories m
+        where ${where.clause}
+          and m.embedding_state = 'ready'
+          and m.embedding_embedder_id = ?`,
+      ...where.params,
+      embedderId,
+    );
+
+    const scored: MemoryVectorHit[] = [];
+    for (const row of rows) {
+      const vector = decodeEmbedding(row.embedding);
+      if (vector === null) continue;
+      // 維度不同時 cosineSimilarity 會拋 TypeError（不得默默跳過損壞的向量資料）。
+      scored.push({ id: Number(row.id), score: cosineSimilarity(queryVec, vector) });
+    }
+    scored.sort((a, b) => (b.score !== a.score ? b.score - a.score : a.id - b.id));
+    return scored.slice(0, limit);
+  }
+
+  /**
+   * 記憶關鍵字檢索（見 `MetadataStore.searchMemoriesKeyword`）。
+   *
+   * 只查 `memories_fts`（**不混 chunk**）；同一組 filter 在 SQL 先套用，再依 bm25 排名，
+   * 同分以 `id` 升冪決勝（可重現）。`rank` 由回傳順序從 1 起算。
+   */
+  async searchMemoriesKeyword(query: string, filter: MemorySearchFilter, k: number): Promise<MemoryKeywordHit[]> {
+    const limit = normalizeMemorySearchK(k);
+    if (limit === 0) return [];
+    const matchExpression = buildMatchExpression(query);
+    if (matchExpression === null) return [];
+
+    const normalized = normalizeMemorySearchFilter(filter);
+    if (normalized.buckets !== undefined && normalized.buckets.length === 0) return [];
+    const where = buildMemorySearchWhere(normalized);
+
+    return selectRows(
+      this.db,
+      `select m.id as id, bm25(memories_fts) as score
+         from memories_fts join memories m on m.id = memories_fts.rowid
+        where memories_fts match ? and ${where.clause}
+        order by score, m.id
+        limit ?`,
+      matchExpression,
+      ...where.params,
+      limit,
+    ).map((row, index) => ({ id: Number(row.id), rank: index + 1 }));
   }
 
   /**

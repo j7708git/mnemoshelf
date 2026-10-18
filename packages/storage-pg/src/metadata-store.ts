@@ -2,22 +2,29 @@ import {
   DuplicateRootError,
   assertMemoryEmbeddingFailure,
   assertMemoryEmbeddingInput,
+  assertMemoryQueryVector,
   normalizeMemoryLimit,
   normalizeMemoryPatch,
+  normalizeMemorySearchFilter,
+  normalizeMemorySearchK,
   type Chunk,
   type ChunkKind,
   type Memory,
   type MemoryEmbeddingFailure,
   type MemoryEmbeddingStats,
   type MemoryFilter,
+  type MemoryKeywordHit,
   type MemoryKind,
   type MemoryPatch,
   type MemoryScope,
+  type MemorySearchFilter,
+  type MemoryVectorHit,
   type MetadataStore,
   type Modality,
   type NewChunk,
   type NewMemory,
   type NewRoot,
+  type NormalizedMemorySearchFilter,
   type RankedHit,
   type Root,
   type RootMode,
@@ -99,6 +106,55 @@ function rowToMemory(row: Record<string, unknown>): Memory {
 function segmentOrNull(text: string | null): string | null {
   if (text === null || text.trim().length === 0) return null;
   return segmentText(text);
+}
+
+/** PostgreSQL 的記憶檢索 WHERE（`m` 是 memories 的別名；**先過濾、後排名**）。 */
+interface PgMemorySearchWhere {
+  clause: string;
+  params: unknown[];
+}
+
+/**
+ * 把正規化後的 `MemorySearchFilter` 組成 PostgreSQL WHERE 子句（卡 B2；兩方法共用）。
+ *
+ * `firstParamIndex` 是第一個可用的參數編號（呼叫端可能已用掉 $1..）：filter 參數會依序佔用
+ * `firstParamIndex`、`firstParamIndex+1`…；bucket 之間 OR、`kind` 與 bucket 群組 AND。
+ */
+function buildPgMemorySearchWhere(filter: NormalizedMemorySearchFilter, firstParamIndex: number): PgMemorySearchWhere {
+  const conditions = ["m.deleted_at is null"];
+  const params: unknown[] = [];
+  const placeholder = (): string => `$${firstParamIndex + params.length}`;
+
+  if (filter.kind !== undefined) {
+    conditions.push(`m.kind = ${placeholder()}`);
+    params.push(filter.kind);
+  }
+
+  const buckets = filter.buckets;
+  if (buckets !== undefined) {
+    const parts: string[] = [];
+    for (const bucket of buckets) {
+      if (bucket.scope === "global") {
+        parts.push("m.scope = 'global'");
+        continue;
+      }
+      if (bucket.scope === "project") {
+        if (bucket.project === undefined) {
+          parts.push("m.scope = 'project'");
+          continue;
+        }
+        parts.push(`(m.scope = 'project' and m.project = ${placeholder()})`);
+        params.push(bucket.project);
+        continue;
+      }
+      // scope === "agent"（正規化時已保證 agent 非空）
+      parts.push(`(m.scope = 'agent' and m.agent = ${placeholder()})`);
+      params.push(bucket.agent);
+    }
+    conditions.push(`(${parts.join(" or ")})`);
+  }
+
+  return { clause: conditions.join(" and "), params };
 }
 
 /**
@@ -465,6 +521,98 @@ export class PgMetadataStore implements MetadataStore {
       tooLong: count(row.too_long),
       stale: count(row.stale),
     };
+  }
+
+  /**
+   * 記憶語意檢索（見 `MetadataStore.searchMemoriesByVector`）。
+   *
+   * 同一句 SQL 內先以 `deleted_at`／`ready`／embedder 身分／filter 過濾，再用 pgvector 的
+   * `<=>` 精確排序（**先過濾再排名**）。`embedding` 不帶維度，維度不符時 pgvector 會在查詢時
+   * 報錯；為維持「維度不符 → TypeError」的跨後端語意，先以 `vector_dims()` 預檢。
+   */
+  async searchMemoriesByVector(
+    queryVec: Float32Array,
+    embedderId: string,
+    filter: MemorySearchFilter,
+    k: number,
+  ): Promise<MemoryVectorHit[]> {
+    assertMemoryQueryVector(queryVec);
+    if (typeof embedderId !== "string" || embedderId.trim() === "") {
+      throw new TypeError("embedderId 必須是非空字串");
+    }
+    const limit = normalizeMemorySearchK(k);
+    if (limit === 0) return [];
+
+    const normalized = normalizeMemorySearchFilter(filter);
+    if (normalized.buckets !== undefined && normalized.buckets.length === 0) return [];
+
+    // 維度預檢：向量 $1、filter 參數 $2..；沒有可用向量時不驗（查詢自然回空）。
+    const dimWhere = buildPgMemorySearchWhere(normalized, 2);
+    const dimResult = await this.pool.query(
+      `select vector_dims(m.embedding) as dim
+         from ${this.memories} m
+        where ${dimWhere.clause}
+          and m.embedding_state = 'ready'
+          and m.embedding_embedder_id = $1
+          and m.embedding is not null
+        limit 1`,
+      [embedderId, ...dimWhere.params],
+    );
+    if (dimResult.rows.length > 0) {
+      const storedDim = Number(dimResult.rows[0]!.dim);
+      if (storedDim !== queryVec.length) {
+        throw new TypeError(`向量維度不符：查詢 ${queryVec.length} 維、記憶 ${storedDim} 維`);
+      }
+    }
+
+    const where = buildPgMemorySearchWhere(normalized, 2);
+    const embedderParam = 2 + where.params.length;
+    const limitParam = 3 + where.params.length;
+    const result = await this.pool.query(
+      `select m.id as id, 1 - (m.embedding <=> $1::vector) as score
+         from ${this.memories} m
+        where ${where.clause}
+          and m.embedding_state = 'ready'
+          and m.embedding_embedder_id = $${embedderParam}
+          and m.embedding is not null
+        order by score desc, m.id asc
+        limit $${limitParam}`,
+      [toVectorLiteral(queryVec), ...where.params, embedderId, limit],
+    );
+    return result.rows.map((row) => ({ id: Number(row.id), score: Number(row.score) }));
+  }
+
+  /**
+   * 記憶關鍵字檢索（見 `MetadataStore.searchMemoriesKeyword`）。
+   *
+   * 只查 memories 的 `tsv`（**不混 chunk**）；同一組 filter 在 SQL 先套用，再依 `ts_rank`
+   * 排名，同分以 `id` 升冪決勝（與 SQLite 端一致、可重現）。`rank` 由回傳順序從 1 起算。
+   */
+  async searchMemoriesKeyword(query: string, filter: MemorySearchFilter, k: number): Promise<MemoryKeywordHit[]> {
+    const limit = normalizeMemorySearchK(k);
+    if (limit === 0) return [];
+    const tokens = segmentText(query)
+      .split(" ")
+      .filter((token) => token.length > 0);
+    if (tokens.length === 0) return [];
+
+    const normalized = normalizeMemorySearchFilter(filter);
+    if (normalized.buckets !== undefined && normalized.buckets.length === 0) return [];
+
+    const tsquery = tokens.map((_, index) => `plainto_tsquery('simple', $${index + 1})`).join(" || ");
+    const where = buildPgMemorySearchWhere(normalized, tokens.length + 1);
+    const limitParam = 1 + tokens.length + where.params.length;
+
+    const result = await this.pool.query(
+      `with q as (select ${tsquery} as tsq)
+       select m.id as id, ts_rank(m.tsv, q.tsq) as score
+         from ${this.memories} m, q
+        where m.tsv @@ q.tsq and ${where.clause}
+        order by score desc, m.id asc
+        limit $${limitParam}`,
+      [...tokens, ...where.params, limit],
+    );
+    return result.rows.map((row, index) => ({ id: Number(row.id), rank: index + 1 }));
   }
 
   async listMemories(filter: MemoryFilter = {}): Promise<Memory[]> {

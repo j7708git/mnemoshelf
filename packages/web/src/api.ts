@@ -747,6 +747,70 @@ export async function deleteMemory(id: number): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// 記憶語意召回（卡 B2：POST /memories/search）
+// ---------------------------------------------------------------------------
+
+/** 召回命中的來源：語意或關鍵字（降級／補足）。 */
+export type MemoryRecallSource = "semantic" | "keyword";
+
+/** 語意不可用時的原因。 */
+export type MemoryRecallDegradedReason = "no-embeddings" | "embedder-unavailable";
+
+/** 一筆召回命中（欄位與 `GET /memories` 一致，另帶 `rank`／`score`／`source`）。 */
+export interface MemoryRecallHit extends Memory {
+  /** 從 1 起算的結果順序。 */
+  rank: number;
+  /** 語意＝cosine；關鍵字＝`1/rank`（僅排序輔助）。 */
+  score: number;
+  source: MemoryRecallSource;
+}
+
+/** 記憶語意化統計（與 `GET /diagnostics` 的 `memories` 相同來源）。 */
+export interface MemoryEmbeddingStats {
+  total: number;
+  ready: number;
+  pending: number;
+  failed: number;
+  tooLong: number;
+  stale: number;
+}
+
+/** `POST /memories/search` 的回應。 */
+export interface MemoryRecallResult {
+  query: string;
+  k: number;
+  degraded: boolean;
+  degradedReason: MemoryRecallDegradedReason | null;
+  memoryEmbedding: MemoryEmbeddingStats;
+  hits: MemoryRecallHit[];
+}
+
+/**
+ * 記憶召回（`POST /memories/search`；語意優先，不可用時伺服器會降級關鍵字並標 `degraded`）。
+ *
+ * 範圍規則：預設「本專案＋全域共享（＋明確提供的 agent）」；`includeAllProjects` 跨所有專案；
+ * 未提供 `project` 且未 `includeAllProjects` → 伺服器回 400（UI 會先擋並提示）。
+ */
+export async function searchMemories(input: {
+  query: string;
+  project?: string;
+  includeAllProjects?: boolean;
+  scope?: MemoryScope;
+  agent?: string;
+  kind?: MemoryKind;
+  k?: number;
+  minScore?: number;
+}): Promise<MemoryRecallResult> {
+  const response = await apiFetch("/memories/search", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  if (!response.ok) throw new Error(await readErrorMessage(response, "搜尋記憶失敗"));
+  return (await response.json()) as MemoryRecallResult;
+}
+
+// ---------------------------------------------------------------------------
 // 除錯資訊匯出（`GET /diagnostics`）
 // ---------------------------------------------------------------------------
 

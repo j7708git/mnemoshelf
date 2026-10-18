@@ -20,6 +20,10 @@
 > 與 `MetadataStore` 的四個記憶向量方法（`markMemoryEmbedded`、`markMemoryEmbeddingFailed`、
 > `listMemoriesNeedingEmbedding`、`memoryEmbeddingStats`）——兩後端皆實作、通過同一組契約測試；
 > `Memory` 公開型別、`VectorIndex`、`/search` 與召回 API 都不變。
+>
+> 2026-10-18（卡 B2）新增 §記憶檢索：`MemorySearchBucket`／`MemorySearchFilter` 與
+> `MetadataStore.searchMemoriesByVector`／`searchMemoriesKeyword`（**先過濾再排名**）——兩後端皆實作、
+> 通過同一組契約測試；`/search`、`VectorIndex` 與檔案索引管線不變。
 
 | 介面 | 職責 | 預設實作 | 預計的替代實作 |
 |---|---|---|---|
@@ -263,8 +267,101 @@ memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats>;
   `POST /memories` 的 scope／project 正規化（省略 scope 帶 project → `project`；矛盾組合 `400`）
   也一併在本卡完成，既有呼叫端行為不回歸。
 
-**與卡 B2 的界線**：本卡只負責「產生、保存、重試與診斷」向量。召回端點（REST／MCP）、
-scope／project 相關的過濾與排名、`degraded` 退回行為都在卡 B2，且不得改動 `/search` 的既有語意。
+**召回端的界線**：本卡只負責「產生、保存、重試與診斷」向量；召回端點（REST／MCP）與
+scope／project 的過濾排名見 §記憶檢索，且不影響 `/search` 的既有語意。
+
+## 記憶檢索（2026-10-18／卡 B2）
+
+記憶召回**不經過** `VectorIndex`（`vectors` 表），也不改 `/search`；語意與關鍵字都在
+`MetadataStore` 對 `memories` 表操作，**先過濾再排名**。原因見 §記憶的語意化
+「為什麼不放在 `VectorIndex`」：vec0 對 `root_id is null`／`key like` 只能在 KNN 之後過濾，
+而記憶召回需要先依 scope／project 精確過濾。
+
+### 可見範圍（`MemorySearchBucket`／`MemorySearchFilter`）
+
+```ts
+export interface MemorySearchBucket {
+  scope: MemoryScope;   // global / project / agent
+  /** scope=project 時：有值＝精確比對專案名；省略＝**所有專案**。 */
+  project?: string;
+  /** scope=agent 時必填（比對 memories.agent）。 */
+  agent?: string;
+}
+
+export interface MemorySearchFilter {
+  buckets?: MemorySearchBucket[];  // OR；未提供＝不限制 scope；空陣列＝沒有結果
+  kind?: MemoryKind;
+}
+```
+
+| bucket | SQL 條件 |
+|---|---|
+| `{scope:"global"}` | `scope='global'`（不得帶 project／agent） |
+| `{scope:"project"}` | `scope='project'`（**所有專案**） |
+| `{scope:"project", project:"p"}` | `scope='project' AND project='p'` |
+| `{scope:"agent", agent:"a"}` | `scope='agent' AND agent='a'`（agent 必填非空） |
+
+- **「所有專案」的介面表示**＝`project` scope **不帶名稱**；呼叫端不需要（也不應該）列舉專案名
+  再組多個 bucket。
+- `kind` 精確比對；所有查詢永遠排除 `deleted_at is not null`。
+- 非法 bucket（scope 不合法、`global` 帶 `project`／`agent`、`agent` 缺 `agent` 或空白、
+  `project` 非字串）→ 拋 `TypeError`；兩後端以 `normalizeMemorySearchFilter` 共用同一套驗證。
+- `filter.buckets` 未提供＝不限制 scope；**空陣列＝沒有可見範圍**（回空清單，不是「不過濾」）。
+
+### 兩個方法
+
+```ts
+searchMemoriesByVector(
+  queryVec: Float32Array, embedderId: string, filter: MemorySearchFilter, k: number,
+): Promise<{ id: number; score: number }[]>;
+
+searchMemoriesKeyword(query: string, filter: MemorySearchFilter, k: number): Promise<{ id: number; rank: number }[]>;
+```
+
+- **`searchMemoriesByVector`**：只取 `embedding_state='ready'` 且 `embedding_embedder_id = embedderId`
+  的未刪除記憶；SQL 先套 filter，再算 cosine similarity。`score` 為 cosine（[-1,1]），排序
+  **score 降冪、同分 id 升冪**。`queryVec` 必須非空且只含有限值；與資料維度不同 → `TypeError`
+  （不得默默跳過）；`k` <= 0 回空、上限 500（`normalizeMemorySearchK`）。
+- **`searchMemoriesKeyword`**：沿用既有 `Intl.Segmenter` 斷詞與 FTS（SQLite `memories_fts`、
+  PostgreSQL `tsv`）；同一組 filter 先在 SQL 套用；**只查記憶、不混 chunk**；空查詢／無可搜尋詞
+  回空；`k` 邊界同上；回傳 `rank` 1..n，同分以 id 決勝（可重現）。
+- 兩者都在**排名前**套用 filter：不會出現「先取 top-k 再過濾」而少給符合條件的記憶。
+
+### 兩後端實作
+
+- **SQLite（預設）**：先以 SQL（`deleted_at`／`ready`／embedder／bucket／kind）撈候選列，於應用層
+  解碼 BLOB 並以 cosine 精確排序（千～萬筆量級可接受；無 ANN）。關鍵字走 `memories_fts` 的 `bm25`。
+- **PostgreSQL**：同一句 SQL 內用 `embedding <=> $1::vector`（精確距離）排序；為維持「維度不符 →
+  `TypeError`」的跨後端語意，先以 `vector_dims()` 預檢一次（向量欄位不帶維度）。關鍵字走
+  `tsv`＋GIN 的 `ts_rank`。
+- 契約測試（`runMetadataStoreContract`）新增五例：bucket 過濾（global／project／所有專案／agent／
+  kind／空 bucket／未提供）、ready／embedder 相符與失敗狀態排除（含同分 id 決勝）、`k` 邊界與
+  維度不符、關鍵字過濾／排除 deleted／不混 chunk／rank 連續、非法 bucket 拋錯。
+  SQLite 必跑；PostgreSQL 同一組測試（`MNEMOSHELF_PG=1`）。
+
+### 召回 API 的行為（REST／MCP；伺服器層）
+
+`POST /memories/search` 與 MCP `search_memories` 共用 `packages/server/src/memory-search.ts`：
+
+- **預設範圍（未指定 `scope`）**：本專案＋`global`（＋呼叫端明確提供的 agent）；未提供 `project`
+  且未 `includeAllProjects` → `400`（避免不明確的召回範圍）。`includeAllProjects=true` →
+  `global`＋所有專案（＋明確提供的 agent）。
+- **明確指定 `scope` 時只回該 scope**（卡 B2 驗收 F1）：`global` → 只 global；`agent` → 只 agent
+  （必須提供 agent）；`project` → 只 project（以 `project` 指定，或 `includeAllProjects=true`
+  代表所有專案）——**不包含 `global`，也不包含自己的 agent**。`scope=project` 同時帶 `project`
+  與 `includeAllProjects=true` 時 **`project` 優先**（`includeAllProjects` 被忽略；卡 B2 驗收 O3）。
+- **語意優先**：以 `embedder.embedQuery`＋`searchMemoriesByVector` 取得語意結果並依 cosine 排序；
+  `minScore`（0..1）只過濾語意結果。只有語意結果不足 `k` 時才以 `searchMemoriesKeyword` **補足**
+  （以 id 去重、附加在後、**不重排**語意結果）。
+- **降級**（卡 B2 驗收 O2／O4）：以「**可用 ready＝`ready − stale`**」判斷；`<= 0` →
+  `degraded: true`＋`degradedReason: "no-embeddings"`（換 embedder 後、回填完成前全部 ready 都是
+  stale 也算，此時連模型都不載入）。有可用向量但 `embedQuery` 失敗（**包含查詢過長的
+  `input-too-long`**）→ `degraded: true`＋`degradedReason: "embedder-unavailable"`；兩者都改用
+  關鍵字結果。這與 `/search` 不同：`/search` 對 `input-too-long` 回 `400`，召回有降級路徑因此回 `200`。
+- 命中回傳完整記憶欄位（與 `GET /memories` 一致）＋`rank`／`score`／`source`（`semantic`／`keyword`；
+  關鍵字以 `1/rank` 當排序輔助分數）。`k` 預設 10；**大於 100 會靜默夾到 100**（不是 `400`；
+  REST／MCP；store 層上限 500；卡 B2 驗收 O6）。
+- 不變更 `/search`、`VectorIndex`、檔案索引管線與記憶寫入路徑。
 
 ## 全文檢索與中文
 

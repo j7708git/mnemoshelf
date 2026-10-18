@@ -4,7 +4,7 @@
  * 另一端用 SDK 的 `Client` 連上同一個框架（newline-delimited JSON），
  * 因此 initialize／tools/list／tools/call 都是真的協定往返。
  *
- * 驗收 3：initialize → tools/list（5 工具）→ tools/call（remember→search 找回同一筆；forget 後搜不到）；
+ * 驗收 3：initialize → tools/list（6 工具）→ tools/call（remember→search 找回同一筆；forget 後搜不到）；
  * token 錯誤時工具回報錯誤。
  */
 import { PassThrough } from "node:stream";
@@ -96,7 +96,7 @@ afterEach(async () => {
 });
 
 describe("MCP stdio 入口", () => {
-  it("initialize → tools/list（5 工具，描述含不受信任資料警語）", async () => {
+  it("initialize → tools/list（6 工具，描述含不受信任資料警語）", async () => {
     const harness = await startMcp();
     rest = harness.rest;
     mcp = harness.mcp;
@@ -110,6 +110,7 @@ describe("MCP stdio 入口", () => {
       "recall",
       "remember",
       "search",
+      "search_memories",
     ]);
     for (const tool of tools.tools) {
       expect(tool.description ?? "").toContain("不受信任");
@@ -122,6 +123,19 @@ describe("MCP stdio 入口", () => {
       "query",
       "rootIds",
     ]);
+
+    const searchMemories = tools.tools.find((tool) => tool.name === "search_memories")!;
+    expect(Object.keys((searchMemories.inputSchema.properties ?? {}) as Record<string, unknown>).sort()).toEqual([
+      "includeAllProjects",
+      "k",
+      "kind",
+      "minScore",
+      "project",
+      "query",
+      "scope",
+    ]);
+    expect(searchMemories.description).toContain("MNEMOSHELF_PROJECT");
+    expect(searchMemories.description).toContain("includeAllProjects");
   });
 
   it("list_roots／search 轉發 REST，命中帶來源", async () => {
@@ -242,6 +256,101 @@ describe("MCP stdio 入口", () => {
     expect(textOf(badId)).toContain("ValidationError");
   });
 
+  it("search_memories：預設專案＋global＋自己的 agent 範圍；includeAllProjects 跨專案", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+    const instance = rest.instance;
+
+    // 預設專案＝cwd basename（測試的 cwd 是 packages/server → "server"）。
+    const memoryBody = { agent: "agent-mcp-recall", content: "mcp 召回測試記憶" };
+    const created: number[] = [];
+    for (const body of [
+      { ...memoryBody, scope: "global", content: "mcp 召回 全域" },
+      { ...memoryBody, scope: "project", project: "server", content: "mcp 召回 本專案" },
+      { ...memoryBody, scope: "project", project: "other-proj", content: "mcp 召回 其他專案" },
+    ]) {
+      const response = await api(instance, "POST", "/memories", { body });
+      expect(response.status).toBe(201);
+      created.push((response.body as { id: number }).id);
+    }
+    // agent 範圍：由 MCP remember 寫入（agent 取自 client 名稱）。
+    const remembered = await harness.mcp.client.callTool({
+      name: "remember",
+      arguments: { content: "mcp 召回 agent 範圍", scope: "agent" },
+    });
+    const agentMemory = jsonOf<{ id: number }>(remembered);
+    created.push(agentMemory.id);
+
+    // 等所有記憶向量就緒（語意路徑才會啟用）。
+    const deadline = Date.now() + 5000;
+    while (Date.now() < deadline) {
+      const diagnostics = (await api(instance, "GET", "/diagnostics")).body as { memories?: { ready?: number } };
+      if ((diagnostics.memories?.ready ?? 0) >= 4) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const defaults = await harness.mcp.client.callTool({ name: "search_memories", arguments: { query: "mcp 召回" } });
+    expect(defaults.isError).toBeFalsy();
+    const body = jsonOf<{
+      degraded: boolean;
+      k: number;
+      memoryEmbedding: { ready: number };
+      hits: { id: number; rank: number; score: number; source: string; content: string }[];
+    }>(defaults);
+    expect(body.degraded).toBe(false);
+    expect(body.memoryEmbedding.ready).toBeGreaterThanOrEqual(4);
+    expect(body.hits.map((hit) => hit.rank)).toEqual(body.hits.map((_hit, index) => index + 1));
+    for (const hit of body.hits) {
+      expect(["semantic", "keyword"]).toContain(hit.source);
+      expect(typeof hit.score).toBe("number");
+      expect(typeof hit.content).toBe("string");
+    }
+    const defaultIds = body.hits.map((hit) => hit.id);
+    // 預設含 global＋本專案＋自己的 agent；不含其他專案。
+    expect(defaultIds).toEqual(expect.arrayContaining(created.slice(0, 2)));
+    expect(defaultIds).toContain(agentMemory.id);
+    expect(defaultIds).not.toContain(created[2]);
+
+    // includeAllProjects：跨專案（含 other-proj）。
+    const all = await harness.mcp.client.callTool({
+      name: "search_memories",
+      arguments: { query: "mcp 召回", includeAllProjects: true },
+    });
+    const allBody = jsonOf<{ hits: { id: number }[] }>(all);
+    expect(allBody.hits.map((hit) => hit.id)).toContain(created[2]);
+  });
+
+  it("search_memories：解析不到專案且未 includeAllProjects → 清楚工具錯誤；scope=global 不需專案", async () => {
+    const fakeHome = path.resolve("synthetic-workspace", "fake-home", "someone");
+    const harness = await startMcp(TEST_TOKEN, { cwd: fakeHome, homeDir: fakeHome });
+    rest = harness.rest;
+    mcp = harness.mcp;
+
+    const unresolved = await harness.mcp.client.callTool({
+      name: "search_memories",
+      arguments: { query: "沒有專案" },
+    });
+    expect(unresolved.isError).toBe(true);
+    expect(textOf(unresolved)).toContain("MNEMOSHELF_PROJECT");
+    expect(textOf(unresolved)).toContain("includeAllProjects");
+
+    // 明確 scope=global 不需要專案，可直接查（沒有資料 → 空結果但不是錯誤）。
+    const globalScope = await harness.mcp.client.callTool({
+      name: "search_memories",
+      arguments: { query: "x", scope: "global" },
+    });
+    expect(globalScope.isError).toBeFalsy();
+    expect(jsonOf<{ hits: unknown[] }>(globalScope).hits).toEqual([]);
+
+    // includeAllProjects 也不需要專案。
+    const allProjects = await harness.mcp.client.callTool({
+      name: "search_memories",
+      arguments: { query: "x", includeAllProjects: true },
+    });
+    expect(allProjects.isError).toBeFalsy();
+  });
+
   it("O4：remember 的非字串 scope 原樣轉 REST（400），不靜默套預設", async () => {
     const harness = await startMcp();
     rest = harness.rest;
@@ -275,7 +384,7 @@ describe("MCP stdio 入口", () => {
 
     // 協定握手不需要 token（MCP 不重複實作授權）
     expect(harness.mcp.client.getServerVersion()?.name).toBe("mnemoshelf");
-    expect((await harness.mcp.client.listTools()).tools).toHaveLength(5);
+    expect((await harness.mcp.client.listTools()).tools).toHaveLength(6);
 
     const result = await harness.mcp.client.callTool({ name: "list_roots", arguments: {} });
     expect(result.isError).toBe(true);

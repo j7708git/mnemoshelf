@@ -4,6 +4,7 @@ import {
   MEMORY_LIST_DEFAULT_LIMIT,
   MEMORY_LIST_MAX_LIMIT,
   type MemoryFilter,
+  type MemorySearchFilter,
   type MetadataStore,
 } from "../ports/metadata-store.js";
 import type { MemoryPatch, MemoryScope, NewMemory, NewRoot } from "../ports/types.js";
@@ -590,6 +591,169 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       expect(await store.listMemoriesNeedingEmbedding(embedderId, 10_000)).toHaveLength(2);
     });
 
+    it("searchMemoriesByVector：bucket 過濾在排名前生效（global／project／所有專案／agent）", async () => {
+      const embedderId = "contract-embedder-vec@1";
+      const add = async (overrides: Partial<NewMemory>): Promise<number> =>
+        (await store.addMemory(memoryInput(overrides))).id;
+
+      const global = await add({ content: "全域記憶", scope: "global", project: null, kind: "fact" });
+      const projA = await add({ content: "專案 A", scope: "project", project: "proj-a", kind: "decision" });
+      const projB = await add({ content: "專案 B", scope: "project", project: "proj-b", kind: "fact" });
+      const agentX = await add({ content: "agent X", scope: "agent", project: null, agent: "agent-x", kind: "fact" });
+      const agentY = await add({ content: "agent Y", scope: "agent", project: null, agent: "agent-y", kind: "fact" });
+
+      // 分數嚴格遞減（query [1,0,0]），且彼此不同以便驗證排序。
+      await store.markMemoryEmbedded(global, embedderId, new Float32Array([1, 0, 0]));
+      await store.markMemoryEmbedded(projA, embedderId, new Float32Array([0.9, 0.1, 0]));
+      await store.markMemoryEmbedded(projB, embedderId, new Float32Array([0.8, 0.2, 0]));
+      await store.markMemoryEmbedded(agentX, embedderId, new Float32Array([0.7, 0.3, 0]));
+      await store.markMemoryEmbedded(agentY, embedderId, new Float32Array([0.6, 0.4, 0]));
+
+      const query = new Float32Array([1, 0, 0]);
+      const ids = async (filter: MemorySearchFilter, k = 10): Promise<number[]> =>
+        (await store.searchMemoriesByVector(query, embedderId, filter, k)).map((hit) => hit.id);
+
+      // 未提供 buckets＝全部 scope，依 cosine 降冪。
+      expect(await ids({})).toEqual([global, projA, projB, agentX, agentY]);
+      expect(await ids({ buckets: [{ scope: "global" }] })).toEqual([global]);
+      expect(await ids({ buckets: [{ scope: "global" }, { scope: "project", project: "proj-a" }] })).toEqual([
+        global,
+        projA,
+      ]);
+      // project bucket 省略 project＝所有專案。
+      expect(await ids({ buckets: [{ scope: "project" }] })).toEqual([projA, projB]);
+      // agent 只在使用者明確提供時納入（bucket 的 agent 精確比對）。
+      expect(await ids({ buckets: [{ scope: "agent", agent: "agent-x" }] })).toEqual([agentX]);
+      // kind 精確過濾（先過濾再排名）。
+      expect(await ids({ kind: "fact" })).toEqual([global, projB, agentX, agentY]);
+      // 空 bucket 陣列＝沒有可見範圍。
+      expect(await ids({ buckets: [] })).toEqual([]);
+
+      // 分數是 cosine：query [1,0,0] 對 [1,0,0] 為 1。
+      const top = await store.searchMemoriesByVector(query, embedderId, {}, 1);
+      expect(top).toHaveLength(1);
+      expect(top[0]).toMatchObject({ id: global });
+      expect(top[0]!.score).toBeCloseTo(1, 5);
+    });
+
+    it("searchMemoriesByVector：只取 ready＋embedder 相符、排除 failed／pending／已刪除；同分 id 升冪", async () => {
+      const embedderId = "contract-embedder-ready@1";
+      const other = await store.addMemory(memoryInput({ content: "別的 embedder" }));
+      const failed = await store.addMemory(memoryInput({ content: "失敗的向量" }));
+      const pending = await store.addMemory(memoryInput({ content: "尚未嵌入" }));
+      const deleted = await store.addMemory(memoryInput({ content: "已刪除的向量" }));
+      const tieA = await store.addMemory(memoryInput({ content: "同分 A" }));
+      const tieB = await store.addMemory(memoryInput({ content: "同分 B" }));
+
+      await store.markMemoryEmbedded(other.id, "contract-embedder-other@1", new Float32Array([1, 0]));
+      await store.markMemoryEmbedded(failed.id, embedderId, new Float32Array([1, 0]));
+      await store.markMemoryEmbeddingFailed(failed.id, "failed"); // 保留向量但狀態 failed → 不採
+      await store.markMemoryEmbedded(deleted.id, embedderId, new Float32Array([1, 0]));
+      await store.forgetMemory(deleted.id);
+      await store.markMemoryEmbedded(tieA.id, embedderId, new Float32Array([1, 0]));
+      await store.markMemoryEmbedded(tieB.id, embedderId, new Float32Array([1, 0]));
+
+      const hits = await store.searchMemoriesByVector(new Float32Array([1, 0]), embedderId, {}, 10);
+      // tieA/tieB 分數相同 → 依 id 升冪；pending／failed／別的 embedder／已刪除都不列入。
+      expect(hits.map((hit) => hit.id)).toEqual([tieA.id, tieB.id]);
+      expect(hits[0]!.score).toBeCloseTo(hits[1]!.score, 6);
+      expect(pending.deletedAt).toBeNull();
+    });
+
+    it("searchMemoriesByVector：k 邊界、非法查詢向量與維度不符都正確", async () => {
+      const embedderId = "contract-embedder-k@1";
+      const created: number[] = [];
+      for (const content of ["k 一", "k 二", "k 三"]) {
+        const memory = await store.addMemory(memoryInput({ content }));
+        await store.markMemoryEmbedded(memory.id, embedderId, new Float32Array([1, 0]));
+        created.push(memory.id);
+      }
+      const query = new Float32Array([1, 0]);
+      expect((await store.searchMemoriesByVector(query, embedderId, {}, 1)).length).toBe(1);
+      expect(await store.searchMemoriesByVector(query, embedderId, {}, 0)).toEqual([]);
+      expect(await store.searchMemoriesByVector(query, embedderId, {}, -3)).toEqual([]);
+      expect(await store.searchMemoriesByVector(query, embedderId, {}, 1.5)).toEqual([]);
+      // 上限 500：資料少於上限時回全部。
+      expect(await store.searchMemoriesByVector(query, embedderId, {}, 10_000)).toHaveLength(created.length);
+
+      // 非法查詢向量 → TypeError。
+      await expect(store.searchMemoriesByVector(new Float32Array(0), embedderId, {}, 5)).rejects.toBeInstanceOf(
+        TypeError,
+      );
+      await expect(
+        store.searchMemoriesByVector(new Float32Array([Number.NaN, 0.5]), embedderId, {}, 5),
+      ).rejects.toBeInstanceOf(TypeError);
+
+      // 同一 embedder 下混入不同維度（模擬損壞資料）：查詢維度不符 → TypeError，不得默默跳過。
+      const corrupt = await store.addMemory(memoryInput({ content: "維度不符的向量" }));
+      await store.markMemoryEmbedded(corrupt.id, embedderId, new Float32Array([0.1, 0.2, 0.3]));
+      await expect(store.searchMemoriesByVector(query, embedderId, {}, 5)).rejects.toBeInstanceOf(TypeError);
+    });
+
+    it("searchMemoriesKeyword：bucket／kind 先過濾、排除已刪除、不混 chunk、rank 連續", async () => {
+      // 同一關鍵詞的 chunk 不得混進記憶檢索。
+      const root = await store.addRoot(rootInput());
+      await store.replaceChunks(root.id, "shared.md", [
+        { seq: 0, kind: "text", text: "專案共享關鍵詞 chunk 版本", contentHash: "shared-hash" },
+      ]);
+
+      const global = await store.addMemory(
+        memoryInput({ content: "專案共享關鍵詞 全域", scope: "global", project: null, kind: "fact" }),
+      );
+      const projA = await store.addMemory(
+        memoryInput({ content: "專案共享關鍵詞 甲專案", scope: "project", project: "proj-a", kind: "decision" }),
+      );
+      const projB = await store.addMemory(
+        memoryInput({ content: "專案共享關鍵詞 乙專案", scope: "project", project: "proj-b", kind: "fact" }),
+      );
+      const agentX = await store.addMemory(
+        memoryInput({ content: "專案共享關鍵詞 agent", scope: "agent", project: null, agent: "agent-x" }),
+      );
+      const deleted = await store.addMemory(memoryInput({ content: "專案共享關鍵詞 已刪除", kind: "fact" }));
+      await store.forgetMemory(deleted.id);
+
+      const ids = async (filter: MemorySearchFilter, k = 10): Promise<number[]> =>
+        (await store.searchMemoriesKeyword("共享關鍵詞", filter, k)).map((hit) => hit.id);
+
+      // 未提供 buckets：global／project／agent 都在，已刪除與 chunk 不在。
+      const all = await ids({});
+      expect(all.sort()).toEqual([global.id, projA.id, projB.id, agentX.id].sort());
+
+      expect(await ids({ buckets: [{ scope: "global" }] })).toEqual([global.id]);
+      expect(await ids({ buckets: [{ scope: "project", project: "proj-a" }] })).toEqual([projA.id]);
+      expect(new Set(await ids({ buckets: [{ scope: "project" }] }))).toEqual(new Set([projA.id, projB.id]));
+      expect(await ids({ buckets: [{ scope: "agent", agent: "agent-x" }] })).toEqual([agentX.id]);
+      expect(new Set(await ids({ kind: "fact" }))).toEqual(new Set([global.id, projB.id, agentX.id]));
+      expect(await ids({ buckets: [] })).toEqual([]);
+
+      // rank 從 1 起算且連續；k 邊界。
+      const ranked = await store.searchMemoriesKeyword("共享關鍵詞", {}, 10);
+      expect(ranked.map((hit) => hit.rank)).toEqual(ranked.map((_hit, index) => index + 1));
+      expect(await store.searchMemoriesKeyword("共享關鍵詞", {}, 1)).toHaveLength(1);
+      expect(await store.searchMemoriesKeyword("共享關鍵詞", {}, 0)).toEqual([]);
+      expect(await store.searchMemoriesKeyword("   ", {}, 5)).toEqual([]);
+      expect(await store.searchMemoriesKeyword("，。！", {}, 5)).toEqual([]);
+    });
+
+    it("兩個記憶檢索方法對非法 bucket 都拋 TypeError（兩後端一致）", async () => {
+      const memory = await store.addMemory(memoryInput({ content: "非法 bucket 的測試記憶" }));
+      const embedderId = "contract-embedder-invalid@1";
+      await store.markMemoryEmbedded(memory.id, embedderId, new Float32Array([1, 0]));
+      const query = new Float32Array([1, 0]);
+
+      const invalidFilters: MemorySearchFilter[] = [
+        { buckets: [{ scope: "bogus" as MemoryScope }] },
+        { buckets: [{ scope: "global", project: "proj" }] },
+        { buckets: [{ scope: "global", agent: "agent" }] },
+        { buckets: [{ scope: "agent" }] },
+        { buckets: [{ scope: "agent", agent: "   " }] },
+        { buckets: [{ scope: "project", project: 42 as unknown as string }] },
+      ];
+      for (const filter of invalidFilters) {
+        await expect(store.searchMemoriesByVector(query, embedderId, filter, 5)).rejects.toBeInstanceOf(TypeError);
+        await expect(store.searchMemoriesKeyword("測試記憶", filter, 5)).rejects.toBeInstanceOf(TypeError);
+      }
+    });
     it("forgetMemory 軟刪除後搜尋不到，但資料仍在", async () => {
       const memory = await store.addMemory({
         content: "踩坑：WAL 下不要開多個寫入者",

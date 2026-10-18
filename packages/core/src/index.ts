@@ -28,17 +28,27 @@ export type { MetadataStore } from "./ports/metadata-store.js";
 export {
   assertMemoryEmbeddingFailure,
   assertMemoryEmbeddingInput,
+  assertMemoryQueryVector,
   MEMORY_EMBEDDING_STATES,
   MEMORY_LIST_DEFAULT_LIMIT,
   MEMORY_LIST_MAX_LIMIT,
   MEMORY_SCOPES,
+  MEMORY_SEARCH_MAX_K,
   normalizeMemoryLimit,
   normalizeMemoryPatch,
+  normalizeMemorySearchFilter,
+  normalizeMemorySearchK,
 } from "./ports/metadata-store.js";
 export type {
   MemoryEmbeddingFailure,
   MemoryEmbeddingStats,
   MemoryFilter,
+  MemoryKeywordHit,
+  MemorySearchBucket,
+  MemorySearchFilter,
+  MemoryVectorHit,
+  NormalizedMemorySearchBucket,
+  NormalizedMemorySearchFilter,
 } from "./ports/metadata-store.js";
 export type { VectorIndex, VectorItem } from "./ports/vector-index.js";
 export type {

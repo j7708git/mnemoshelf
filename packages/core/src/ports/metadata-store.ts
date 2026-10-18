@@ -98,6 +98,169 @@ export function normalizeMemoryPatch(
 /** `markMemoryEmbeddingFailed` 可設定的狀態：可重試的 `failed` 或永久跳過的 `too-long`。 */
 export type MemoryEmbeddingFailure = "failed" | "too-long";
 
+/** 記憶語意／關鍵字檢索的 `k` 上限（store 層；REST 較嚴格，另有自己的上限）。 */
+export const MEMORY_SEARCH_MAX_K = 500;
+
+/**
+ * 把記憶檢索的 `k` 正規化成實際要查詢的筆數。
+ *
+ * - 非正整數或 <= 0 → 0（呼叫端據此回傳空清單，與 `searchKeyword(k <= 0)` 的慣例一致）；
+ * - 超過 `MEMORY_SEARCH_MAX_K` → 夾到上限。
+ *
+ * 放在 port 檔案裡，讓各實作與呼叫端共用同一套邊界語意（不得各自解讀）。
+ */
+export function normalizeMemorySearchK(k: number): number {
+  if (!Number.isInteger(k) || k <= 0) return 0;
+  return Math.min(k, MEMORY_SEARCH_MAX_K);
+}
+
+/**
+ * 記憶檢索的一個「可見 bucket」（OR 起來；卡 B2）。
+ *
+ * - `global`：只比對 `scope='global'`；不得帶 `project`／`agent`。
+ * - `project`：比對 `scope='project'`；`project` 有值＝精確比對該專案名，**省略＝所有專案**
+ *   （「找全部專案」用；這是介面層對「所有專案」的唯一表示，不需要列舉專案名）。
+ * - `agent`：比對 `scope='agent' AND agent = ?`；`agent` 必填且非空白。
+ */
+export interface MemorySearchBucket {
+  scope: MemoryScope;
+  /** `scope=project` 時：有值＝精確比對專案名；省略＝所有專案。 */
+  project?: string;
+  /** `scope=agent` 時必填（比對 `memories.agent`）。 */
+  agent?: string;
+}
+
+/**
+ * 記憶檢索的過濾條件（`searchMemoriesByVector`／`searchMemoriesKeyword` 共用）。
+ *
+ * - `buckets` 未提供＝不限制 scope（仍永遠排除軟刪除）；空陣列＝沒有可見範圍（回空清單）。
+ * - `kind` 精確比對。
+ */
+export interface MemorySearchFilter {
+  buckets?: MemorySearchBucket[];
+  kind?: MemoryKind;
+}
+
+/** 驗證並正規化後的 bucket（`project` 省略＝所有專案）。 */
+export interface NormalizedMemorySearchBucket {
+  scope: MemoryScope;
+  project?: string;
+  agent?: string;
+}
+
+/** `normalizeMemorySearchFilter` 的結果。 */
+export interface NormalizedMemorySearchFilter {
+  /** 未提供＝`undefined`；空陣列＝沒有可見範圍。 */
+  buckets: NormalizedMemorySearchBucket[] | undefined;
+  kind: MemoryKind | undefined;
+}
+
+/**
+ * 驗證並正規化 `MemorySearchFilter`（兩後端共用；不得各自解讀）。
+ *
+ * 非法 bucket（scope 不合法、`global` 帶 `project`／`agent`、`agent` 缺 `agent` 或空白、
+ * `project` 非字串）→ 拋 `TypeError`。`project` 名稱 trim 後儲存／比對（寫入端已 trim）；
+ * `agent` 是寫入者標識，**不 trim**（只要求 trim 後非空）以維持精確比對。
+ */
+export function normalizeMemorySearchFilter(filter: MemorySearchFilter = {}): NormalizedMemorySearchFilter {
+  if (filter === null || typeof filter !== "object") {
+    throw new TypeError("MemorySearchFilter 必須是物件");
+  }
+  const kind = filter.kind;
+  const rawBuckets = filter.buckets;
+  if (rawBuckets === undefined) return { buckets: undefined, kind };
+  if (!Array.isArray(rawBuckets)) throw new TypeError("MemorySearchFilter.buckets 必須是陣列");
+
+  return {
+    buckets: rawBuckets.map((bucket, index) => {
+      if (bucket === null || typeof bucket !== "object" || Array.isArray(bucket)) {
+        throw new TypeError(`buckets[${index}] 必須是物件`);
+      }
+      const record = bucket as { scope?: unknown; project?: unknown; agent?: unknown };
+      const scope = record.scope;
+      if (typeof scope !== "string" || !(MEMORY_SCOPES as readonly string[]).includes(scope)) {
+        throw new TypeError(`buckets[${index}].scope 不合法：${String(scope)}`);
+      }
+
+      if (scope === "global") {
+        if (record.project !== undefined || record.agent !== undefined) {
+          throw new TypeError(`buckets[${index}]：scope=global 不得帶 project／agent`);
+        }
+        return { scope: "global" };
+      }
+      if (scope === "project") {
+        if (record.project !== undefined && typeof record.project !== "string") {
+          throw new TypeError(`buckets[${index}].project 必須是字串`);
+        }
+        return typeof record.project === "string"
+          ? { scope: "project", project: record.project.trim() }
+          : { scope: "project" };
+      }
+      // scope === "agent"
+      if (typeof record.agent !== "string" || record.agent.trim() === "") {
+        throw new TypeError(`buckets[${index}]：scope=agent 時 agent 必須是非空字串`);
+      }
+      return { scope: "agent", agent: record.agent };
+    }),
+    kind,
+  };
+}
+
+/**
+ * 驗證記憶向量檢索的查詢向量：必須是非空、只含有限值的 `Float32Array`。
+ * 維度與資料不符時由實作在比對時拋 `TypeError`（不得默默跳過）。
+ */
+export function assertMemoryQueryVector(vector: Float32Array): void {
+  if (!(vector instanceof Float32Array) || vector.length === 0) {
+    throw new TypeError("queryVec 必須是非空的 Float32Array");
+  }
+  for (const value of vector) {
+    if (!Number.isFinite(value)) throw new TypeError("queryVec 只能包含有限值");
+  }
+}
+
+/**
+ * 兩個向量的 cosine similarity（精確、O(dim)；SQLite 端在應用層計算）。
+ * 維度不同 → 拋 `TypeError`；任一向量模長為 0 → 回 0（不出現 NaN）。
+ *
+ * 結果夾在 [-1, 1]：float32 資料以 float64 運算時，相同向量的比值可能出現 1+1e-16 這種
+ * 浮點誤差，契約承諾 `score` 範圍是 [-1,1]，因此在邊界收斂（不影響排序）。
+ */
+export function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  if (a.length !== b.length) {
+    throw new TypeError(`向量維度不符：查詢 ${a.length} 維、記憶 ${b.length} 維`);
+  }
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let index = 0; index < a.length; index += 1) {
+    const left = a[index]!;
+    const right = b[index]!;
+    dot += left * right;
+    normA += left * left;
+    normB += right * right;
+  }
+  if (normA === 0 || normB === 0) return 0;
+  const similarity = dot / (Math.sqrt(normA) * Math.sqrt(normB));
+  return Math.min(1, Math.max(-1, similarity));
+}
+
+/**
+ * 記憶語意檢索的一筆命中（store 層；只帶 id 與 cosine 分數，完整 `Memory` 由呼叫端補）。
+ * 排序：`score` 降冪、同分 `id` 升冪。
+ */
+export interface MemoryVectorHit {
+  id: number;
+  /** cosine similarity（float，範圍 [-1, 1]）。 */
+  score: number;
+}
+
+/** 記憶關鍵字檢索的一筆命中（store 層；`rank` 從 1 起算）。 */
+export interface MemoryKeywordHit {
+  id: number;
+  rank: number;
+}
+
 /**
  * 記憶語意化的狀態統計（`MetadataStore.memoryEmbeddingStats`）。
  *
@@ -254,6 +417,33 @@ export interface MetadataStore {
 
   /** 統計未刪除記憶的語意化狀態（見 `MemoryEmbeddingStats`）。 */
   memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats>;
+
+  /**
+   * 記憶的**語意**檢索（卡 B2）：先過濾、再排名（不得先取 top-k 再過濾）。
+   *
+   * - 只取 `embedding_state='ready'`、`embedding_embedder_id = embedderId` 且未刪除的記憶；
+   *   `filter`（bucket／kind）在 SQL 先套用，再計算 cosine similarity。
+   * - `queryVec` 必須是非空、只含有限值的 `Float32Array`（見 `assertMemoryQueryVector`）；
+   *   與資料維度不同 → 拋 `TypeError`（不默默跳過）。
+   * - `k` 的邊界語意見 `normalizeMemorySearchK`（<= 0 回空、上限 500）。
+   * - 回傳 `{id, score}`：`score` 為 cosine similarity（[-1, 1]）；排序 `score` 降冪、同分 `id` 升冪。
+   * - 沒有可用向量時回 `[]`（不拋錯）；`filter.buckets` 空陣列也回 `[]`。
+   */
+  searchMemoriesByVector(
+    queryVec: Float32Array,
+    embedderId: string,
+    filter: MemorySearchFilter,
+    k: number,
+  ): Promise<MemoryVectorHit[]>;
+
+  /**
+   * 記憶的**關鍵字**檢索（卡 B2）：沿用後端 FTS 與既有斷詞，**先套同一組 filter**、再排名。
+   *
+   * - 只回未刪除的記憶（**不得**混入 chunk 結果）；空查詢／無可搜尋詞 → `[]`。
+   * - `k` 邊界同 `searchMemoriesByVector`（<= 0 空、上限 500）。
+   * - 回傳 `{id, rank}`（rank 從 1 起算）；排序由後端 FTS 決定，同分以 `id` 決勝以確保可重現。
+   */
+  searchMemoriesKeyword(query: string, filter: MemorySearchFilter, k: number): Promise<MemoryKeywordHit[]>;
 
   /**
    * 列舉**未刪除**的記憶（軟刪除者與被取代者不會出現）。

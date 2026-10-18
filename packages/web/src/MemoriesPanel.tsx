@@ -12,8 +12,10 @@ import {
   deleteMemory,
   listMemories,
   pinMemory,
+  searchMemories,
   updateMemory,
   type Memory,
+  type MemoryRecallResult,
   type MemoryScope,
 } from "./api";
 import { formatDateTime, MEMORY_KIND_LABEL, MEMORY_SCOPE_LABEL } from "./format";
@@ -22,6 +24,13 @@ type LoadState =
   | { kind: "loading" }
   | { kind: "ready"; memories: Memory[] }
   | { kind: "error"; message: string };
+
+/** 記憶搜尋的狀態（與列表的載入狀態分開，搜尋失敗不影響列表）。 */
+type RecallState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | { kind: "ready"; result: MemoryRecallResult };
 
 /** 篩選值：`"all"` 表示不過濾。 */
 type ScopeFilter = MemoryScope | "all";
@@ -42,6 +51,49 @@ function collectProjectNames(memories: Memory[]): string[] {
   );
 }
 
+/** 召回結果清單（純呈現；不改變列表狀態）。 */
+function RecallResults({ result }: { result: MemoryRecallResult }) {
+  // 降級提示與命中數無關：0 命中＋degraded 時也要讓使用者知道「語意不可用、這是關鍵字結果」
+  // （卡 B2 驗收 O5）。
+  const degradedNotice = result.degraded ? (
+    <p role="status" className="rounded-md border border-line bg-surface px-3 py-2 text-xs text-ink">
+      語意搜尋目前不可用（
+      {result.degradedReason === "no-embeddings" ? "向量尚未就緒" : "embedder 無法使用"}
+      ）{result.hits.length > 0 ? "，以下為關鍵字結果。" : "，已改用關鍵字搜尋。"}
+    </p>
+  ) : null;
+
+  if (result.hits.length === 0) {
+    return (
+      <div className="space-y-2">
+        {degradedNotice}
+        <p className="text-xs text-muted">沒有找到相關記憶。</p>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      {degradedNotice}
+      <ul className="space-y-2">
+        {result.hits.map((hit) => (
+          <li key={hit.id} className="rounded-md border border-line bg-white px-3 py-2">
+            <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
+              <span className="rounded bg-surface px-1.5 py-0.5">{MEMORY_KIND_LABEL[hit.kind]}</span>
+              <span className="rounded bg-surface px-1.5 py-0.5">範圍 {MEMORY_SCOPE_LABEL[hit.scope]}</span>
+              <span className="rounded bg-surface px-1.5 py-0.5">專案 {hit.project ?? "全域"}</span>
+              <span>來源 {hit.source === "semantic" ? "語意" : "關鍵字"}</span>
+              <span>分數 {hit.score.toFixed(3)}</span>
+              <span>#{hit.id}</span>
+            </div>
+            <p className="mt-1 whitespace-pre-wrap break-words text-sm text-ink">{hit.content}</p>
+            <p className="mt-1 text-[11px] text-muted">寫入者 {hit.agent}</p>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 export function MemoriesPanel() {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -56,6 +108,10 @@ export function MemoriesPanel() {
   const [projectFilter, setProjectFilter] = useState<string>(ALL_PROJECTS);
   /** 每筆「改回專案」目前選定的目標專案（未選時用清單第一個可選專案）。 */
   const [shareTargets, setShareTargets] = useState<Record<number, string>>({});
+  /** 記憶搜尋（卡 B2）：查詢字串、「找全部專案」與結果狀態。 */
+  const [recallQuery, setRecallQuery] = useState("");
+  const [recallAllProjects, setRecallAllProjects] = useState(false);
+  const [recallState, setRecallState] = useState<RecallState>({ kind: "idle" });
 
   /** 清單中出現過的專案名稱（供篩選與共享開關的目標選單）。 */
   const availableProjects = state.kind === "ready" ? collectProjectNames(state.memories) : [];
@@ -127,6 +183,41 @@ export function MemoriesPanel() {
       },
       `已改回專案「${target}」。`,
     );
+  };
+
+  /**
+   * 執行記憶搜尋（沿用列表的專案／範圍篩選值＋「找全部專案」勾選）。
+   *
+   * 範圍不明確時（沒選專案、沒勾找全部、範圍又不是全域）先在前端提示，
+   * 不送出伺服器必定 400 的請求；`agent` 範圍在 UI 沒有身分可用，故不支援（直接提示）。
+   */
+  const runRecall = async (): Promise<void> => {
+    const query = recallQuery.trim();
+    if (query === "") {
+      setRecallState({ kind: "error", message: "請輸入查詢字串。" });
+      return;
+    }
+    if (scopeFilter === "agent") {
+      setRecallState({ kind: "error", message: "UI 搜尋不支援 agent 範圍（agent 範圍需由 agent 明確指定）。" });
+      return;
+    }
+    if (!recallAllProjects && projectFilter === ALL_PROJECTS && scopeFilter !== "global") {
+      setRecallState({ kind: "error", message: "請選擇專案、勾選「找全部專案」，或把範圍設為全域。" });
+      return;
+    }
+    setRecallState({ kind: "loading" });
+    try {
+      const result = await searchMemories({
+        query,
+        ...(recallAllProjects ? { includeAllProjects: true } : {}),
+        ...(!recallAllProjects && projectFilter !== ALL_PROJECTS ? { project: projectFilter } : {}),
+        ...(scopeFilter !== "all" ? { scope: scopeFilter } : {}),
+        k: 10,
+      });
+      setRecallState({ kind: "ready", result });
+    } catch (error) {
+      setRecallState({ kind: "error", message: error instanceof Error ? error.message : "搜尋記憶失敗。" });
+    }
   };
 
   const startEdit = (memory: Memory): void => {
@@ -232,6 +323,50 @@ export function MemoriesPanel() {
         >
           重新載入
         </button>
+      </div>
+
+      <div className="space-y-2 rounded-lg border border-line bg-white/70 px-4 py-3">
+        <div className="flex flex-wrap items-baseline gap-2">
+          <h3 className="text-sm font-medium text-ink">搜尋記憶</h3>
+          <span className="text-[11px] text-muted">
+            語意優先；預設本專案＋全域共享（＋自己的 agent 範圍），可用下方篩選與「找全部專案」
+          </span>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            type="search"
+            value={recallQuery}
+            onChange={(event) => setRecallQuery(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") void runRecall();
+            }}
+            aria-label="搜尋記憶"
+            placeholder="用自然語言找記憶…"
+            className="min-w-[14rem] flex-1 rounded-md border border-line bg-white px-3 py-1.5 text-sm text-ink outline-none focus:border-ink"
+          />
+          <label className="flex items-center gap-1.5 text-xs text-muted">
+            <input
+              type="checkbox"
+              checked={recallAllProjects}
+              onChange={(event) => setRecallAllProjects(event.target.checked)}
+            />
+            找全部專案
+          </label>
+          <button
+            type="button"
+            disabled={recallState.kind === "loading"}
+            onClick={() => void runRecall()}
+            className="rounded-md bg-ink px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
+          >
+            {recallState.kind === "loading" ? "搜尋中…" : "搜尋"}
+          </button>
+        </div>
+        {recallState.kind === "error" && (
+          <p role="alert" className="text-xs text-red-600">
+            {recallState.message}
+          </p>
+        )}
+        {recallState.kind === "ready" && <RecallResults result={recallState.result} />}
       </div>
 
       {state.memories.length > 0 && (

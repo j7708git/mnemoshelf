@@ -13,6 +13,7 @@
  * - `POST /search`（`query` 超過模型單筆輸入上限時 → `400 InputTooLongError`，見 `toHttpError`）
  * - `POST /memories`（建立後只 enqueue 背景嵌入，立即回 201）、`GET /memories`、`PATCH /memories/:id`、
  *   `POST /memories/:id/pin`、`DELETE /memories/:id`
+ * - `POST /memories/search`（記憶語意召回；先過濾再排名，語意不可用時降級關鍵字，見 `memory-search.ts`）
  *
  * 行為規則：
  * - **單一寫入者**：資料庫只被本行程開啟；本模組是唯一的寫入路徑（MCP 走 HTTP 進來的）。
@@ -89,6 +90,12 @@ import {
 import { requireLocalHost, requireLoopback, requireToken } from "./auth.js";
 import { unifiedSearch, type SearchMode, type UnifiedSearchResult } from "../search.js";
 import type { MemoryEmbeddingWorker } from "../memory-embedder.js";
+import {
+  MEMORY_SEARCH_DEFAULT_K,
+  MEMORY_SEARCH_MAX_K,
+  searchMemories,
+  type MemoryRecallResponseBody,
+} from "../memory-search.js";
 
 /** JSON 請求主體上限。 */
 export const MAX_JSON_BODY_BYTES = 1024 * 1024;
@@ -1389,6 +1396,82 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     return { status: 200, body: { memories } };
   };
 
+  /**
+   * `POST /memories/search`：記憶語意召回（卡 B2）。
+   *
+   * 驗證在這裡做（形狀與 400 邊界），召回流程（bucket 組法／語意優先／關鍵字降級／minScore）
+   * 在 `memory-search.ts`（REST 與 MCP 共用同一條路徑）：
+   * - `query` 必填非空；`k` 非正整數 → 400，超過上限夾到 `MEMORY_SEARCH_MAX_K`（100）；
+   * - `scope`／`kind` 有提供時必須是合法值；`minScore` 必須在 0..1；
+   * - 未提供 `project` 且未 `includeAllProjects` → 由 bucket 組法回 400（避免不明確的召回範圍）；
+   * - 成功回 `200`＋`{query,k,degraded,degradedReason,memoryEmbedding,hits}`。
+   */
+  const searchMemoriesRoute = async (request: IncomingMessage): Promise<{ status: number; body: unknown }> => {
+    const body = await readJsonBody(request);
+    const query = requireString(body.query, "query");
+
+    const projectRaw = optionalString(body.project, "project");
+    const project = projectRaw === undefined ? undefined : projectRaw.trim();
+    const projectValue = project === "" ? undefined : project;
+
+    const includeAllProjects = optionalBoolean(body.includeAllProjects, "includeAllProjects");
+
+    let scope: MemoryScope | undefined;
+    if (body.scope !== undefined) {
+      if (typeof body.scope !== "string" || !(MEMORY_SCOPES as readonly string[]).includes(body.scope)) {
+        throw new ValidationError("scope", `必須是 ${MEMORY_SCOPES.join(" / ")} 之一`);
+      }
+      scope = body.scope as MemoryScope;
+    }
+
+    const agentRaw = optionalString(body.agent, "agent");
+    const agent = agentRaw === undefined || agentRaw.trim() === "" ? undefined : agentRaw;
+
+    let kind: MemoryKind | undefined;
+    if (body.kind !== undefined) {
+      if (typeof body.kind !== "string" || !(MEMORY_KINDS as readonly string[]).includes(body.kind)) {
+        throw new ValidationError("kind", `必須是 ${MEMORY_KINDS.join(" / ")} 之一`);
+      }
+      kind = body.kind as MemoryKind;
+    }
+
+    let k = MEMORY_SEARCH_DEFAULT_K;
+    if (body.k !== undefined) {
+      if (typeof body.k !== "number" || !Number.isInteger(body.k) || body.k <= 0) {
+        throw new ValidationError("k", "必須是正整數");
+      }
+      k = Math.min(body.k, MEMORY_SEARCH_MAX_K);
+    }
+
+    let minScore: number | undefined;
+    if (body.minScore !== undefined) {
+      if (
+        typeof body.minScore !== "number" ||
+        !Number.isFinite(body.minScore) ||
+        body.minScore < 0 ||
+        body.minScore > 1
+      ) {
+        throw new ValidationError("minScore", "必須是 0 到 1 之間的數字");
+      }
+      minScore = body.minScore;
+    }
+
+    const result: MemoryRecallResponseBody = await searchMemories(
+      { store: deps.store, embedder: deps.embedder },
+      {
+        query,
+        ...(projectValue === undefined ? {} : { project: projectValue }),
+        ...(includeAllProjects === undefined ? {} : { includeAllProjects }),
+        ...(scope === undefined ? {} : { scope }),
+        ...(agent === undefined ? {} : { agent }),
+        ...(kind === undefined ? {} : { kind }),
+        k,
+        ...(minScore === undefined ? {} : { minScore }),
+      },
+    );
+    return { status: 200, body: result };
+  };
+
   const routeMemories = async (
     request: IncomingMessage,
     method: string,
@@ -1399,6 +1482,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       if (method === "POST") return await addMemory(request);
       if (method === "GET") return await listMemories(url);
       throw new MethodNotAllowedError(method, ["GET", "POST"]);
+    }
+    if (segments.length === 2 && segments[1] === "search") {
+      if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
+      return await searchMemoriesRoute(request);
     }
     if (segments.length === 2) {
       if (method === "DELETE") return await forgetMemory(parseId(segments[1]!, "記憶"));

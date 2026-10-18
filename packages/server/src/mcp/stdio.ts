@@ -37,7 +37,7 @@ export const MCP_SERVER_NAME = "mnemoshelf";
  */
 export const MCP_SERVER_VERSION = APP_VERSION;
 
-/** 五個工具（原始 JSON Schema；參數的語意驗證由 REST 負責）。 */
+/** 六個工具（原始 JSON Schema；參數的語意驗證由 REST 負責）。 */
 export const MCP_TOOLS: Tool[] = [
   {
     name: "search",
@@ -96,6 +96,28 @@ export const MCP_TOOLS: Tool[] = [
         agent: { type: "string" },
         limit: { type: "integer" },
       },
+    },
+  },
+  {
+    name: "search_memories",
+    description:
+      `用自然語言搜尋記憶（語意優先；語意不可用時自動退回關鍵字，回應帶 degraded／degradedReason）。` +
+      `預設範圍＝目前專案＋全域共享（＋自己的 agent 範圍）；要跨所有專案請設 includeAllProjects=true。` +
+      `project 未提供時依 remember 的規則解析（參數 > 環境變數 MNEMOSHELF_PROJECT > 行程 cwd 的資料夾名稱）。` +
+      `scope：global／project／agent（agent 只含自己的）；kind 選填；k 預設 10、上限 100；` +
+      `minScore 0..1 只過濾語意結果。每筆命中帶 score／rank／source 與完整記憶欄位。${UNTRUSTED_DATA_WARNING}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string", description: "查詢字串（必填）" },
+        project: { type: "string", description: "專案名稱（未提供時自動解析）" },
+        includeAllProjects: { type: "boolean", description: "true＝跨所有專案（忽略專案限制）" },
+        scope: { type: "string", enum: ["global", "project", "agent"], description: "明確指定召回範圍" },
+        kind: { type: "string", enum: ["fact", "decision", "pitfall", "preference"] },
+        k: { type: "integer", description: "回傳筆數，預設 10、上限 100" },
+        minScore: { type: "number", description: "0..1，只過濾語意結果" },
+      },
+      required: ["query"],
     },
   },
   {
@@ -379,6 +401,54 @@ export function createMcpServer(options: McpServerOptions): Server {
               2,
             ),
           );
+
+        case "search_memories": {
+          // 寫入者／agent 標識一律取 MCP 客戶端名稱：只有「自己的 agent 範圍」會被納入召回。
+          const agent = server.getClientVersion()?.name ?? "mcp";
+          const projectArgument = args.project;
+          let project: unknown = projectArgument;
+          if (
+            projectArgument === undefined ||
+            (typeof projectArgument === "string" && projectArgument.trim() === "")
+          ) {
+            const resolution = resolveProjectName({
+              argument: projectArgument,
+              configProject: options.project,
+              ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+              ...(options.homeDir === undefined ? {} : { homeDir: options.homeDir }),
+            });
+            // 解析不到專案、又沒有 includeAllProjects／明確 scope → 先給清楚的工具錯誤，
+            // 不要送一個 REST 必定 400 的模糊請求（卡 B2 §5）。
+            if (
+              resolution.project === null &&
+              args.includeAllProjects !== true &&
+              (args.scope === undefined || args.scope === "project")
+            ) {
+              throw new ValidationError(
+                "project",
+                "無法解析專案：請帶 project、設定環境變數 MNEMOSHELF_PROJECT，或指定 includeAllProjects=true",
+              );
+            }
+            project = resolution.project ?? undefined;
+          }
+
+          return toolText(
+            JSON.stringify(
+              await callRest(options, "POST", "/memories/search", {
+                query: args.query,
+                ...(project === undefined ? {} : { project }),
+                ...(args.includeAllProjects === undefined ? {} : { includeAllProjects: args.includeAllProjects }),
+                ...(args.scope === undefined ? {} : { scope: args.scope }),
+                ...(args.kind === undefined ? {} : { kind: args.kind }),
+                ...(args.k === undefined ? {} : { k: args.k }),
+                ...(args.minScore === undefined ? {} : { minScore: args.minScore }),
+                agent,
+              }),
+              null,
+              2,
+            ),
+          );
+        }
 
         case "forget": {
           const id = Number(args.id);
