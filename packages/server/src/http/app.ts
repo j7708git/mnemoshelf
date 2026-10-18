@@ -8,10 +8,11 @@
  * - `POST /roots/:id/preview`、`POST /roots/:id/index`、`POST /roots/:id/index/cancel`
  * - `GET  /roots/:id/entries?path=`（目錄子項）、`GET /roots/:id/file?path=`（文字預覽／圖片位元組）、
  *   `GET /roots/:id/thumb?path=`（縮圖）、`GET /roots/:id/index/status`（索引进度輪詢）
- * - `GET  /diagnostics`（除錯資訊匯出：版本、平台、embedder（含執行裝置與退回原因）、每 root 統計；
- *   家目錄前綴遮罩成 `~`）
+ * - `GET  /diagnostics`（除錯資訊匯出：版本、平台、embedder（含執行裝置與退回原因）、每 root 統計、
+ *   記憶語意化狀態與背景 worker 統計；家目錄前綴遮罩成 `~`）
  * - `POST /search`（`query` 超過模型單筆輸入上限時 → `400 InputTooLongError`，見 `toHttpError`）
- * - `POST /memories`、`GET /memories`、`PATCH /memories/:id`、`POST /memories/:id/pin`、`DELETE /memories/:id`
+ * - `POST /memories`（建立後只 enqueue 背景嵌入，立即回 201）、`GET /memories`、`PATCH /memories/:id`、
+ *   `POST /memories/:id/pin`、`DELETE /memories/:id`
  *
  * 行為規則：
  * - **單一寫入者**：資料庫只被本行程開啟；本模組是唯一的寫入路徑（MCP 走 HTTP 進來的）。
@@ -87,6 +88,7 @@ import {
 } from "./explorer.js";
 import { requireLocalHost, requireLoopback, requireToken } from "./auth.js";
 import { unifiedSearch, type SearchMode, type UnifiedSearchResult } from "../search.js";
+import type { MemoryEmbeddingWorker } from "../memory-embedder.js";
 
 /** JSON 請求主體上限。 */
 export const MAX_JSON_BODY_BYTES = 1024 * 1024;
@@ -313,6 +315,33 @@ export interface DiagnosticsResponse {
   roots: DiagnosticsRoot[];
   /** 進行中的索引任務（本行程；沒有時為空陣列）。 */
   indexing: { rootId: number; startedAt: string | null }[];
+  /** 記憶語意化的狀態與背景 worker 統計（卡 B1；additive 欄位）。 */
+  memories: DiagnosticsMemoryEmbedding;
+}
+
+/**
+ * `GET /diagnostics` 的記憶語意化統計（卡 B1）。
+ *
+ * `total`／四個狀態數／`stale` 來自 `MetadataStore.memoryEmbeddingStats`
+ * （`total = pending + ready + failed + tooLong`）；`worker.*` 是本行程 worker 的累計計數
+ * （重啟歸零，佇列長度是即時值）。
+ */
+export interface DiagnosticsMemoryEmbedding {
+  /** 未刪除的記憶總數。 */
+  total: number;
+  ready: number;
+  pending: number;
+  failed: number;
+  tooLong: number;
+  /** `ready` 但 embedder 身分與目前 embedder 不同（換 embedder 後待重嵌）。 */
+  stale: number;
+  worker: {
+    queued: number;
+    processing: number;
+    embedded: number;
+    failed: number;
+    tooLong: number;
+  };
 }
 
 /** 統一的錯誤回應格式。 */
@@ -353,6 +382,8 @@ export interface RestAppDeps {
   store: MetadataStore;
   vec: VectorIndex;
   embedder: Embedder;
+  /** 記憶向量背景 worker（卡 B1）：`POST /memories` enqueue、診斷讀 stats。 */
+  memoryEmbedder: MemoryEmbeddingWorker;
   token: string;
   /** root 加入時的「過寬」判定基準；預設 `os.homedir()`。 */
   homeDir?: string;
@@ -1057,6 +1088,9 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       };
     });
 
+    const memoryStats = await deps.store.memoryEmbeddingStats(deps.embedder.info.id);
+    const memoryWorkerStats = deps.memoryEmbedder.stats();
+
     const raw: DiagnosticsResponse = {
       generatedAt: new Date().toISOString(),
       app: {
@@ -1071,6 +1105,22 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       embedderRuntime: deps.embedder.runtimeStatus ?? null,
       roots: rootSummaries,
       indexing: [...indexing.keys()].map((rootId) => ({ rootId, startedAt: indexStatus.status(rootId).startedAt })),
+      memories: {
+        total: memoryStats.total,
+        ready: memoryStats.ready,
+        pending: memoryStats.pending,
+        failed: memoryStats.failed,
+        tooLong: memoryStats.tooLong,
+        stale: memoryStats.stale,
+        // 本行程累計；重啟歸零、佇列長度是即時值（卡 B1）。
+        worker: {
+          queued: memoryWorkerStats.queued,
+          processing: memoryWorkerStats.processing,
+          embedded: memoryWorkerStats.embedded,
+          failed: memoryWorkerStats.failed,
+          tooLong: memoryWorkerStats.tooLong,
+        },
+      },
     };
     // 一律遮罩家目錄前綴：不輸出使用者家目錄的絕對路徑（見 repo 隱私規範）。
     return maskDiagnostics(raw, homeDir);
@@ -1105,14 +1155,42 @@ export function createRestApp(deps: RestAppDeps): RestApp {
    *
    * 被取代者原本若已釘選，新版本**繼承**其 `pinned`（`NewMemory` 契約仍無 `pinned`，
    * 新記憶一律 `false`；這裡是 server 端在建立後補一次 `setMemoryPinned` 的行為細節）。
+   *
+   * **O2（卡 B1）scope／project 正規化**：
+   * - `scope` 省略且有 `project` → 視為 `scope: "project"`（方便呼叫端；避免默默存出矛盾組合）；
+   * - `scope` 省略且無 `project` → `global`（維持既有預設）；
+   * - `scope: "project"` 且 `project` 缺少／空字串 → `400`（專案名 trim 後儲存）；
+   * - `scope: "global" | "agent"` 且帶非 null `project` → `400`。
+   *
+   * 建立成功後只把 id 交給背景 worker（`memoryEmbedder.enqueue`）：**不等待嵌入**，
+   * 回應仍是立即的 `201`；向量稍後就緒（狀態見 `GET /diagnostics` 的 `memories`）。
    */
   const addMemory = async (request: IncomingMessage): Promise<{ status: number; body: unknown }> => {
     const body = await readJsonBody(request);
     const content = requireString(body.content, "content", { maxLength: MAX_MEMORY_CHARS });
     const agent = requireString(body.agent, "agent");
     const kind = enumValue(body.kind, MEMORY_KINDS, "kind", "fact");
-    const scope = enumValue(body.scope, MEMORY_SCOPES, "scope", "global");
-    const project = optionalString(body.project, "project") ?? null;
+
+    const projectInput = optionalString(body.project, "project");
+    const hasProject = projectInput !== undefined;
+    let scope: MemoryScope;
+    if (body.scope === undefined) {
+      // 省略 scope：有 project 就視為 project，否則沿用既有預設 global。
+      scope = hasProject ? "project" : "global";
+    } else {
+      // **顯式**提供的 scope 必須是合法字串；`null`／數字／其他型別一律 400——
+      // 不把「非字串」靜默當成「未指定」（O2／O4，卡 B1）。
+      if (body.scope === null) throw new ValidationError("scope", `必須是 ${MEMORY_SCOPES.join(" / ")} 之一`);
+      scope = enumValue(body.scope, MEMORY_SCOPES, "scope", "global");
+    }
+    let project: string | null = null;
+    if (scope === "project") {
+      const trimmed = projectInput?.trim() ?? "";
+      if (trimmed === "") throw new ValidationError("project", "scope 為 project 時必須提供非空的專案名稱");
+      project = trimmed;
+    } else if (hasProject) {
+      throw new ValidationError("project", `scope 為 ${scope} 時 project 必須是 null（全域／agent 範圍沒有專案）`);
+    }
     const supersedes = optionalId(body.supersedes, "supersedes");
 
     // 先讀被取代者（若存在）的 pinned：建立新記憶會把舊版軟刪除，之後仍可讀，但先讀較清楚。
@@ -1122,6 +1200,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       await deps.store.setMemoryPinned(memory.id, true);
       memory = (await deps.store.getMemory(memory.id)) ?? memory;
     }
+    // 背景、非阻塞：回應不必等模型。supersedes 產生的新版本同樣要嵌入。
+    deps.memoryEmbedder.enqueue(memory.id);
     return { status: 201, body: memory };
   };
 

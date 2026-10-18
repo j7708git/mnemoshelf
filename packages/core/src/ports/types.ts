@@ -66,6 +66,16 @@ export type MemoryKind = "fact" | "decision" | "pitfall" | "preference";
 /** 記憶的作用範圍。 */
 export type MemoryScope = "global" | "project" | "agent";
 
+/**
+ * 記憶向量的狀態機（卡 B1；存在 `memories.embedding_state`，**不是** `Memory` 的公開欄位）。
+ *
+ * - `pending`：待嵌入（新資料與既有資料的預設）；
+ * - `ready`：向量已產生且可信（還要 `embedding_embedder_id` 與查詢的 embedder 相符）；
+ * - `failed`：嵌入失敗，可重試（回填流程會再試）；
+ * - `too-long`：超過 embedder 的單筆輸入上限，**永久跳過**（重試也不會成功）。
+ */
+export type MemoryEmbeddingState = "pending" | "ready" | "failed" | "too-long";
+
 /** 一筆共享記憶。 */
 export interface Memory {
   id: number;

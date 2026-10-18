@@ -1,7 +1,11 @@
 import { DuplicateRootError } from "../../errors.js";
 import {
+  assertMemoryEmbeddingFailure,
+  assertMemoryEmbeddingInput,
   normalizeMemoryLimit,
   normalizeMemoryPatch,
+  type MemoryEmbeddingFailure,
+  type MemoryEmbeddingStats,
   type MemoryFilter,
   type MetadataStore,
 } from "../../ports/metadata-store.js";
@@ -75,6 +79,17 @@ function rowToMemory(row: Record<string, unknown>): Memory {
     createdAt: String(row.created_at),
     deletedAt: row.deleted_at === null || row.deleted_at === undefined ? null : String(row.deleted_at),
   };
+}
+
+/**
+ * 把記憶向量編碼成 SQLite BLOB（little-endian float32，與 `Float32Array` 的記憶體配置相同）。
+ *
+ * 先包成 `Uint8Array` 再交給 `Buffer.from` 是**複製**（不是共享 view）：避免呼叫端日後改寫
+ * 同一個 `Float32Array` 就悄悄改到資料庫裡的值，也避免 BLOB 參照到被回收的緩衝區。
+ * 讀回端（卡 B2）以對稱方式解碼；本卡不把向量暴露在 `Memory`。
+ */
+function encodeEmbedding(vector: Float32Array): Buffer {
+  return Buffer.from(new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength));
 }
 
 /**
@@ -315,6 +330,90 @@ export class SqliteMetadataStore implements MetadataStore {
       .prepare("update memories set scope = ?, project = ? where id = ? and deleted_at is null")
       .run(next.scope, next.project, id);
     return await this.getMemory(id);
+  }
+
+  /**
+   * 寫入記憶向量並設為 `ready`（見 `MetadataStore.markMemoryEmbedded`）。
+   *
+   * `deleted_at is null` 讓「讀到之後才被軟刪除」的競態變成 no-op；未知 id 同樣更新不到任何列。
+   * 狀態與向量在同一個 UPDATE 寫入，不會觀察到「ready 但沒有向量」的中間狀態。
+   */
+  async markMemoryEmbedded(id: number, embedderId: string, vec: Float32Array): Promise<void> {
+    assertMemoryEmbeddingInput(embedderId, vec);
+    this.db
+      .prepare(
+        `update memories
+            set embedding = ?, embedding_embedder_id = ?, embedding_state = 'ready'
+          where id = ? and deleted_at is null`,
+      )
+      .run(encodeEmbedding(vec), embedderId, id);
+  }
+
+  /**
+   * 把狀態設為 `failed`／`too-long`（見 `MetadataStore.markMemoryEmbeddingFailed`）。
+   *
+   * 刻意**不**清掉既有 `embedding`／`embedding_embedder_id`：卡 B2 的召回端只採 `ready` 且
+   * embedder 相符者，保留舊向量可讓「同一 embedder 重試成功」時省一次寫入，也便於診斷。
+   */
+  async markMemoryEmbeddingFailed(id: number, reason: MemoryEmbeddingFailure): Promise<void> {
+    assertMemoryEmbeddingFailure(reason);
+    this.db
+      .prepare("update memories set embedding_state = ? where id = ? and deleted_at is null")
+      .run(reason, id);
+  }
+
+  /**
+   * 列出需要（重新）產生向量的未刪除記憶（見 `MetadataStore.listMemoriesNeedingEmbedding`）。
+   *
+   * `embedding_embedder_id is null` 也視為 stale：`ready` 正常一定有 embedder id，但防禦
+   * 早期手動改資料或未來遷移留下的半套狀態。
+   */
+  async listMemoriesNeedingEmbedding(embedderId: string, limit?: number): Promise<Memory[]> {
+    const normalized = normalizeMemoryLimit(limit);
+    if (normalized === 0) return [];
+
+    return selectRows(
+      this.db,
+      `select ${MEMORY_COLUMNS} from memories
+        where deleted_at is null
+          and (embedding_state in ('pending', 'failed')
+               or (embedding_state = 'ready'
+                   and (embedding_embedder_id is null or embedding_embedder_id <> ?)))
+        order by created_at desc, id desc
+        limit ?`,
+      embedderId,
+      normalized,
+    ).map(rowToMemory);
+  }
+
+  /** 統計未刪除記憶的語意化狀態（見 `MetadataStore.memoryEmbeddingStats`；四個狀態數自洽）。 */
+  async memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats> {
+    const row = selectRow(
+      this.db,
+      `select
+         count(*) as total,
+         sum(case when embedding_state = 'pending' then 1 else 0 end) as pending,
+         sum(case when embedding_state = 'ready' then 1 else 0 end) as ready,
+         sum(case when embedding_state = 'failed' then 1 else 0 end) as failed,
+         sum(case when embedding_state = 'too-long' then 1 else 0 end) as too_long,
+         sum(case
+               when embedding_state = 'ready'
+                and (embedding_embedder_id is null or embedding_embedder_id <> ?)
+               then 1 else 0
+             end) as stale
+       from memories where deleted_at is null`,
+      embedderId,
+    );
+
+    const count = (value: unknown): number => Number(value ?? 0);
+    return {
+      total: count(row?.total),
+      pending: count(row?.pending),
+      ready: count(row?.ready),
+      failed: count(row?.failed),
+      tooLong: count(row?.too_long),
+      stale: count(row?.stale),
+    };
   }
 
   /**

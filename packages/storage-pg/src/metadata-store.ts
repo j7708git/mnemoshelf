@@ -1,10 +1,14 @@
 import {
   DuplicateRootError,
+  assertMemoryEmbeddingFailure,
+  assertMemoryEmbeddingInput,
   normalizeMemoryLimit,
   normalizeMemoryPatch,
   type Chunk,
   type ChunkKind,
   type Memory,
+  type MemoryEmbeddingFailure,
+  type MemoryEmbeddingStats,
   type MemoryFilter,
   type MemoryKind,
   type MemoryPatch,
@@ -24,6 +28,7 @@ import type { Pool } from "pg";
 import { qualified } from "./schema.js";
 import { segmentText } from "./segment.js";
 import { withTransaction } from "./connection.js";
+import { toVectorLiteral } from "./vector-index.js";
 
 /** `PgMetadataStore` 的選項。 */
 export interface PgMetadataStoreOptions {
@@ -155,6 +160,12 @@ function metadataSchemaSql(schema: string): string {
 
     -- 既有資料庫（本卡之前建立的表）補上 pinned；冪等，重複執行無害。
     alter table ${memories} add column if not exists pinned boolean not null default false;
+
+    -- 卡 B1：記憶向量欄位。vector 刻意「不帶維度」（換 embedder／維度時由回填流程重算，
+    -- 不在此處鎖死）；embedder 身分另存 text，換 embedder 後把舊向量視為 stale。
+    alter table ${memories} add column if not exists embedding vector;
+    alter table ${memories} add column if not exists embedding_embedder_id text;
+    alter table ${memories} add column if not exists embedding_state text not null default 'pending';
   `;
 }
 
@@ -181,6 +192,10 @@ export class PgMetadataStore implements MetadataStore {
   }
 
   async migrate(): Promise<void> {
+    // `embedding vector` 需要 pgvector 型別。本後端可能在 `PgVectorIndex.migrate()` 之前先跑
+    // （例如只跑 MetadataStore 契約測試的環境），因此自己確保擴充存在；`if not exists` 冪等，
+    // 但建立擴充需要資料庫權限（與 PgVectorIndex 既有的要求相同）。
+    await this.pool.query("create extension if not exists vector");
     // 多個 statement 以簡單查詢協定一次送出；全部 `if not exists`，可重複呼叫。
     await this.pool.query(metadataSchemaSql(this.schema));
   }
@@ -379,6 +394,77 @@ export class PgMetadataStore implements MetadataStore {
       [id, next.scope, next.project],
     );
     return result.rows.length === 0 ? null : rowToMemory(result.rows[0]!);
+  }
+
+  /**
+   * 寫入記憶向量並設為 `ready`（語意與 SQLite 後端完全相同，見 `MetadataStore.markMemoryEmbedded`）。
+   *
+   * 以 pgvector 的文字格式（`[0.1,0.2,…]`）綁定參數、在 SQL 內 `$3::vector` 轉型；`vector`
+   * 欄位不帶維度，換 embedder／維度時由回填流程覆寫。未知 id 或已軟刪除更新不到任何列。
+   */
+  async markMemoryEmbedded(id: number, embedderId: string, vec: Float32Array): Promise<void> {
+    assertMemoryEmbeddingInput(embedderId, vec);
+    await this.pool.query(
+      `update ${this.memories}
+          set embedding = $2::vector, embedding_embedder_id = $3, embedding_state = 'ready'
+        where id = $1 and deleted_at is null`,
+      [id, toVectorLiteral(vec), embedderId],
+    );
+  }
+
+  /** 把狀態設為 `failed`／`too-long`；保留既有向量與 embedder 身分（見 `MetadataStore` 的說明）。 */
+  async markMemoryEmbeddingFailed(id: number, reason: MemoryEmbeddingFailure): Promise<void> {
+    assertMemoryEmbeddingFailure(reason);
+    await this.pool.query(
+      `update ${this.memories} set embedding_state = $1 where id = $2 and deleted_at is null`,
+      [reason, id],
+    );
+  }
+
+  /** 列出需要（重新）產生向量的未刪除記憶（見 `MetadataStore.listMemoriesNeedingEmbedding`）。 */
+  async listMemoriesNeedingEmbedding(embedderId: string, limit?: number): Promise<Memory[]> {
+    const normalized = normalizeMemoryLimit(limit);
+    if (normalized === 0) return [];
+
+    const result = await this.pool.query(
+      `select ${MEMORY_COLUMNS} from ${this.memories}
+        where deleted_at is null
+          and (embedding_state in ('pending', 'failed')
+               or (embedding_state = 'ready'
+                   and (embedding_embedder_id is null or embedding_embedder_id <> $1)))
+        order by created_at desc, id desc
+        limit $2`,
+      [embedderId, normalized],
+    );
+    return result.rows.map(rowToMemory);
+  }
+
+  /** 統計未刪除記憶的語意化狀態（見 `MetadataStore.memoryEmbeddingStats`；四個狀態數自洽）。 */
+  async memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats> {
+    const result = await this.pool.query(
+      `select
+         count(*)::int as total,
+         (count(*) filter (where embedding_state = 'pending'))::int as pending,
+         (count(*) filter (where embedding_state = 'ready'))::int as ready,
+         (count(*) filter (where embedding_state = 'failed'))::int as failed,
+         (count(*) filter (where embedding_state = 'too-long'))::int as too_long,
+         (count(*) filter (
+           where embedding_state = 'ready'
+             and (embedding_embedder_id is null or embedding_embedder_id <> $1)
+         ))::int as stale
+       from ${this.memories} where deleted_at is null`,
+      [embedderId],
+    );
+    const row = result.rows[0] ?? {};
+    const count = (value: unknown): number => Number(value ?? 0);
+    return {
+      total: count(row.total),
+      pending: count(row.pending),
+      ready: count(row.ready),
+      failed: count(row.failed),
+      tooLong: count(row.too_long),
+      stale: count(row.stale),
+    };
   }
 
   async listMemories(filter: MemoryFilter = {}): Promise<Memory[]> {

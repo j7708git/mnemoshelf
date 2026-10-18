@@ -21,6 +21,7 @@ import {
 import { TransformersEmbedder } from "@mnemoshelf/embedder-transformers";
 import { LOOPBACK_HOST, loadServerConfig, type ServerConfig } from "./config.js";
 import { APP_VERSION, createRestApp, type RestApp } from "./http/app.js";
+import { MemoryEmbeddingWorker, type MemoryEmbeddingWorkerOptions } from "./memory-embedder.js";
 
 export interface CreateServerOptions {
   /** 環境變數來源；預設 `process.env`。 */
@@ -37,6 +38,11 @@ export interface CreateServerOptions {
   embedder?: Embedder;
   /** 「過寬 root」判定的家目錄基準；預設 `os.homedir()`。 */
   homeDir?: string;
+  /**
+   * 記憶嵌入 worker 的調校（卡 B1；測試可把重試延遲設 0）。
+   * `store`／`embedder` 由 `createServer` 自己注入，這裡只接受調校欄位。
+   */
+  memoryEmbedding?: Pick<MemoryEmbeddingWorkerOptions, "batchSize" | "retryAttempts" | "retryDelayMs">;
 }
 
 export interface MnemoshelfServer {
@@ -51,6 +57,8 @@ export interface MnemoshelfServer {
   store: MetadataStore;
   vec: VectorIndex;
   embedder: Embedder;
+  /** 記憶向量背景 worker（卡 B1；診斷與測試可讀 stats）。 */
+  memoryEmbedder: MemoryEmbeddingWorker;
   app: RestApp;
   /** 關閉 HTTP、等背景工作結束、釋放 embedder 與資料庫。 */
   close(): Promise<void>;
@@ -102,17 +110,28 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     });
   const vec: VectorIndex = new SqliteVectorIndex(db, embedder.info.dim);
 
+  // 記憶向量背景 worker（卡 B1）：非阻塞回填既有記憶，之後由 POST /memories enqueue。
+  const memoryEmbedder = new MemoryEmbeddingWorker({
+    store,
+    embedder,
+    ...(options.memoryEmbedding ?? {}),
+  });
+
   const app = createRestApp({
     store,
     vec,
     embedder,
     token: config.token,
     webDir: config.webDir,
+    memoryEmbedder,
     ...(options.homeDir === undefined ? {} : { homeDir: options.homeDir }),
   });
 
   const server = http.createServer(app.handler);
   const port = await listen(server, config.port);
+
+  // 監聽成功後才啟動背景回填（啟動失敗時不留背景工作）。
+  memoryEmbedder.start();
 
   let closed = false;
   return {
@@ -124,15 +143,17 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     store,
     vec,
     embedder,
+    memoryEmbedder,
     app,
     async close(): Promise<void> {
       if (closed) return;
       closed = true;
       // 先停止接受新連線並把既有連線收乾淨（含 keep-alive），否則 server.close() 會一直等；
-      // 再等在途請求收尾，最後釋放 embedder 與資料庫。
+      // 再等在途請求收尾（可能還在 enqueue），最後關掉 worker 並釋放 embedder 與資料庫。
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
       await app.settled();
+      await memoryEmbedder.close();
       await embedder.dispose();
       db.close();
     },
@@ -242,3 +263,10 @@ export type {
 } from "./search.js";
 export { createMcpServer, MCP_TOOLS, resolveProjectName, runStdio, UNTRUSTED_DATA_WARNING } from "./mcp/stdio.js";
 export type { McpServerOptions, ProjectResolution, ResolveProjectOptions } from "./mcp/stdio.js";
+export {
+  MEMORY_EMBEDDING_DEFAULT_BATCH_SIZE,
+  MEMORY_EMBEDDING_DEFAULT_RETRY_ATTEMPTS,
+  MEMORY_EMBEDDING_DEFAULT_RETRY_DELAY_MS,
+  MemoryEmbeddingWorker,
+} from "./memory-embedder.js";
+export type { MemoryEmbeddingWorkerOptions, MemoryEmbeddingWorkerStats } from "./memory-embedder.js";

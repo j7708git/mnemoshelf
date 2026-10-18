@@ -1,6 +1,7 @@
 import type {
   Chunk,
   Memory,
+  MemoryEmbeddingState,
   MemoryKind,
   MemoryPatch,
   MemoryScope,
@@ -20,6 +21,9 @@ export const MEMORY_LIST_MAX_LIMIT = 500;
 
 /** 合法的記憶作用範圍（runtime 檢查用；型別上是 `MemoryScope`）。 */
 export const MEMORY_SCOPES: readonly MemoryScope[] = ["global", "project", "agent"];
+
+/** 合法的記憶向量狀態（runtime 檢查用；型別上是 `MemoryEmbeddingState`）。 */
+export const MEMORY_EMBEDDING_STATES: readonly MemoryEmbeddingState[] = ["pending", "ready", "failed", "too-long"];
 
 /**
  * 列舉記憶的過濾條件。全部可選，未指定（或 `undefined`）＝該欄位不過濾。
@@ -89,6 +93,53 @@ export function normalizeMemoryPatch(
     throw new TypeError(`scope 為 ${scope} 時 project 必須是 null（全域／agent 範圍沒有專案）`);
   }
   return { scope, project: null };
+}
+
+/** `markMemoryEmbeddingFailed` 可設定的狀態：可重試的 `failed` 或永久跳過的 `too-long`。 */
+export type MemoryEmbeddingFailure = "failed" | "too-long";
+
+/**
+ * 記憶語意化的狀態統計（`MetadataStore.memoryEmbeddingStats`）。
+ *
+ * 只統計**未刪除**的記憶；四個狀態數必須自洽（`total = pending + ready + failed + tooLong`）。
+ */
+export interface MemoryEmbeddingStats {
+  /** 未刪除的記憶總數。 */
+  total: number;
+  pending: number;
+  ready: number;
+  failed: number;
+  /** `state = "too-long"` 的筆數（狀態字串有連字號，欄位名用 camelCase）。 */
+  tooLong: number;
+  /**
+   * `state = "ready"` 但 `embedding_embedder_id` 不是查詢的 embedder（換 embedder 後待重嵌）。
+   * 這是 `ready` 的子集，**不**另計入 `total`。
+   */
+  stale: number;
+}
+
+/**
+ * 驗證 `markMemoryEmbedded` 的輸入。兩後端共用（不得各自解讀）：
+ * `embedderId` 必須是 trim 後非空的字串；`vec` 必須是非空、只含有限值的 `Float32Array`。
+ * **不驗證 L2 正規化**（由 embedder 契約保證，見 `docs/embedder-contract.md`）。
+ */
+export function assertMemoryEmbeddingInput(embedderId: string, vector: Float32Array): void {
+  if (typeof embedderId !== "string" || embedderId.trim().length === 0) {
+    throw new TypeError("embedderId 必須是非空字串");
+  }
+  if (!(vector instanceof Float32Array) || vector.length === 0) {
+    throw new TypeError("vec 必須是非空的 Float32Array");
+  }
+  for (const value of vector) {
+    if (!Number.isFinite(value)) throw new TypeError("vec 只能包含有限值");
+  }
+}
+
+/** 驗證 `markMemoryEmbeddingFailed` 的 `reason`（runtime 值；型別之外的值一律拋 `TypeError`）。 */
+export function assertMemoryEmbeddingFailure(reason: MemoryEmbeddingFailure): void {
+  if (reason !== "failed" && reason !== "too-long") {
+    throw new TypeError(`未知的記憶向量失敗狀態：${String(reason)}`);
+  }
 }
 
 /**
@@ -172,6 +223,37 @@ export interface MetadataStore {
    * - 回傳**更新後**的完整 `Memory`，呼叫端不必再讀一次；`getMemory`／`listMemories` 也反映新值。
    */
   updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null>;
+
+  /**
+   * 寫入記憶向量並把狀態設為 `ready`（卡 B1；背景 worker 的唯一成功寫入入口）。
+   *
+   * - 同時設定 `embedding`、`embedding_embedder_id` 與 `embedding_state='ready'`。
+   * - **未知 id 或已軟刪除 → 無操作**（不拋錯，也不改資料）。
+   * - `embedderId` 空白或 `vec` 空／含非有限值 → 拋 `TypeError`（見 `assertMemoryEmbeddingInput`）。
+   * - 不驗證 L2 正規化（由 embedder 契約保證）；向量不暴露在 `Memory` 與 REST 回應。
+   */
+  markMemoryEmbedded(id: number, embedderId: string, vec: Float32Array): Promise<void>;
+
+  /**
+   * 把記憶的向量狀態設為 `failed`（可重試）或 `too-long`（永久跳過）。
+   *
+   * - **保留**既有 `embedding`／`embedding_embedder_id`（若有）：召回端只採 `ready` 且
+   *   embedder 相符者（卡 B2），失敗狀態的舊向量不得被當成可用結果。
+   * - 未知 id 或已軟刪除 → 無操作；`reason` 非法 → 拋 `TypeError`。
+   */
+  markMemoryEmbeddingFailed(id: number, reason: MemoryEmbeddingFailure): Promise<void>;
+
+  /**
+   * 列出需要（重新）產生向量的未刪除記憶，供回填與重試流程使用。
+   *
+   * 條件＝`state in ('pending','failed')` 或（`state='ready'` 但 embedder 不相符）；
+   * **排除 `too-long`**。排序與 `listMemories` 相同（`createdAt` 由新到舊、同毫秒以 `id` 決序）；
+   * `limit` 的邊界語意沿用 `normalizeMemoryLimit`（預設 100、上限 500、<= 0 回傳空清單）。
+   */
+  listMemoriesNeedingEmbedding(embedderId: string, limit?: number): Promise<Memory[]>;
+
+  /** 統計未刪除記憶的語意化狀態（見 `MemoryEmbeddingStats`）。 */
+  memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats>;
 
   /**
    * 列舉**未刪除**的記憶（軟刪除者與被取代者不會出現）。

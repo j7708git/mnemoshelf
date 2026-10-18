@@ -242,6 +242,32 @@ describe("MCP stdio 入口", () => {
     expect(textOf(badId)).toContain("ValidationError");
   });
 
+  it("O4：remember 的非字串 scope 原樣轉 REST（400），不靜默套預設", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+
+    for (const scope of [42, true, { scope: "global" }] as const) {
+      const result = await harness.mcp.client.callTool({
+        name: "remember",
+        arguments: { content: "非字串 scope 的記憶", scope },
+      });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("ValidationError");
+    }
+    // `null` 也是非字串：不得被當成「未指定」而套預設。
+    const nullScope = await harness.mcp.client.callTool({
+      name: "remember",
+      arguments: { content: "null scope 的記憶", scope: null },
+    });
+    expect(nullScope.isError).toBe(true);
+    expect(textOf(nullScope)).toContain("ValidationError");
+
+    // 全部被 REST 拒絕 → 沒有任何記憶被寫入。
+    const listed = (await api(rest.instance, "GET", "/memories")).body as { memories: unknown[] };
+    expect(listed.memories).toEqual([]);
+  });
+
   it("token 錯誤：initialize 仍成功，工具呼叫回報 401 錯誤", async () => {
     const harness = await startMcp("wrong-token-value");
     rest = harness.rest;

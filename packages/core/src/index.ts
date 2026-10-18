@@ -9,6 +9,7 @@ export type {
   Chunk,
   ChunkKind,
   Memory,
+  MemoryEmbeddingState,
   MemoryKind,
   MemoryPatch,
   MemoryScope,
@@ -25,13 +26,20 @@ export type {
 
 export type { MetadataStore } from "./ports/metadata-store.js";
 export {
+  assertMemoryEmbeddingFailure,
+  assertMemoryEmbeddingInput,
+  MEMORY_EMBEDDING_STATES,
   MEMORY_LIST_DEFAULT_LIMIT,
   MEMORY_LIST_MAX_LIMIT,
   MEMORY_SCOPES,
   normalizeMemoryLimit,
   normalizeMemoryPatch,
 } from "./ports/metadata-store.js";
-export type { MemoryFilter } from "./ports/metadata-store.js";
+export type {
+  MemoryEmbeddingFailure,
+  MemoryEmbeddingStats,
+  MemoryFilter,
+} from "./ports/metadata-store.js";
 export type { VectorIndex, VectorItem } from "./ports/vector-index.js";
 export type {
   DocumentInput,

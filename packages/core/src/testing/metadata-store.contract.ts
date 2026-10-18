@@ -39,6 +39,14 @@ function memoryInput(overrides: Partial<NewMemory> = {}): NewMemory {
 }
 
 /**
+ * 記憶向量的測試資料（只驗證儲存與狀態流程，不求 L2 正規化——契約不驗證正規化，
+ * 正規化由 embedder 保證）。數值刻意簡單、可重現。
+ */
+function embeddingVector(values: number[] = [0.1, 0.2, 0.3]): Float32Array {
+  return new Float32Array(values);
+}
+
+/**
  * MetadataStore 的契約測試。任何實作（SQLite、PostgreSQL…）只要通過同一組測試，
  * 就符合 docs/storage-ports.md 的介面契約。
  */
@@ -447,6 +455,139 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       // 以上全部不得留下任何變更。
       expect(await store.getMemory(project.id)).toMatchObject({ scope: "project", project: "proj-x" });
       expect(await store.getMemory(global.id)).toMatchObject({ scope: "global", project: null });
+    });
+
+    it("記憶向量：markMemoryEmbedded 把狀態設為 ready、list 不再需要、stats 反映", async () => {
+      const memory = await store.addMemory(memoryInput({ content: "要嵌入的記憶" }));
+      const embedderId = "contract-embedder@1";
+
+      // 新記憶預設 pending：stats 與待嵌清單都看得到。
+      expect(await store.memoryEmbeddingStats(embedderId)).toEqual({
+        total: 1,
+        pending: 1,
+        ready: 0,
+        failed: 0,
+        tooLong: 0,
+        stale: 0,
+      });
+      expect((await store.listMemoriesNeedingEmbedding(embedderId)).map((item) => item.id)).toEqual([memory.id]);
+
+      await store.markMemoryEmbedded(memory.id, embedderId, embeddingVector());
+
+      const stats = await store.memoryEmbeddingStats(embedderId);
+      expect(stats).toEqual({ total: 1, pending: 0, ready: 1, failed: 0, tooLong: 0, stale: 0 });
+      // 四個狀態數必須自洽。
+      expect(stats.total).toBe(stats.pending + stats.ready + stats.failed + stats.tooLong);
+      expect(await store.listMemoriesNeedingEmbedding(embedderId)).toEqual([]);
+      // `Memory` 型別不暴露向量；既有的讀取行為不變。
+      expect((await store.getMemory(memory.id))?.content).toBe("要嵌入的記憶");
+    });
+
+    it("換 embedder 後 ready 記憶成為 stale 並重新列入待嵌清單", async () => {
+      const memory = await store.addMemory(memoryInput({ content: "換 embedder 的記憶" }));
+      await store.markMemoryEmbedded(memory.id, "embedder-a@1", embeddingVector());
+      expect((await store.memoryEmbeddingStats("embedder-a@1")).stale).toBe(0);
+
+      expect(await store.memoryEmbeddingStats("embedder-b@2")).toEqual({
+        total: 1,
+        pending: 0,
+        ready: 1,
+        failed: 0,
+        tooLong: 0,
+        stale: 1,
+      });
+      expect((await store.listMemoriesNeedingEmbedding("embedder-b@2")).map((item) => item.id)).toEqual([memory.id]);
+
+      // 用新 embedder 重嵌 → stale 消失、不再需要重嵌。
+      await store.markMemoryEmbedded(memory.id, "embedder-b@2", embeddingVector([0.4, 0.5]));
+      expect(await store.memoryEmbeddingStats("embedder-b@2")).toMatchObject({ ready: 1, stale: 0 });
+      expect(await store.listMemoriesNeedingEmbedding("embedder-b@2")).toEqual([]);
+    });
+
+    it("markMemoryEmbeddingFailed：failed 可重試、too-long 永久排除，stats 自洽", async () => {
+      const retryable = await store.addMemory(memoryInput({ content: "可重試的記憶" }));
+      const skipped = await store.addMemory(memoryInput({ content: "太長的記憶" }));
+      const embedderId = "contract-embedder@1";
+
+      await store.markMemoryEmbeddingFailed(retryable.id, "failed");
+      await store.markMemoryEmbeddingFailed(skipped.id, "too-long");
+
+      // failed 會再被列出（下次回填重試）；too-long 不會。
+      expect((await store.listMemoriesNeedingEmbedding(embedderId)).map((item) => item.id)).toEqual([retryable.id]);
+      const stats = await store.memoryEmbeddingStats(embedderId);
+      expect(stats).toEqual({ total: 2, pending: 0, ready: 0, failed: 1, tooLong: 1, stale: 0 });
+      expect(stats.total).toBe(stats.pending + stats.ready + stats.failed + stats.tooLong);
+
+      // failed 之後成功 → ready；too-long 不受影響。
+      await store.markMemoryEmbedded(retryable.id, embedderId, embeddingVector());
+      expect(await store.memoryEmbeddingStats(embedderId)).toMatchObject({ ready: 1, failed: 0, tooLong: 1 });
+    });
+
+    it("mark* 對未知或已軟刪除的 id 是 no-op（不拋錯、不建立列）", async () => {
+      const embedderId = "contract-embedder@1";
+      const memory = await store.addMemory(memoryInput({ content: "已刪除的記憶" }));
+      await store.forgetMemory(memory.id);
+
+      await expect(store.markMemoryEmbedded(987654, embedderId, embeddingVector())).resolves.toBeUndefined();
+      await expect(store.markMemoryEmbeddingFailed(987654, "failed")).resolves.toBeUndefined();
+      await expect(store.markMemoryEmbedded(memory.id, embedderId, embeddingVector())).resolves.toBeUndefined();
+      await expect(store.markMemoryEmbeddingFailed(memory.id, "too-long")).resolves.toBeUndefined();
+
+      // 已刪除者不列入統計與待嵌清單；未知 id 也不會被憑空建立。
+      expect(await store.memoryEmbeddingStats(embedderId)).toEqual({
+        total: 0,
+        pending: 0,
+        ready: 0,
+        failed: 0,
+        tooLong: 0,
+        stale: 0,
+      });
+      expect(await store.listMemoriesNeedingEmbedding(embedderId)).toEqual([]);
+      expect(await store.getMemory(memory.id)).toMatchObject({ deletedAt: expect.any(String) });
+    });
+
+    it("mark* 的非法輸入會拋 TypeError", async () => {
+      const memory = await store.addMemory(memoryInput({ content: "非法輸入的記憶" }));
+      const embedderId = "contract-embedder@1";
+
+      await expect(store.markMemoryEmbedded(memory.id, "   ", embeddingVector())).rejects.toBeInstanceOf(TypeError);
+      await expect(store.markMemoryEmbedded(memory.id, "", embeddingVector())).rejects.toBeInstanceOf(TypeError);
+      await expect(store.markMemoryEmbedded(memory.id, embedderId, new Float32Array(0))).rejects.toBeInstanceOf(
+        TypeError,
+      );
+      await expect(
+        store.markMemoryEmbedded(memory.id, embedderId, new Float32Array([Number.NaN, 0.1])),
+      ).rejects.toBeInstanceOf(TypeError);
+      await expect(
+        store.markMemoryEmbedded(memory.id, embedderId, new Float32Array([Number.POSITIVE_INFINITY])),
+      ).rejects.toBeInstanceOf(TypeError);
+      await expect(store.markMemoryEmbeddingFailed(memory.id, "bogus" as "failed")).rejects.toBeInstanceOf(TypeError);
+
+      // 全部被拒之後狀態仍是 pending。
+      expect((await store.memoryEmbeddingStats(embedderId)).pending).toBe(1);
+    });
+
+    it("listMemoriesNeedingEmbedding：只回未刪除者、新到舊排序、支援 limit 邊界", async () => {
+      const embedderId = "contract-embedder@1";
+      const first = await store.addMemory(memoryInput({ content: "第一筆待嵌" }));
+      const second = await store.addMemory(memoryInput({ content: "第二筆待嵌" }));
+      const third = await store.addMemory(memoryInput({ content: "第三筆待嵌" }));
+      const deleted = await store.addMemory(memoryInput({ content: "被刪除的待嵌" }));
+      await store.forgetMemory(deleted.id);
+      await store.markMemoryEmbeddingFailed(third.id, "too-long");
+
+      // 排序與 listMemories 相同：新到舊，同毫秒以 id 決勝；too-long 與已刪除者排除。
+      expect((await store.listMemoriesNeedingEmbedding(embedderId)).map((item) => item.id)).toEqual([
+        second.id,
+        first.id,
+      ]);
+      expect((await store.listMemoriesNeedingEmbedding(embedderId, 1)).map((item) => item.id)).toEqual([second.id]);
+      // <= 0 或非正整數 → 空清單（沿用 normalizeMemoryLimit）。
+      expect(await store.listMemoriesNeedingEmbedding(embedderId, 0)).toEqual([]);
+      expect(await store.listMemoriesNeedingEmbedding(embedderId, -3)).toEqual([]);
+      expect(await store.listMemoriesNeedingEmbedding(embedderId, 1.5)).toEqual([]);
+      // 未指定 limit → 預設 100；超過上限夾到 500。此處資料少於上限，兩者都回全部。
+      expect(await store.listMemoriesNeedingEmbedding(embedderId, 10_000)).toHaveLength(2);
     });
 
     it("forgetMemory 軟刪除後搜尋不到，但資料仍在", async () => {

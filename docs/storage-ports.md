@@ -15,6 +15,11 @@
 > 2026-10-18（卡 A）新增 §記憶的範圍更新：`MetadataStore.updateMemory(id, patch)` 與
 > `MemoryPatch` 型別（僅 `scope`／`project`）——兩後端皆實作、通過同一組契約測試；
 > 既有的記憶方法（新增、釘選、軟刪除、列舉、關鍵字搜尋）與排序語意不變。
+>
+> 2026-10-18（卡 B1）新增 §記憶的語意化：`memories` 的向量欄位、`MemoryEmbeddingState`
+> 與 `MetadataStore` 的四個記憶向量方法（`markMemoryEmbedded`、`markMemoryEmbeddingFailed`、
+> `listMemoriesNeedingEmbedding`、`memoryEmbeddingStats`）——兩後端皆實作、通過同一組契約測試；
+> `Memory` 公開型別、`VectorIndex`、`/search` 與召回 API 都不變。
 
 | 介面 | 職責 | 預設實作 | 預計的替代實作 |
 |---|---|---|---|
@@ -150,6 +155,116 @@ updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null>;
   （不可變欄位原樣保留）、`scope` 正規化、冪等、不存在的 id、已軟刪除的 id、非法 patch。
   SQLite 與 PostgreSQL 兩個後端都必須通過同一組測試。
 - REST 對應：`PATCH /memories/:id`（語意見 `docs/roots-and-privacy.md` §記憶的範圍與共享）。
+
+## 記憶的語意化（2026-10-18／卡 B1）
+
+記憶內容用**同一個多模態 embedder 的文字路徑**（`embedDocument`）產生向量，存在記憶自己的欄位。
+本節只定義「產生與維護向量」；召回 API、跨專案過濾與排名屬卡 B2，不在本節。
+
+### 為什麼不放在 `VectorIndex`
+
+`VectorIndex`（sqlite-vec 的 `vectors` 表）的 `root_id is null` 與 `key like 'm:%'` 都是
+**KNN 之後才過濾**（post-filter）：鄰近的 chunk 向量一多，只查記憶的 top-k 可能回不到該有的記憶。
+記憶召回最需要的是**先依 scope／project 精確過濾再排名**，因此改存 `memories` 自己的欄位，
+讓卡 B2 能在同一個 SQL 過濾後再算相似度（SQLite 在應用層算 cosine、PostgreSQL 用 pgvector `<=>`）。
+`VectorIndex`、`vectors` 表與 `/search` 都**不變**。
+
+### 欄位與狀態機
+
+`Memory` 公開型別**不變**（向量不暴露在 REST／MCP 回應）；下列是 `memories` 表的實作欄位：
+
+| 欄位 | SQLite | PostgreSQL | 說明 |
+|---|---|---|---|
+| `embedding` | `blob`（nullable） | `vector`（nullable、**不帶維度**） | 向量；未嵌入時為 `NULL` |
+| `embedding_embedder_id` | `text`（nullable） | `text` | 產生這個向量的 embedder `info.id`；換 embedder 後視為 stale |
+| `embedding_state` | `text not null default 'pending'` | 同左 | 狀態機，見下 |
+
+`MemoryEmbeddingState`＝`"pending" | "ready" | "failed" | "too-long"`：
+
+- `pending`：待嵌入；**新資料與既有資料的預設**（既有資料含已軟刪除者一律 `pending`，但回填只處理未刪除者）。
+- `ready`：向量已產生；是否可用還要求 `embedding_embedder_id` 與目前 embedder 相符。
+- `failed`：嵌入失敗，**可重試**（同一次執行內不回填；下一次 `start()` 的回填會再試）。
+- `too-long`：超過 embedder 的單筆輸入上限，**永久跳過**（重試也不會成功）。
+
+SQLite 以版本化遷移 `0003_memory_embedding` 逐欄補上（先查 `pragma table_info`，冪等）；
+PostgreSQL 在 `migrate()` 以 `alter table … add column if not exists` 補欄位（冪等），並先確保
+pgvector 擴充存在（`create extension if not exists vector`；與 `PgVectorIndex.migrate()` 相同要求）。
+向量以 Float32Array 的 little-endian 位元組存 SQLite BLOB；PostgreSQL 以 pgvector 的文字格式綁定參數。
+
+### `MetadataStore` 的四個方法
+
+```ts
+export type MemoryEmbeddingState = "pending" | "ready" | "failed" | "too-long";
+
+export interface MemoryEmbeddingStats {
+  total: number;   // 未刪除的記憶總數
+  pending: number;
+  ready: number;
+  failed: number;
+  tooLong: number;
+  stale: number;   // state=ready 但 embedding_embedder_id != 查詢的 embedderId
+}
+
+markMemoryEmbedded(id: number, embedderId: string, vec: Float32Array): Promise<void>;
+markMemoryEmbeddingFailed(id: number, reason: "failed" | "too-long"): Promise<void>;
+listMemoriesNeedingEmbedding(embedderId: string, limit?: number): Promise<Memory[]>;
+memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats>;
+```
+
+- **`markMemoryEmbedded`**：同一次 UPDATE 設定 `embedding`、`embedding_embedder_id` 與
+  `embedding_state='ready'`，不會觀察到「ready 但沒有向量」的中間狀態。不驗證 L2 正規化
+  （由 embedder 契約保證）。`embedderId` 空白或 `vec` 空／含非有限值 → 拋 `TypeError`。
+- **`markMemoryEmbeddingFailed`**：把狀態設為 `failed` 或 `too-long`，**保留**既有向量與 embedder
+  身分（召回端只採 `ready` 且 embedder 相符者；保留舊值便於同 embedder 重試成功時比對／診斷）。
+  `reason` 非法 → 拋 `TypeError`。
+- **兩者的未知 id 或已軟刪除者都是 no-op**（不拋錯、不建立資料列），與 `setMemoryPinned` 的風格一致。
+- **`listMemoriesNeedingEmbedding`**：只回未刪除者；條件＝`state in ('pending','failed')` 或
+  （`state='ready'` 但 embedder 不相符）；**排除 `too-long`**；排序與 `listMemories` 相同
+  （`createdAt` 由新到舊、同毫秒以 `id` 決序）；`limit` 沿用 `normalizeMemoryLimit`（預設 100、上限 500、<= 0 空清單）。
+- **`memoryEmbeddingStats`**：只統計未刪除者；`total = pending + ready + failed + tooLong`；
+  `stale` 是 `ready` 的子集（另計、不重複進 total）。`embedding_embedder_id is null` 的 `ready` 也算 stale（防禦性）。
+
+兩後端共用契約測試（`@mnemoshelf/core/testing` 的 `runMetadataStoreContract`）新增六例：
+`markMemoryEmbedded`／stats／待嵌清單、換 embedder 的 stale 重嵌、failed 可重試與 too-long 排除、
+未知與已刪除 id 的 no-op、非法輸入拋錯、待嵌清單的排序與 `limit` 邊界。
+
+### 背景回填與重試（伺服器層）
+
+伺服器建立 `MemoryEmbeddingWorker`（`packages/server/src/memory-embedder.ts`），
+`createServer()` 監聽成功後 `start()`：
+
+- **非阻塞**：`start()` 只啟動背景 loop；`POST /memories` 只把 id `enqueue()`，立即回 `201`，
+  `supersedes` 產生的新版本同樣排入。向量在背景完成（狀態由 `pending` 變 `ready`）。
+- **佇列去重**：同一 id 在「佇列中」或「處理中」重複 `enqueue()` 都會被忽略（去重保留到
+  `processOne` 完成）；處理完成後再 enqueue 才會重新處理。
+- **回填**：佇列空了就從 DB 抓一批需要嵌入的記憶（新到舊、每次 `batchSize`＝100 筆）。
+  **同一次 `start()` 內**以 attempted 集合去重：已嘗試過的 id（含 `failed`）不會在同一輪被重抓，
+  避免無限迴圈；因此 `failed` **只會在下一次 `start()`**（下一次服務啟動）再試，同一次執行內不回填。
+- **回填的已知限制（F2，本卡只揭露、未修正）**：每次只取「新到舊」的前 `batchSize` 筆；若這一整批
+  都在同輪失敗（或都已被 attempted 跳過），較舊的 `pending` 記憶在同一次執行內不會被嘗試，要等
+  下一次 `start()` 才可能被回填。正常情況（同輪失敗筆數少於 `batchSize`）不受影響；stale 重嵌
+  同受此每次 batch 的限制。修正列後續卡。
+- **併發 1**；重試：`input-too-long` → `too-long`（不重試），其他錯誤重試至多 3 次
+  （不含第一次）後標 `failed`（同一次執行不再重試，見上）。
+- **換 embedder**：舊向量（`embedding_embedder_id` 不同）視為 stale，回填流程會用新 embedder 重嵌
+  （受同一每次 batch 限制）。
+- **`close()`**：停止拉新工作、取消重試等待、清空佇列，等目前處理中的那一筆結束後返回；
+  已排隊未處理者留在 `pending`，下次啟動回填。不留 timer／hanging promise。
+- **診斷**：`GET /diagnostics` 新增 additive 的 `memories` 欄位：
+
+  ```json
+  "memories": {
+    "total": 0, "ready": 0, "pending": 0, "failed": 0, "tooLong": 0, "stale": 0,
+    "worker": { "queued": 0, "processing": 0, "embedded": 0, "failed": 0, "tooLong": 0 }
+  }
+  ```
+
+  狀態數來自 `memoryEmbeddingStats`；`worker` 是本行程累計（重啟歸零）。
+  `POST /memories` 的 scope／project 正規化（省略 scope 帶 project → `project`；矛盾組合 `400`）
+  也一併在本卡完成，既有呼叫端行為不回歸。
+
+**與卡 B2 的界線**：本卡只負責「產生、保存、重試與診斷」向量。召回端點（REST／MCP）、
+scope／project 相關的過濾與排名、`degraded` 退回行為都在卡 B2，且不得改動 `/search` 的既有語意。
 
 ## 全文檢索與中文
 

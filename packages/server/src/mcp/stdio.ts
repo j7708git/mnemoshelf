@@ -333,7 +333,7 @@ export function createMcpServer(options: McpServerOptions): Server {
             // 明確指定非專案範圍：project 一律不送，不受環境變數／cwd 影響。
             scope = requestedScope;
             project = null;
-          } else if (requestedScope === undefined) {
+          } else if (scopeArgument === undefined) {
             // 未指定 scope：能解析出專案就以專案為預設，否則退回 global。
             if (resolution.project !== null) {
               scope = "project";
@@ -343,7 +343,8 @@ export function createMcpServer(options: McpServerOptions): Server {
               project = null;
             }
           }
-          // 其他 scope 值（非法或非字串）原樣轉發，由 REST 回 400（驗證只有一處）。
+          // 其他值（不合法字串、非字串、null）一律**原樣轉發**給 REST 驗證：
+          // 不得把非字串 scope 當成「未指定」而套預設（O4，卡 B1）。REST 對非字串回 400。
 
           return toolText(
             JSON.stringify(
