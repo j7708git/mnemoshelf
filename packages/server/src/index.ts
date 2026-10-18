@@ -125,6 +125,12 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
   const db: SqliteDatabase = openDatabase(config.dbPath);
   const store: MetadataStore = new SqliteMetadataStore(db);
   await store.migrate();
+  // 卡 C2：把舊版留下的矛盾 scope／project 冪等正規化（只記筆數，不記錄任何內容）。
+  // 放在開機路徑（監聽之前）完成，之後的 REST／MCP 都只會看到合法組合。
+  const normalizedLegacyMemories = await store.normalizeLegacyMemoryScopes();
+  if (normalizedLegacyMemories.updated > 0) {
+    console.error(`[mnemoshelf] 已正規化 ${normalizedLegacyMemories.updated} 筆 legacy 記憶 scope`);
+  }
   // 資料庫與其 WAL 檔可能含敏感記憶內容：建立後立刻收緊權限（best-effort、POSIX only）。
   await restrictDataPermissions(config.dataDir, config.dbPath);
 
@@ -251,6 +257,7 @@ export {
   toHttpError,
 } from "./http/app.js";
 export type {
+  AddMemoryResponse,
   AddRootRequest,
   BytesRouteResult,
   CancelIndexResponse,
@@ -260,6 +267,8 @@ export type {
   DiagnosticsResponse,
   DiagnosticsRoot,
   ErrorResponse,
+  ForgetMemoryResponse,
+  HardDeleteMemoryResponse,
   IndexCancelledResponse,
   IndexRootResponse,
   JsonRouteResult,
@@ -318,3 +327,24 @@ export {
   MemoryEmbeddingWorker,
 } from "./memory-embedder.js";
 export type { MemoryEmbeddingWorkerOptions, MemoryEmbeddingWorkerStats } from "./memory-embedder.js";
+export {
+  countImportDuplicates,
+  MAX_MEMORY_IMPORT_BYTES,
+  MAX_MEMORY_IMPORT_ERRORS,
+  MEMORY_EXPORT_CONTENT_TYPE,
+  MEMORY_EXPORT_SCHEMA_VERSION,
+  MEMORY_KINDS,
+  memoryExportFilename,
+  memoryExportRecord,
+  parseDryRunParam,
+  planMemoryImport,
+  serializeMemoryExportLine,
+  serializeMemoriesExport,
+} from "./memory-export.js";
+export type {
+  MemoryExportRecord,
+  MemoryImportEntry,
+  MemoryImportLineError,
+  MemoryImportPlan,
+  MemoryImportResponse,
+} from "./memory-export.js";

@@ -25,6 +25,7 @@ export type {
 } from "./ports/types.js";
 
 export type { MetadataStore } from "./ports/metadata-store.js";
+export { memoryContentHash, normalizeMemoryContentForHash } from "./memory/content-normalize.js";
 export {
   assertMemoryEmbeddingFailure,
   assertMemoryEmbeddingInput,
@@ -73,6 +74,10 @@ export {
 } from "./errors.js";
 
 export { rrfMerge, RRF_DEFAULT_K } from "./search/rrf.js";
+
+// 機密遮罩（記憶與檔案索引共用同一組 curated 規則；卡 C1）
+export { containsRedacted, maskSecrets, REDACTED_PREFIX } from "./privacy/secret-masking.js";
+export type { MaskSecretsResult, SecretKind } from "./privacy/secret-masking.js";
 
 export { blockedReason, isBlocked } from "./roots/blacklist.js";
 export {

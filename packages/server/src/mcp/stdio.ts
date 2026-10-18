@@ -74,6 +74,8 @@ export const MCP_TOOLS: Tool[] = [
       `（cwd 是家目錄時跳過）；解析不到專案才退回 global。` +
       `kind：fact／decision／pitfall／preference；scope：global／project／agent。` +
       `專案優先——要寫成全域共享請明確指定 scope: "global"。` +
+      `精確去重：同一範圍（scope／project／agent）已有相同內容時不新增，回應是既有記憶並帶 duplicate: true；` +
+      `要強制新增請帶 force: true。內容編輯（產生新版本並取代舊版）仍用 REST 的 supersedes 語意。` +
       `內容在寫入前會遮蔽可辨識的機密（API key／token／私鑰等），回應帶 redacted／redactedCount。` +
       `${UNTRUSTED_DATA_WARNING}`,
     inputSchema: {
@@ -90,6 +92,10 @@ export const MCP_TOOLS: Tool[] = [
           type: "string",
           maxLength: 200,
           description: "專案名稱（最優先；未提供時用 MNEMOSHELF_PROJECT 或 cwd 資料夾名稱；上限 200 字元）",
+        },
+        force: {
+          type: "boolean",
+          description: "true＝即使已有相同內容的記憶也強制新增一筆（預設 false：重複時回既有記憶並標 duplicate: true）",
         },
       },
       required: ["content"],
@@ -398,6 +404,8 @@ export function createMcpServer(options: McpServerOptions): Server {
                 scope,
                 project,
                 agent,
+                // `force` 原樣轉發（非 boolean 由 REST 回 400），不在 MCP 層自行解讀。
+                ...(args.force === undefined ? {} : { force: args.force }),
               }),
               null,
               2,

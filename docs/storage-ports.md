@@ -24,6 +24,15 @@
 > 2026-10-18 新增 §記憶檢索：`MemorySearchBucket`／`MemorySearchFilter` 與
 > `MetadataStore.searchMemoriesByVector`／`searchMemoriesKeyword`（**先過濾再排名**）——兩後端皆實作、
 > 通過同一組契約測試；`/search`、`VectorIndex` 與檔案索引管線不變。
+>
+> 2026-10-19 新增 §記憶的寫入去重與硬刪除：`memories.content_hash`、`MetadataStore` 的三個新方法
+> （`addMemoryUnlessDuplicate`、`normalizeLegacyMemoryScopes`、`hardDeleteMemory`）與
+> `DELETE /memories/:id?hard=true`——兩後端皆實作、通過同一組契約測試；`Memory` 公開型別、
+> 召回與 `/search` 的既有語意不變。
+>
+> 2026-10-19 新增 §記憶的匯出／匯入：`MetadataStore.listMemoriesForExport()` 與 REST
+> `GET /memories/export`／`POST /memories/import`（NDJSON、`dryRun`、32 MiB 上限）——兩後端皆實作、
+> 通過同一組契約測試；本版**只做記憶**（不含 chunk／向量）。設計規則 6 同步改為誠實版本。
 
 | 介面 | 職責 | 預設實作 | 預計的替代實作 |
 |---|---|---|---|
@@ -48,8 +57,9 @@
    之後可擴充 `kind`、`path` 前綴。
 4. **單一寫入者。** 只有核心服務行程寫入資料庫；MCP、CLI、UI 都經由本機 HTTP。
 5. **契約測試。** 同一組測試套件對每個實作都要通過；新增後端就是讓它通過同一組測試。
-6. **中立的匯出格式。** 提供匯出與匯入（JSON Lines 加上向量檔），用於跨後端搬遷。
-   **現況：尚未實作，列後續。**
+6. **中立的匯出格式。** 提供匯出與匯入，用於備份與跨後端搬遷。**本版範圍：記憶的 JSON Lines
+   （NDJSON）備份——不含 chunk／向量與已刪除的歷史版本；匯入後由背景 worker 重建向量。**
+   chunk／向量與整庫搬遷（含向量檔）仍列後續；見 §記憶的匯出／匯入。
 
 ## 搜尋模式與預設（M2 修訂）
 
@@ -160,6 +170,75 @@ updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null>;
   （不可變欄位原樣保留）、`scope` 正規化、冪等、不存在的 id、已軟刪除的 id、非法 patch。
   SQLite 與 PostgreSQL 兩個後端都必須通過同一組測試。
 - REST 對應：`PATCH /memories/:id`（語意見 `docs/roots-and-privacy.md` §記憶的範圍與共享）。
+
+## 記憶的寫入去重與硬刪除（2026-10-19）
+
+### 精確去重（寫入時）
+
+- **正規化**：`normalizeMemoryContentForHash`（core 共用；呼叫端不得各自實作）＝Unicode NFC →
+  去除前後空白 → 連續空白（含換行）收斂為單一空格；**不轉大小寫、不動標點**。
+  `memoryContentHash` 為正規化後 UTF-8 的 sha256 hex。
+- **去重 key**＝（`content_hash`, `scope`, `project`, `agent`）；`project` 以 null-safe 比較；
+  **已軟刪除者不計入**。內容是呼叫端送來的**遮罩後**內容（REST／MCP 先遮罩再寫入）。
+- `memories.content_hash` 由遷移 `0004_memory_content_hash` 補上並回填既有列；兩後端共用同一個
+  hash 函式，不得各自解讀正規化規則。
+- `MetadataStore.addMemoryUnlessDuplicate(m)`：**原子** insert-or-return-existing；回
+  `{ memory, duplicate }`。同 key 已有未刪除記憶時回既有列（`duplicate: true`）、不新增、不 enqueue；
+  否則與 `addMemory` 相同地新增（含 FTS 維護、`content_hash`、`supersedes` 軟刪除、`pinned=false`）。
+  `supersedes` 有值時仍先標記被取代者；REST 的編輯流程另行跳過去重。
+- REST：`POST /memories` 支援 additive `force: true`（強制新增、回 `201`）；重複回 `200`＋既有記憶
+  ＋`duplicate: true`。`Memory` 公開型別不變。
+
+### legacy scope 正規化
+
+`MetadataStore.normalizeLegacyMemoryScopes()`：啟動時呼叫一次、**冪等**；把舊版矛盾資料收斂為
+合法組合——`scope in ('global','agent')` 但 `project` 非 null → `project = null`；
+`scope = 'project'` 但 `project` 為 null／空字串 → `scope = 'global'`（無法猜專案）。
+回傳實際更新列數；不清除、不合併任何記憶內容。
+
+### 硬刪除
+
+`MetadataStore.hardDeleteMemory(id): Promise<boolean>`：刪除資料列（含 FTS 列；向量是同列欄位）、
+可刪已軟刪除者、未知 id 回 `false`。REST：`DELETE /memories/:id?hard=true`（只接受 `true`／`1`，
+其他值 `400`；未帶參數維持軟刪除）。**不做取證級抹除**（SQLite WAL／檔案系統頁面可能殘留、
+at-rest 仍明文、無加密），見 `docs/roots-and-privacy.md` §資料存放與刪除。
+
+## 記憶的匯出／匯入（2026-10-19）
+
+備份的範圍**只有記憶**：NDJSON（JSON Lines，一行一筆），**不含** chunk／向量與已刪除的歷史版本；
+匯入後向量由背景 worker 重建。整庫搬遷（含向量檔）不在本版範圍，見 §設計規則 6。
+
+| 方法 | 語意 |
+|---|---|
+| `MetadataStore.listMemoriesForExport()` | 列出**全部未刪除**記憶；`createdAt` 由舊到新（同毫秒以 `id` 由小到大）；**不套** `listMemories` 的 500 筆上限 |
+
+- **匯出（讀取路徑）**：`GET /memories/export` → `application/x-ndjson; charset=utf-8` 附件
+  `memories-YYYYMMDD.ndjson`；一行一筆，欄位固定為
+  `{schemaVersion:1, id, content, kind, scope, project, agent, pinned, createdAt, supersedes}`；
+  結尾換行；0 筆時是 0 bytes 的空檔。順序與 `listMemoriesForExport` 相同。
+- **匯出的遮罩語意**：匯出是**讀取遮罩後視圖**，與 `GET /memories` 用同一組 `maskSecrets`
+  （`content`、`agent`、`project`）；資料庫裡的舊資料即使未遮罩，匯出檔也不會出現可辨識憑證的
+  原文。還原的是**遮罩後內容**，不是原文；備份檔由使用者保管，可能含專案內部資訊。
+- **匯入（寫入路徑）**：`POST /memories/import`，body 是原始 NDJSON
+  （`application/x-ndjson`），上限 **32 MiB**（超過回 `413 PayloadTooLargeError`）。
+  查詢 `dryRun=1`／`true` 只驗證與估算（其他值 `400`；未帶參數＝正式匯入）。
+- **整批先驗證**：任何一行不合法 → `400` 且**完全不寫**（不做部分匯入）；回應含
+  `error:{name,message}`（沿用 REST 錯誤格式）與 `invalid:[{line,reason}]`（最多前 100 筆，
+  行號從 1 起算）。驗證規則與 `POST /memories` 相同：`content` 必填非空且 ≤ 8000 字元、
+  `kind` ∈ fact／decision／pitfall／preference（可省略，預設 `fact`）、
+  `scope` ∈ global／project／agent（可省略：有 `project` 視為 `project`，否則 `global`）、
+  scope／project 組合規則一致、`agent` 必填且 ≤ 200 字元；
+  `schemaVersion` 可省略（有值必須是 1）、`pinned` 可選 boolean；未知欄位與
+  `id`／`createdAt`／`supersedes` 一律忽略。`agent`／`project` 是查詢鍵，含 token-like 機密時
+  該行不合法（不遮罩改寫）。
+- **寫入流程**：內容先 `maskSecrets`（回應的 `redacted` 以**筆**計）→ metadata token-like 檢查
+  → `addMemoryUnlessDuplicate`（重複跳過、計入 `duplicates`）→ `pinned` 時 `setMemoryPinned`
+  → `memoryEmbedder.enqueue`（不阻塞回應）。**不保留** `id`／`createdAt`／`supersedes`
+  （新 id、匯入時間、無歷史鏈）；`pinned` 保留。同批次內較早的重複也計入 `duplicates`。
+- **回應**：`{dryRun, total, valid, invalid, duplicates, redacted, created, wouldCreate}`。
+  dry-run 時 `created = 0`、`wouldCreate` 是預計新增數；正式匯入時 `wouldCreate = 0`。
+  空檔（0 行）→ `200`＋全 0。
+- **不做**：加密、自動排程備份、串流下載、MCP 工具、chunk／向量／整庫搬遷。
 
 ## 記憶的語意化（2026-10-18）
 
@@ -406,6 +485,11 @@ SQLite FTS5 預設斷詞對中文效果差；三字元的 `trigram` tokenizer �
 **`trigram` 的失效方式不同**：SQLite FTS5 `trigram` 對 2 字查詢回 0 命中；pg_trgm ＋ `LIKE` 對 2 字
 中文結果仍正確、只是用不到索引。兩者的「失效方式」不同，因此**不能直接照搬 SQLite 的 `LIKE` 備援設計**
 到 PostgreSQL 端。
+
+> **實測狀態（誠實標示）**：本文件 2026-10-19 新增的記憶方法（去重、legacy 正規化、硬刪除、
+> `listMemoriesForExport`）與匯出／匯入端點，PostgreSQL 端有實作與同一組契約測試，但測試需
+> `MNEMOSHELF_PG=1`（Docker／PG 環境）才執行；本版開發機沒有 Docker，**PG 尚未實跑**，
+> 不能宣稱已在 PostgreSQL 驗證。SQLite 端為預設路徑、已實跑。
 
 ## 規模參考
 

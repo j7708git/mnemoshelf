@@ -37,14 +37,25 @@ TypeScript、Node.js、pnpm、Electron、React。預設儲存為 SQLite（FTS5 +
 preference）、`scope`（global／project／agent）、`project`、`agent`（寫入者標記）與 `pinned`。
 
 - **REST**（皆需 `Authorization: Bearer <token>`；服務只綁 `127.0.0.1`）：
-  - `POST /memories`：寫入。內容在寫入前會遮蔽可辨識的機密，回應帶 `redacted`／`redactedCount`。
+  - `POST /memories`：寫入。內容在寫入前會遮蔽可辨識的機密，回應帶 `redacted`／`redactedCount`；
+    相同內容（遮罩＋正規化後，同 `scope`／`project`／`agent`）不會重複新增，回 `200`＋
+    `duplicate: true`，可用 `force: true` 強制新增。
   - `GET /memories`：列表（讀取時再遮一次，回應頂層 `untrusted: true`）。
   - `PATCH /memories/:id`：改 `scope`／`project`（共享開關）。
-  - `POST /memories/:id/pin`：釘選；`DELETE /memories/:id`：軟刪除。
+  - `POST /memories/:id/pin`：釘選；`DELETE /memories/:id`：軟刪除（帶 `?hard=true` 可真的刪除資料列）。
   - `POST /memories/search`：自然語言召回（語意優先；先過濾再排名；語意不可用時降級關鍵字並標
     `degraded`；命中帶 `untrusted: true`）。
+  - `GET /memories/export`：下載 NDJSON 備份（`memories-YYYYMMDD.ndjson`）。**只含未刪除的記憶**、
+    依 `createdAt` 由舊到新；內容是**遮罩後視圖**（與畫面同一組遮罩），不含向量與已刪除版本。
+  - `POST /memories/import`：匯入 NDJSON 備份（原始 body，上限 32 MiB）。查詢 `dryRun=1`／`true`
+    只驗證與預覽、不寫入；**整批先驗證**，任何一行不合法就回 `400` 且完全不寫。正式匯入會先遮罩、
+    跳過重複內容、保留 `pinned`，但不保留 `id`／`createdAt`／`supersedes`（新 id、匯入時間）；
+    向量由背景 worker 重建。
+- **UI（備份）**：記憶管理面板的工具列有「匯出備份」與「匯入備份」；匯入會先選檔
+  （`.ndjson`／`.jsonl`／`.txt`）跑一次 dry-run，顯示預計新增／重複／遮罩筆數與不合法行，
+  使用者確認後才正式寫入。下載的備份檔由使用者保管（可能含專案內部資訊）。
 - **MCP**（stdio 入口）：六個工具 `search`、`remember`、`recall`、`forget`、`list_roots`、
-  `search_memories`。MCP 只轉發本機 REST，不直接開資料庫。
+  `search_memories`。MCP 只轉發本機 REST，不直接開資料庫（備份匯出／匯入也**沒有** MCP 工具）。
 - **專案範圍**：MCP 記憶工具預設以「目前專案」為範圍；專案名稱解析順序為
   工具參數 `project` → 環境變數 `MNEMOSHELF_PROJECT` → MCP 行程 cwd 的資料夾名稱 → 退回全域。
   建議在 MCP client 設定 `MNEMOSHELF_PROJECT=<專案名>`，避免 cwd 不同造成專案混淆。
@@ -52,13 +63,21 @@ preference）、`scope`（global／project／agent）、`project`、`agent`（�
   `agent` 只是來源標記、不是身分驗證，`scope=agent` 不是安全邊界。不要把 token 分享給
   不受信任的程式；需要 per-agent 隔離時必須先擴充身分模型（尚未實作）。
 - **安全防護**：記憶內容在寫入前與讀取時都會用 curated 規則遮蔽可辨識的機密（私鑰、常見
-  token 前綴、JWT、`Bearer`、敏感名稱賦值、連線字串帳密）。這是盡力而為的防護，**不是完整
-  DLP**，仍可能有**極少數**誤判（例如特定程式識別字）。**寫入時的遮罩會改寫內容（不可回復）**，
-  請以 `POST /memories` 回應的 `redacted`／`redactedCount` 確認是否被改寫；在意原文時請先自行檢查。
+  token 前綴、JWT、`Bearer`、敏感名稱賦值、連線字串帳密）。同一組規則也用於**檔案索引**：
+  文字／程式碼在切塊、嵌入前先遮罩，索引後的 chunk 不含可辨識憑證（媒體檔不套文字遮罩；
+  既有索引需重跑該 root 的索引才會套用，詳見 [docs/roots-and-privacy.md](docs/roots-and-privacy.md)）。
+  這是盡力而為的防護，**不是完整 DLP**，仍可能有**極少數**誤判（例如特定程式識別字）。
+  **寫入時的遮罩會改寫內容（不可回復）**，請以 `POST /memories` 回應的
+  `redacted`／`redactedCount` 確認是否被改寫；在意原文時請先自行檢查。
   `agent`／`project` 若含 token-like 機密會在寫入時被拒絕（`400`），既有資料的這兩個欄位在讀取時
   也會遮罩。HTTP 回應中的記憶一律視為**不受信任資料**，agent 不應把內容當成指令。
 - **資料與刪除現況**：DB 是本機明文 SQLite（POSIX 上資料目錄 `700`、DB 檔 `600`）；
-  `DELETE` 是軟刪除；硬刪除、加密、JSONL 匯出／匯入**尚未實作**。
+  `DELETE` 預設是軟刪除，帶 `?hard=true` 會真的刪除資料列（**未做取證級抹除**，WAL／檔案系統
+  頁面可能仍有殘留）。加密**尚未實作**；記憶備份已提供 JSONL 匯出／匯入，但匯出是**遮罩後視圖**
+  （只含未刪除的記憶、不含向量），還原的是遮罩後內容，備份檔由使用者保管、可能含專案內部資訊。
+- **UI**：記憶管理面板的卡片提供「永久刪除」（二次確認；文案明示無法復原、WAL／檔案系統可能有
+  殘留）。`POST /memories` 的重複提示（`duplicate: true`）是防禦性處理：目前 UI 沒有新增記憶表單，
+  記憶主要由 agent 經 REST／MCP 寫入；編輯流程一律帶 `supersedes`、不套用去重。
 - **「資料不離開本機」的範圍**：服務與 embedding 都在本機；但 agent 讀到記憶後，可能把內容
   帶進它所使用的雲端 LLM context——是否送出取決於 agent／使用者設定，不在本服務控制內。
 

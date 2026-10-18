@@ -363,9 +363,51 @@ export interface MetadataStore {
 
   /** 新增記憶；`supersedes` 有值時把被取代者標記 `deletedAt`。新增的記憶一律 `pinned=false`。 */
   addMemory(m: NewMemory): Promise<Memory>;
+
+  /**
+   * 寫入記憶，但**先做精確去重**：同一 key（內容 hash＋`scope`＋`project`＋`agent`）已有
+   * 未刪除（`deletedAt == null`）的記憶時，不新增、回傳既有列與 `duplicate: true`；
+   * 否則與 `addMemory` 相同地新增（含 FTS 維護、`content_hash`、`supersedes` 軟刪除、
+   * `pinned` 預設 `false`）並回 `duplicate: false`。
+   *
+   * - **key 的內容部分**＝`memoryContentHash(m.content)`（Unicode NFC、trim、連續空白收斂；
+   *   不轉大小寫、不動標點）。呼叫端（REST）傳入的是**遮罩後**內容，因此「憑證不同但遮罩後
+   *   同文」視為重複。
+   * - `project` 以 SQL 的 null-safe 比較（`is`／`coalesce`），不會因 null 比較漏判；
+   *   非 `project` scope 的 `project` 一律是 `null`。
+   * - **競態**：檢查與新增在同一個交易／單一 SQL 敘述內完成（本專案是單一寫入者；
+   *   PostgreSQL 的實作以 `insert … where not exists` 語意對齊）。
+   * - **已軟刪除者不計入**：軟刪除後可以再新增一筆相同內容；`duplicate` 的既有列一定是
+   *   未刪除者。
+   * - `supersedes` 有值時**仍會**先標記被取代者（與 `addMemory` 相同）；REST 的「編輯流程」
+   *   另行跳過去重，不在這裡判斷。
+   */
+  addMemoryUnlessDuplicate(m: NewMemory): Promise<{ memory: Memory; duplicate: boolean }>;
+
   getMemory(id: number): Promise<Memory | null>;
   /** 軟刪除。 */
   forgetMemory(id: number): Promise<void>;
+
+  /**
+   * 把舊版留下的**矛盾 scope／project 組合**冪等正規化（啟動時呼叫一次）：
+   *
+   * - `scope in ('global','agent')` 但 `project` 非 null → `project = null`；
+   * - `scope = 'project'` 但 `project` 為 null／空字串（trim 後）→ `scope = 'global'`
+   *   且 `project = null`（無法猜專案）。
+   *
+   * 其他合法列不動；不清除、不合併任何記憶內容。回傳**實際更新**的列數（第二次呼叫為 0）。
+   */
+  normalizeLegacyMemoryScopes(): Promise<{ updated: number }>;
+
+  /**
+   * 硬刪除記憶資料列（含 FTS 列；向量是同一列的欄位，一併消失）。
+   *
+   * - 可刪已軟刪除者；未知 id 回 `false`（不拋錯、不建立列）。
+   * - 僅保證「API／查詢不再可見、資料列不存在」；**不做取證級抹除**（SQLite WAL／檔案系統
+   *   頁面可能仍有殘留，at-rest 仍為明文），見 `docs/roots-and-privacy.md`。
+   * - 其他記憶的 `supersedes` 若指向被刪除的 id，屬歷史欄位，不影響讀取。
+   */
+  hardDeleteMemory(id: number): Promise<boolean>;
 
   /**
    * 設定記憶的釘選狀態（冪等；M3 擴充）。
@@ -453,6 +495,18 @@ export interface MetadataStore {
    * - `filter.limit` 的邊界語意見 `normalizeMemoryLimit`（預設 100、上限 500、<= 0 回傳空清單）。
    */
   listMemories(filter?: MemoryFilter): Promise<Memory[]>;
+
+  /**
+   * 列出**全部未刪除**的記憶，供備份匯出使用（見 `docs/storage-ports.md` §記憶的匯出／匯入）。
+   *
+   * - 只列未刪除者（軟刪除與被取代者不列）；**不受 `normalizeMemoryLimit` 的 500 筆上限限制**
+   *   ——備份要全量，不是一次頁面查詢。
+   * - 排序：`createdAt` 由**舊到新**（與 `listMemories` 相反）；同一毫秒以 `id` 由小到大決勝，
+   *   匯入端依相同內容重建後仍可重現相對順序。
+   * - 回傳的是資料庫原文（未遮罩）；遮罩是呼叫端（REST 匯出）的責任，與其他讀取路徑一致。
+   * - 沒有任何未刪除記憶時回 `[]`（不拋錯）。
+   */
+  listMemoriesForExport(): Promise<Memory[]>;
 
   /** 關鍵字搜尋 chunk 文字與未刪除的記憶，回傳排名清單。 */
   searchKeyword(query: string, filter: SearchFilter, k: number): Promise<RankedHit[]>;

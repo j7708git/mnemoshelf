@@ -688,10 +688,24 @@ export async function listMemories(): Promise<Memory[]> {
 }
 
 /**
+ * `POST /memories` 的回應（卡 C2 的 additive 欄位；`Memory` 本身的欄位不變）。
+ *
+ * - `duplicate: true` 只會出現在 `200`：已有相同內容的未刪除記憶，這次沒有新增；
+ *   呼叫端必須**不要**把它當成新卡片（UI 顯示既有 id 的提示即可）。
+ * - `redacted`／`redactedCount` 描述這次寫入前的遮罩結果；重複時為 `false`／`0`。
+ */
+export interface AddMemoryResponse extends Memory {
+  duplicate: boolean;
+  redacted?: boolean;
+  redactedCount?: number;
+}
+
+/**
  * 新增記憶。
  *
  * `supersedes` 帶入被編輯記憶的 id 時，會建立新版本並把舊版標記軟刪除
  * （Core 的 supersedes 語意），這就是 UI 的「編輯」流程。
+ * 未帶 `supersedes` 時伺服器會做精確去重：重複則回 `200`＋既有記憶＋`duplicate: true`。
  */
 export async function addMemory(input: {
   content: string;
@@ -700,14 +714,14 @@ export async function addMemory(input: {
   scope?: MemoryScope;
   project?: string | null;
   supersedes?: number | null;
-}): Promise<Memory & { redacted?: boolean; redactedCount?: number }> {
+}): Promise<AddMemoryResponse> {
   const response = await apiFetch("/memories", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
   });
   if (!response.ok) throw new Error(await readErrorMessage(response, "儲存記憶失敗"));
-  return (await response.json()) as Memory & { redacted?: boolean; redactedCount?: number };
+  return (await response.json()) as AddMemoryResponse;
 }
 
 /** 設定／取消釘選（冪等）；回傳更新後的記憶。 */
@@ -740,10 +754,149 @@ export async function updateMemory(
   return (await response.json()) as Memory;
 }
 
-/** 軟刪除記憶。 */
-export async function deleteMemory(id: number): Promise<void> {
-  const response = await apiFetch(`/memories/${id}`, { method: "DELETE" });
-  if (!response.ok) throw new Error(await readErrorMessage(response, "刪除記憶失敗"));
+/**
+ * 刪除記憶。
+ *
+ * - 預設是**軟刪除**（內容仍在資料庫，只是不再列出／搜尋）。
+ * - `opts.hard = true` 送出 `DELETE /memories/:id?hard=true`：真的刪除資料列，**無法復原**；
+ *   本機的 SQLite 檔案／WAL 仍可能有殘留（未做安全抹除）。
+ */
+export async function deleteMemory(id: number, opts: { hard?: boolean } = {}): Promise<void> {
+  const query = opts.hard === true ? "?hard=true" : "";
+  const response = await apiFetch(`/memories/${id}${query}`, { method: "DELETE" });
+  if (!response.ok) throw new Error(await readErrorMessage(response, opts.hard === true ? "永久刪除記憶失敗" : "刪除記憶失敗"));
+}
+
+// ---------------------------------------------------------------------------
+// 記憶備份（GET /memories/export、POST /memories/import）
+// ---------------------------------------------------------------------------
+
+/** 匯入檔的一行錯誤（行號從 1 起算）。 */
+export interface MemoryImportLineError {
+  line: number;
+  reason: string;
+}
+
+/**
+ * `POST /memories/import` 的回應。
+ *
+ * - `dryRun: true` 時 `created` 一律 0、`wouldCreate` 是預計新增數；
+ * - 正式匯入時 `wouldCreate` 一律 0；
+ * - `duplicates` 是因為與既有（或同批次較早）的未刪除記憶同 key 而跳過的筆數；
+ * - `redacted` 是內容被遮罩的**筆數**（不是機密片段數）。
+ */
+export interface MemoryImportResult {
+  dryRun: boolean;
+  total: number;
+  valid: number;
+  invalid: MemoryImportLineError[];
+  duplicates: number;
+  redacted: number;
+  created: number;
+  wouldCreate: number;
+}
+
+/**
+ * 匯入失敗（400／413 等）；若是「整批驗證失敗」，`result` 會帶著逐行錯誤，UI 可直接顯示。
+ */
+export class MemoryImportError extends Error {
+  readonly result: MemoryImportResult | null;
+
+  constructor(message: string, result: MemoryImportResult | null = null) {
+    super(message);
+    this.name = "MemoryImportError";
+    this.result = result;
+  }
+}
+
+/** 匯出檔的預設檔名：`memories-YYYYMMDD.ndjson`（伺服器沒給 `content-disposition` 時用）。 */
+export function memoriesExportFilename(now: Date = new Date()): string {
+  const stamp = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}`;
+  return `memories-${stamp}.ndjson`;
+}
+
+/** 從 `content-disposition` 取檔名；只留最後一段，避免把路徑分隔字元帶進下載屬性。 */
+function filenameFromContentDisposition(header: string | null): string | null {
+  if (header === null) return null;
+  const match = /filename="?([^";]+)"?/i.exec(header);
+  if (match === null) return null;
+  const name = match[1]!.trim().split(/[\\/]/).pop() ?? "";
+  return name === "" ? null : name;
+}
+
+/** 是否是匯入結果的形狀（400 的錯誤 body 也會帶這些欄位；413 則只有 `error`）。 */
+function isMemoryImportResult(value: unknown): value is MemoryImportResult {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.dryRun === "boolean" &&
+    typeof record.total === "number" &&
+    typeof record.valid === "number" &&
+    Array.isArray(record.invalid) &&
+    typeof record.duplicates === "number" &&
+    typeof record.redacted === "number" &&
+    typeof record.created === "number" &&
+    typeof record.wouldCreate === "number"
+  );
+}
+
+/**
+ * 下載記憶備份（NDJSON）：`fetch` → 文字 → Blob＋`<a download>`（與診斷下載相同模式）。
+ *
+ * 檔名取自 `content-disposition`；取不到時退回 `memories-YYYYMMDD.ndjson`。
+ * 備份檔是**遮罩後**視圖、只含未刪除的記憶（不含向量）；檔案由使用者保管。
+ */
+export async function downloadMemoriesExport(): Promise<{ filename: string }> {
+  const response = await apiFetch("/memories/export");
+  if (!response.ok) throw new Error(await readErrorMessage(response, "下載記憶備份失敗"));
+  const text = await response.text();
+  const filename =
+    filenameFromContentDisposition(response.headers.get("content-disposition")) ?? memoriesExportFilename();
+  const url = URL.createObjectURL(new Blob([text], { type: "application/x-ndjson" }));
+  try {
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+  } finally {
+    // 讓瀏覽器有時間讀取 blob 之後再釋放。
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  return { filename };
+}
+
+/**
+ * 匯入記憶備份（原始 NDJSON 文字）。
+ *
+ * `opts.dryRun = true` 只驗證與估算、不寫入；正式匯入前 UI 應先跑一次 dry-run 讓使用者確認。
+ * 伺服器會整批先驗證：任何一行不合法就回 400 且完全不寫；此時丟出的 `MemoryImportError`
+ * 會帶 `result.invalid`（行號＋原因）供 UI 顯示。
+ */
+export async function importMemories(
+  text: string,
+  opts: { dryRun: boolean },
+): Promise<MemoryImportResult> {
+  const query = opts.dryRun ? "?dryRun=1" : "";
+  const response = await apiFetch(`/memories/import${query}`, {
+    method: "POST",
+    headers: { "content-type": "application/x-ndjson" },
+    body: text,
+  });
+  if (!response.ok) {
+    let body: unknown = null;
+    try {
+      body = await response.json();
+    } catch {
+      // 非 JSON（理論上不會發生）：用通用訊息。
+    }
+    const errorRecord = body as { error?: { message?: unknown } } | null;
+    const message =
+      typeof errorRecord?.error?.message === "string" ? errorRecord.error.message : "匯入記憶備份失敗";
+    throw new MemoryImportError(message, isMemoryImportResult(body) ? body : null);
+  }
+  return (await response.json()) as MemoryImportResult;
 }
 
 // ---------------------------------------------------------------------------

@@ -896,5 +896,224 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       expect(await store.listMemories({ limit: MEMORY_LIST_MAX_LIMIT + 1000 })).toHaveLength(MEMORY_LIST_MAX_LIMIT);
       expect(await store.listMemories()).toHaveLength(MEMORY_LIST_DEFAULT_LIMIT);
     });
+
+    it("listMemoriesForExport 只列未刪除、createdAt 由舊到新（與 listMemories 相反）", async () => {
+      const first = await store.addMemory(memoryInput({ content: "匯出第一筆" }));
+      const forgotten = await store.addMemory(memoryInput({ content: "匯出已刪除" }));
+      const second = await store.addMemory(memoryInput({ content: "匯出第二筆" }));
+      const replaced = await store.addMemory(memoryInput({ content: "匯出被取代的舊版" }));
+      const replacement = await store.addMemory(
+        memoryInput({ content: "匯出取代後的新版", supersedes: replaced.id }),
+      );
+
+      await store.forgetMemory(forgotten.id);
+
+      // 同一毫秒內新增時以 id 由小到大決勝，因此等於插入順序；軟刪除與被取代者都不列。
+      const exported = await store.listMemoriesForExport();
+      expect(exported.map((memory) => memory.id)).toEqual([first.id, second.id, replacement.id]);
+      expect(exported.map((memory) => memory.id)).not.toContain(forgotten.id);
+      expect(exported.map((memory) => memory.id)).not.toContain(replaced.id);
+
+      // 時間由舊到新；回傳完整的 Memory（欄位與 addMemory 的回傳一致）。
+      const times = exported.map((memory) => Date.parse(memory.createdAt));
+      for (let index = 1; index < times.length; index += 1) {
+        expect(times[index]!).toBeGreaterThanOrEqual(times[index - 1]!);
+      }
+      expect(exported[0]).toEqual(first);
+      expect(exported[0]?.deletedAt).toBeNull();
+
+      // 與 `listMemories` 的排序對照：後者是前者的精確反向。
+      expect((await store.listMemories()).map((memory) => memory.id)).toEqual(
+        exported.map((memory) => memory.id).reverse(),
+      );
+    });
+
+    it("listMemoriesForExport 不受 listMemories 的 500 筆上限限制", async () => {
+      const total = MEMORY_LIST_MAX_LIMIT + 3;
+      const created: number[] = [];
+      for (let index = 0; index < total; index += 1) {
+        const memory = await store.addMemory(memoryInput({ content: `匯出全量記憶 ${index}` }));
+        created.push(memory.id);
+      }
+
+      expect(await store.listMemories()).toHaveLength(MEMORY_LIST_DEFAULT_LIMIT);
+      const exported = await store.listMemoriesForExport();
+      expect(exported).toHaveLength(total);
+      expect(exported.map((memory) => memory.id)).toEqual(created);
+    });
+
+    // -------------------------------------------------------------------------
+    // 卡 C2：寫入去重／legacy scope 正規化／硬刪除
+    // -------------------------------------------------------------------------
+
+    it("addMemoryUnlessDuplicate：同內容只差空白／換行 → duplicate、回既有列、不新增", async () => {
+      const first = await store.addMemoryUnlessDuplicate(
+        memoryInput({ content: "去重測試的第一行\n第二行", scope: "project", project: "proj-dedupe" }),
+      );
+      expect(first.duplicate).toBe(false);
+      expect(first.memory.project).toBe("proj-dedupe");
+
+      // 只差前後空白、換行與 Tab：正規化後同 hash → 視為重複。
+      const second = await store.addMemoryUnlessDuplicate(
+        memoryInput({ content: "  去重測試的第一行\r\n\r\n第二行\t ", scope: "project", project: "proj-dedupe" }),
+      );
+      expect(second.duplicate).toBe(true);
+      expect(second.memory.id).toBe(first.memory.id);
+      // 內容保留「第一次寫入」的原文（呼叫端看到的是既有記憶）。
+      expect(second.memory.content).toBe("去重測試的第一行\n第二行");
+
+      expect(await store.listMemories({ project: "proj-dedupe" })).toHaveLength(1);
+      // 重複時不新增 FTS 列：關鍵字只會命中一筆。
+      expect(await store.searchMemoriesKeyword("去重測試", {}, 10)).toHaveLength(1);
+    });
+
+    it("addMemoryUnlessDuplicate：不同 scope／project／agent 不誤判（null-safe 的 project 比較）", async () => {
+      const base = { content: "同一段內容", kind: "fact", supersedes: null } as const;
+      const globalMemory = await store.addMemoryUnlessDuplicate(
+        memoryInput({ ...base, scope: "global", project: null, agent: "dedupe-agent" }),
+      );
+      expect(globalMemory.duplicate).toBe(false);
+
+      // agent 不同 → 不同 key。
+      const otherAgent = await store.addMemoryUnlessDuplicate(
+        memoryInput({ ...base, scope: "global", project: null, agent: "dedupe-agent-2" }),
+      );
+      expect(otherAgent.duplicate).toBe(false);
+
+      // scope 不同（project 都是 null）→ 不同 key。
+      const agentScope = await store.addMemoryUnlessDuplicate(
+        memoryInput({ ...base, scope: "agent", project: null, agent: "dedupe-agent" }),
+      );
+      expect(agentScope.duplicate).toBe(false);
+
+      // project 不同 → 不同 key；同名專案才是重複。
+      const projectA = await store.addMemoryUnlessDuplicate(
+        memoryInput({ ...base, scope: "project", project: "dedupe-proj-a", agent: "dedupe-agent" }),
+      );
+      expect(projectA.duplicate).toBe(false);
+      const projectB = await store.addMemoryUnlessDuplicate(
+        memoryInput({ ...base, scope: "project", project: "dedupe-proj-b", agent: "dedupe-agent" }),
+      );
+      expect(projectB.duplicate).toBe(false);
+      const projectAAgain = await store.addMemoryUnlessDuplicate(
+        memoryInput({ ...base, scope: "project", project: "dedupe-proj-a", agent: "dedupe-agent" }),
+      );
+      expect(projectAAgain.duplicate).toBe(true);
+      expect(projectAAgain.memory.id).toBe(projectA.memory.id);
+
+      expect(await store.listMemories()).toHaveLength(5);
+    });
+
+    it("addMemoryUnlessDuplicate：軟刪除後可再新增同內容；force（一般 addMemory）可新增第二筆", async () => {
+      const content = "可以重複的內容：軟刪除與 force";
+      const first = await store.addMemoryUnlessDuplicate(memoryInput({ content }));
+      expect(first.duplicate).toBe(false);
+
+      // 軟刪除者不計入去重 → 可以再新增一筆。
+      await store.forgetMemory(first.memory.id);
+      const afterDelete = await store.addMemoryUnlessDuplicate(memoryInput({ content }));
+      expect(afterDelete.duplicate).toBe(false);
+      expect(afterDelete.memory.id).not.toBe(first.memory.id);
+      expect((await store.listMemories()).map((memory) => memory.id)).toEqual([afterDelete.memory.id]);
+
+      // force 語意＝走一般 addMemory：即使已存在未刪除的同內容，也新增第二筆。
+      const forced = await store.addMemory(memoryInput({ content }));
+      expect(forced.id).not.toBe(afterDelete.memory.id);
+      expect((await store.listMemories({ limit: 10 })).map((memory) => memory.id).sort()).toEqual(
+        [afterDelete.memory.id, forced.id].sort(),
+      );
+    });
+
+    it("addMemoryUnlessDuplicate：帶 supersedes 時仍會軟刪除被取代者", async () => {
+      const original = await store.addMemory(memoryInput({ content: "被取代的原文" }));
+      const replacement = await store.addMemoryUnlessDuplicate(
+        memoryInput({ content: "取代後的新文", supersedes: original.id }),
+      );
+      expect(replacement.duplicate).toBe(false);
+      expect(replacement.memory.supersedes).toBe(original.id);
+      expect((await store.getMemory(original.id))?.deletedAt).not.toBeNull();
+      expect((await store.listMemories()).map((memory) => memory.id)).toEqual([replacement.memory.id]);
+    });
+
+    it("normalizeLegacyMemoryScopes：矛盾組合各一列＋合法列不動、回傳更新數、第二次為 0", async () => {
+      const globalWithProject = await store.addMemory(
+        memoryInput({ content: "legacy：global 帶 project", scope: "global", project: "legacy-proj" }),
+      );
+      const agentWithProject = await store.addMemory(
+        memoryInput({ content: "legacy：agent 帶 project", scope: "agent", project: "legacy-proj", agent: "legacy-agent" }),
+      );
+      const projectWithoutProject = await store.addMemory(
+        memoryInput({ content: "legacy：project 沒有 project", scope: "project", project: null }),
+      );
+      const projectWithBlankProject = await store.addMemory(
+        memoryInput({ content: "legacy：project 只有空白", scope: "project", project: "   " }),
+      );
+      const legalProject = await store.addMemory(
+        memoryInput({ content: "合法：project 有 project", scope: "project", project: "legal-proj" }),
+      );
+      const legalGlobal = await store.addMemory(
+        memoryInput({ content: "合法：global 無 project", scope: "global", project: null }),
+      );
+      const legalAgent = await store.addMemory(
+        memoryInput({ content: "合法：agent 無 project", scope: "agent", project: null, agent: "legal-agent" }),
+      );
+
+      expect(await store.normalizeLegacyMemoryScopes()).toEqual({ updated: 4 });
+
+      expect(await store.getMemory(globalWithProject.id)).toMatchObject({ scope: "global", project: null });
+      expect(await store.getMemory(agentWithProject.id)).toMatchObject({ scope: "agent", project: null });
+      expect(await store.getMemory(projectWithoutProject.id)).toMatchObject({ scope: "global", project: null });
+      expect(await store.getMemory(projectWithBlankProject.id)).toMatchObject({ scope: "global", project: null });
+      // 合法列原樣保留（含 scope=project 的專案名稱）。
+      expect(await store.getMemory(legalProject.id)).toMatchObject({ scope: "project", project: "legal-proj" });
+      expect(await store.getMemory(legalGlobal.id)).toMatchObject({ scope: "global", project: null });
+      expect(await store.getMemory(legalAgent.id)).toMatchObject({ scope: "agent", project: null });
+      // 不清除、不合併：列數不變。
+      expect(await store.listMemories({ limit: 20 })).toHaveLength(7);
+
+      // 冪等：再跑一次沒有任何更新。
+      expect(await store.normalizeLegacyMemoryScopes()).toEqual({ updated: 0 });
+      expect(await store.getMemory(legalProject.id)).toMatchObject({ scope: "project", project: "legal-proj" });
+    });
+
+    it("hardDeleteMemory：列與 FTS 真的消失（可刪已軟刪除者）、未知 id 回 false", async () => {
+      const embedderId = "contract-embedder-hard-delete@1";
+      const memory = await store.addMemory(memoryInput({ content: "硬刪除測試的鰻魚飯" }));
+      await store.markMemoryEmbedded(memory.id, embedderId, embeddingVector());
+      expect(await store.memoryEmbeddingStats(embedderId)).toMatchObject({ total: 1, ready: 1 });
+
+      // 未刪除時兩條搜尋都找得到；軟刪除後只剩硬刪除前的「列還在」。
+      expect((await store.searchMemoriesKeyword("鰻魚飯", {}, 10)).map((hit) => hit.id)).toEqual([memory.id]);
+      expect((await store.searchKeyword("鰻魚飯", {}, 10)).map((hit) => hit.key)).toEqual([`m:${memory.id}`]);
+
+      // 可刪已軟刪除者：先軟刪除，再硬刪除。
+      await store.forgetMemory(memory.id);
+      expect(await store.hardDeleteMemory(memory.id)).toBe(true);
+
+      expect(await store.getMemory(memory.id)).toBeNull();
+      expect((await store.listMemories()).find((item) => item.id === memory.id)).toBeUndefined();
+      // 記憶 FTS 與一般（chunk＋記憶）搜尋都不得再命中。
+      expect(await store.searchMemoriesKeyword("鰻魚飯", {}, 10)).toEqual([]);
+      expect(await store.searchKeyword("鰻魚飯", {}, 10)).toEqual([]);
+      // 向量是同一列的欄位，隨列消失（統計歸零）。
+      expect(await store.memoryEmbeddingStats(embedderId)).toMatchObject({ total: 0, ready: 0 });
+
+      // 同一 id 再刪 → false；未知 id → false；都不會建立列。
+      expect(await store.hardDeleteMemory(memory.id)).toBe(false);
+      expect(await store.hardDeleteMemory(987654)).toBe(false);
+      expect(await store.listMemories()).toEqual([]);
+    });
+
+    it("hardDeleteMemory：其他記憶的 supersedes 參照不受影響", async () => {
+      const original = await store.addMemory(memoryInput({ content: "被硬刪除的舊版本" }));
+      const replacement = await store.addMemory(
+        memoryInput({ content: "取代後的新版本", supersedes: original.id }),
+      );
+
+      expect(await store.hardDeleteMemory(original.id)).toBe(true);
+      const after = await store.getMemory(replacement.id);
+      expect(after).toMatchObject({ supersedes: original.id, deletedAt: null });
+      expect(await store.listMemories()).toEqual([after]);
+    });
   });
 }

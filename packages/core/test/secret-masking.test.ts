@@ -5,7 +5,7 @@
  * 原始碼裡不會出現連續、可被 secret scanner 判真的字面憑證；樣本本身也是明顯假的。
  */
 import { describe, expect, it } from "vitest";
-import { containsRedacted, maskSecrets, REDACTED_PREFIX } from "../src/secret-masking.js";
+import { containsRedacted, maskSecrets, REDACTED_PREFIX } from "../src/privacy/secret-masking.js";
 
 /** 以片段拼接組出測試樣本（避免原始碼出現連續的憑證樣式）。 */
 function fake(...parts: string[]): string {

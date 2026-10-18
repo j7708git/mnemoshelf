@@ -1,4 +1,5 @@
 import { DuplicateRootError } from "../../errors.js";
+import { memoryContentHash } from "../../memory/content-normalize.js";
 import {
   assertMemoryEmbeddingFailure,
   assertMemoryEmbeddingInput,
@@ -352,10 +353,10 @@ export class SqliteMetadataStore implements MetadataStore {
       }
       const info = this.db
         .prepare(
-          `insert into memories(content, kind, scope, project, agent, supersedes, created_at, deleted_at)
-           values (?, ?, ?, ?, ?, ?, ?, null)`,
+          `insert into memories(content, kind, scope, project, agent, supersedes, created_at, deleted_at, content_hash)
+           values (?, ?, ?, ?, ?, ?, ?, null, ?)`,
         )
-        .run(m.content, m.kind, m.scope, m.project, m.agent, m.supersedes, createdAt);
+        .run(m.content, m.kind, m.scope, m.project, m.agent, m.supersedes, createdAt, memoryContentHash(m.content));
       const memoryId = Number(info.lastInsertRowid);
       if (m.content.trim().length > 0) {
         this.db.prepare("insert into memories_fts(rowid, seg) values (?, ?)").run(memoryId, segmentText(m.content));
@@ -369,6 +370,81 @@ export class SqliteMetadataStore implements MetadataStore {
     return created;
   }
 
+  /**
+   * 原子 insert-or-return-existing（見 `MetadataStore.addMemoryUnlessDuplicate`）。
+   *
+   * 去重 key＝（內容 hash, `scope`, `project`, `agent`），以 `project is ?` 做 null-safe 比較；
+   * **檢查與新增在同一句 `insert … select … where not exists`**：SQLite 的單一寫入者＋同步交易下，
+   * 不會出現「檢查後、插入前被別人插隊」的視窗。
+   *
+   * `supersedes` 與 `addMemory` 相同，會先標記被取代者；若該列剛好是唯一的重複列，標記後它已
+   * 不在去重範圍（`deleted_at is null`），因此仍會新增（與「編輯流程優先」的語意一致）。
+   * 重複時**不**寫 FTS（既有列的 FTS 本來就在），也不新增任何列。
+   */
+  async addMemoryUnlessDuplicate(m: NewMemory): Promise<{ memory: Memory; duplicate: boolean }> {
+    const createdAt = new Date().toISOString();
+    const contentHash = memoryContentHash(m.content);
+
+    const attempt = this.db.transaction((): { id: number; duplicate: boolean } => {
+      if (m.supersedes !== null) {
+        this.db
+          .prepare("update memories set deleted_at = ? where id = ? and deleted_at is null")
+          .run(createdAt, m.supersedes);
+      }
+
+      const info = this.db
+        .prepare(
+          `insert into memories(content, kind, scope, project, agent, supersedes, created_at, deleted_at, content_hash)
+           select ?, ?, ?, ?, ?, ?, ?, null, ?
+            where not exists (
+              select 1 from memories
+               where content_hash = ? and scope = ? and project is ? and agent = ? and deleted_at is null
+            )`,
+        )
+        .run(
+          m.content,
+          m.kind,
+          m.scope,
+          m.project,
+          m.agent,
+          m.supersedes,
+          createdAt,
+          contentHash,
+          contentHash,
+          m.scope,
+          m.project,
+          m.agent,
+        );
+
+      if (Number(info.changes) === 0) {
+        const existing = selectRow(
+          this.db,
+          `select ${MEMORY_COLUMNS} from memories
+            where content_hash = ? and scope = ? and project is ? and agent = ? and deleted_at is null
+            order by id
+            limit 1`,
+          contentHash,
+          m.scope,
+          m.project,
+          m.agent,
+        );
+        if (existing === undefined) throw new Error("去重判定為重複，但讀不回既有記憶");
+        return { id: Number(existing.id), duplicate: true };
+      }
+
+      const memoryId = Number(info.lastInsertRowid);
+      if (m.content.trim().length > 0) {
+        this.db.prepare("insert into memories_fts(rowid, seg) values (?, ?)").run(memoryId, segmentText(m.content));
+      }
+      return { id: memoryId, duplicate: false };
+    });
+
+    const { id, duplicate } = attempt();
+    const memory = await this.getMemory(id);
+    if (memory === null) throw new Error("新增記憶後讀不回資料列");
+    return { memory, duplicate };
+  }
+
   async getMemory(id: number): Promise<Memory | null> {
     const row = selectRow(this.db, `select ${MEMORY_COLUMNS} from memories where id = ?`, id);
     return row === undefined ? null : rowToMemory(row);
@@ -376,6 +452,48 @@ export class SqliteMetadataStore implements MetadataStore {
 
   async forgetMemory(id: number): Promise<void> {
     this.db.prepare("update memories set deleted_at = ? where id = ? and deleted_at is null").run(new Date().toISOString(), id);
+  }
+
+  /**
+   * 冪等正規化舊版留下的矛盾 scope／project（見 `MetadataStore.normalizeLegacyMemoryScopes`）。
+   *
+   * 兩個 UPDATE 的條件互斥（`scope in ('global','agent')` vs `scope = 'project'`），因此更新列數
+   * 可以直接相加；包含已軟刪除的列（純資料一致性，不影響可見性）。第二次執行時條件已不成立，
+   * 回傳 `updated: 0`。回傳的是**實際被改動的列數**（SQLite 的 `changes`）。
+   */
+  async normalizeLegacyMemoryScopes(): Promise<{ updated: number }> {
+    const normalize = this.db.transaction((): number => {
+      const clearedProject = this.db
+        .prepare("update memories set project = null where scope in ('global', 'agent') and project is not null")
+        .run();
+      const promotedScope = this.db
+        .prepare(
+          `update memories
+              set scope = 'global', project = null
+            where scope = 'project' and (project is null or trim(project) = '')`,
+        )
+        .run();
+      return Number(clearedProject.changes) + Number(promotedScope.changes);
+    });
+
+    return { updated: normalize() };
+  }
+
+  /**
+   * 硬刪除記憶（見 `MetadataStore.hardDeleteMemory`）。
+   *
+   * 先確認列存在（未知 id → `false`，不拋錯），再刪 FTS 列與主列；向量是同列的 BLOB 欄位，
+   * 隨主列消失。`memories_fts` 可能在內容為空白時沒有對應列，DELETE 不到任何列是正常情況。
+   */
+  async hardDeleteMemory(id: number): Promise<boolean> {
+    const remove = this.db.transaction((): boolean => {
+      const existing = selectRow(this.db, "select id from memories where id = ?", id);
+      if (existing === undefined) return false;
+      this.db.prepare("delete from memories_fts where rowid = ?").run(id);
+      this.db.prepare("delete from memories where id = ?").run(id);
+      return true;
+    });
+    return remove();
   }
 
   /** 設定釘選（冪等）；不存在的 id 更新不到任何列，等同無操作。 */
@@ -593,6 +711,19 @@ export class SqliteMetadataStore implements MetadataStore {
       `select ${MEMORY_COLUMNS} from memories where ${conditions.join(" and ")} order by created_at desc, id desc limit ?`,
       ...params,
       limit,
+    ).map(rowToMemory);
+  }
+
+  /**
+   * 列出全部未刪除的記憶（見 `MetadataStore.listMemoriesForExport` 的契約）。
+   *
+   * 備份用：刻意**不套** `normalizeMemoryLimit`（沒有 `limit`），排序與 `listMemories` 相反
+   * （`created_at asc, id asc`），讓匯入端依相同順序重建相對先後。
+   */
+  async listMemoriesForExport(): Promise<Memory[]> {
+    return selectRows(
+      this.db,
+      `select ${MEMORY_COLUMNS} from memories where deleted_at is null order by created_at asc, id asc`,
     ).map(rowToMemory);
   }
 

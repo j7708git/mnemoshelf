@@ -128,6 +128,18 @@ describe("MCP stdio 入口", () => {
       "rootIds",
     ]);
 
+    // 卡 C2：remember 多了 additive 的 force 參數（描述要講清楚 duplicate 與 force 的差異）。
+    const remember = tools.tools.find((tool) => tool.name === "remember")!;
+    expect(Object.keys((remember.inputSchema.properties ?? {}) as Record<string, unknown>).sort()).toEqual([
+      "content",
+      "force",
+      "kind",
+      "project",
+      "scope",
+    ]);
+    expect(remember.description).toContain("duplicate: true");
+    expect(remember.description).toContain("force");
+
     const searchMemories = tools.tools.find((tool) => tool.name === "search_memories")!;
     expect(Object.keys((searchMemories.inputSchema.properties ?? {}) as Record<string, unknown>).sort()).toEqual([
       "includeAllProjects",
@@ -201,6 +213,49 @@ describe("MCP stdio 入口", () => {
     const afterForget = await mcp.client.callTool({ name: "search", arguments: { query: "unique-marker-77", mode: "keyword" } });
     const remaining = jsonOf<{ hits: { type: string }[] }>(afterForget).hits.filter((hit) => hit.type === "memory");
     expect(remaining).toHaveLength(0);
+  });
+
+  it("remember 精確去重：重複回既有記憶＋duplicate: true；force 可新增；非 boolean force 回工具錯誤", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+
+    const base = { content: "MCP 去重測試內容 unique-marker-dedupe", kind: "fact", scope: "global" } as const;
+    const first = jsonOf<{ id: number; duplicate?: boolean }>(
+      await mcp.client.callTool({ name: "remember", arguments: base }),
+    );
+    expect(first.duplicate).toBe(false);
+
+    // 只差前後空白 → 同 key，不新增；回應是既有記憶＋duplicate: true。
+    const second = jsonOf<{ id: number; duplicate?: boolean }>(
+      await mcp.client.callTool({ name: "remember", arguments: { ...base, content: `  ${base.content}  ` } }),
+    );
+    expect(second.duplicate).toBe(true);
+    expect(second.id).toBe(first.id);
+
+    const recalled = jsonOf<{ memories: { id: number }[] }>(
+      await mcp.client.callTool({ name: "recall", arguments: {} }),
+    );
+    expect(recalled.memories.map((memory) => memory.id)).toEqual([first.id]);
+
+    // force: true → 一般新增（第二筆同內容）。
+    const forced = jsonOf<{ id: number; duplicate?: boolean }>(
+      await mcp.client.callTool({ name: "remember", arguments: { ...base, force: true } }),
+    );
+    expect(forced.duplicate).toBe(false);
+    expect(forced.id).not.toBe(first.id);
+    const recalledAfterForce = jsonOf<{ memories: { id: number }[] }>(
+      await mcp.client.callTool({ name: "recall", arguments: {} }),
+    );
+    expect(recalledAfterForce.memories.map((memory) => memory.id).sort()).toEqual([first.id, forced.id].sort());
+
+    // `force` 原樣轉發給 REST：非 boolean → 400，工具回報 ValidationError。
+    const badForce = await mcp.client.callTool({
+      name: "remember",
+      arguments: { ...base, content: "force 型別錯誤", force: "true" },
+    });
+    expect(badForce.isError).toBe(true);
+    expect(textOf(badForce)).toContain("ValidationError");
   });
 
   it("recall 列出記憶（可帶 filter），forget 後不再列出", async () => {

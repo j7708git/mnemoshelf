@@ -11,8 +11,12 @@
  * - `GET  /diagnostics`（除錯資訊匯出：版本、平台、embedder（含執行裝置與退回原因）、每 root 統計、
  *   記憶語意化狀態與背景 worker 統計；家目錄前綴遮罩成 `~`）
  * - `POST /search`（`query` 超過模型單筆輸入上限時 → `400 InputTooLongError`，見 `toHttpError`）
- * - `POST /memories`（建立後只 enqueue 背景嵌入，立即回 201）、`GET /memories`、`PATCH /memories/:id`、
- *   `POST /memories/:id/pin`、`DELETE /memories/:id`
+ * - `POST /memories`（精確去重：重複回 200＋`duplicate: true`，新增回 201 並 enqueue 背景嵌入）、
+ *   `GET /memories`、`PATCH /memories/:id`、`POST /memories/:id/pin`、
+ *   `DELETE /memories/:id`（預設軟刪除；`?hard=true` 硬刪除）
+ * - `GET  /memories/export`（NDJSON 備份下載；讀取遮罩視圖、只含未刪除）
+ *   `POST /memories/import`（NDJSON 匯入；raw body 上限 32 MiB、`?dryRun=1` 只預覽、
+ *   整批先驗證，任何一行不合法就 400 且不寫）
  * - `POST /memories/search`（記憶語意召回；先過濾再排名，語意不可用時降級關鍵字，見 `memory-search.ts`）
  *
  * 行為規則：
@@ -41,6 +45,7 @@ import {
   indexRoot,
   isBlocked,
   type IndexRootResult,
+  MEMORY_SCOPES,
   type Memory,
   type MemoryKind,
   type MemoryPatch,
@@ -97,15 +102,24 @@ import {
   searchMemories,
   type MemoryRecallResponseBody,
 } from "../memory-search.js";
+import {
+  countImportDuplicates,
+  MAX_MEMORY_CHARS,
+  MAX_MEMORY_IMPORT_BYTES,
+  MAX_MEMORY_METADATA_CHARS,
+  MEMORY_EXPORT_CONTENT_TYPE,
+  MEMORY_KINDS,
+  memoryExportFilename,
+  parseDryRunParam,
+  planMemoryImport,
+  serializeMemoriesExport,
+  type MemoryImportResponse,
+} from "../memory-export.js";
 
 /** JSON 請求主體上限。 */
 export const MAX_JSON_BODY_BYTES = 1024 * 1024;
-/** 單筆記憶內容長度上限（契約未明定，由本實作決定的濫用防護）。 */
-export const MAX_MEMORY_CHARS = 8000;
 /** 記憶召回查詢字串長度上限（UTF-16 長度；超過回 400）。 */
 export const MAX_MEMORY_QUERY_CHARS = 2000;
-/** 記憶的 agent／project 名稱長度上限（UTF-16 長度；超過回 400）。 */
-export const MAX_MEMORY_METADATA_CHARS = 200;
 /**
  * 請求 URL（request-target）長度上限。
  *
@@ -115,9 +129,11 @@ export const MAX_MEMORY_METADATA_CHARS = 200;
  */
 export const MAX_REQUEST_URL_LENGTH = 8 * 1024;
 
+// 記憶的長度上限定義在 `../memory-export.js`（REST 寫入與 NDJSON 匯入共用同一組）；
+// 這裡保持原本的公開匯出路徑，呼叫端不需要改 import。
+export { MAX_MEMORY_CHARS, MAX_MEMORY_METADATA_CHARS } from "../memory-export.js";
+
 const MODALITIES: readonly Modality[] = ["text", "code", "image", "audio", "video"];
-const MEMORY_KINDS: readonly MemoryKind[] = ["fact", "decision", "pitfall", "preference"];
-const MEMORY_SCOPES: readonly MemoryScope[] = ["global", "project", "agent"];
 
 /**
  * API 的第一段路徑前綴。
@@ -209,6 +225,32 @@ export interface ListMemoriesResponse {
 export interface PatchMemoryRequest {
   scope?: MemoryScope;
   project?: string | null;
+}
+
+/**
+ * `POST /memories` 的回應（卡 C2 的 additive 欄位；`Memory` 公開型別本身不變）。
+ *
+ * - `duplicate: true` 只會出現在 `200`：已有同 key 的未刪除記憶，這次沒有新增、也沒有 enqueue。
+ * - `redacted`／`redactedCount` 描述這次**寫入前**的遮罩結果（與既有行為相同）；
+ *   重複時為 `false`／`0`（沒有寫入任何內容）。
+ */
+export interface AddMemoryResponse extends Memory {
+  duplicate: boolean;
+  redacted: boolean;
+  redactedCount: number;
+}
+
+/** `DELETE /memories/:id` 的軟刪除回應（形狀與 C2 之前相同）。 */
+export interface ForgetMemoryResponse {
+  id: number;
+  deleted: boolean;
+}
+
+/** `DELETE /memories/:id?hard=true` 的硬刪除回應。 */
+export interface HardDeleteMemoryResponse {
+  id: number;
+  deleted: true;
+  hard: true;
 }
 
 /** `POST /roots/:id/index` 的回應（`IndexRootResult` 摘要＋量測）。 */
@@ -610,6 +652,43 @@ async function readJsonBody(request: IncomingMessage): Promise<Record<string, un
   return parsed;
 }
 
+/**
+ * 讀取原始請求主體（文字）並套用位元組上限；空主體回空字串。
+ *
+ * 兩層上限檢查：
+ * 1. `Content-Length` 已宣告超過上限 → 立刻 413，不讀 body；
+ * 2. 串流（chunked／未帶長度）則邊讀邊計數，超過後**停止累積但把剩下位元組排空**再拋
+ *    `PayloadTooLargeError`——若像 `readJsonBody` 一樣在讀取中途 `request.destroy()`，客戶端
+ *    可能只看到連線中斷而拿不到 413。記憶體用量仍以 `limitBytes` 為界。
+ */
+async function readTextBody(request: IncomingMessage, limitBytes: number): Promise<string> {
+  // 先看 Content-Length：明顯超量時不必等下載完才拒絕（也避免惡意客戶端用超大 body 佔頻寬）。
+  // 需要排空的串流（chunked／未帶長度）仍由下方累積計數處理。
+  const declared = request.headers["content-length"];
+  if (declared !== undefined) {
+    const declaredBytes = Number(declared);
+    if (Number.isFinite(declaredBytes) && declaredBytes > limitBytes) {
+      throw new PayloadTooLargeError(limitBytes);
+    }
+  }
+
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let exceeded = false;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > limitBytes) {
+      exceeded = true;
+      chunks.length = 0;
+      continue;
+    }
+    chunks.push(buffer);
+  }
+  if (exceeded) throw new PayloadTooLargeError(limitBytes);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 function requireString(value: unknown, field: string, options: { maxLength?: number } = {}): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new ValidationError(field, "必須是非空的字串");
@@ -694,6 +773,19 @@ function booleanFlag(value: string | null, field: string, fallback: boolean): bo
   if (normalized === "" || normalized === "0" || normalized === "false" || normalized === "no") return false;
   if (normalized === "1" || normalized === "true" || normalized === "yes") return true;
   throw new ValidationError(field, "必須是 1/0（或 true/false）");
+}
+
+/**
+ * 解析 `DELETE /memories/:id?hard=`（卡 C2）。
+ *
+ * 刻意比其他旗標嚴格：只接受 `true`／`1`（大小寫敏感）；未帶參數＝軟刪除；其他值（含空字串、
+ * `false`、`yes`）一律 `400`——「硬刪除」不可用模糊寫法誤觸。
+ */
+function parseHardDeleteFlag(url: URL): boolean {
+  if (!url.searchParams.has("hard")) return false;
+  const value = url.searchParams.get("hard");
+  if (value === "true" || value === "1") return true;
+  throw new ValidationError("hard", "只接受 true 或 1（未帶參數＝軟刪除；硬刪除無法復原）");
 }
 
 function parseId(raw: string, resource: string): number {
@@ -1194,10 +1286,17 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   };
 
   /**
-   * `POST /memories`：新增記憶。
+   * `POST /memories`：新增記憶（卡 C2：精確去重）。
    *
    * `supersedes`（可選）為被取代的記憶 id：帶了就把該筆標記軟刪除（見 `addMemory` 的契約），
-   * UI 的「編輯」流程即以此產生新版本並取代舊版。
+   * UI 的「編輯」流程即以此產生新版本並取代舊版。**帶 `supersedes` 時跳過去重**（編輯語意優先）。
+   *
+   * `force`（可選，boolean；非 boolean → `400`）：強制新增，即使已有相同內容的未刪除記憶。
+   *
+   * 未帶 `force` 且非 `supersedes` 時走 `addMemoryUnlessDuplicate`：同一 key（正規化內容 hash＋
+   * `scope`＋`project`＋`agent`）已有未刪除的記憶 → **不新增、不 enqueue**，回 `200`＋既有記憶
+   * （讀取視圖，遮罩）＋`duplicate: true`；新增則回 `201`＋`duplicate: false`。
+   * 去重比較的是**遮罩後**內容（寫入前已遮罩），因此「憑證不同但遮罩後同文」視為重複。
    *
    * 被取代者原本若已釘選，新版本**繼承**其 `pinned`（`NewMemory` 契約仍無 `pinned`，
    * 新記憶一律 `false`；這裡是 server 端在建立後補一次 `setMemoryPinned` 的行為細節）。
@@ -1220,6 +1319,13 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const agent = requireString(body.agent, "agent", { maxLength: MAX_MEMORY_METADATA_CHARS });
     assertNoSecretInMetadata(agent, "agent");
     const kind = enumValue(body.kind, MEMORY_KINDS, "kind", "fact");
+    // `force` 只影響寫入路徑；必須是 JSON boolean（字串 "true"、數字、null 一律 400），
+    // 避免「硬刪除／強制新增」這類不可逆操作被模糊寫法誤觸。
+    let force = false;
+    if (body.force !== undefined) {
+      if (typeof body.force !== "boolean") throw new ValidationError("force", "必須是布林值");
+      force = body.force;
+    }
 
     const projectInput = optionalString(body.project, "project", { maxLength: MAX_MEMORY_METADATA_CHARS });
     const hasProject = projectInput !== undefined;
@@ -1246,17 +1352,37 @@ export function createRestApp(deps: RestAppDeps): RestApp {
 
     // 先讀被取代者（若存在）的 pinned：建立新記憶會把舊版軟刪除，之後仍可讀，但先讀較清楚。
     const replaced = supersedes === null ? null : await deps.store.getMemory(supersedes);
-    let memory: Memory = await deps.store.addMemory({ content, kind, scope, project, agent, supersedes });
+    const input = { content, kind, scope, project, agent, supersedes };
+
+    // 編輯流程（supersedes）與 force 都走一般新增；其餘交給原子的 insert-or-return-existing。
+    let memory: Memory;
+    let duplicate = false;
+    if (supersedes !== null || force) {
+      memory = await deps.store.addMemory(input);
+    } else {
+      const result = await deps.store.addMemoryUnlessDuplicate(input);
+      memory = result.memory;
+      duplicate = result.duplicate;
+    }
+
+    if (duplicate) {
+      // 不新增、不 enqueue：回既有記憶的讀取視圖（遮罩後）＋additive 的 duplicate 標記。
+      return {
+        status: 200,
+        body: { ...maskMemoryContent(memory), duplicate: true, redacted: false, redactedCount: 0 },
+      };
+    }
+
     if (replaced?.pinned === true) {
       await deps.store.setMemoryPinned(memory.id, true);
       memory = (await deps.store.getMemory(memory.id)) ?? memory;
     }
     // 背景、非阻塞：回應不必等模型。supersedes 產生的新版本同樣要嵌入。
     deps.memoryEmbedder.enqueue(memory.id);
-    // `Memory` 公開型別不變；`redacted`／`redactedCount` 只是這個端點的 additive 回應欄位。
+    // `Memory` 公開型別不變；`duplicate`／`redacted`／`redactedCount` 只是這個端點的 additive 回應欄位。
     return {
       status: 201,
-      body: { ...memory, redacted: maskedContent.redacted, redactedCount: maskedContent.count },
+      body: { ...memory, duplicate: false, redacted: maskedContent.redacted, redactedCount: maskedContent.count },
     };
   };
 
@@ -1276,9 +1402,21 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     return { status: 200, body: updated === null ? null : maskMemoryContent(updated) };
   };
 
-  const forgetMemory = async (id: number): Promise<{ status: number; body: unknown }> => {
+  /**
+   * `DELETE /memories/:id`：預設**軟刪除**（設定 `deleted_at`，回應形狀不變）。
+   *
+   * 帶 `?hard=true`（或 `hard=1`）改成**硬刪除**：真的刪除資料列（含 FTS；向量同列欄位），
+   * 回應 `{ id, deleted: true, hard: true }`。可刪已軟刪除者；未知 id → `404`（與軟刪除一致）。
+   * `hard` 的其他值 → `400`（值域只接受 `true`／`1`，見 `parseHardDeleteFlag`）。
+   */
+  const forgetMemory = async (id: number, hard: boolean): Promise<{ status: number; body: unknown }> => {
     const memory = await deps.store.getMemory(id);
     if (memory === null) throw new NotFoundError("記憶", id);
+    if (hard) {
+      const deleted = await deps.store.hardDeleteMemory(id);
+      if (!deleted) throw new NotFoundError("記憶", id);
+      return { status: 200, body: { id, deleted: true, hard: true } };
+    }
     const alreadyDeleted = memory.deletedAt !== null;
     if (!alreadyDeleted) await deps.store.forgetMemory(id);
     return { status: 200, body: { id, deleted: !alreadyDeleted } };
@@ -1529,23 +1667,138 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     return { status: 200, body: result };
   };
 
+  /**
+   * `GET /memories/export`：把全部未刪除的記憶匯出成 NDJSON 附件。
+   *
+   * - 資料來自 `MetadataStore.listMemoriesForExport`（`createdAt` 由舊到新、不受列表上限限制）；
+   * - **讀取遮罩**：與 `GET /memories` 相同，先過 `maskMemoryContent` 再序列化——匯出檔與畫面
+   *   看到的是同一個視圖，不可能把未遮罩的舊資料帶出去；
+   * - 結尾換行；0 筆時回空檔（0 bytes）。
+   */
+  const exportMemories = async (): Promise<RouteResult> => {
+    const memories = (await deps.store.listMemoriesForExport()).map(maskMemoryContent);
+    const bytes = serializeMemoriesExport(memories);
+    return {
+      status: 200,
+      bytes,
+      contentType: MEMORY_EXPORT_CONTENT_TYPE,
+      headers: { "content-disposition": `attachment; filename="${memoryExportFilename()}"` },
+    };
+  };
+
+  /**
+   * `POST /memories/import`：匯入 NDJSON 記憶備份。
+   *
+   * 流程：解析查詢旗標 → 讀原始 body（上限 32 MiB）→ **整批驗證**（`planMemoryImport`；
+   * 內容先遮罩、metadata token-like 視為該行不合法）→ 有任何不合法就回 400、完全不寫
+   * → 合法才逐筆 `addMemoryUnlessDuplicate`（重複跳過）→ `pinned` 補設 → enqueue 背景嵌入。
+   *
+   * `dryRun=1`／`true` 只驗證與估算（`wouldCreate`），不寫入、不回報 `created`。
+   * 匯入不保留 `id`／`createdAt`／`supersedes`（新 id、匯入時間）；`pinned` 保留。
+   */
+  const importMemories = async (request: IncomingMessage, url: URL): Promise<RouteResult> => {
+    const dryRun = parseDryRunParam(url.searchParams.get("dryRun"));
+    const text = await readTextBody(request, MAX_MEMORY_IMPORT_BYTES);
+    const plan = planMemoryImport(text);
+    const valid = plan.total - plan.invalidCount;
+
+    if (plan.invalid.length > 0) {
+      // 整批拒絕：不回報任何「已寫入」的假象；錯誤含行號與原因（最多前 100 筆）。
+      const body: MemoryImportResponse & { error: { name: string; message: string } } = {
+        error: {
+          name: "ValidationError",
+          message: `匯入檔有 ${plan.invalidCount} 行不合法，未寫入任何資料`,
+        },
+        dryRun,
+        total: plan.total,
+        valid,
+        invalid: plan.invalid,
+        duplicates: 0,
+        redacted: plan.redacted,
+        created: 0,
+        wouldCreate: 0,
+      };
+      return { status: 400, body };
+    }
+
+    if (dryRun) {
+      // 讀取既有未刪除記憶以估算重複；不寫入任何東西。
+      const existing = await deps.store.listMemoriesForExport();
+      const duplicates = countImportDuplicates(plan.entries, existing);
+      const body: MemoryImportResponse = {
+        dryRun: true,
+        total: plan.total,
+        valid,
+        invalid: [],
+        duplicates,
+        redacted: plan.redacted,
+        created: 0,
+        wouldCreate: valid - duplicates,
+      };
+      return { status: 200, body };
+    }
+
+    let duplicates = 0;
+    let created = 0;
+    for (const entry of plan.entries) {
+      const result = await deps.store.addMemoryUnlessDuplicate({
+        content: entry.content,
+        kind: entry.kind,
+        scope: entry.scope,
+        project: entry.project,
+        agent: entry.agent,
+        // 匯入不保留歷史鏈：只匯出未刪除者，還原時 supersedes 一律清空。
+        supersedes: null,
+      });
+      if (result.duplicate) {
+        duplicates += 1;
+        continue;
+      }
+      if (entry.pinned) await deps.store.setMemoryPinned(result.memory.id, true);
+      // 背景、非阻塞：匯入回應不等模型；向量由 worker 重建。
+      deps.memoryEmbedder.enqueue(result.memory.id);
+      created += 1;
+    }
+
+    const body: MemoryImportResponse = {
+      dryRun: false,
+      total: plan.total,
+      valid,
+      invalid: [],
+      duplicates,
+      redacted: plan.redacted,
+      created,
+      wouldCreate: 0,
+    };
+    return { status: 200, body };
+  };
+
   const routeMemories = async (
     request: IncomingMessage,
     method: string,
     segments: string[],
     url: URL,
-  ): Promise<{ status: number; body: unknown }> => {
+  ): Promise<RouteResult> => {
     if (segments.length === 1) {
       if (method === "POST") return await addMemory(request);
       if (method === "GET") return await listMemories(url);
       throw new MethodNotAllowedError(method, ["GET", "POST"]);
+    }
+    // 固定字面路徑必須在 `parseId` 之前處理，否則 "export"／"import" 會被當成 id。
+    if (segments.length === 2 && segments[1] === "export") {
+      if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
+      return await exportMemories();
+    }
+    if (segments.length === 2 && segments[1] === "import") {
+      if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
+      return await importMemories(request, url);
     }
     if (segments.length === 2 && segments[1] === "search") {
       if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
       return await searchMemoriesRoute(request);
     }
     if (segments.length === 2) {
-      if (method === "DELETE") return await forgetMemory(parseId(segments[1]!, "記憶"));
+      if (method === "DELETE") return await forgetMemory(parseId(segments[1]!, "記憶"), parseHardDeleteFlag(url));
       if (method === "PATCH") return await patchMemory(request, parseId(segments[1]!, "記憶"));
       throw new MethodNotAllowedError(method, ["DELETE", "PATCH"]);
     }
