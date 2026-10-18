@@ -1,6 +1,7 @@
 import { DuplicateRootError } from "../../errors.js";
 import {
   normalizeMemoryLimit,
+  normalizeMemoryPatch,
   type MemoryFilter,
   type MetadataStore,
 } from "../../ports/metadata-store.js";
@@ -9,6 +10,7 @@ import type {
   ChunkKind,
   Memory,
   MemoryKind,
+  MemoryPatch,
   MemoryScope,
   Modality,
   NewChunk,
@@ -295,6 +297,24 @@ export class SqliteMetadataStore implements MetadataStore {
   /** 設定釘選（冪等）；不存在的 id 更新不到任何列，等同無操作。 */
   async setMemoryPinned(id: number, pinned: boolean): Promise<void> {
     this.db.prepare("update memories set pinned = ? where id = ?").run(pinned ? 1 : 0, id);
+  }
+
+  /**
+   * 更新記憶的 `scope`／`project`（見 `MetadataStore.updateMemory`）。
+   *
+   * 先讀回現值再套 patch（`normalizeMemoryPatch`）——合併與正規化語意只有一處，
+   * 不寫成 `coalesce(?, …)` 這種 SQL 表達；`deleted_at is null` 讓「讀到之後才被軟刪除」
+   * 的競態也回 `null`，與 PG 端的 `returning` 語意一致。內容沒動，因此 FTS 列不必更新。
+   */
+  async updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null> {
+    const existing = await this.getMemory(id);
+    if (existing === null || existing.deletedAt !== null) return null;
+
+    const next = normalizeMemoryPatch(existing, patch);
+    this.db
+      .prepare("update memories set scope = ?, project = ? where id = ? and deleted_at is null")
+      .run(next.scope, next.project, id);
+    return await this.getMemory(id);
   }
 
   /**

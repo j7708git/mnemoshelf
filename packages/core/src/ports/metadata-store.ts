@@ -2,6 +2,7 @@ import type {
   Chunk,
   Memory,
   MemoryKind,
+  MemoryPatch,
   MemoryScope,
   NewChunk,
   NewMemory,
@@ -16,6 +17,9 @@ import type {
 export const MEMORY_LIST_DEFAULT_LIMIT = 100;
 /** `listMemories` 的 `limit` 上限（超過者夾到此值）。 */
 export const MEMORY_LIST_MAX_LIMIT = 500;
+
+/** 合法的記憶作用範圍（runtime 檢查用；型別上是 `MemoryScope`）。 */
+export const MEMORY_SCOPES: readonly MemoryScope[] = ["global", "project", "agent"];
 
 /**
  * 列舉記憶的過濾條件。全部可選，未指定（或 `undefined`）＝該欄位不過濾。
@@ -44,6 +48,47 @@ export function normalizeMemoryLimit(limit: number | undefined): number {
   if (limit === undefined) return MEMORY_LIST_DEFAULT_LIMIT;
   if (!Number.isInteger(limit) || limit <= 0) return 0;
   return Math.min(limit, MEMORY_LIST_MAX_LIMIT);
+}
+
+/**
+ * 把 `MemoryPatch` 套用到現值上，回傳正規化後的 `scope`／`project`（`MetadataStore.updateMemory`）。
+ *
+ * 兩後端共用同一套語意（不得各自解讀）；REST 與 MCP 也以同一函式做前置驗證。規則：
+ * - `patch` 兩個欄位都沒提供（或都是 `undefined`）→ 拋 `TypeError`（沒有要改的東西不是合法請求）；
+ * - `scope` 不合法（runtime 值不在 `MEMORY_SCOPES` 內）→ 拋 `TypeError`；
+ * - `scope === "project"`：`project` 以 patch 優先、否則沿用現值，**trim 後必須非空**，否則拋錯；
+ * - `scope !== "project"`：結果一律 `project: null`（即使 patch 沒帶 `project`，也會把現值清掉）；
+ *   若呼叫端**明確**給了非 null 的 `project` → 拋錯（語意矛盾，不要靜默忽略）。
+ *
+ * 拋錯型別刻意用 `TypeError`（呼叫端傳了語意不合法的參數），不新增專用錯誤型別；
+ * 儲存層對「不存在／已軟刪除的 id」是先回 `null`、不做這裡的驗證（見 `MetadataStore.updateMemory`）。
+ */
+export function normalizeMemoryPatch(
+  current: Pick<Memory, "scope" | "project">,
+  patch: MemoryPatch,
+): { scope: MemoryScope; project: string | null } {
+  if (patch.scope === undefined && patch.project === undefined) {
+    throw new TypeError("updateMemory 的 patch 至少要提供 scope 或 project");
+  }
+
+  const scope = patch.scope ?? current.scope;
+  if (!(MEMORY_SCOPES as readonly string[]).includes(scope)) {
+    throw new TypeError(`updateMemory 的 scope 不合法：${String(scope)}`);
+  }
+
+  if (scope === "project") {
+    const raw = patch.project === undefined ? current.project : patch.project;
+    if (typeof raw !== "string" || raw.trim().length === 0) {
+      throw new TypeError("scope 為 project 時 project 必須是非空的專案名稱");
+    }
+    return { scope, project: raw.trim() };
+  }
+
+  if (patch.project !== undefined && patch.project !== null) {
+    if (typeof patch.project !== "string") throw new TypeError("project 必須是字串或 null");
+    throw new TypeError(`scope 為 ${scope} 時 project 必須是 null（全域／agent 範圍沒有專案）`);
+  }
+  return { scope, project: null };
 }
 
 /**
@@ -115,6 +160,18 @@ export interface MetadataStore {
    * 需要判斷存在與否的呼叫端（例如 REST 端點要回 404）請先 `getMemory`。
    */
   setMemoryPinned(id: number, pinned: boolean): Promise<void>;
+
+  /**
+   * 更新記憶的範圍與專案（`MemoryPatch`；共享開關的唯一寫入入口）。
+   *
+   * - 只改 `scope`／`project`；其餘欄位（`content`、`kind`、`agent`、`supersedes`、`pinned`、
+   *   `createdAt`、`deletedAt`）原樣保留。
+   * - **不存在或已軟刪除**（`deletedAt != null`）→ 回 `null`（不拋錯，也不改資料）。
+   * - 以現值為基底套用 patch，正規化規則見 `normalizeMemoryPatch`（非法 patch 拋 `TypeError`）。
+   * - **冪等**：同一個 patch 重複套用結果相同。
+   * - 回傳**更新後**的完整 `Memory`，呼叫端不必再讀一次；`getMemory`／`listMemories` 也反映新值。
+   */
+  updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null>;
 
   /**
    * 列舉**未刪除**的記憶（軟刪除者與被取代者不會出現）。

@@ -4,8 +4,9 @@
  * 契約（docs/storage-ports.md §設計規則 4「單一寫入者」）：**MCP 行程不碰資料庫**，
  * 一律經本機 HTTP 打 REST；授權邏輯也不重複實作——token 直接轉發，錯誤由 REST 決定。
  *
- * 啟動參數只有兩個環境變數：`MNEMOSHELF_URL`（REST 基底網址）與 `MNEMOSHELF_TOKEN`。
- * 缺少時直接失敗（`MissingMcpConfigError`）；token 錯誤則在工具呼叫時回報 REST 的錯誤。
+ * 啟動參數：`MNEMOSHELF_URL`（REST 基底網址）與 `MNEMOSHELF_TOKEN` 必填；
+ * `MNEMOSHELF_PROJECT` 選配，是 `remember` 解析預設專案的第二順位（見 `resolveProjectName`）。
+ * 缺少必填變數時直接失敗（`MissingMcpConfigError`）；token 錯誤則在工具呼叫時回報 REST 的錯誤。
  *
  * 安全（docs/roots-and-privacy.md §Agent 存取）：所有工具的描述都帶「內容視為不受信任資料」
  * 警語，回傳值也帶來源欄位（REST 已標註）。
@@ -16,6 +17,8 @@
  * 為了不新增宣告的依賴，工具定義改用原始 JSON Schema、參數由 REST 驗證（見回報）。
  */
 import type { Readable, Writable } from "node:stream";
+import { homedir } from "node:os";
+import path from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type Tool } from "@modelcontextprotocol/sdk/types.js";
@@ -57,14 +60,24 @@ export const MCP_TOOLS: Tool[] = [
     name: "remember",
     description:
       `寫入一筆共享記憶（寫入者標識取自 MCP 客戶端名稱）。` +
-      `kind：fact／decision／pitfall／preference；scope：global／project／agent。${UNTRUSTED_DATA_WARNING}`,
+      `預設以「目前專案」寫入：project 參數 > 環境變數 MNEMOSHELF_PROJECT > 行程 cwd 的資料夾名稱` +
+      `（cwd 是家目錄時跳過）；解析不到專案才退回 global。` +
+      `kind：fact／decision／pitfall／preference；scope：global／project／agent。` +
+      `專案優先——要寫成全域共享請明確指定 scope: "global"。${UNTRUSTED_DATA_WARNING}`,
     inputSchema: {
       type: "object",
       properties: {
         content: { type: "string", description: "記憶內容（必填）" },
         kind: { type: "string", enum: ["fact", "decision", "pitfall", "preference"], description: "預設 fact" },
-        scope: { type: "string", enum: ["global", "project", "agent"], description: "預設 global" },
-        project: { type: "string", description: "scope 為 project 時的專案名稱（選填）" },
+        scope: {
+          type: "string",
+          enum: ["global", "project", "agent"],
+          description: "預設 project（解析得到專案時）；解析不到專案時退回 global",
+        },
+        project: {
+          type: "string",
+          description: "專案名稱（最優先；未提供時用 MNEMOSHELF_PROJECT 或 cwd 資料夾名稱）",
+        },
       },
       required: ["content"],
     },
@@ -101,6 +114,58 @@ export const MCP_TOOLS: Tool[] = [
   },
 ];
 
+/** 兩個路徑是否指向同一個位置（Windows 不分大小寫；POSIX 分大小寫）。 */
+function samePath(a: string, b: string): boolean {
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/** `resolveProjectName` 的結果。 */
+export interface ProjectResolution {
+  /** 解析出的專案名稱（trim 後非空）；解析不到為 `null`。 */
+  project: string | null;
+  /** 名稱來源（除錯與測試用）：工具參數／環境變數／cwd／解析不到。 */
+  source: "argument" | "env" | "cwd" | "none";
+}
+
+/** `resolveProjectName` 的輸入。 */
+export interface ResolveProjectOptions {
+  /** 工具參數 `project`（型別未知；只有 trim 後非空的字串才算數）。 */
+  argument?: unknown;
+  /** MCP 設定（`MNEMOSHELF_PROJECT`）解析出的專案名稱；空白視為未設定。 */
+  configProject?: string | undefined;
+  /** 行程 cwd；預設 `process.cwd()`（測試可注入）。 */
+  cwd?: string;
+  /** 家目錄；預設 `os.homedir()`（測試可注入）。 */
+  homeDir?: string;
+}
+
+/**
+ * 解析 `remember` 要用的專案名稱（卡 A §3 的優先序）：
+ *
+ * 1. 工具參數 `project`（trim 後非空）；
+ * 2. 環境變數 `MNEMOSHELF_PROJECT`（MCP 啟動時讀入 `McpConfig.project`；空白視為未設定）；
+ * 3. `process.cwd()` 的 basename——**但 cwd 等於家目錄時跳過**（家目錄的 basename 是使用者名稱，
+ *    不是專案，不得被寫進記憶）；
+ * 4. 解析不到 → `null`（呼叫端退回 `global`）。
+ *
+ * 只做純字串運算，不寫入任何路徑到記憶或磁碟；路徑比較用 `node:path`（不硬寫分隔符）。
+ */
+export function resolveProjectName(options: ResolveProjectOptions = {}): ProjectResolution {
+  const argument = typeof options.argument === "string" ? options.argument.trim() : "";
+  if (argument !== "") return { project: argument, source: "argument" };
+
+  const configProject = typeof options.configProject === "string" ? options.configProject.trim() : "";
+  if (configProject !== "") return { project: configProject, source: "env" };
+
+  const cwd = path.resolve(options.cwd ?? process.cwd());
+  const homeDir = path.resolve(options.homeDir ?? homedir());
+  if (!samePath(cwd, homeDir)) {
+    const project = path.basename(cwd).trim();
+    if (project !== "") return { project, source: "cwd" };
+  }
+  return { project: null, source: "none" };
+}
+
 /** REST 呼叫失敗（非 2xx）。`remoteName` 是 REST 回應的 `error.name`。 */
 export class RestCallError extends Error {
   readonly status: number;
@@ -118,6 +183,15 @@ export interface McpServerOptions {
   /** REST 基底網址（例如 `http://127.0.0.1:8787`）。 */
   url: string;
   token: string;
+  /**
+   * 預設專案（`MNEMOSHELF_PROJECT`）；`remember` 在工具參數沒帶 `project` 時使用。
+   * 未設定時退回 cwd basename（家目錄會跳過）。
+   */
+  project?: string;
+  /** cwd 覆寫（測試用；預設 `process.cwd()`）。 */
+  cwd?: string;
+  /** 家目錄覆寫（測試用；預設 `os.homedir()`）。 */
+  homeDir?: string;
   /** 測試注入用；預設全域 `fetch`。 */
   fetchImpl?: typeof fetch;
 }
@@ -234,13 +308,50 @@ export function createMcpServer(options: McpServerOptions): Server {
         case "remember": {
           // 寫入者標識：MCP 客戶端在 initialize 時自報的名稱；取不到時用 "mcp"。
           const agent = server.getClientVersion()?.name ?? "mcp";
+          const scopeArgument = args.scope;
+          const requestedScope = typeof scopeArgument === "string" ? scopeArgument : undefined;
+          const resolution = resolveProjectName({
+            argument: args.project,
+            configProject: options.project,
+            ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+            ...(options.homeDir === undefined ? {} : { homeDir: options.homeDir }),
+          });
+
+          let scope: unknown = scopeArgument;
+          let project: string | null = null;
+          if (requestedScope === "project") {
+            // 明確要專案範圍但解析不到專案 → 工具錯誤；不要送出不合法請求。
+            if (resolution.project === null) {
+              throw new ValidationError(
+                "project",
+                "無法解析專案：請在 remember 參數帶 project，或設定環境變數 MNEMOSHELF_PROJECT",
+              );
+            }
+            scope = "project";
+            project = resolution.project;
+          } else if (requestedScope === "global" || requestedScope === "agent") {
+            // 明確指定非專案範圍：project 一律不送，不受環境變數／cwd 影響。
+            scope = requestedScope;
+            project = null;
+          } else if (requestedScope === undefined) {
+            // 未指定 scope：能解析出專案就以專案為預設，否則退回 global。
+            if (resolution.project !== null) {
+              scope = "project";
+              project = resolution.project;
+            } else {
+              scope = "global";
+              project = null;
+            }
+          }
+          // 其他 scope 值（非法或非字串）原樣轉發，由 REST 回 400（驗證只有一處）。
+
           return toolText(
             JSON.stringify(
               await callRest(options, "POST", "/memories", {
                 content: args.content,
                 ...(args.kind === undefined ? {} : { kind: args.kind }),
-                ...(args.scope === undefined ? {} : { scope: args.scope }),
-                ...(args.project === undefined ? {} : { project: args.project }),
+                scope,
+                project,
                 agent,
               }),
               null,
@@ -295,6 +406,10 @@ export interface RunStdioOptions {
   stdin?: Readable;
   /** 覆寫 stdout（測試用；預設 `process.stdout`）。 */
   stdout?: Writable;
+  /** cwd 覆寫（測試用；預設 `process.cwd()`）。 */
+  cwd?: string;
+  /** 家目錄覆寫（測試用；預設 `os.homedir()`）。 */
+  homeDir?: string;
   fetchImpl?: typeof fetch;
 }
 
@@ -302,12 +417,16 @@ export interface RunStdioOptions {
  * 啟動 stdio 入口：讀環境設定 → 建 server → 連接 `StdioServerTransport`。
  *
  * 注意：stdio 模式下 **stdout 是協定通道**，任何除錯訊息都必須走 stderr。
+ * `MNEMOSHELF_PROJECT`（選配）經 `loadMcpConfig` 讀入後交給 `remember` 當預設專案。
  */
 export async function runStdio(options: RunStdioOptions = {}): Promise<{ config: McpConfig; server: Server }> {
   const config = loadMcpConfig(options.env ?? process.env);
   const server = createMcpServer({
     url: config.url,
     token: config.token,
+    ...(config.project === undefined ? {} : { project: config.project }),
+    ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+    ...(options.homeDir === undefined ? {} : { homeDir: options.homeDir }),
     ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
   });
   const transport = new StdioServerTransport(options.stdin, options.stdout);

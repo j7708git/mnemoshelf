@@ -9,6 +9,10 @@
  * | `MNEMOSHELF_PORT` | 監聽埠 | `0`（隨機埠） |
  * | `MNEMOSHELF_WEB_DIR` | Web UI 靜態檔目錄 | 本 repo 的 `packages/web/dist` |
  *
+ * MCP stdio 入口（`loadMcpConfig`）另有自己的三個變數：`MNEMOSHELF_URL`、`MNEMOSHELF_TOKEN`
+ * （皆必填）與 `MNEMOSHELF_PROJECT`（選配的預設專案名稱；供 `remember` 在工具參數沒帶
+ * `project` 時使用）。
+ *
  * 另有三個**由 embedder 直接讀取**（不經此處解析，本表僅登錄以免漏查；見
  * `@mnemoshelf/embedder-transformers` 的 `device.ts`）：
  *
@@ -101,9 +105,21 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
 export interface McpConfig {
   url: string;
   token: string;
+  /**
+   * 這個 MCP 行程的預設專案（選配；來自 `MNEMOSHELF_PROJECT`）。
+   *
+   * 未設定（或只有空白）時為 `undefined`；`remember` 解析不到工具參數時會依序退回它、
+   * 再退回 `process.cwd()` 的 basename（見 `mcp/stdio.ts` 的 `resolveProjectName`）。
+   */
+  project?: string;
 }
 
-/** 讀出 MCP 入口設定；兩個變數都必填，缺少者列入錯誤的 `missing`。 */
+/**
+ * 讀出 MCP 入口設定；`MNEMOSHELF_URL`／`MNEMOSHELF_TOKEN` 必填，缺少者列入錯誤的 `missing`。
+ *
+ * `MNEMOSHELF_PROJECT` 是選配的預設專案名稱（trim 後非空才採用；純空白視為未設定），
+ * 供 `remember` 在工具參數沒帶 `project` 時使用。
+ */
 export function loadMcpConfig(env: NodeJS.ProcessEnv = process.env): McpConfig {
   const missing: string[] = [];
   const url = env.MNEMOSHELF_URL;
@@ -111,5 +127,13 @@ export function loadMcpConfig(env: NodeJS.ProcessEnv = process.env): McpConfig {
   if (url === undefined || url.trim() === "") missing.push("MNEMOSHELF_URL");
   if (token === undefined || token.trim() === "") missing.push("MNEMOSHELF_TOKEN");
   if (missing.length > 0) throw new MissingMcpConfigError(missing);
-  return { url: url!.replace(/\/+$/, ""), token: token! };
+
+  const projectSetting = env.MNEMOSHELF_PROJECT;
+  const project = projectSetting !== undefined && projectSetting.trim() !== "" ? projectSetting.trim() : undefined;
+
+  return {
+    url: url!.replace(/\/+$/, ""),
+    token: token!,
+    ...(project === undefined ? {} : { project }),
+  };
 }

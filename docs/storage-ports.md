@@ -11,6 +11,10 @@
 >
 > 2026-10-16 新增 §root 設定的更新：`MetadataStore.updateRoot(id, patch)` 與 `RootPatch`
 > 型別（目前僅 `modalities`）——兩後端皆實作、通過同一組契約測試。
+>
+> 2026-10-18（卡 A）新增 §記憶的範圍更新：`MetadataStore.updateMemory(id, patch)` 與
+> `MemoryPatch` 型別（僅 `scope`／`project`）——兩後端皆實作、通過同一組契約測試；
+> 既有的記憶方法（新增、釘選、軟刪除、列舉、關鍵字搜尋）與排序語意不變。
 
 | 介面 | 職責 | 預設實作 | 預計的替代實作 |
 |---|---|---|---|
@@ -109,6 +113,43 @@ root 建立之後只有一部分設定可變更；`MetadataStore.updateRoot(id, 
 - 契約測試（`@mnemoshelf/core/testing` 的 `runMetadataStoreContract`）新增四例：更新並回傳
   （不可變欄位原樣保留）、冪等與關閉模態、`patch` 未提供欄位、不存在的 id。SQLite 與 PostgreSQL
   兩個後端都必須通過同一組測試。
+
+## 記憶的範圍更新（2026-10-18）
+
+共享開關（把單筆記憶在「專案」與「全域」之間切換）的唯一寫入入口是
+`MetadataStore.updateMemory(id, patch)`；可變欄位由 `MemoryPatch`（`ports/types.ts`）界定。
+
+| 方法 | 語意 |
+|---|---|
+| `MetadataStore.updateMemory(id, patch)` | 更新 `MemoryPatch`（`scope?`／`project?`）；回傳**更新後**的完整 `Memory` |
+
+```ts
+/** 只允許改這兩個欄位；未提供的欄位維持原值。 */
+export interface MemoryPatch {
+  scope?: MemoryScope;
+  project?: string | null;
+}
+updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null>;
+```
+
+- **不存在或已軟刪除**（`deletedAt != null`）→ 回 `null`（不拋錯、也不改資料）；REST 層據此回 `404`。
+- **有效結果的正規化**（`normalizeMemoryPatch`；兩後端與 REST／MCP 共用同一套語意）：
+  - `scope === "project"` → `project` 必須是非空字串（trim 後儲存）；否則拋錯。
+  - `scope !== "project"` → `project` 一律為 `null`（即使 patch 沒帶 `project`，也會把現值清掉）；
+    呼叫端明確給非 null 的 `project` 是矛盾請求 → 拋錯，不靜默忽略。
+  - 兩個欄位都沒提供 → 非法 patch，拋錯。
+- **合併方式**：以現值為基底套用 patch；`scope` 未提供時維持原範圍（例如只帶 `project` 就是改專案名稱）。
+- **不可變欄位**：`content`、`kind`、`agent`、`supersedes`、`pinned`、`createdAt`、`deletedAt`
+  原樣保留。內容的變更一律走 supersede（建立新版本、舊版軟刪除），不經此方法。
+- **冪等**：同一個 patch 重複套用結果相同。
+- **兩個後端的實作**：SQLite 先讀回現值，再以 `update … where deleted_at is null` 寫入（之後重讀）；
+  PostgreSQL 以 `update … returning` 在同一次查詢取回更新後的列。本專案是**單一寫入者**，
+  「讀到之後才被軟刪除」的競態不會發生，因此兩者在實際使用下語意一致；若未來放寬單一寫入者，
+  需重新定義這個回傳語意。
+- 契約測試（`@mnemoshelf/core/testing` 的 `runMetadataStoreContract`）新增六例：更新並回傳
+  （不可變欄位原樣保留）、`scope` 正規化、冪等、不存在的 id、已軟刪除的 id、非法 patch。
+  SQLite 與 PostgreSQL 兩個後端都必須通過同一組測試。
+- REST 對應：`PATCH /memories/:id`（語意見 `docs/roots-and-privacy.md` §記憶的範圍與共享）。
 
 ## 全文檢索與中文
 

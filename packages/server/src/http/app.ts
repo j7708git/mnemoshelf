@@ -11,7 +11,7 @@
  * - `GET  /diagnostics`（除錯資訊匯出：版本、平台、embedder（含執行裝置與退回原因）、每 root 統計；
  *   家目錄前綴遮罩成 `~`）
  * - `POST /search`（`query` 超過模型單筆輸入上限時 → `400 InputTooLongError`，見 `toHttpError`）
- * - `POST /memories`、`GET /memories`、`POST /memories/:id/pin`、`DELETE /memories/:id`
+ * - `POST /memories`、`GET /memories`、`PATCH /memories/:id`、`POST /memories/:id/pin`、`DELETE /memories/:id`
  *
  * 行為規則：
  * - **單一寫入者**：資料庫只被本行程開啟；本模組是唯一的寫入路徑（MCP 走 HTTP 進來的）。
@@ -41,9 +41,11 @@ import {
   type IndexRootResult,
   type Memory,
   type MemoryKind,
+  type MemoryPatch,
   type MemoryScope,
   type MetadataStore,
   type Modality,
+  normalizeMemoryPatch,
   PathBlockedError,
   PathOutsideRootError,
   previewRoot,
@@ -180,6 +182,17 @@ export interface RemoveRootResponse {
 /** `GET /memories` 的回應（未刪除的記憶，由新到舊）。 */
 export interface ListMemoriesResponse {
   memories: Memory[];
+}
+
+/**
+ * `PATCH /memories/:id` 的請求主體（共享開關）。
+ *
+ * 只接受 `scope`／`project`；其餘欄位（`content`、`kind`、`pinned` 等）一律 `400`（不靜默忽略）。
+ * 至少提供一個欄位；`scope: "project"` 時 `project` 必須明確給非空字串。
+ */
+export interface PatchMemoryRequest {
+  scope?: MemoryScope;
+  project?: string | null;
 }
 
 /** `POST /roots/:id/index` 的回應（`IndexRootResult` 摘要＋量測）。 */
@@ -1134,6 +1147,72 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     return { status: 200, body: { id, deleted: !alreadyDeleted } };
   };
 
+  /**
+   * `PATCH /memories/:id`：更新記憶的範圍與專案（共享開關）。
+   *
+   * 規格（卡 A §2）：
+   * - 主體 `{scope?, project?}`；只接受這兩個欄位，其餘（`content`、`kind`、`pinned`…）→ `400`，
+   *   不靜默忽略；至少提供一個欄位，否則 `400`。
+   * - `scope` 非合法值 → `400`；`project` 非字串／非 null → `400`。
+   * - `scope: "project"` 且 `project` 缺少／空字串 → `400`（**必須明確指定**目標專案）；
+   *   `scope: "global" | "agent"` 且帶非 null `project` → `400`。
+   * - 不存在的 id 或已軟刪除 → `404`；成功回 `200`＋更新後的完整 `Memory`。
+   *
+   * 驗證分兩層：先做請求形狀（與上述明確規則），再讀現值用 `normalizeMemoryPatch`
+   * 驗「合併後的結果」（例如只帶非 null `project` 但現值 scope 不是 project）。實際寫入仍走
+   * `store.updateMemory`（同一套正規化語意在儲存層把關）。
+   */
+  const patchMemory = async (request: IncomingMessage, id: number): Promise<{ status: number; body: unknown }> => {
+    const body = await readJsonBody(request);
+    const allowedFields: readonly string[] = ["scope", "project"];
+    for (const key of Object.keys(body)) {
+      if (!allowedFields.includes(key)) {
+        throw new ValidationError(key, "不支援的欄位（共享開關只能改 scope 與 project）");
+      }
+    }
+    if (body.scope === undefined && body.project === undefined) {
+      throw new ValidationError("body", "至少要提供 scope 或 project");
+    }
+
+    const patch: MemoryPatch = {};
+    if (body.scope !== undefined) {
+      if (typeof body.scope !== "string" || !(MEMORY_SCOPES as readonly string[]).includes(body.scope)) {
+        throw new ValidationError("scope", `必須是 ${MEMORY_SCOPES.join(" / ")} 之一`);
+      }
+      patch.scope = body.scope as MemoryScope;
+    }
+    if (body.project !== undefined) {
+      if (body.project !== null && typeof body.project !== "string") {
+        throw new ValidationError("project", "必須是字串或 null");
+      }
+      patch.project = body.project as string | null;
+    }
+
+    // 明確規則：切成專案時一定要指定目標專案；非專案範圍不得帶專案。
+    if (patch.scope === "project") {
+      if (patch.project === undefined || patch.project === null || patch.project.trim() === "") {
+        throw new ValidationError("project", "scope 為 project 時必須提供非空的專案名稱");
+      }
+    } else if (patch.scope !== undefined && patch.project !== undefined && patch.project !== null) {
+      throw new ValidationError("project", `scope 為 ${patch.scope} 時 project 必須是 null`);
+    }
+
+    const existing = await deps.store.getMemory(id);
+    if (existing === null || existing.deletedAt !== null) throw new NotFoundError("記憶", id);
+
+    // 合併現值後再驗一次（例如 scope 未提供、卻帶了非 null project 的 patch）。
+    try {
+      normalizeMemoryPatch(existing, patch);
+    } catch (error) {
+      throw new ValidationError("patch", error instanceof Error ? error.message : "非法的 patch");
+    }
+
+    const updated = await deps.store.updateMemory(id, patch);
+    // 讀到之後才被軟刪除的競態：與未知 id 同樣回 404，不吞掉。
+    if (updated === null) throw new NotFoundError("記憶", id);
+    return { status: 200, body: updated };
+  };
+
   const routeRoots = async (
     request: IncomingMessage,
     method: string,
@@ -1242,8 +1321,9 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       throw new MethodNotAllowedError(method, ["GET", "POST"]);
     }
     if (segments.length === 2) {
-      if (method !== "DELETE") throw new MethodNotAllowedError(method, ["DELETE"]);
-      return await forgetMemory(parseId(segments[1]!, "記憶"));
+      if (method === "DELETE") return await forgetMemory(parseId(segments[1]!, "記憶"));
+      if (method === "PATCH") return await patchMemory(request, parseId(segments[1]!, "記憶"));
+      throw new MethodNotAllowedError(method, ["DELETE", "PATCH"]);
     }
     if (segments.length === 3 && segments[2] === "pin") {
       if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);

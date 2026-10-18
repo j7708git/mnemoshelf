@@ -1,12 +1,21 @@
 /**
  * 記憶管理畫面：列表（釘選標示、釘選優先排序）、釘選／取消、編輯（走 supersedes 語意——
- * 產生新版本並取代舊版）、刪除（需確認）、看來源。
+ * 產生新版本並取代舊版）、刪除（需確認）、看來源，以及專案／範圍篩選與共享開關。
  *
  * 記憶由 AI agent 透過 `remember` 寫入，這個畫面是管理面：不直接改動既有列，
  * 「編輯」一律建立新版本並把舊版標記軟刪除（`POST /memories` 帶 `supersedes`）。
+ * 共享開關只允許 `project` ↔ `global`（`PATCH /memories/:id`）；`agent` 範圍在本版唯讀。
  */
 import { useCallback, useEffect, useState } from "react";
-import { addMemory, deleteMemory, listMemories, pinMemory, type Memory } from "./api";
+import {
+  addMemory,
+  deleteMemory,
+  listMemories,
+  pinMemory,
+  updateMemory,
+  type Memory,
+  type MemoryScope,
+} from "./api";
 import { formatDateTime, MEMORY_KIND_LABEL, MEMORY_SCOPE_LABEL } from "./format";
 
 type LoadState =
@@ -14,12 +23,23 @@ type LoadState =
   | { kind: "ready"; memories: Memory[] }
   | { kind: "error"; message: string };
 
+/** 篩選值：`"all"` 表示不過濾。 */
+type ScopeFilter = MemoryScope | "all";
+const ALL_PROJECTS = "all";
+
 /** 釘選者優先，其次依 createdAt 由新到舊（伺服器已給新到舊，這裡穩定排序）。 */
 function sortMemories(memories: Memory[]): Memory[] {
   return [...memories].sort((a, b) => {
     if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
     return Date.parse(b.createdAt) - Date.parse(a.createdAt);
   });
+}
+
+/** 清單中出現過的專案名稱（去重、排序；供篩選與「改回專案」的目標選單使用）。 */
+function collectProjectNames(memories: Memory[]): string[] {
+  return [...new Set(memories.map((memory) => memory.project).filter((project): project is string => project !== null))].sort(
+    (a, b) => a.localeCompare(b),
+  );
 }
 
 export function MemoriesPanel() {
@@ -30,6 +50,15 @@ export function MemoriesPanel() {
   const [busyId, setBusyId] = useState<number | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  /** 範圍篩選（`all`＝全部）。 */
+  const [scopeFilter, setScopeFilter] = useState<ScopeFilter>("all");
+  /** 專案篩選（`all`＝全部專案；其餘為專案名稱）。 */
+  const [projectFilter, setProjectFilter] = useState<string>(ALL_PROJECTS);
+  /** 每筆「改回專案」目前選定的目標專案（未選時用清單第一個可選專案）。 */
+  const [shareTargets, setShareTargets] = useState<Record<number, string>>({});
+
+  /** 清單中出現過的專案名稱（供篩選與共享開關的目標選單）。 */
+  const availableProjects = state.kind === "ready" ? collectProjectNames(state.memories) : [];
 
   const load = useCallback(async (): Promise<void> => {
     setState({ kind: "loading" });
@@ -66,6 +95,37 @@ export function MemoriesPanel() {
         await pinMemory(memory.id, !memory.pinned);
       },
       memory.pinned ? "已取消釘選。" : "已釘選。",
+    );
+  };
+
+  /** 共享開關：專案記憶 → 全域共享（`PATCH {scope:"global"}`）。 */
+  const shareGlobally = (memory: Memory): void => {
+    void run(
+      memory.id,
+      async () => {
+        await updateMemory(memory.id, { scope: "global" });
+      },
+      "已設為全域共享。",
+    );
+  };
+
+  /**
+   * 共享開關：全域記憶 → 改回專案（`PATCH {scope:"project", project}`）。
+   *
+   * 目標專案以清單中出現過的專案名為選項；沒有可選專案時按鈕會停用，這裡再擋一次並提示。
+   */
+  const moveToProject = (memory: Memory): void => {
+    const target = shareTargets[memory.id] ?? availableProjects[0];
+    if (target === undefined) {
+      setActionError("目前清單沒有可選的專案名稱，無法把這筆記憶改回專案範圍。");
+      return;
+    }
+    void run(
+      memory.id,
+      async () => {
+        await updateMemory(memory.id, { scope: "project", project: target });
+      },
+      `已改回專案「${target}」。`,
     );
   };
 
@@ -140,14 +200,30 @@ export function MemoriesPanel() {
     );
   }
 
+  // 篩選一律在前端做（清單已是 `GET /memories` 的完整結果；不另外打伺服器、行為與畫面一致）。
+  const filteredMemories = state.memories.filter(
+    (memory) =>
+      (scopeFilter === "all" || memory.scope === scopeFilter) &&
+      (projectFilter === ALL_PROJECTS || memory.project === projectFilter),
+  );
+
   return (
     <section className="space-y-4">
       <div className="flex items-center justify-between gap-2">
         <div>
           <h2 className="text-base font-medium text-ink">
-            記憶管理<span className="ml-1 text-xs text-muted">（{state.memories.length}）</span>
+            記憶管理
+            <span className="ml-1 text-xs text-muted">
+              （
+              {filteredMemories.length === state.memories.length
+                ? state.memories.length
+                : `${filteredMemories.length} / ${state.memories.length}`}
+              ）
+            </span>
           </h2>
-          <p className="mt-0.5 text-xs text-muted">釘選的記憶會優先顯示；編輯會產生新版本並取代舊版。</p>
+          <p className="mt-0.5 text-xs text-muted">
+            釘選的記憶會優先顯示；編輯會產生新版本並取代舊版。共享開關只在專案與全域之間切換，agent 範圍為唯讀。
+          </p>
         </div>
         <button
           type="button"
@@ -157,6 +233,53 @@ export function MemoriesPanel() {
           重新載入
         </button>
       </div>
+
+      {state.memories.length > 0 && (
+        <div className="flex flex-wrap items-center gap-3 text-xs text-muted">
+          <label className="flex items-center gap-1.5">
+            專案
+            <select
+              aria-label="依專案篩選"
+              value={projectFilter}
+              onChange={(event) => setProjectFilter(event.target.value)}
+              className="rounded-md border border-line bg-white px-2 py-1 text-xs text-ink"
+            >
+              <option value={ALL_PROJECTS}>全部專案</option>
+              {availableProjects.map((project) => (
+                <option key={project} value={project}>
+                  {project}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-1.5">
+            範圍
+            <select
+              aria-label="依範圍篩選"
+              value={scopeFilter}
+              onChange={(event) => setScopeFilter(event.target.value as ScopeFilter)}
+              className="rounded-md border border-line bg-white px-2 py-1 text-xs text-ink"
+            >
+              <option value="all">全部範圍</option>
+              <option value="global">全域</option>
+              <option value="project">專案</option>
+              <option value="agent">agent</option>
+            </select>
+          </label>
+          {(scopeFilter !== "all" || projectFilter !== ALL_PROJECTS) && (
+            <button
+              type="button"
+              onClick={() => {
+                setScopeFilter("all");
+                setProjectFilter(ALL_PROJECTS);
+              }}
+              className="rounded-md border border-line px-2 py-1 text-xs text-ink"
+            >
+              清除篩選
+            </button>
+          )}
+        </div>
+      )}
 
       {message !== null && (
         <p className="rounded-lg border border-line bg-white px-4 py-2 text-sm text-ink">{message}</p>
@@ -171,9 +294,13 @@ export function MemoriesPanel() {
         <div className="flex h-[40vh] items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center text-sm text-muted">
           尚無記憶。AI agent 透過 remember 寫入的共享記憶會出現在這裡。
         </div>
+      ) : filteredMemories.length === 0 ? (
+        <div className="flex h-[30vh] items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center text-sm text-muted">
+          沒有符合目前篩選條件的記憶。
+        </div>
       ) : (
         <ul className="space-y-3">
-          {state.memories.map((memory) => {
+          {filteredMemories.map((memory) => {
             const editing = editingId === memory.id;
             const showSource = sourceId === memory.id;
             const busy = busyId === memory.id;
@@ -193,7 +320,9 @@ export function MemoriesPanel() {
                   </span>
                   <span className="rounded bg-surface px-1.5 py-0.5 text-[11px] text-muted">
                     範圍 {MEMORY_SCOPE_LABEL[memory.scope]}
-                    {memory.project === null ? "" : `：${memory.project}`}
+                  </span>
+                  <span className="rounded bg-surface px-1.5 py-0.5 text-[11px] text-muted">
+                    專案 {memory.project ?? "全域"}
                   </span>
                   <span className="text-[11px] text-muted">#{memory.id}</span>
                   <span className="ml-auto text-[11px] text-muted">{formatDateTime(memory.createdAt)}</span>
@@ -262,6 +391,50 @@ export function MemoriesPanel() {
                   >
                     {showSource ? "收起來源" : "看來源"}
                   </button>
+                  {memory.scope === "agent" ? (
+                    <span className="rounded-md border border-line px-2.5 py-1 text-xs text-muted">
+                      agent 範圍（唯讀）
+                    </span>
+                  ) : memory.scope === "project" ? (
+                    <button
+                      type="button"
+                      disabled={busy}
+                      onClick={() => shareGlobally(memory)}
+                      className="rounded-md border border-line px-2.5 py-1 text-xs text-ink disabled:opacity-40"
+                    >
+                      設為全域共享
+                    </button>
+                  ) : (
+                    <>
+                      <select
+                        aria-label={`選擇要改回的專案（記憶 #${memory.id}）`}
+                        value={shareTargets[memory.id] ?? availableProjects[0] ?? ""}
+                        onChange={(event) =>
+                          setShareTargets((previous) => ({ ...previous, [memory.id]: event.target.value }))
+                        }
+                        disabled={busy || availableProjects.length === 0}
+                        className="rounded-md border border-line bg-white px-2 py-1 text-xs text-ink disabled:opacity-40"
+                      >
+                        {availableProjects.length === 0 ? (
+                          <option value="">沒有可選專案</option>
+                        ) : (
+                          availableProjects.map((project) => (
+                            <option key={project} value={project}>
+                              {project}
+                            </option>
+                          ))
+                        )}
+                      </select>
+                      <button
+                        type="button"
+                        disabled={busy || availableProjects.length === 0}
+                        onClick={() => moveToProject(memory)}
+                        className="rounded-md border border-line px-2.5 py-1 text-xs text-ink disabled:opacity-40"
+                      >
+                        改回專案
+                      </button>
+                    </>
+                  )}
                   <button
                     type="button"
                     disabled={busy}

@@ -721,6 +721,25 @@ export async function pinMemory(id: number, pinned: boolean): Promise<Memory> {
   return (await response.json()) as Memory;
 }
 
+/**
+ * 更新記憶的範圍與專案（`PATCH /memories/:id`；UI 的共享開關）。
+ *
+ * 只允許 `scope`／`project`，其他欄位由伺服器以 400 拒絕；`scope: "project"` 時必須帶非空
+ * `project`，`scope: "global"` 時 `project` 會由伺服器清為 null。回傳更新後的完整記憶。
+ */
+export async function updateMemory(
+  id: number,
+  patch: { scope?: MemoryScope; project?: string | null },
+): Promise<Memory> {
+  const response = await apiFetch(`/memories/${id}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!response.ok) throw new Error(await readErrorMessage(response, "更新記憶範圍失敗"));
+  return (await response.json()) as Memory;
+}
+
 /** 軟刪除記憶。 */
 export async function deleteMemory(id: number): Promise<void> {
   const response = await apiFetch(`/memories/${id}`, { method: "DELETE" });

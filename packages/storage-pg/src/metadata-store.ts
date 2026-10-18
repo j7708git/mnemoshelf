@@ -1,11 +1,13 @@
 import {
   DuplicateRootError,
   normalizeMemoryLimit,
+  normalizeMemoryPatch,
   type Chunk,
   type ChunkKind,
   type Memory,
   type MemoryFilter,
   type MemoryKind,
+  type MemoryPatch,
   type MemoryScope,
   type MetadataStore,
   type Modality,
@@ -355,6 +357,28 @@ export class PgMetadataStore implements MetadataStore {
   /** 設定釘選（冪等）；不存在的 id 更新不到任何列，等同無操作。 */
   async setMemoryPinned(id: number, pinned: boolean): Promise<void> {
     await this.pool.query(`update ${this.memories} set pinned = $1 where id = $2`, [pinned, id]);
+  }
+
+  /**
+   * 更新記憶的 `scope`／`project`（語意與 SQLite 後端完全相同，見 `MetadataStore.updateMemory`）。
+   *
+   * 先 select 現值以套用 `normalizeMemoryPatch`（合併與正規化只有一處），再以
+   * `update … returning` 一次拿到更新後的列；`deleted_at is null` 讓「讀到之後才被軟刪除」
+   * 的競態也回 `null`（0 列），與 SQLite 端一致。內容沒動，`seg`/`tsv` 不必重算。
+   */
+  async updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null> {
+    const current = await this.getMemory(id);
+    if (current === null || current.deletedAt !== null) return null;
+
+    const next = normalizeMemoryPatch(current, patch);
+    const result = await this.pool.query(
+      `update ${this.memories}
+          set scope = $2, project = $3
+        where id = $1 and deleted_at is null
+        returning ${MEMORY_COLUMNS}`,
+      [id, next.scope, next.project],
+    );
+    return result.rows.length === 0 ? null : rowToMemory(result.rows[0]!);
   }
 
   async listMemories(filter: MemoryFilter = {}): Promise<Memory[]> {

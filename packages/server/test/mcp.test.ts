@@ -8,6 +8,7 @@
  * token 錯誤時工具回報錯誤。
  */
 import { PassThrough } from "node:stream";
+import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -20,7 +21,7 @@ import {
   TEST_TOKEN,
   type TestServer,
 } from "./helpers.js";
-import { runStdio } from "../src/index.js";
+import { loadMcpConfig, resolveProjectName, runStdio } from "../src/index.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 
 interface McpHarness {
@@ -29,14 +30,23 @@ interface McpHarness {
   close(): Promise<void>;
 }
 
+/** `startMcp` 的額外選項：MCP 環境變數與 cwd／家目錄注入。 */
+interface McpExtraOptions {
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+  homeDir?: string;
+}
+
 /** 啟動 REST ＋ MCP，並把兩端接起來。 */
-async function startMcp(token = TEST_TOKEN): Promise<{ rest: TestServer; mcp: McpHarness }> {
+async function startMcp(token = TEST_TOKEN, extra: McpExtraOptions = {}): Promise<{ rest: TestServer; mcp: McpHarness }> {
   const rest = await startTestServer();
   const clientToServer = new PassThrough();
   const serverToClient = new PassThrough();
 
   const started = await runStdio({
-    env: { MNEMOSHELF_URL: rest.instance.url, MNEMOSHELF_TOKEN: token },
+    env: { MNEMOSHELF_URL: rest.instance.url, MNEMOSHELF_TOKEN: token, ...extra.env },
+    ...(extra.cwd === undefined ? {} : { cwd: extra.cwd }),
+    ...(extra.homeDir === undefined ? {} : { homeDir: extra.homeDir }),
     stdin: clientToServer,
     stdout: serverToClient,
   });
@@ -263,11 +273,155 @@ describe("MCP stdio 入口", () => {
   });
 });
 
+describe("MCP：remember 的專案解析（參數 > 環境變數 > cwd basename > 退回 global）", () => {
+  // 合成路徑（不涉及任何真實使用者目錄）。
+  const cwdProject = path.resolve("synthetic-workspace", "proj-from-cwd");
+  const fakeHome = path.resolve("synthetic-workspace", "fake-home", "someone");
+
+  /** 呼叫 remember 並取出 REST 回傳的記憶（工具回應是 JSON 字串）。 */
+  async function callRemember(
+    harness: McpHarness,
+    args: Record<string, unknown>,
+  ): Promise<{ id: number; scope: string; project: string | null }> {
+    const result = await harness.client.callTool({ name: "remember", arguments: args });
+    expect(result.isError).toBeFalsy();
+    return jsonOf<{ id: number; scope: string; project: string | null }>(result);
+  }
+
+  it("工具參數最優先；未帶參數時用 MNEMOSHELF_PROJECT", async () => {
+    const harness = await startMcp(TEST_TOKEN, {
+      env: { MNEMOSHELF_PROJECT: "proj-env" },
+      cwd: cwdProject,
+      homeDir: fakeHome,
+    });
+    rest = harness.rest;
+    mcp = harness.mcp;
+
+    // 參數 > 環境變數（參數值 trim）。
+    expect(await callRemember(harness.mcp, { content: "參數優先的記憶", project: "  proj-arg  " })).toMatchObject({
+      scope: "project",
+      project: "proj-arg",
+    });
+    expect(await callRemember(harness.mcp, { content: "環境變數專案的記憶" })).toMatchObject({
+      scope: "project",
+      project: "proj-env",
+    });
+
+    // 工具描述要說明預設專案來源與「全域要明確指定」。
+    const tools = await harness.mcp.client.listTools();
+    const remember = tools.tools.find((tool) => tool.name === "remember")!;
+    expect(remember.description).toContain("MNEMOSHELF_PROJECT");
+    expect(remember.description).toContain("全域");
+  });
+
+  it("沒有參數與環境變數時，用 cwd 的資料夾名稱當專案", async () => {
+    const harness = await startMcp(TEST_TOKEN, { cwd: cwdProject, homeDir: fakeHome });
+    rest = harness.rest;
+    mcp = harness.mcp;
+
+    expect(await callRemember(harness.mcp, { content: "cwd 專案的記憶" })).toMatchObject({
+      scope: "project",
+      project: "proj-from-cwd",
+    });
+  });
+
+  it("cwd 就是家目錄時跳過（不把使用者名稱當專案），退回 global", async () => {
+    const harness = await startMcp(TEST_TOKEN, { cwd: fakeHome, homeDir: fakeHome });
+    rest = harness.rest;
+    mcp = harness.mcp;
+
+    expect(await callRemember(harness.mcp, { content: "家目錄下退回全域的記憶" })).toMatchObject({
+      scope: "global",
+      project: null,
+    });
+  });
+
+  it("明確 scope: project 但解析不到專案 → 工具錯誤（提示可帶 project 或設 MNEMOSHELF_PROJECT）", async () => {
+    const harness = await startMcp(TEST_TOKEN, { cwd: fakeHome, homeDir: fakeHome });
+    rest = harness.rest;
+    mcp = harness.mcp;
+
+    const result = await harness.mcp.client.callTool({
+      name: "remember",
+      arguments: { content: "不該被送出的記憶", scope: "project" },
+    });
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toContain("MNEMOSHELF_PROJECT");
+    expect(textOf(result)).toContain("project");
+  });
+
+  it("明確 scope: global 不受環境變數與 project 參數影響（project 一律 null）", async () => {
+    const harness = await startMcp(TEST_TOKEN, {
+      env: { MNEMOSHELF_PROJECT: "proj-env" },
+      cwd: cwdProject,
+      homeDir: fakeHome,
+    });
+    rest = harness.rest;
+    mcp = harness.mcp;
+
+    expect(await callRemember(harness.mcp, { content: "明確全域的記憶", scope: "global" })).toMatchObject({
+      scope: "global",
+      project: null,
+    });
+    expect(
+      await callRemember(harness.mcp, { content: "明確全域且帶 project 參數的記憶", scope: "global", project: "proj-arg" }),
+    ).toMatchObject({ scope: "global", project: null });
+  });
+});
+
+describe("MCP：resolveProjectName 的純函式優先序", () => {
+  const cwdProject = path.resolve("synthetic-workspace", "proj-from-cwd");
+  const fakeHome = path.resolve("synthetic-workspace", "fake-home", "someone");
+
+  it("參數 > 環境變數 > cwd basename", () => {
+    expect(resolveProjectName({ argument: "proj-arg", configProject: "proj-env", cwd: cwdProject, homeDir: fakeHome })).toEqual({
+      project: "proj-arg",
+      source: "argument",
+    });
+    expect(resolveProjectName({ configProject: "proj-env", cwd: cwdProject, homeDir: fakeHome })).toEqual({
+      project: "proj-env",
+      source: "env",
+    });
+    expect(resolveProjectName({ cwd: cwdProject, homeDir: fakeHome })).toEqual({
+      project: "proj-from-cwd",
+      source: "cwd",
+    });
+  });
+
+  it("空白或非字串的參數／設定視為未設定，繼續往下退", () => {
+    expect(resolveProjectName({ argument: "   ", configProject: "  ", cwd: cwdProject, homeDir: fakeHome })).toEqual({
+      project: "proj-from-cwd",
+      source: "cwd",
+    });
+    expect(resolveProjectName({ argument: 42, configProject: undefined, cwd: cwdProject, homeDir: fakeHome })).toEqual({
+      project: "proj-from-cwd",
+      source: "cwd",
+    });
+  });
+
+  it("cwd 等於家目錄、或 cwd 解析不出名稱時回 none", () => {
+    expect(resolveProjectName({ cwd: fakeHome, homeDir: fakeHome })).toEqual({ project: null, source: "none" });
+    expect(resolveProjectName({ cwd: path.parse(cwdProject).root, homeDir: fakeHome })).toEqual({
+      project: null,
+      source: "none",
+    });
+  });
+});
+
 describe("MCP 啟動設定", () => {
   it("缺少 MNEMOSHELF_URL／TOKEN → 具名錯誤", async () => {
     await expect(runStdio({ env: {} })).rejects.toMatchObject({ name: "MissingMcpConfigError" });
     await expect(runStdio({ env: { MNEMOSHELF_URL: "http://127.0.0.1:1" } })).rejects.toMatchObject({
       name: "MissingMcpConfigError",
     });
+  });
+
+  it("loadMcpConfig 讀選配的 MNEMOSHELF_PROJECT（trim；空白視為未設定）", () => {
+    const base = { MNEMOSHELF_URL: "http://127.0.0.1:1", MNEMOSHELF_TOKEN: "synthetic-token" };
+    const withoutProject = loadMcpConfig(base);
+    expect(withoutProject.project).toBeUndefined();
+    expect(loadMcpConfig({ ...base, MNEMOSHELF_PROJECT: "  proj-config  " }).project).toBe("proj-config");
+    expect(loadMcpConfig({ ...base, MNEMOSHELF_PROJECT: "   " }).project).toBeUndefined();
+    expect(loadMcpConfig({ ...base, MNEMOSHELF_PROJECT: "" }).project).toBeUndefined();
   });
 });

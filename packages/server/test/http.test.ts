@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { RootNotIndexableError } from "@mnemoshelf/core";
+import type { Memory } from "@mnemoshelf/core";
 import { FAKE_EMBEDDER_MAX_INPUT_CHARS } from "@mnemoshelf/core/testing";
 import {
   api,
@@ -672,6 +673,152 @@ describe("REST：記憶", () => {
     const byId = new Map(listed.memories.map((memory) => [memory.id, memory]));
     expect(byId.get(pinnedReplacement.id)?.pinned).toBe(true);
     expect(byId.has(pinnedOriginal.id)).toBe(false);
+  });
+});
+
+describe("REST：PATCH /memories/:id（共享開關）", () => {
+  /** 建立一筆測試記憶並回傳完整 `Memory`。 */
+  async function createMemory(body: Record<string, unknown> = {}): Promise<Memory> {
+    const created = await api(server!.instance, "POST", "/memories", {
+      body: { content: "共享開關的測試記憶", agent: "agent-share", kind: "decision", ...body },
+    });
+    expect(created.status).toBe(201);
+    return created.body as Memory;
+  }
+
+  it("project → global：200、project 清為 null、不可變欄位原樣保留，GET 也反映", async () => {
+    server = await startTestServer();
+    const memory = await createMemory({ scope: "project", project: "mnemoshelf" });
+    expect(memory.project).toBe("mnemoshelf");
+
+    const patched = await api(server.instance, "PATCH", `/memories/${memory.id}`, { body: { scope: "global" } });
+    expect(patched.status).toBe(200);
+    expect(patched.body).toMatchObject({
+      id: memory.id,
+      content: memory.content,
+      kind: memory.kind,
+      agent: memory.agent,
+      supersedes: memory.supersedes,
+      pinned: memory.pinned,
+      createdAt: memory.createdAt,
+      deletedAt: null,
+      scope: "global",
+      project: null,
+    });
+
+    const listed = (await api(server.instance, "GET", "/memories")).body as ListMemoriesResponse;
+    expect(listed.memories.find((item) => item.id === memory.id)).toMatchObject({ scope: "global", project: null });
+  });
+
+  it("global → project：200、專案名稱 trim 後儲存，重複套用冪等，可用 project 過濾找到", async () => {
+    server = await startTestServer();
+    const memory = await createMemory({ scope: "global" });
+
+    const patched = await api(server.instance, "PATCH", `/memories/${memory.id}`, {
+      body: { scope: "project", project: "  proj-share  " },
+    });
+    expect(patched.status).toBe(200);
+    expect(patched.body).toMatchObject({ scope: "project", project: "proj-share" });
+
+    // 冪等：同一個 patch 再套一次，回應完全相同。
+    const again = await api(server.instance, "PATCH", `/memories/${memory.id}`, {
+      body: { scope: "project", project: "proj-share" },
+    });
+    expect(again.status).toBe(200);
+    expect(again.body).toEqual(patched.body);
+
+    const filtered = (await api(server.instance, "GET", "/memories?project=proj-share")).body as ListMemoriesResponse;
+    expect(filtered.memories.map((item) => item.id)).toEqual([memory.id]);
+  });
+
+  it("只帶 project（現值 scope 是 project）→ 更新專案名稱；只帶非 null project 而現值不是 project → 400", async () => {
+    server = await startTestServer();
+    const projectMemory = await createMemory({ scope: "project", project: "proj-old" });
+    const renamed = await api(server.instance, "PATCH", `/memories/${projectMemory.id}`, {
+      body: { project: "proj-new" },
+    });
+    expect(renamed.status).toBe(200);
+    expect(renamed.body).toMatchObject({ scope: "project", project: "proj-new" });
+
+    const globalMemory = await createMemory({ scope: "global" });
+    const invalid = await api(server.instance, "PATCH", `/memories/${globalMemory.id}`, {
+      body: { project: "proj-new" },
+    });
+    expect(invalid.status).toBe(400);
+    expect(errorName(invalid.body)).toBe("ValidationError");
+    // 不合法請求不得留下任何變更。
+    const after = (await api(server.instance, "GET", "/memories")).body as ListMemoriesResponse;
+    expect(after.memories.find((item) => item.id === globalMemory.id)).toMatchObject({
+      scope: "global",
+      project: null,
+    });
+  });
+
+  it("400：主體不合法（空、未知欄位、scope 非法、project 型別、scope=project 缺／空專案、scope!=project 帶專案）", async () => {
+    server = await startTestServer();
+    const memory = await createMemory({ scope: "project", project: "proj-keep" });
+
+    const badBodies: Record<string, unknown>[] = [
+      {},
+      { content: "不能改內容" },
+      { kind: "decision" },
+      { pinned: true },
+      { agent: "attacker" },
+      // 有效欄位＋未知欄位並存：未知欄位必須被拒絕，不能因為有其他合法欄位就靜默忽略。
+      { scope: "global", content: "不能改內容" },
+      { scope: "project", project: "proj-keep", pinned: true },
+      { scope: "nope" },
+      { project: 42 },
+      { scope: "project" },
+      { scope: "project", project: null },
+      { scope: "project", project: "" },
+      { scope: "project", project: "   " },
+      { scope: "global", project: "proj-keep" },
+      { scope: "agent", project: "proj-keep" },
+    ];
+    for (const body of badBodies) {
+      const response = await api(server.instance, "PATCH", `/memories/${memory.id}`, { body });
+      expect(response.status, JSON.stringify(body)).toBe(400);
+      expect(errorName(response.body)).toBe("ValidationError");
+    }
+
+    // 全部被拒之後，記憶維持原樣。
+    const listed = (await api(server.instance, "GET", "/memories")).body as ListMemoriesResponse;
+    expect(listed.memories.find((item) => item.id === memory.id)).toMatchObject({
+      content: "共享開關的測試記憶",
+      kind: "decision",
+      agent: "agent-share",
+      scope: "project",
+      project: "proj-keep",
+    });
+  });
+
+  it("404：未知 id、已軟刪除的 id；401：無 token", async () => {
+    server = await startTestServer();
+    const unknown = await api(server.instance, "PATCH", "/memories/987654", { body: { scope: "global" } });
+    expect(unknown.status).toBe(404);
+    expect(errorName(unknown.body)).toBe("NotFoundError");
+
+    const memory = await createMemory({ scope: "project", project: "proj-soft" });
+    expect((await api(server.instance, "DELETE", `/memories/${memory.id}`)).status).toBe(200);
+    const deleted = await api(server.instance, "PATCH", `/memories/${memory.id}`, { body: { scope: "global" } });
+    expect(deleted.status).toBe(404);
+    expect(errorName(deleted.body)).toBe("NotFoundError");
+
+    const noToken = await api(server.instance, "PATCH", `/memories/${memory.id}`, {
+      body: { scope: "global" },
+      token: null,
+    });
+    expect(noToken.status).toBe(401);
+    expect(errorName(noToken.body)).toBe("UnauthorizedError");
+  });
+
+  it("405：不支援的方法，Allow 帶 DELETE 與 PATCH", async () => {
+    server = await startTestServer();
+    const memory = await createMemory();
+    const response = await api(server.instance, "PUT", `/memories/${memory.id}`, { body: { scope: "global" } });
+    expect(response.status).toBe(405);
+    expect(response.headers.get("allow")).toBe("DELETE, PATCH");
   });
 });
 

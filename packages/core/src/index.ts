@@ -10,6 +10,7 @@ export type {
   ChunkKind,
   Memory,
   MemoryKind,
+  MemoryPatch,
   MemoryScope,
   Modality,
   NewChunk,
@@ -26,7 +27,9 @@ export type { MetadataStore } from "./ports/metadata-store.js";
 export {
   MEMORY_LIST_DEFAULT_LIMIT,
   MEMORY_LIST_MAX_LIMIT,
+  MEMORY_SCOPES,
   normalizeMemoryLimit,
+  normalizeMemoryPatch,
 } from "./ports/metadata-store.js";
 export type { MemoryFilter } from "./ports/metadata-store.js";
 export type { VectorIndex, VectorItem } from "./ports/vector-index.js";

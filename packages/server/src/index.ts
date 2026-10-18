@@ -212,6 +212,7 @@ export type {
   JsonRouteResult,
   ListEntriesResponse,
   ListMemoriesResponse,
+  PatchMemoryRequest,
   PatchRootRequest,
   RemoveRootResponse,
   RestApp,
@@ -239,5 +240,5 @@ export type {
   UnifiedSearchOptions,
   UnifiedSearchResult,
 } from "./search.js";
-export { createMcpServer, MCP_TOOLS, runStdio, UNTRUSTED_DATA_WARNING } from "./mcp/stdio.js";
-export type { McpServerOptions } from "./mcp/stdio.js";
+export { createMcpServer, MCP_TOOLS, resolveProjectName, runStdio, UNTRUSTED_DATA_WARNING } from "./mcp/stdio.js";
+export type { McpServerOptions, ProjectResolution, ResolveProjectOptions } from "./mcp/stdio.js";

@@ -6,7 +6,7 @@ import {
   type MemoryFilter,
   type MetadataStore,
 } from "../ports/metadata-store.js";
-import type { NewMemory, NewRoot } from "../ports/types.js";
+import type { MemoryPatch, MemoryScope, NewMemory, NewRoot } from "../ports/types.js";
 
 /** 每個測試都要拿到全新、獨立的實例（暫存目錄或 :memory:）。 */
 export type MetadataStoreFactory = () => MetadataStore | Promise<MetadataStore>;
@@ -327,6 +327,126 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       expect(await store.getMemory(987654)).toBeNull();
       // 不存在的 id 不會被憑空建立。
       expect(await store.listMemories()).toEqual([]);
+    });
+
+    it("updateMemory 更新 scope／project 並回傳更新後的完整記憶（不可變欄位原樣保留）", async () => {
+      const previous = await store.addMemory(
+        memoryInput({ content: "被取代的舊記憶", kind: "decision", scope: "global", project: null }),
+      );
+      const memory = await store.addMemory({
+        content: "共享開關的契約測試記憶",
+        kind: "pitfall",
+        scope: "project",
+        project: "contract-project",
+        agent: "contract-agent-update",
+        supersedes: previous.id,
+      });
+      await store.setMemoryPinned(memory.id, true);
+      const before = (await store.getMemory(memory.id))!;
+
+      // project → global：project 應被清為 null，其餘欄位原樣。
+      const updated = await store.updateMemory(memory.id, { scope: "global" });
+      expect(updated).not.toBeNull();
+      expect(updated).toMatchObject({
+        id: before.id,
+        content: before.content,
+        kind: before.kind,
+        agent: before.agent,
+        supersedes: before.supersedes,
+        pinned: before.pinned,
+        createdAt: before.createdAt,
+        deletedAt: null,
+        scope: "global",
+        project: null,
+      });
+      // 讀回來也要是新的值（不能只改回傳物件）。
+      expect(await store.getMemory(memory.id)).toEqual(updated);
+      expect((await store.listMemories({ scope: "global" })).find((item) => item.id === memory.id)?.project).toBeNull();
+
+      // global → project（專案名稱 trim 後儲存）。
+      const back = await store.updateMemory(memory.id, { scope: "project", project: "  contract-project  " });
+      expect(back).toMatchObject({ scope: "project", project: "contract-project", pinned: true });
+      expect((await store.getMemory(memory.id))?.project).toBe("contract-project");
+      // 不可變的 supersedes 關係仍可追溯。
+      expect((await store.getMemory(memory.id))?.supersedes).toBe(previous.id);
+      expect((await store.getMemory(previous.id))?.deletedAt).not.toBeNull();
+    });
+
+    it("updateMemory 的 scope 非 project 時一律把 project 清為 null，且可只改 project", async () => {
+      const project = await store.addMemory(
+        memoryInput({ content: "專案記憶", scope: "project", project: "proj-a" }),
+      );
+      const toAgent = await store.updateMemory(project.id, { scope: "agent" });
+      expect(toAgent).toMatchObject({ scope: "agent", project: null });
+
+      // 只帶 project（scope 沿用現值 project）＝改專案名稱。
+      const project2 = await store.addMemory(memoryInput({ content: "另一筆專案記憶", scope: "project", project: "proj-c" }));
+      expect(await store.updateMemory(project2.id, { project: "proj-d" })).toMatchObject({
+        scope: "project",
+        project: "proj-d",
+      });
+    });
+
+    it("updateMemory 是冪等的：同一個 patch 重複套用結果相同", async () => {
+      const memory = await store.addMemory(
+        memoryInput({ content: "冪等測試", scope: "project", project: "proj-idem" }),
+      );
+
+      const first = await store.updateMemory(memory.id, { scope: "global" });
+      const second = await store.updateMemory(memory.id, { scope: "global" });
+      expect(second).toEqual(first);
+      expect(second).toMatchObject({ scope: "global", project: null });
+
+      // 已切回專案之後再套用同一個 project patch，結果也一樣。
+      const toProject = await store.updateMemory(memory.id, { scope: "project", project: "proj-idem" });
+      const again = await store.updateMemory(memory.id, { scope: "project", project: "proj-idem" });
+      expect(again).toEqual(toProject);
+    });
+
+    it("updateMemory 對不存在的 id 回傳 null（不拋錯、不建立列）", async () => {
+      expect(await store.updateMemory(987654, { scope: "global" })).toBeNull();
+      // 不存在優先於 patch 驗證：空 patch 也是回 null，不是拋錯（不洩漏存在性以外的資訊）。
+      expect(await store.updateMemory(987654, {})).toBeNull();
+      expect(await store.listMemories()).toEqual([]);
+    });
+
+    it("updateMemory 對已軟刪除的記憶回傳 null 且不改資料", async () => {
+      const memory = await store.addMemory(
+        memoryInput({ content: "已刪除的記憶", scope: "project", project: "proj-gone" }),
+      );
+      await store.forgetMemory(memory.id);
+
+      expect(await store.updateMemory(memory.id, { scope: "global" })).toBeNull();
+      const after = await store.getMemory(memory.id);
+      expect(after).toMatchObject({ scope: "project", project: "proj-gone" });
+      expect(after?.deletedAt).not.toBeNull();
+    });
+
+    it("updateMemory 的非法 patch 會拋錯：空 patch、scope=project 缺專案、scope!=project 帶專案", async () => {
+      const project = await store.addMemory(
+        memoryInput({ content: "非法 patch 的測試記憶", scope: "project", project: "proj-x" }),
+      );
+      const global = await store.addMemory(memoryInput({ content: "全域記憶", scope: "global", project: null }));
+
+      // 兩個欄位都沒給。
+      const emptyPatch: MemoryPatch = {};
+      await expect(store.updateMemory(project.id, emptyPatch)).rejects.toThrow();
+      // scope=project 但解析不到非空 project。
+      await expect(store.updateMemory(global.id, { scope: "project" })).rejects.toThrow();
+      await expect(store.updateMemory(project.id, { project: null })).rejects.toThrow();
+      await expect(store.updateMemory(project.id, { scope: "project", project: "" })).rejects.toThrow();
+      await expect(store.updateMemory(project.id, { scope: "project", project: "   " })).rejects.toThrow();
+      // scope!=project 時明確帶非 null project。
+      await expect(store.updateMemory(global.id, { scope: "global", project: "proj-x" })).rejects.toThrow();
+      await expect(store.updateMemory(project.id, { scope: "agent", project: "proj-x" })).rejects.toThrow();
+      // 不合法的 scope 值（runtime；型別外）。
+      await expect(store.updateMemory(project.id, { scope: "bogus" as MemoryScope })).rejects.toThrow();
+      // 不合法的 project 型別（runtime；型別外）。
+      await expect(store.updateMemory(project.id, { project: 42 as unknown as string })).rejects.toThrow();
+
+      // 以上全部不得留下任何變更。
+      expect(await store.getMemory(project.id)).toMatchObject({ scope: "project", project: "proj-x" });
+      expect(await store.getMemory(global.id)).toMatchObject({ scope: "global", project: null });
     });
 
     it("forgetMemory 軟刪除後搜尋不到，但資料仍在", async () => {
