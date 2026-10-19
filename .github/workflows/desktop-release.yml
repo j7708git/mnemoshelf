@@ -214,6 +214,9 @@ jobs:
           # GitHub runner 的 chrome-sandbox 不是 setuid，GUI 啟動需要 --no-sandbox；
           # 這個開關只影響 smoke 啟動的 GUI 行程，headless smoke 不受影響。
           MNEMOSHELF_SMOKE_NO_SANDBOX: "1"
+          # runner 的 xvfb／軟體渲染環境可能讓 webContents.capturePage() 丟出
+          # UnknownVizError；索引 smoke 只驗流程，跳過截圖（本機 smoke 不受影響）。
+          MNEMOSHELF_AUTOTEST_SKIP_SHOTS: "1"
         run: node packages/desktop/scripts/smoke.mjs gui --only bootstrap,index --user-data .tmp/desktop-ci-index/userData --out .tmp/desktop-ci-index --skip-build
 
       # 授權清單：以 desktop 為主的 production 相依閉包（含 @img/sharp-libvips-*／sqlite-vec-*），

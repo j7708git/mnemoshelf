@@ -218,11 +218,28 @@ function elementInfoExpression(selector: string): string {
 })()`;
 }
 
+/**
+ * 截一張圖並寫檔，回傳檔案路徑。
+ *
+ * `MNEMOSHELF_AUTOTEST_SKIP_SHOTS=1` 時直接回傳空字串（不呼叫 `capturePage`、不寫檔）：
+ * GitHub runner 的 xvfb／軟體渲染環境可能讓 `capturePage` 丟出 `UnknownVizError`，
+ * CI 只需要流程的斷言結果，不需要截圖。
+ *
+ * 截圖失敗一律吞掉並印一行記錄，**不讓整個 autotest 失敗**；本機沒有這個 env 時
+ * 仍照常截圖。回傳空字串代表「這次沒有圖」，報告最後會過濾掉。
+ */
 async function shoot(window: BrowserWindow, outputDir: string, name: string): Promise<string> {
-  const image = await window.webContents.capturePage();
-  const file = path.join(outputDir, name);
-  await fs.writeFile(file, image.toPNG());
-  return file;
+  if (process.env.MNEMOSHELF_AUTOTEST_SKIP_SHOTS === "1") return "";
+  try {
+    const image = await window.webContents.capturePage();
+    const file = path.join(outputDir, name);
+    await fs.writeFile(file, image.toPNG());
+    return file;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.log(`[autotest] 截圖失敗（${name}）：${message}`);
+    return "";
+  }
 }
 
 /** 遞迴列目錄（供報告引用模型快取的落地檔案）。 */
@@ -673,7 +690,8 @@ export async function runAutotest(options: AutotestOptions): Promise<AutotestRes
     scenarios,
     environment: options.environment ?? {},
     steps,
-    screenshots: shots,
+    // 跳過截圖或截圖失敗時 shoot() 回傳空字串，報告只列真正寫出的檔案。
+    screenshots: shots.filter((file) => file !== ""),
     previewText,
     bootstrapFinal: finalBootstrap,
     bootstrapHistory,
