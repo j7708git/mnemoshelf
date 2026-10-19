@@ -2,7 +2,8 @@
 #
 # 觸發：
 # - push `v*` tag：三平台各建安裝檔，並建立 GitHub Release（tag 名即版本），附件含安裝檔與授權資料。
-# - workflow_dispatch：同樣建三平台安裝檔並上傳 artifacts，但**不**建立 Release（測試用）。
+# - workflow_dispatch：同樣建三平台安裝檔，但**不**上傳 artifacts（避開額度）、**不**建立正式 Release；
+#   macOS arm64 會另外把 dmg 與授權清單放進草稿 Release（tag `mac-test-<run id>-<attempt>`，測試用）。
 #   不在非 tag 的 push 上自動建置（避免每次 commit 都跑三平台）。
 #
 # 三平台（各平台用原生 runner 各建各的；不從 Linux 交叉建 macOS）：
@@ -90,7 +91,7 @@ jobs:
           } > test-summary.txt
 
       - name: 上傳測試基準
-        if: always()
+        if: always() && github.event_name != 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: test-baseline
@@ -105,6 +106,10 @@ jobs:
   build:
     name: 建置（${{ matrix.platform }}）
     runs-on: ${{ matrix.os }}
+    # workflow_dispatch 時，macOS leg 會用 GITHUB_TOKEN 建立草稿 Release（見下方步驟）。
+    # tag 建置的正式 Release 由獨立 release job 處理；這裡的 write 權限只為草稿 Release。
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -190,6 +195,10 @@ jobs:
       - name: 打包後索引 smoke（Linux x64）
         if: matrix.platform == 'linux-x64'
         timeout-minutes: 45
+        env:
+          # GitHub runner 的 chrome-sandbox 不是 setuid，GUI 啟動需要 --no-sandbox；
+          # 這個開關只影響 smoke 啟動的 GUI 行程，headless smoke 不受影響。
+          MNEMOSHELF_SMOKE_NO_SANDBOX: "1"
         run: node packages/desktop/scripts/smoke.mjs gui --only bootstrap,index --user-data .tmp/desktop-ci-index/userData --out .tmp/desktop-ci-index --skip-build
 
       # 授權清單：以 desktop 為主的 production 相依閉包（含 @img/sharp-libvips-*／sqlite-vec-*），
@@ -204,7 +213,26 @@ jobs:
         run: |
           pnpm --filter "@mnemoshelf/desktop..." licenses list --prod --long > "packages/desktop/dist-app/third-party-licenses-${{ matrix.platform }}.txt"
 
+      # workflow_dispatch 時，Actions artifact 額度可能已滿；macOS 測試包改放草稿 Release 供下載。
+      # tag 一律用 `mac-test-...`（不是 `v*`），避免觸發 `on: push: tags: v*` 的正式發版流程。
+      # 僅 macOS arm64 執行；草稿 Release 不是正式版本，測完可刪。
+      - name: 建立 macOS 草稿 Release（workflow_dispatch）
+        if: github.event_name == 'workflow_dispatch' && matrix.platform == 'macos-arm64'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="mac-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$TAG" --draft \
+            --title "macOS 測試包 ${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --notes "由 workflow_dispatch 產生的 macOS 測試包；不是正式 Release。來源：${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            packages/desktop/dist-app/*.dmg \
+            packages/desktop/dist-app/third-party-licenses-macos-arm64.txt
+
       - name: 上傳安裝檔與授權清單
+        # workflow_dispatch 不上傳 artifacts（避免額度讓整個 run 紅）；tag 建置照舊。
+        if: github.event_name != 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.platform }}

@@ -19,6 +19,9 @@
  * 選項：`--out <dir>`、`--user-data <dir>`、`--sample-root <dir>`、`--skip-build`、`--only <情境>`。
  *
  * 需要 `xvfb-run`（headless 的 GUI session；Electron 沒有 display 起不來）。第一次跑會下載模型（約 300 MB）。
+ * CI／`chrome-sandbox` 不是 setuid 的環境（例如 GitHub runner）GUI 啟動會被 Chromium sandbox 擋下；
+ * 設環境變數 `MNEMOSHELF_SMOKE_NO_SANDBOX=1` 會在使用者 args 前加上 `--no-sandbox`。
+ * 這個開關**只給上述環境用**，預設關閉；本機手動跑請維持原行為。
  * **`XDG_CONFIG_HOME` 一律指到 `.tmp/` 底下**，因此開機自啟的驗收不會動到使用者真正的 `~/.config/autostart`。
  *
  * 產物：`<out>/report/`（截圖與 report.json）、`<out>/*.log`、`<out>/summary.json`（未進版控）。
@@ -310,7 +313,10 @@ async function runHiddenCheck({ executable, baseEnv, userData, outRoot, withHidd
 async function runApp({ executable, env, args = [], logFile, onLine, killWhen = null }) {
   const stream = createWriteStream(logFile, { flags: "w" });
   const lines = [];
-  const child = spawn("xvfb-run", ["-a", "-s", "-screen 0 1440x1000x24", executable, ...args], {
+  // CI／chrome-sandbox 不是 setuid 的環境需要 `--no-sandbox` 才能啟動 GUI（headless smoke 不受影響）。
+  // 預設不開；`--no-sandbox` 必須放在 executable 之後、使用者 args 之前。
+  const sandboxArgs = env?.MNEMOSHELF_SMOKE_NO_SANDBOX === "1" ? ["--no-sandbox"] : [];
+  const child = spawn("xvfb-run", ["-a", "-s", "-screen 0 1440x1000x24", executable, ...sandboxArgs, ...args], {
     env,
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,

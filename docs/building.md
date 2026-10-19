@@ -114,7 +114,10 @@ pnpm --filter "@mnemoshelf/desktop..." licenses list --prod --long
   與 token 驗證）；Linux x64 另外會跑 `bootstrap,index` 的真正索引 smoke（會觸發 worker／
   embedder，首次需下載模型，CI 有快取），最後由獨立的 release job 建立 GitHub Release 並附上安裝檔與授權資料。
   建置前會先跑 `pnpm typecheck`、`pnpm build`、`pnpm test`（verify job），全綠才發布。
-- 手動觸發（`workflow_dispatch`）：只建置並上傳 artifacts，**不**建立 Release（測試用）。
+- 手動觸發（`workflow_dispatch`）：**不**建立正式 Release、也不上傳 artifacts（避開 Actions
+  artifact 額度）；macOS arm64 會把 dmg 與授權清單放進 **草稿 Release**（tag 為
+  `mac-test-<run id>-<attempt>`），適合在 Actions artifact 額度不足時取測試包；草稿 Release 不是
+  正式版本，測完可刪。
 - tag 去 `v` 後的版本號會在建置時寫入 app 版本，因此安裝檔版本與 tag 一致。
 
 ## 已知限制
