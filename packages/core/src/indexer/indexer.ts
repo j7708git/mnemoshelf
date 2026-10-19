@@ -374,7 +374,10 @@ async function embedInputs(
   }
 
   // title 用相對路徑：spike 顯示帶 title 對檢索顯著有利。
-  const documents: DocumentInput[] = inputs.map((input) => ({ text: input.text ?? "", title: file.relPath }));
+  // 檔名同樣可能含 token-like 字串（例如 `leak-ghp_….md`），送進 embedder 前套同一組遮罩；
+  // 只影響送出的 title，索引鍵（relPath）與 chunk 內容不變。
+  const title = maskSecrets(file.relPath).text;
+  const documents: DocumentInput[] = inputs.map((input) => ({ text: input.text ?? "", title }));
   throwIfAborted(signal);
   return embedder.embedDocuments(documents, { signal });
 }
@@ -561,8 +564,9 @@ async function processFile(
  *   chunk 的 `contentHash` 比對；hash 未變**且**該檔向量齊全才整檔跳過，否則重做
  *   （可自癒「DB 有 hash 但缺向量」的狀態）。
  * - **機密遮罩**：文字／程式碼在切塊、嵌入、寫入 DB 之前套用 curated 遮罩（與記憶同一組規則），
- *   chunk 文字不含可辨識憑證；媒體檔不套文字遮罩（位元組照舊送 embedder）。使用者磁碟上的
- *   檔案只讀不寫。`maskedFiles` 回報本輪至少遮一處的檔案數。
+ *   chunk 文字不含可辨識憑證；送進 embedder 的 `title`（相對路徑檔名）也先遮罩。媒體檔不套
+ *   文字遮罩（位元組照舊送 embedder）。使用者磁碟上的檔案只讀不寫。`maskedFiles` 回報本輪
+ *   至少遮一處的檔案數。
  * - 清理：以 `listRelPaths(rootId)` 減去**本次將納入的 `files`** 為準。磁碟上已消失、或本次
  *   被跳過（排除規則、`.gitignore`、黑名單、關模態、超過大小上限等）的檔案，其 chunk 與向量
  *   一律清除——不得因為出現在 skipped 就保留索引（隱私契約：不索引、不回傳）。

@@ -5,6 +5,9 @@
  * 不需要真的模型。另有一個測試用**真正的 `node:worker_threads` Worker**（見 `fixtures/`），
  * 驗證跨執行緒的崩潰處理：在途呼叫要有清楚錯誤、不 hang，下一次呼叫會自動重建一次。
  */
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import { describe, expect, it } from "vitest";
 import type { EmbedderInfo, EmbedderRuntimeStatus } from "@mnemoshelf/core";
@@ -17,6 +20,7 @@ import {
   type EmbedderWorkerLike,
   type WorkerEmbedderOptions,
 } from "../src/index.js";
+import { resolveEmbedderWorkerUrl } from "../src/worker-embedder.js";
 
 const INFO: EmbedderInfo = new FakeEmbedder().info;
 
@@ -405,5 +409,44 @@ describe("WorkerEmbedder：崩潰與關閉", () => {
     const { embedder, workers } = makeEmbedder(withRequests(() => undefined));
     await embedder.dispose();
     expect(workers).toHaveLength(0);
+  });
+});
+
+describe("resolveEmbedderWorkerUrl：Electron asar 解包", () => {
+  // 用平台無關的方式組出 fixture 路徑（不建立實體檔案；存在性由注入的 pathExists 決定）。
+  const resources = path.join(os.tmpdir(), "mnemoshelf-asar-fixture", "resources");
+  const moduleUrl = pathToFileURL(
+    path.join(resources, "app.asar", "packages", "server", "dist", "worker-embedder.js"),
+  );
+  const expectedWorkerUrl = pathToFileURL(
+    path.join(resources, "app.asar.unpacked", "packages", "server", "dist", "embedder-worker.js"),
+  );
+
+  it("module 在 app.asar、且 unpacked 有 embedder-worker.js → 用 unpacked 路徑", () => {
+    const probed: string[] = [];
+    const resolved = resolveEmbedderWorkerUrl(moduleUrl, (filePath) => {
+      probed.push(filePath);
+      return true;
+    });
+    expect(resolved.href).toBe(expectedWorkerUrl.href);
+    expect(probed).toEqual([fileURLToPath(expectedWorkerUrl)]);
+  });
+
+  it("module 在 app.asar、但 unpacked 沒有檔案 → 維持原本的 asar 路徑", () => {
+    const resolved = resolveEmbedderWorkerUrl(moduleUrl, () => false);
+    expect(resolved.href).toBe(new URL("./embedder-worker.js", moduleUrl).href);
+  });
+
+  it("module 不在 asar（開發環境）→ 維持原路徑，也不檢查 unpacked", () => {
+    let probed = false;
+    const devModule = pathToFileURL(
+      path.join(resources, "packages", "server", "dist", "worker-embedder.js"),
+    );
+    const resolved = resolveEmbedderWorkerUrl(devModule, () => {
+      probed = true;
+      return true;
+    });
+    expect(resolved.href).toBe(new URL("./embedder-worker.js", devModule).href);
+    expect(probed).toBe(false);
   });
 });

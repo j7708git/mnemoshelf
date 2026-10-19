@@ -190,6 +190,25 @@ class ConcurrencyProbeEmbedder extends RecordingEmbedder {
   }
 }
 
+/**
+ * 記錄每次 `embedDocuments` 開始的時間。
+ *
+ * 限速的休眠發生在「上一檔處理完、下一檔開始前」，因此相鄰兩次嵌入開始時間的差
+ * 直接就是「上一檔嵌入＋寫入＋休眠＋下一檔讀取」的總和；用這個間隔當證據，
+ * 不必比較兩個獨立刻度的總耗時（負載下容易 flake）。
+ */
+class TimedEmbedder extends RecordingEmbedder {
+  readonly embedStarts: number[] = [];
+
+  override async embedDocuments(
+    inputs: readonly DocumentInput[],
+    opts?: EmbedDocumentsOptions,
+  ): Promise<Float32Array[]> {
+    this.embedStarts.push(performance.now());
+    return super.embedDocuments(inputs, opts);
+  }
+}
+
 let opened: SqliteDatabase[] = [];
 
 async function makeHarness(files: Record<string, string | Buffer>, overrides: Partial<Root> = {}): Promise<Harness> {
@@ -257,6 +276,28 @@ describe("indexRoot", () => {
     const titles = new Set(harness.embedder.documents.map((call) => call.title));
     expect(titles.has("a.md")).toBe(true);
     expect(titles.has("code/b.ts")).toBe(true);
+  });
+
+  it("S7：檔名（title）在送進 embedder 前也套用遮罩，索引鍵與 chunk 不變", async () => {
+    const token = ["gh", "p_", "0123456789abcdefghijklmn"].join("");
+    const relPath = `leak-${token}.md`;
+    const h = await makeHarness({ [relPath]: "# 標題\n\n一般內容" });
+    try {
+      const result = await indexRoot(h.root, options(h));
+      expect(result).toMatchObject({ total: 1, processed: 1 });
+
+      const titles = h.embedder.documents.map((document) => document.title ?? "");
+      expect(titles.length).toBeGreaterThan(0);
+      for (const title of titles) {
+        expect(title).not.toContain(token);
+        expect(title).toContain(`${REDACTED_PREFIX}token]`);
+      }
+
+      // 只有送出的 title 被遮罩；索引鍵（relPath）與 chunk 儲存不受影響。
+      expect(await h.store.listChunksByPath(h.root.id, relPath)).toHaveLength(1);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
   });
 
   it("文字檔每檔一次批次呼叫（檔案內不再逐塊 await）", async () => {
@@ -1332,27 +1373,30 @@ describe("索引限速（throttle；預設 0＝與舊版相同）", () => {
     "c.md": "# 標題\n\n第三份文件",
   };
 
-  /** 用同一個 harness 索引一次並回傳耗時（檔案內容不變，第二次會是 skippedUnchanged，成本相近）。 */
-  async function timedIndex(harness: Harness, throttle?: { betweenFilesMs: number }): Promise<number> {
-    const startedAt = performance.now();
-    const result = await indexRoot(harness.root, {
-      ...options(harness),
-      concurrency: 1,
-      ...(throttle === undefined ? {} : { throttle }),
-    });
-    const elapsed = performance.now() - startedAt;
-    expect(result).toMatchObject({ total: 3, processed: 3 });
-    return elapsed;
-  }
-
-  it("betweenFilesMs 在檔案之間休眠：總時間變長，但結果與未限速一致", async () => {
+  it("betweenFilesMs 在相鄰檔案批次之間形成間隔，但結果與未限速一致", async () => {
     const plain = await makeHarness(files);
     const throttled = await makeHarness(files);
+    const betweenFilesMs = 150;
     try {
-      const fast = await timedIndex(plain);
-      const slow = await timedIndex(throttled, { betweenFilesMs: 150 });
-      // 3 個檔案、concurrency 1 → 2 次休眠（至少 300ms）；量測誤差留餘裕。
-      expect(slow - fast).toBeGreaterThanOrEqual(250);
+      const plainResult = await indexRoot(plain.root, { ...options(plain), concurrency: 1 });
+      expect(plainResult).toMatchObject({ total: 3, processed: 3 });
+
+      const timed = new TimedEmbedder();
+      throttled.embedder = timed;
+      const slowResult = await indexRoot(throttled.root, {
+        ...options(throttled),
+        concurrency: 1,
+        throttle: { betweenFilesMs },
+      });
+      expect(slowResult).toMatchObject({ total: 3, processed: 3 });
+
+      // 三個檔案、concurrency 1 → 三次嵌入，相鄰開始時間的差直接反映「上一檔結束後休眠」。
+      // setTimeout 不會早於指定毫秒；留 10ms 給計時器精度，不用總時間差（避免負載下 flake）。
+      expect(timed.embedStarts).toHaveLength(3);
+      for (let index = 1; index < timed.embedStarts.length; index += 1) {
+        const gap = timed.embedStarts[index]! - timed.embedStarts[index - 1]!;
+        expect(gap).toBeGreaterThanOrEqual(betweenFilesMs - 10);
+      }
 
       // 限速只影響節奏，不影響索引結果（同樣的 chunk 數與向量數）。
       const plainChunks = await plain.store.listChunksByPath(plain.root.id, "a.md");

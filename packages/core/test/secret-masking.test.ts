@@ -182,6 +182,72 @@ describe("maskSecrets：規則命中（真陽性）", () => {
     );
   });
 
+  it("M1：底線前綴（DB_PASSWORD／SMTP_PASSWORD／my_token）命中並保留名稱", () => {
+    const secret = fake("abcd", "ef01", "2345", "6789");
+    const placeholder = `${REDACTED_PREFIX}assignment]`;
+    for (const key of ["DB_PASSWORD", "SMTP_PASSWORD", "my_token"]) {
+      const result = maskSecrets(`${key}=${secret}`);
+      // 名稱完整保留（不是 `DB_[REDACTED:assignment]`），值被遮掉。
+      expect(result.text, key).toBe(`${key}=${placeholder}`);
+      expect(result.count, key).toBe(1);
+      expect(result.text, key).not.toContain(secret);
+    }
+  });
+
+  it("M1：引號值一律視為字面值遮罩（含長得像程式參考的內容）", () => {
+    const placeholder = `${REDACTED_PREFIX}assignment]`;
+    const upperSecret = fake("ABCD", "EF01", "2345", "6789");
+    const cases: [string, string][] = [
+      [fake("pass", "word", ' = "', upperSecret, '"'), fake("pass", "word", ' = "', placeholder, '"')],
+      [fake("pass", "word", "='", upperSecret, "'"), fake("pass", "word", "='", placeholder, "'")],
+      [fake('{"pass', 'word":"', upperSecret, '"}'), fake('{"pass', 'word":"', placeholder, '"}')],
+    ];
+    for (const [input, expected] of cases) {
+      const result = maskSecrets(input);
+      expect(result.text, input).toBe(expected);
+      expect(result.count, input).toBe(1);
+    }
+
+    // 引號內就算長得像屬性存取，仍是寫進內容的字面值 → 遮罩（舊版誤判為程式參考而漏遮）。
+    const quotedReference = maskSecrets(fake("pass", "word", ' = "req.', "body.", "pass", 'word"'));
+    expect(quotedReference.text).toBe(fake("pass", "word", ' = "', placeholder, '"'));
+    expect(quotedReference.count).toBe(1);
+  });
+
+  it("M1：未引號的程式參考仍不遮（process.env／屬性存取）", () => {
+    for (const text of [
+      fake("pass", "word", " = process.", "env.PASSWORD"),
+      fake("tok", "en: req.", "body.", "tok", "en"),
+      fake("const api", "Key = process.", "env.API_KEY;"),
+      fake("const access", "Token = req.", "body.accessToken;"),
+    ]) {
+      const result = maskSecrets(text);
+      expect(result.redacted, text).toBe(false);
+      expect(result.text, text).toBe(text);
+    }
+  });
+
+  it("M1：新命中的遮罩結果仍 idempotent", () => {
+    const secret = fake("abcd", "ef01", "2345", "6789");
+    const upperSecret = fake("ABCD", "EF01", "2345", "6789");
+    const text = [
+      `DB_PASSWORD=${secret}`,
+      `SMTP_PASSWORD=${secret}`,
+      `my_token=${secret}`,
+      `password = "${upperSecret}"`,
+      `password='${upperSecret}'`,
+      `{"password":"${upperSecret}"}`,
+    ].join("\n");
+    const first = maskSecrets(text);
+    expect(first.redacted).toBe(true);
+    expect(first.count).toBe(6);
+
+    const second = maskSecrets(first.text);
+    expect(second.text).toBe(first.text);
+    expect(second.redacted).toBe(false);
+    expect(second.count).toBe(0);
+  });
+
   it("同一段文字的多個機密都遮，count 反應命中次數", () => {
     const text = `${samples.openAiStyle} 與 ${samples.awsStyle}`;
     const result = maskSecrets(text);
@@ -239,7 +305,6 @@ describe("maskSecrets：idempotency 與誤遮對照（F1 regression）", () => {
       // 程式中的參考（不是字面憑證）也不遮：
       fake("const api", "Key = process.", "env.API_KEY;"),
       fake("const access", "Token = req.", "body.accessToken;"),
-      fake("pass", "word", ' = "req.', "body.", "pass", 'word"'),
     ];
     for (const text of falsePositiveCandidates) {
       const result = maskSecrets(text);

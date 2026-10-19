@@ -42,12 +42,14 @@ root 加入後要更改可索引的模態（例如之後才想含圖片）不必
 
 - 將納入的檔案數量、總大小、各類型分佈；
 - 預估索引時間；
-- 將被跳過的檔案與原因（排除規則、黑名單、系統／垃圾檔、過大等；
-  檔案內容的機密偵測**尚未實作**）。
+- 將被跳過的檔案與原因（排除規則、黑名單、系統／垃圾檔、過大等）。**預覽不會因為檔案含機密
+  而跳過**：索引階段會對文字／程式碼套用遮罩（見 §機密遮罩），原檔案仍會被納入、只讀不寫。
 
-使用者確認後才開始索引。索引可暫停並限速，避免占滿 CPU。
-  <!-- 2026-10-15 註：現行實作提供「取消」（`POST /roots/:id/index/cancel`）；
-       「限速」尚未實作，列為待辦。 -->
+使用者確認後才開始索引。索引可取消，也可限速，避免占滿 CPU。
+  <!-- 2026-10-19 更新：`POST /roots/:id/index/cancel` 已實作；限速 `MNEMOSHELF_INDEX_RATE=off|normal|low`
+       也已實作（`normal` 50ms、`low` 250ms，`off` 為預設），只作用於「檔案與檔案之間」，
+       同一個大檔的嵌入批次仍一次跑完。預設值與完整行為以 README 與
+       `packages/server/src/config.ts` 為準。 -->
 
 ## 路徑安全（所有檔案存取都要通過）
 
@@ -126,7 +128,8 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
 - 讀取路徑（`GET /memories`、`POST /memories/search`、`POST /search` 的記憶命中、MCP）會再遮一次，
   因此**既有 DB 的未遮罩舊資料**也不會原文外流；遮罩是 idempotent。
 - **檔案索引路徑**：文字／程式碼檔案在**切塊、嵌入、寫入 DB 之前**套用同一組遮罩，索引後的 chunk
-  文字只有 `[REDACTED:<kind>]`、不含可辨識憑證；使用者磁碟上的檔案**只讀不寫**（原文不變）。
+  文字只有 `[REDACTED:<kind>]`、不含可辨識憑證；送進 embedder 的 `title`（相對路徑檔名）也先
+  套同一組遮罩；使用者磁碟上的檔案**只讀不寫**（原文不變）。
   - 檔案級 `contentHash` 以**遮罩後內容**計算：既有未遮罩的索引會在下一次索引自動重做；
     只改到會被遮罩的區段（遮罩後內容相同）不會重嵌；遮罩規則改進也會自動觸發重做。
   - `POST /roots/:id/index` 的回應（`IndexRootResult`）新增 additive `maskedFiles`：本輪至少遮一處
@@ -171,17 +174,20 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
 |---|---|---|
 | `global` | 所有專案可見（全域共享） | 已實作；可由 UI 或 REST 明確切換 |
 | `project` | 只屬於同一個 `project` 名稱的專案 | 已實作寫入、標記與召回範圍過濾（見下方「召回」） |
-| `agent` | 寫入者 agent 的個人範圍 | **約定，尚未強制**；召回需明確提供 agent 才納入、本版不提供共享切換 |
+| `agent` | 寫入者 agent 的個人範圍 | **約定，尚未強制**；可用 `PATCH /memories/:id` 設定，召回需明確提供 agent 才納入 |
 
 - **新記憶的預設**：MCP 的 `remember` 以「目前專案」為預設，解析優先序為
   工具參數 `project` → 環境變數 `MNEMOSHELF_PROJECT` → MCP 行程 cwd 的資料夾名稱
   （cwd 是家目錄時跳過，不會把使用者名稱當專案）→ 都解析不到才退回 `global`。
   全域共享必須**明確指定**（`scope: "global"`）或事後在 UI 切換；agent 不應自行把專案記憶升為全域。
   明確指定 `scope: "project"` 但解析不到專案時，工具會回錯誤，不會送出不合法請求。
-- **共享開關**：UI 的記憶卡片提供兩種切換，對應 REST `PATCH /memories/:id`：
+- **共享開關**：對應 REST `PATCH /memories/:id`；UI 的記憶卡片提供前兩種切換：
   - `project` → `global`：主體 `{ "scope": "global" }`，`project` 由伺服器清為 `null`。
   - `global` → `project`：主體 `{ "scope": "project", "project": "<專案名稱>" }`，必須指定目標專案。
-  - `agent` 範圍在本版**不提供切換**（唯讀）；可見性強制與 per-agent 身分屬後續工作。
+  - **切到 `agent`**：REST `PATCH /memories/:id` 明確支援 `{ "scope": "agent" }`（`project` 會清為
+    `null`），但 **UI 不提供這個切換**。切到 agent 時**沿用該筆記憶原本的寫入者**（`agent` 是不可
+    變欄位，呼叫端不能經此端點指定新的寫入者）。`scope=agent` **不是安全邊界**，只是約定上的
+    個人範圍；可見性強制與 per-agent 身分屬後續工作。
 - **只改範圍欄位**：共享開關只改 `scope`／`project`；內容、種類、寫入者、取代關係、釘選與建立時間
   都原樣保留（內容編輯仍走 supersede，產生新版本）。不存在的 id 或已軟刪除的記憶 → `404`；
   不合法的主體 → `400`（未知欄位不靜默忽略，至少提供一個欄位）。

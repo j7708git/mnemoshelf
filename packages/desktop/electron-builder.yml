@@ -72,6 +72,9 @@ asarUnpack:
   # onnxruntime-node：onnxruntime_binding.node 與 libonnxruntime.so／.dll。
   - "**/*.node"
   - "**/node_modules/onnxruntime-node/bin/**"
+  # server 的 embedder worker 入口：worker_threads 需要真實檔案路徑，不能載入 asar 虛擬路徑。
+  # 解包後由 worker-embedder 的 resolver 改指 app.asar.unpacked（見 packages/server/src/worker-embedder.ts）。
+  - "**/@mnemoshelf/server/dist/embedder-worker.js"
 
 # Web UI 靜態檔放在 asar 之外（resources/web），由 Core 服務以 MNEMOSHELF_WEB_DIR 讀取。
 # 放在 asar 內也可以（Electron 會導向），但靜態檔沒有必要進 asar，也讓「UI 是不是打包進去」

@@ -136,8 +136,10 @@ root 建立之後只有一部分設定可變更；`MetadataStore.updateRoot(id, 
 
 ## 記憶的範圍更新（2026-10-18）
 
-共享開關（把單筆記憶在「專案」與「全域」之間切換）的唯一寫入入口是
-`MetadataStore.updateMemory(id, patch)`；可變欄位由 `MemoryPatch`（`ports/types.ts`）界定。
+共享開關（切換單筆記憶的 `scope`／`project`；`scope` 可為 `global`／`project`／`agent`）的唯一
+寫入入口是 `MetadataStore.updateMemory(id, patch)`；可變欄位由 `MemoryPatch`（`ports/types.ts`）
+界定。UI 只提供「專案 ↔ 全域」切換；`agent` 範圍可由 REST `PATCH /memories/:id` 設定，
+切換時沿用原本的寫入者（`agent` 不在 `MemoryPatch` 內）。
 
 | 方法 | 語意 |
 |---|---|

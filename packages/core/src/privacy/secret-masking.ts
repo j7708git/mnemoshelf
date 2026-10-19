@@ -45,8 +45,10 @@ interface MaskRule {
 /**
  * 常見憑證的「名稱」清單（賦值樣式用）。
  *
- * 用完整名稱（而不是單獨的 `token`／`secret`）才不會被 `\b` 邊界卡住
- * （`client_secret` 的 `secret` 前面是 `_`，不是 word boundary）。
+ * 用完整名稱（而不是單獨的 `token`／`secret`）避免過度誤遮；名稱前的邊界用
+ * `(?<![A-Za-z0-9])` 而不是 `\b`：`_` 是 word character，`\b` 會讓 `DB_PASSWORD`／
+ * `my_token` 這類底線前綴完全無法命中。允許在底線後開始匹配也讓替換結果保留原名
+ * （`my_token=[REDACTED:assignment]`，而不是 `my_[REDACTED:assignment]`）。
  */
 const SECRET_KEY_PATTERN =
   "client[_-]?secret|access[_-]?token|refresh[_-]?token|private[_-]?key|api[_-]?key|apikey|auth[_-]?token|secret|token|password|passwd|pwd";
@@ -86,9 +88,11 @@ const RULES: readonly MaskRule[] = [
   // 7) 敏感名稱的賦值：支援 `key = value`、`key: value`、JSON 風格 `"key":"value"`。
   //    引號值 >= 8 字元；未引號值 >= 16 字元，且排除 `.`／括號等屬性存取字元
   //    （避免把屬性存取這類正常程式碼誤遮）。
+  //    名稱前用 `(?<![A-Za-z0-9])`：底線不是字母數字，因此 `DB_PASSWORD`／`my_token`
+  //    能在底線後命中，且替換時保留整個名稱（見上方 SECRET_KEY_PATTERN 的說明）。
   {
     pattern: new RegExp(
-      `\\b(${SECRET_KEY_PATTERN})\\b([ \\t]*(?:"[ \\t]*)?[:=][ \\t]*)` +
+      `(?<![A-Za-z0-9])(${SECRET_KEY_PATTERN})\\b([ \\t]*(?:"[ \\t]*)?[:=][ \\t]*)` +
         `(?:"((?!\\[REDACTED:)[^"]{8,})"|'((?!\\[REDACTED:)[^']{8,})'|((?!\\[REDACTED:)[^\\s"',;.(){}[\\]]{16,}))`,
       "gi",
     ),
@@ -101,6 +105,9 @@ const RULES: readonly MaskRule[] = [
  *
  * 這是為了避免遮罩正常程式碼（例如環境變數或物件屬性的參考）；
  * 真正的字面憑證不會長成這些形式。
+ *
+ * **只套用在未引號值**：引號內的內容是字面字串，即使長得像 `req.body.password` 也已經是
+ * 寫進記憶／檔案的字面值，一律遮罩（否則 `password = "req.body.password"` 會漏遮）。
  */
 function looksLikeCodeReference(value: string): boolean {
   if (/^(?:process\.env|import\.meta\.env|req\.|request\.|ctx\.|this\.)/.test(value)) return true;
@@ -142,10 +149,11 @@ export function maskSecrets(text: string): MaskSecretsResult {
         // groups：0=整個 match、1=名稱、2=分隔符（可含 JSON 的引號）、3=雙引號值、
         // 4=單引號值、5=未引號值。
         const value = groups[3] ?? groups[4] ?? groups[5] ?? "";
-        if (looksLikeCodeReference(value)) return args[0] as string; // 程式參考：不遮、不計數
+        const quote = groups[3] !== undefined ? '"' : groups[4] !== undefined ? "'" : "";
+        // 引號值一律視為字面值；只有未引號值才用程式參考判斷（見 looksLikeCodeReference）。
+        if (quote === "" && looksLikeCodeReference(value)) return args[0] as string; // 不遮、不計數
         count += 1;
         const prefix = `${groups[1] ?? ""}${groups[2] ?? ""}`;
-        const quote = groups[3] !== undefined ? '"' : groups[4] !== undefined ? "'" : "";
         return quote === "" ? `${prefix}${placeholder}` : `${prefix}${quote}${placeholder}${quote}`;
       }
       count += 1;

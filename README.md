@@ -56,8 +56,10 @@ preference）、`scope`（global／project／agent）、`project`、`agent`（�
   使用者確認後才正式寫入。下載的備份檔由使用者保管（可能含專案內部資訊）。
 - **MCP**（stdio 入口）：六個工具 `search`、`remember`、`recall`、`forget`、`list_roots`、
   `search_memories`。MCP 只轉發本機 REST，不直接開資料庫（備份匯出／匯入也**沒有** MCP 工具）。
-- **專案範圍**：MCP 記憶工具預設以「目前專案」為範圍；專案名稱解析順序為
-  工具參數 `project` → 環境變數 `MNEMOSHELF_PROJECT` → MCP 行程 cwd 的資料夾名稱 → 退回全域。
+- **專案範圍**：MCP 的 `remember`／`search_memories` 預設以「目前專案」為範圍；`recall` 是
+  **跨專案列表**（可用 `project`／`scope` 篩選，不套用預設專案解析）。專案名稱解析順序
+  （適用 `remember`／`search_memories`）為工具參數 `project` → 環境變數 `MNEMOSHELF_PROJECT` →
+  MCP 行程 cwd 的資料夾名稱 → 退回全域。
   建議在 MCP client 設定 `MNEMOSHELF_PROJECT=<專案名>`，避免 cwd 不同造成專案混淆。
 - **信任模型（重要）**：目前是**本機單一 owner 全權**——一組 token 就能讀寫全部記憶；
   `agent` 只是來源標記、不是身分驗證，`scope=agent` 不是安全邊界。不要把 token 分享給

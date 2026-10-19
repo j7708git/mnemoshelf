@@ -33,6 +33,9 @@
  * worker → 主執行緒：`ready`（info／runtimeStatus／初始化錯誤）、`response`（結果／錯誤／
  * runtimeStatus）。結果中的 `Float32Array` 以 transferable 傳回，避免多一次記憶體複製。
  */
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import type { Transferable } from "node:worker_threads";
 import type {
@@ -284,15 +287,54 @@ async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boo
   }
 }
 
+/** `app.asar` 在檔案路徑中的目錄段（前後都帶分隔符，避免誤中 `app.asar.unpacked`）。 */
+const ASAR_SEGMENT = `${path.sep}app.asar${path.sep}`;
+
+/**
+ * 把 `…/app.asar/…` 路徑換成對應的 `…/app.asar.unpacked/…`；不在 asar 內時回 `null`。
+ *
+ * 用 `path.sep` 比對而非寫死 `/`：Windows 的 `fileURLToPath` 會給反斜線路徑。
+ */
+function toUnpackedPath(filePath: string): string | null {
+  const index = filePath.indexOf(ASAR_SEGMENT);
+  if (index === -1) return null;
+  return (
+    filePath.slice(0, index) +
+    `${path.sep}app.asar.unpacked${path.sep}` +
+    filePath.slice(index + ASAR_SEGMENT.length)
+  );
+}
+
+/**
+ * 解析 `embedder-worker.js` 的實際路徑（預設同目錄）。
+ *
+ * Electron 打包後 `import.meta.url` 位於 `app.asar` 內；worker 的入口必須是真實檔案，
+ * 因此當 `electron-builder.yml` 把 `embedder-worker.js` 解包到 `app.asar.unpacked` 時，
+ * 改用 unpacked 路徑。只有「module 在 app.asar 內」**且**「unpacked 檔真的存在」才替換；
+ * 其餘情況（開發環境、未解包、檔案缺失）維持原路徑，行為與舊版相同。
+ *
+ * 抽成獨立函式是為了可測試：`pathExists` 可注入，單元測試不必真的建立 asar。
+ */
+export function resolveEmbedderWorkerUrl(
+  moduleUrl: string | URL = import.meta.url,
+  pathExists: (filePath: string) => boolean = existsSync,
+): URL {
+  const workerUrl = new URL("./embedder-worker.js", moduleUrl);
+  const unpackedPath = toUnpackedPath(fileURLToPath(workerUrl));
+  if (unpackedPath === null || !pathExists(unpackedPath)) return workerUrl;
+  return pathToFileURL(unpackedPath);
+}
+
 /**
  * 預設 worker：載入 build 後的同目錄入口。
  *
  * `src/worker-embedder.ts` 與 `dist/worker-embedder.js` 旁邊都有 `embedder-worker.*`；
  * 正式路徑（`tsc` 產物）解析到 `dist/embedder-worker.js`。單元測試一律注入 `createWorker`，
- * 因此不依賴 vitest 對 TS 原始碼的轉換。
+ * 因此不依賴 vitest 對 TS 原始碼的轉換。Electron 打包後由 `resolveEmbedderWorkerUrl`
+ * 改用 `app.asar.unpacked` 的實體檔案（見 `electron-builder.yml` 的 `asarUnpack`）。
  */
 function defaultCreateWorker(): EmbedderWorkerLike {
-  return new Worker(new URL("./embedder-worker.js", import.meta.url));
+  return new Worker(resolveEmbedderWorkerUrl(import.meta.url));
 }
 
 /**
