@@ -82,6 +82,20 @@ export interface IndexRootOptions {
   onProgress?: (progress: IndexProgress) => void;
   /** 單檔大小上限，預設 10 MB（見 scan.walkRoot）。 */
   maxFileBytes?: number;
+  /**
+   * **索引限速**（額外、預設不啟用）：每個檔案處理完、換下一個檔案之前休眠指定毫秒，
+   * 把 CPU 讓給同一台機器上的其他工作（使用者感受與常駐服務的回應性）。
+   *
+   * - 未設定或 `betweenFilesMs <= 0` 時**行為與舊版完全相同**（不建立任何 timer）。
+   * - 休眠以 `setTimeout` 實作，**可被 `signal` 立即中止**（不會拖慢取消）。
+   * - 休眠次數是「每個 worker 每處理完一個檔案就一次」：`concurrency` 為 2 時，
+   *   兩個 worker 各自節流（總 duty cycle 仍由 `betweenFilesMs` 與單檔成本決定）。
+   * - 只影響索引路徑，不影響搜尋、記憶寫入與 MCP；模型推論本身不受此選項改變。
+   */
+  throttle?: {
+    /** 檔案與檔案之間的休眠毫秒（預設 0＝不限速）。 */
+    betweenFilesMs?: number;
+  };
 }
 
 export interface IndexRootResult {
@@ -268,6 +282,47 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
     error.name = "AbortError";
     throw error;
   }
+}
+
+/** 以與 `throwIfAborted` 相同語意產生取消錯誤（供限速休眠被中止時使用）。 */
+function abortError(signal: AbortSignal): Error {
+  const reason = signal.reason;
+  if (reason instanceof Error) return reason;
+  const error = new Error("索引已取消");
+  error.name = "AbortError";
+  return error;
+}
+
+/**
+ * 可取消的 `setTimeout` 休眠（索引限速用）。
+ *
+ * - `ms <= 0`：不建立 timer，但仍然檢查一次取消（呼叫端不必自行區分）。
+ * - 休眠中 `signal` 中止：立刻清除 timer 並以取消錯誤拒絕（`AbortError`），
+ *   因此「限速」不會讓取消變慢。
+ * - 不 `unref()` timer：索引工作本身是唯一存活原因時，行程仍應等它完成（與原本的索引一致）。
+ */
+function sleepWithSignal(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (!(ms > 0)) {
+    throwIfAborted(signal);
+    return Promise.resolve();
+  }
+  if (signal === undefined) {
+    return new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+  throwIfAborted(signal);
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(abortError(signal));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 /**
@@ -522,6 +577,8 @@ async function processFile(
  * - 進度：檔案級計數（`processed`／`skippedUnchanged`／`skipped`／`failed`）整輪可對帳
  *   （四者相加 === `total`）；另有 chunk 級資訊（`processedChunks`／`estimatedChunks`），
  *   後者是逐檔切塊後累加的下界，只增不減（單一大檔的嵌入是單次批次呼叫，檔內不會有中間值）。
+ * - **限速**（`options.throttle.betweenFilesMs`，預設 0＝與舊版完全相同）：每個檔案處理完、
+ *   換下一檔之前可被 `signal` 立即中止的休眠；只降低索引佔用的 duty cycle，不改變結果。
  * - 全程唯讀使用者檔案。
  */
 export async function indexRoot(root: Root, options: IndexRootOptions): Promise<IndexRootResult> {
@@ -534,6 +591,8 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
   // 這裡是唯一的下限來源，呼叫端傳進來的 concurrency 也不得超過它。
   const serialized = embedder.runtimeStatus?.serializedInference === true;
   const concurrency = serialized ? 1 : Math.max(1, Math.floor(options.concurrency ?? 2));
+  // 限速（預設 0＝不限速、不建立 timer）：夾成非負整數，負值／NaN 一律視為 0。
+  const betweenFilesMs = Math.max(0, Math.floor(options.throttle?.betweenFilesMs ?? 0));
   const scanOptions: ScanOptions = {};
   if (options.maxFileBytes !== undefined) scanOptions.maxFileBytes = options.maxFileBytes;
   // 把 signal 一路帶進掃描層：大目錄下取消不必等整輪走訪結束（見 ScanOptions.signal）。
@@ -577,11 +636,18 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
 
   let cursor = 0;
   const worker = async (): Promise<void> => {
+    // 每個 worker 自己數（見 IndexRootOptions.throttle）：處理完一個檔案才在下一輪開始前休眠。
+    let handled = 0;
     for (;;) {
       const index = cursor;
       cursor += 1;
       if (index >= files.length) return;
       throwIfAborted(signal);
+      if (handled > 0) {
+        await sleepWithSignal(betweenFilesMs, signal);
+        throwIfAborted(signal);
+      }
+      handled += 1;
       const file = files[index]!;
       let outcome: FileOutcome;
       try {

@@ -92,7 +92,32 @@ preference）、`scope`（global／project／agent）、`project`、`agent`（�
 | `MNEMOSHELF_EMBED_DML_DEVICE_ID` | 非負整數 | `0` | DirectML adapter 索引（`0`＝預設顯示卡；多顯卡筆電常用來指定獨顯）。非法值會直接拒絕啟動。 |
 | `MNEMOSHELF_EMBED_ORT_LOG` | `0`–`4` | 未設定（不覆寫） | ONNX Runtime 的 log 等級（`0`＝verbose、`4`＝fatal），只用於除錯：`0` 會印出內部配置訊息（含 arena 的擴張量），可診斷「單一配置有多大」。訊息量大、會拖慢啟動，平時不要開；非法值會直接拒絕啟動。 |
 | `MNEMOSHELF_MEMORY_BACKFILL` | `on`／`off` | `on` | 啟動時是否回填既有記憶的向量。`off` 只停**啟動回填**（新寫入的記憶仍會嵌入）；非法值會直接拒絕啟動。 |
+| `MNEMOSHELF_INDEX_RATE` | `off`／`normal`／`low` | `off` | **索引限速**：`normal`／`low` 會在「每處理完一個檔案、換下一檔之前」休眠（`normal` 50ms、`low` 250ms）。索引總時間會變長，但同一台機器上的其他工作（UI、影片、其他程式）比較不會被索引吃滿。`off` 是現行行為（不休眠）。限速**只作用於檔案與檔案之間**，同一個大檔的嵌入批次仍會一次跑完。推論在 worker thread，健康檢查與一般 HTTP 不受影響，但**需要嵌入的請求會排隊**（見下節）。非法值會直接拒絕啟動。 |
 | `MNEMOSHELF_PROJECT` | 專案名稱 | 未設定 | MCP 記憶工具的預設專案（`remember`／`search_memories` 在參數未帶 `project` 時使用）。 |
+
+## 索引進行中與關閉
+
+索引與 embedding 在**server 行程的 worker thread** 執行，主執行緒只做 HTTP／DB。以下是目前
+版本的實際語意（不是待辦）：
+
+- **健康檢查與一般 HTTP 可回應**：索引期間 `GET /health`、`GET /diagnostics`、
+  `GET /roots/:id/index/status` 等不需要嵌入的請求可正常回應。
+- **需要嵌入的請求會排隊**：worker 一次只跑一個推論。語意搜尋（`POST /search`、
+  `POST /memories/search`）與記憶的背景嵌入會排在**目前批次**之後，索引期間可能等數十秒。
+  要避免等待請等索引完成，或把大 root 拆成小 root 分批索引（查詢優先權列為後續工作）。
+- **取消**（`POST /roots/:id/index/cancel`）：在 native 推論的**下一個邊界**生效，最長等目前
+  一個檔案的嵌入批次（大檔可能數十秒），不是立即中斷。
+- **限速**（`MNEMOSHELF_INDEX_RATE`）：只在**檔案與檔案之間**休眠；同一個大檔的嵌入批次不受影響。
+- **關閉**：`close()` 會先**取消在途索引**（該輪可能記為 `cancelled`；已完成的檔案是逐檔交易，
+  下一次索引會重做未完成的部分）並停止記憶嵌入 worker 拉新工作，然後**等目前在途的推論批次
+  收尾**才返回（閒置時立即完成）。因為 ONNX Runtime 的 native 推論不可中斷，關閉不會硬殺正在
+  推論的 worker（那會讓行程以 `Napi::Error` abort／SIGABRT 結束）；代價是索引中關閉最壞多等
+  **目前一個嵌入批次**（實測 1 檔 7 chunks 約 14 秒、2 檔 15 chunks 在第一次檔案批次收尾約
+  18 秒；批次時間依切塊與內容而定，大檔可能數十秒）。
+  **`close()` 回傳後再結束行程（含 `process.exit`）是安全的**：此時 worker 已閒置並安全
+  terminate，不會 SIGABRT；若 `close()` 還沒回傳就被作業系統強制砍掉，不在保證內。若推論超過
+  120 秒仍未收尾（worker 卡死），關閉會記錄並完成，但此時結束行程不保證安全（理論邊界）。
+  要**即時**關閉（<1 秒）需要把 embedder 隔離到子行程，列為 S2。重啟同一資料目錄後可正常再索引。
 
 **明示 `coreml` 的提醒**：設定 `MNEMOSHELF_EMBED_DEVICE=coreml` 表示「**忽略已快取的決定、
 強制嘗試 CoreML**」（不自我測試、也不寫回快取），由使用者自負後果。macOS 的 CoreML EP

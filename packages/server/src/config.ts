@@ -9,6 +9,7 @@
  * | `MNEMOSHELF_PORT` | 監聽埠 | `0`（隨機埠） |
  * | `MNEMOSHELF_WEB_DIR` | Web UI 靜態檔目錄 | 本 repo 的 `packages/web/dist` |
  * | `MNEMOSHELF_MEMORY_BACKFILL` | 啟動時是否回填既有記憶向量（`on`／`off`） | `on` |
+ * | `MNEMOSHELF_INDEX_RATE` | 索引限速 `off`／`normal`／`low`（索引時每檔之間休眠） | `off` |
  *
  * MCP stdio 入口（`loadMcpConfig`）另有自己的三個變數：`MNEMOSHELF_URL`、`MNEMOSHELF_TOKEN`
  * （皆必填）與 `MNEMOSHELF_PROJECT`（選配的預設專案名稱；供 `remember` 在工具參數沒帶
@@ -34,6 +35,23 @@ import { MissingMcpConfigError, MissingTokenError, ValidationError } from "./err
 /** 服務綁定的位址：只綁 loopback，永遠不可設定成 0.0.0.0。 */
 export const LOOPBACK_HOST = "127.0.0.1";
 
+/** 索引限速等級（`MNEMOSHELF_INDEX_RATE`）。 */
+export type IndexRate = "off" | "normal" | "low";
+
+/**
+ * 各限速等級在「檔案與檔案之間」插入的休眠毫秒。
+ *
+ * 為什麼是這種 duty-cycle 而不是降低模型執行緒數：推論成本主要在 native 端，一次 `Run`
+ * 無法中斷；在檔案邊界休眠最便宜、可取消，也完全不會改變檢索品質（切塊、模型、
+ * 批次視窗都不動）。`normal` 讓出一點 CPU 給 UI／其他程式，`low` 明顯降低索引佔用
+ * （總時間變長是預期代價）。
+ */
+export const INDEX_RATE_BETWEEN_FILES_MS: Readonly<Record<IndexRate, number>> = {
+  off: 0,
+  normal: 50,
+  low: 250,
+};
+
 export interface ServerConfig {
   /** 資料目錄（已解析為絕對路徑）。 */
   dataDir: string;
@@ -53,6 +71,13 @@ export interface ServerConfig {
    * 資料留到下一次以 `on` 啟動時才回填。
    */
   memoryBackfill: boolean;
+  /**
+   * 索引限速（`MNEMOSHELF_INDEX_RATE=off|normal|low`，預設 `off`）。
+   *
+   * `off`＝現行行為（檔案之間不休眠）；`normal`／`low` 在檔案邊界休眠
+   * （見 `INDEX_RATE_BETWEEN_FILES_MS`）。非法值直接拒絕啟動。
+   */
+  indexRate: IndexRate;
 }
 
 /**
@@ -117,7 +142,28 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     memoryBackfill = normalized === "on";
   }
 
-  return { dataDir, dbPath: path.join(dataDir, "mnemoshelf.db"), token, modelDir, port, webDir, memoryBackfill };
+  // 索引限速（預設 off＝現行行為）。只接受 off／normal／low（大小寫不拘）；
+  // 與其他開關一致：非法值直接拒絕啟動，而不是默默退回預設（使用者設了卻沒生效最難查）。
+  const indexRateSetting = env.MNEMOSHELF_INDEX_RATE;
+  let indexRate: IndexRate = "off";
+  if (indexRateSetting !== undefined && indexRateSetting.trim() !== "") {
+    const normalized = indexRateSetting.trim().toLowerCase();
+    if (normalized !== "off" && normalized !== "normal" && normalized !== "low") {
+      throw new ValidationError("MNEMOSHELF_INDEX_RATE", "必須是 off、normal 或 low");
+    }
+    indexRate = normalized;
+  }
+
+  return {
+    dataDir,
+    dbPath: path.join(dataDir, "mnemoshelf.db"),
+    token,
+    modelDir,
+    port,
+    webDir,
+    memoryBackfill,
+    indexRate,
+  };
 }
 
 /** MCP stdio 入口的連線設定（`MNEMOSHELF_URL` + `MNEMOSHELF_TOKEN`）。 */

@@ -18,10 +18,15 @@ import {
   type SqliteDatabase,
   type VectorIndex,
 } from "@mnemoshelf/core";
-import { TransformersEmbedder } from "@mnemoshelf/embedder-transformers";
-import { LOOPBACK_HOST, loadServerConfig, type ServerConfig } from "./config.js";
+import {
+  INDEX_RATE_BETWEEN_FILES_MS,
+  LOOPBACK_HOST,
+  loadServerConfig,
+  type ServerConfig,
+} from "./config.js";
 import { APP_VERSION, createRestApp, type RestApp } from "./http/app.js";
 import { MemoryEmbeddingWorker, type MemoryEmbeddingWorkerOptions } from "./memory-embedder.js";
+import { WorkerEmbedder } from "./worker-embedder.js";
 
 export interface CreateServerOptions {
   /** 環境變數來源；預設 `process.env`。 */
@@ -34,7 +39,10 @@ export interface CreateServerOptions {
   port?: number;
   /** 覆寫 `MNEMOSHELF_WEB_DIR`（Web UI 靜態檔目錄）。 */
   webDir?: string;
-  /** 覆寫 embedder（測試注入 `FakeEmbedder`；預設 `TransformersEmbedder`，lazy 載入）。 */
+  /**
+   * 覆寫 embedder（測試注入 `FakeEmbedder`）；預設 `WorkerEmbedder`（worker thread 內跑
+   * `TransformersEmbedder`，模型 lazy 載入，主執行緒不被推論阻塞）。
+   */
   embedder?: Embedder;
   /** 「過寬 root」判定的家目錄基準；預設 `os.homedir()`。 */
   homeDir?: string;
@@ -63,7 +71,16 @@ export interface MnemoshelfServer {
   /** 記憶向量背景 worker（卡 B1；診斷與測試可讀 stats）。 */
   memoryEmbedder: MemoryEmbeddingWorker;
   app: RestApp;
-  /** 關閉 HTTP、等背景工作結束、釋放 embedder 與資料庫。 */
+  /**
+   * 關閉 HTTP、**取消在途索引**、等目前在途的嵌入批次收尾、釋放 embedder 與資料庫。
+   *
+   * 「取消在途索引、等一個推論批次、安全結束」：先中止在途索引（該輪可能是 `cancelled`，
+   * 未完成的檔案下次索引重做）並停止記憶嵌入 worker；再等目前在途的 native 推論批次收尾
+   * （idle 時立即完成），最後才 dispose embedder（此時 worker 閒置，可安全 terminate）並關 DB。
+   * 因此 **close 回傳後再結束行程是安全的**（不會 N-API abort）；代價是索引中關閉最壞多等
+   * 目前那一個批次。若批次超過上限（預設 120 秒）會記錄並完成關閉，此時不保證可安全
+   * `process.exit()`（worker 卡死的理論邊界）。已寫入的檔案是逐檔交易，重啟後可正常再索引。
+   */
   close(): Promise<void>;
 }
 
@@ -106,9 +123,70 @@ async function listen(server: http.Server, port: number): Promise<number> {
 }
 
 /**
+ * 關閉時等「目前在途的 native 推論」收尾的上限（毫秒）。
+ *
+ * 取消在途索引後，索引會在 embedder 的下一個邊界結束；但 native 推論本身不可中斷，
+ * 安全關閉必須等**目前這一個批次**跑完（實測數秒到數十秒）。這裡給足一個批次的時間，
+ * 不再用 2 秒硬放棄（放棄後立刻 `process.exit()` 會 SIGABRT）。
+ * 真的超過（worker 卡死）才記錄並完成關閉；此時不宣稱可安全結束行程（理論邊界）。
+ */
+const CLOSE_DRAIN_TIMEOUT_MS = 120_000;
+
+/**
+ * 注入 embedder（沒有 `drain()`：測試的 `FakeEmbedder` 等）的既有有限等待（毫秒）。
+ *
+ * 這類 embedder 沒有 native 推論／worker thread，維持原語意：先等背景工作自然收尾，
+ * 超過就 `dispose()` 強制收尾，close 不被永不返回的假嵌入拖住。
+ */
+const CLOSE_GRACE_MS = 2_000;
+
+/** 強制收尾後，等背景工作真正結束的上限（毫秒；只給沒有 drain 的注入 embedder）。 */
+const CLOSE_FORCE_MS = 2_000;
+
+/** drain 完成後，等剩餘 HTTP／背景工作收尾的上限（毫秒；正常情況是 0，只是防線）。 */
+const CLOSE_SETTLE_MS = 5_000;
+
+/** 有 `drain()` 能力的 embedder（`WorkerEmbedder`；注入的實作通常沒有）。 */
+interface DrainableEmbedder {
+  /** 等目前在途／已排隊的嵌入呼叫全部結束（只等不拋）。 */
+  drain(): Promise<void>;
+}
+
+/** 傳 `timeoutMs` 給 `WorkerEmbedder.dispose()` 用；其他 `Embedder` 實作會忽略多餘參數。 */
+interface DisposableEmbedder extends Embedder {
+  dispose(options?: { timeoutMs?: number }): Promise<void>;
+}
+
+/** 取得 embedder 的 `drain()` 能力（沒有就回 `null`，走注入 embedder 的舊路徑）。 */
+function drainableEmbedder(embedder: Embedder): DrainableEmbedder | null {
+  const candidate = embedder as Partial<DrainableEmbedder>;
+  return typeof candidate.drain === "function" ? (candidate as DrainableEmbedder) : null;
+}
+
+/**
+ * 等 promise 最多 `ms` 毫秒；回傳是否在期限內完成。
+ *
+ * 只用於關閉流程的「有限等待」：rejection 也算完成（呼叫端之後不依賴結果），
+ * 且**不會**把計時器留到 promise 之後才清掉。
+ */
+async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  try {
+    return await Promise.race([promise.then(() => true, () => true), timeout]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
  * 建立並啟動常駐服務。
  *
- * embedder 預設是 `TransformersEmbedder`（lazy：啟動不下載模型，第一次索引才載入）。
+ * embedder 預設是 `WorkerEmbedder`：真的 `TransformersEmbedder` 在 **worker thread** 內
+ * （lazy：啟動不下載模型，第一次索引／查詢才載入），主執行緒只做 HTTP／DB，推論不會阻塞 API。
+ * 注入 `options.embedder`（例如測試的 `FakeEmbedder`）時維持直接使用、不建立 worker。
  * 資料目錄不存在時會建立（只建立自己的資料目錄，不動使用者的 root）。
  */
 export async function createServer(options: CreateServerOptions = {}): Promise<MnemoshelfServer> {
@@ -136,11 +214,13 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
 
   const embedder: Embedder =
     options.embedder ??
-    new TransformersEmbedder({
-      // 應用版本是裝置決定快取的身分欄位之一：換版本時 macOS 的 CoreML 自我測試會重測一次
-      // （量測結果與當時的實作綁在一起，見 embedder 的 `self-test.ts`）。
-      appVersion: APP_VERSION,
-      ...(config.modelDir === undefined ? {} : { cacheDir: config.modelDir }),
+    new WorkerEmbedder({
+      embedderOptions: {
+        // 應用版本是裝置決定快取的身分欄位之一：換版本時 macOS 的 CoreML 自我測試會重測一次
+        // （量測結果與當時的實作綁在一起，見 embedder 的 `self-test.ts`）。
+        appVersion: APP_VERSION,
+        ...(config.modelDir === undefined ? {} : { cacheDir: config.modelDir }),
+      },
     });
   const vec: VectorIndex = new SqliteVectorIndex(db, embedder.info.dim);
 
@@ -161,6 +241,10 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     webDir: config.webDir,
     memoryEmbedder,
     ...(options.homeDir === undefined ? {} : { homeDir: options.homeDir }),
+    // 索引限速（MNEMOSHELF_INDEX_RATE）：0＝off，完全不傳（行為與舊版相同）。
+    ...(INDEX_RATE_BETWEEN_FILES_MS[config.indexRate] > 0
+      ? { indexThrottle: { betweenFilesMs: INDEX_RATE_BETWEEN_FILES_MS[config.indexRate] } }
+      : {}),
   });
 
   const server = http.createServer(app.handler);
@@ -184,20 +268,81 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     async close(): Promise<void> {
       if (closed) return;
       closed = true;
-      // 先停止接受新連線並把既有連線收乾淨（含 keep-alive），否則 server.close() 會一直等；
-      // 再等在途請求收尾（可能還在 enqueue），最後關掉 worker 並釋放 embedder 與資料庫。
+      // 先停止接受新連線並把既有連線收乾淨（含 keep-alive），否則 server.close() 會一直等。
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      await app.settled();
-      await memoryEmbedder.close();
-      await embedder.dispose();
+
+      // 關閉優先：先中止所有在途索引。索引是背景工作，native 推論本身不可中斷，因此這裡只送
+      // abort；下面的等待／drain 才是 close 的實際邊界。
+      const cancelled = app.cancelAllIndexing();
+      if (cancelled > 0) {
+        console.error(
+          `[mnemoshelf] 關閉中：已取消 ${cancelled} 個在途索引（未完成的檔案下次索引重做）`,
+        );
+      }
+      // 記憶嵌入 worker 也停止拉新工作；它會等目前那一筆嵌入結束。
+      const memoryClosed = memoryEmbedder.close();
+      // 背景工作＝在途 HTTP 請求（含索引）＋目前這一筆記憶嵌入。
+      const settled = Promise.all([app.settled(), memoryClosed]).then(() => undefined);
+
+      const drainable = drainableEmbedder(embedder);
+      if (drainable !== null) {
+        // 安全關閉：等目前在途的 native 推論批次收尾（不再 2 秒硬放棄）。`settled` 涵蓋在途
+        // HTTP（索引／搜尋）與記憶嵌入；`drain` 涵蓋直接呼叫 embedder 的背景工作，兩者一起等。
+        const drained = await settlesWithin(
+          Promise.all([settled, drainable.drain()]).then(() => undefined),
+          CLOSE_DRAIN_TIMEOUT_MS,
+        );
+        if (drained) {
+          // worker 已閒置：dispose 只會釋放模型並在安全邊界 terminate（不 abort 行程）。
+          await embedder.dispose();
+        } else {
+          // worker 卡死（超過一個批次的理論上限）：記錄、放棄等待，不再重複等一輪。
+          // 此時不能宣稱「close 後立刻 process.exit 安全」——文件已寫明理論邊界。
+          console.error(
+            `[mnemoshelf] 關閉時在途推論超過 ${CLOSE_DRAIN_TIMEOUT_MS}ms 仍未收尾；` +
+              "仍完成關閉，但此時結束行程不保證安全（native 批次可能還在跑）",
+          );
+          await (embedder as DisposableEmbedder).dispose({ timeoutMs: 0 });
+          // 放棄在途呼叫後讓背景工作以清楚的關閉錯誤收尾，避免 db.close() 與在途寫入交錯。
+          if (!(await settlesWithin(settled, CLOSE_SETTLE_MS))) {
+            console.error("[mnemoshelf] 關閉時背景工作未在期限內結束，仍繼續關閉（不 hang）");
+          }
+        }
+      } else {
+        // 注入的 embedder（沒有 drain；例如測試的 FakeEmbedder）：維持既有「有限等待＋強制
+        // 收尾」語意，避免被永不返回的假嵌入拖住。真的 WorkerEmbedder 走上面的安全路徑。
+        if (!(await settlesWithin(settled, CLOSE_GRACE_MS))) {
+          // 讓 embedder 放棄在途呼叫（以清楚的關閉錯誤結束），索引已 abort 會優先當成取消。
+          const disposing = embedder.dispose();
+          if (!(await settlesWithin(settled, CLOSE_FORCE_MS))) {
+            // 理論上只剩「注入的 embedder 不理 dispose」；仍不 hang，但記錄下來供診斷。
+            console.error("[mnemoshelf] 關閉時背景工作未在期限內結束，仍繼續關閉（不 hang）");
+          }
+          // 放棄路徑會立刻返回；仍給 dispose 一個上限，避免注入的 embedder 不守約定。
+          await settlesWithin(disposing, CLOSE_FORCE_MS);
+        }
+        // 正常路徑：優雅關閉 embedder；強制路徑已 dispose 過（第二次是 no-op）。
+        await embedder.dispose();
+      }
       db.close();
     },
   };
 }
 
 export { LOOPBACK_HOST, loadMcpConfig, loadServerConfig } from "./config.js";
-export type { McpConfig, ServerConfig } from "./config.js";
+export type { IndexRate, McpConfig, ServerConfig } from "./config.js";
+export {
+  EmbedderWorkerClosedError,
+  EmbedderWorkerCrashError,
+  WorkerEmbedder,
+} from "./worker-embedder.js";
+export type {
+  EmbedderWorkerEvent,
+  EmbedderWorkerLike,
+  EmbedderWorkerMethod,
+  WorkerEmbedderOptions,
+} from "./worker-embedder.js";
 export {
   FileTooLargeError,
   IndexInProgressError,

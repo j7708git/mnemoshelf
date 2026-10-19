@@ -44,6 +44,7 @@ import {
   DuplicateRootError,
   indexRoot,
   isBlocked,
+  type IndexRootOptions,
   type IndexRootResult,
   MEMORY_SCOPES,
   type Memory,
@@ -449,6 +450,12 @@ export interface RestAppDeps {
    * 不存在時靜態路徑一律回 404 JSON（API 不受影響）——讓「還沒 build UI」不是啟動錯誤。
    */
   webDir: string;
+  /**
+   * 索引限速（**選填**；由 `createServer` 依 `MNEMOSHELF_INDEX_RATE` 決定）。
+   *
+   * 未提供時完全沿用既有行為（檔案之間不休眠）。詳見 core 的 `IndexRootOptions.throttle`。
+   */
+  indexThrottle?: NonNullable<IndexRootOptions["throttle"]>;
 }
 
 export interface RestApp {
@@ -458,6 +465,23 @@ export interface RestApp {
   readonly indexing: ReadonlyMap<number, Promise<IndexRootResult>>;
   /** 等待中的請求全部結束（測試用：確認沒有殘留的非同步工作）。 */
   settled(): Promise<void>;
+  /**
+   * 真正傳給 `indexRoot` 的限速參數（`undefined`＝不限速）。
+   *
+   * 唯讀、僅供診斷／測試核對「設定有接到索引器」；呼叫端不應修改它。
+   */
+  readonly indexThrottle: NonNullable<IndexRootOptions["throttle"]> | undefined;
+  /**
+   * 中止所有進行中的索引（**關閉流程用**；additive）。
+   *
+   * - 對每個在途索引的 `AbortController` 送出 abort；索引會在 native 推論的下一個邊界
+   *   （最長一個檔案的嵌入批次）以 `AbortError` 結束，由 `POST /roots/:id/index` 轉成
+   *   `200 {cancelled: true}`（連線若已關閉則只是完成背景工作）。
+   * - **冪等**；呼叫後這個 app 不再啟動新的索引（之後進來的索引請求直接以 cancelled 結束），
+   *   讓 `createServer.close()` 不必等一整輪索引。
+   * - 回傳這次實際中止的索引數（已經 abort 過的不重複計數）。
+   */
+  cancelAllIndexing(): number;
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
@@ -880,6 +904,13 @@ export function createRestApp(deps: RestAppDeps): RestApp {
    * 只放進行中的任務：`finally` 移除，因此取消已結束的任務會找不到 controller（回 404）。
    */
   const indexControllers = new Map<number, AbortController>();
+  /**
+   * 關閉流程已要求停止索引（由 `cancelAllIndexing()` 設定；只增不減）。
+   *
+   * 設定後**不再啟動**新的索引：`startIndex` 直接以 `cancelled` 結束，避免關閉過程中
+   * 又排進一輪新的索引而拖住 `createServer.close()`。
+   */
+  let indexesCancelled = false;
   const inflight = new Set<Promise<unknown>>();
   /** 索引工作狀態（行程內記憶體；供 `GET /roots/:id/index/status` 輪詢）。 */
   const indexStatus = new IndexStatusTracker();
@@ -1048,6 +1079,12 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const root = await getRootOr404(id);
     if (root.mode !== "index") throw new RootNotIndexableError(root.id, root.mode);
     if (indexing.has(id)) throw new IndexInProgressError(id);
+    if (indexesCancelled) {
+      // 關閉中（或已由 cancelAllIndexing 停止）：不再啟動新索引，直接回「已取消」。
+      // 正常情況下連線已被關掉、不會走到這裡；這是關閉與請求競態時的防線。
+      const body: IndexCancelledResponse = { rootId: id, durationMs: 0, cancelled: true };
+      return { status: 200, body };
+    }
 
     const startedAt = Date.now();
     const maxFileBytes = maxFileBytesByRoot.get(id);
@@ -1060,6 +1097,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       signal: controller.signal,
       onProgress: (progress) => indexStatus.report(id, progress),
       ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
+      ...(deps.indexThrottle === undefined ? {} : { throttle: deps.indexThrottle }),
     });
     indexing.set(id, run);
     indexControllers.set(id, controller);
@@ -1100,6 +1138,23 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     controller.abort();
     const body: CancelIndexResponse = { rootId: id, cancelled: true };
     return { status: 200, body };
+  };
+
+  /**
+   * 中止所有進行中的索引（提供給 `createServer.close()`；見 `RestApp.cancelAllIndexing`）。
+   *
+   * 只做「送 abort」：native 推論不可從 JS 中斷，索引會在 embedder 的下一個邊界
+   * （批次視窗／下一個檔案開始前）結束；`close()` 另外有有限的寬限與放棄在途呼叫的後備。
+   */
+  const cancelAllIndexing = (): number => {
+    indexesCancelled = true;
+    let cancelled = 0;
+    for (const controller of indexControllers.values()) {
+      if (controller.signal.aborted) continue;
+      controller.abort();
+      cancelled += 1;
+    }
+    return cancelled;
   };
 
   /**
@@ -1894,6 +1949,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   return {
     handler,
     indexing,
+    indexThrottle: deps.indexThrottle,
+    cancelAllIndexing,
     async settled(): Promise<void> {
       // 索引是背景工作（回應會等它），這裡等所有在途請求結束。
       while (inflight.size > 0) {

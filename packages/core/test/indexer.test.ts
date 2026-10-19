@@ -1324,3 +1324,69 @@ describe("索引端機密遮罩（切塊前遮罩、maskedFiles）", () => {
     }
   });
 });
+
+describe("索引限速（throttle；預設 0＝與舊版相同）", () => {
+  const files = {
+    "a.md": "# 標題\n\n第一份文件",
+    "b.md": "# 標題\n\n第二份文件",
+    "c.md": "# 標題\n\n第三份文件",
+  };
+
+  /** 用同一個 harness 索引一次並回傳耗時（檔案內容不變，第二次會是 skippedUnchanged，成本相近）。 */
+  async function timedIndex(harness: Harness, throttle?: { betweenFilesMs: number }): Promise<number> {
+    const startedAt = performance.now();
+    const result = await indexRoot(harness.root, {
+      ...options(harness),
+      concurrency: 1,
+      ...(throttle === undefined ? {} : { throttle }),
+    });
+    const elapsed = performance.now() - startedAt;
+    expect(result).toMatchObject({ total: 3, processed: 3 });
+    return elapsed;
+  }
+
+  it("betweenFilesMs 在檔案之間休眠：總時間變長，但結果與未限速一致", async () => {
+    const plain = await makeHarness(files);
+    const throttled = await makeHarness(files);
+    try {
+      const fast = await timedIndex(plain);
+      const slow = await timedIndex(throttled, { betweenFilesMs: 150 });
+      // 3 個檔案、concurrency 1 → 2 次休眠（至少 300ms）；量測誤差留餘裕。
+      expect(slow - fast).toBeGreaterThanOrEqual(250);
+
+      // 限速只影響節奏，不影響索引結果（同樣的 chunk 數與向量數）。
+      const plainChunks = await plain.store.listChunksByPath(plain.root.id, "a.md");
+      const slowChunks = await throttled.store.listChunksByPath(throttled.root.id, "a.md");
+      expect(slowChunks.map((chunk) => chunk.text)).toEqual(plainChunks.map((chunk) => chunk.text));
+      expect(await throttled.vec.count()).toBe(await plain.vec.count());
+    } finally {
+      await fs.rm(plain.dir, { recursive: true, force: true });
+      await fs.rm(throttled.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("休眠期間取消會立刻以 AbortError 結束，不等到休眠結束", async () => {
+    const h = await makeHarness({
+      "a.md": "# 標題\n\n第一份文件",
+      "b.md": "# 標題\n\n第二份文件",
+    });
+    try {
+      const controller = new AbortController();
+      const startedAt = performance.now();
+      const run = indexRoot(h.root, {
+        ...options(h),
+        concurrency: 1,
+        throttle: { betweenFilesMs: 5_000 },
+        signal: controller.signal,
+        onProgress: (progress) => {
+          // 第一檔完成後進入 5 秒休眠；在休眠中 abort，必須立即結束。
+          if (progress.processed === 1) setTimeout(() => controller.abort(), 30);
+        },
+      });
+      await expect(run).rejects.toMatchObject({ name: "AbortError" });
+      expect(performance.now() - startedAt).toBeLessThan(2_000);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+});
