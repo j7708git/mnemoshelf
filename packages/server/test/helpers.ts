@@ -9,7 +9,7 @@ import os from "node:os";
 import path from "node:path";
 import { type DocumentInput, type Embedder, type EmbedderInfo, type EmbedDocumentsOptions, type ImageInput, type ProbeResult } from "@mnemoshelf/core";
 import { FakeEmbedder } from "@mnemoshelf/core/testing";
-import { createServer, type MnemoshelfServer } from "../src/index.js";
+import { createServer, type MnemoshelfServer, type MemoryEmbeddingWorkerOptions } from "../src/index.js";
 
 /** 測試用 token（合成值，不是任何真實憑證）。 */
 export const TEST_TOKEN = "test-token-2f8c1a9e";
@@ -142,7 +142,13 @@ export interface TestServer {
 
 /** 啟動測試伺服器（FakeEmbedder＋port 0＋暫存資料目錄）。 */
 export async function startTestServer(
-  options: { embedder?: Embedder; homeDir?: string; webDir?: string } = {},
+  options: {
+    embedder?: Embedder;
+    homeDir?: string;
+    webDir?: string;
+    /** 記憶嵌入 worker 的調校（卡 B1；測試通常把重試延遲設 0）。 */
+    memoryEmbedding?: Pick<MemoryEmbeddingWorkerOptions, "batchSize" | "retryAttempts" | "retryDelayMs">;
+  } = {},
 ): Promise<TestServer> {
   const dataDir = await makeTempDir("mnemoshelf-data-");
   const instance = await createServer({
@@ -153,6 +159,7 @@ export async function startTestServer(
     embedder: options.embedder ?? new FakeEmbedder(),
     homeDir: options.homeDir ?? os.homedir(),
     ...(options.webDir === undefined ? {} : { webDir: options.webDir }),
+    ...(options.memoryEmbedding === undefined ? {} : { memoryEmbedding: options.memoryEmbedding }),
   });
   return {
     instance,

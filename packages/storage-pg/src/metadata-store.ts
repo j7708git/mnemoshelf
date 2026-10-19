@@ -1,17 +1,31 @@
 import {
   DuplicateRootError,
+  assertMemoryEmbeddingFailure,
+  assertMemoryEmbeddingInput,
+  assertMemoryQueryVector,
+  memoryContentHash,
   normalizeMemoryLimit,
+  normalizeMemoryPatch,
+  normalizeMemorySearchFilter,
+  normalizeMemorySearchK,
   type Chunk,
   type ChunkKind,
   type Memory,
+  type MemoryEmbeddingFailure,
+  type MemoryEmbeddingStats,
   type MemoryFilter,
+  type MemoryKeywordHit,
   type MemoryKind,
+  type MemoryPatch,
   type MemoryScope,
+  type MemorySearchFilter,
+  type MemoryVectorHit,
   type MetadataStore,
   type Modality,
   type NewChunk,
   type NewMemory,
   type NewRoot,
+  type NormalizedMemorySearchFilter,
   type RankedHit,
   type Root,
   type RootMode,
@@ -22,6 +36,7 @@ import type { Pool } from "pg";
 import { qualified } from "./schema.js";
 import { segmentText } from "./segment.js";
 import { withTransaction } from "./connection.js";
+import { toVectorLiteral } from "./vector-index.js";
 
 /** `PgMetadataStore` 的選項。 */
 export interface PgMetadataStoreOptions {
@@ -94,6 +109,55 @@ function segmentOrNull(text: string | null): string | null {
   return segmentText(text);
 }
 
+/** PostgreSQL 的記憶檢索 WHERE（`m` 是 memories 的別名；**先過濾、後排名**）。 */
+interface PgMemorySearchWhere {
+  clause: string;
+  params: unknown[];
+}
+
+/**
+ * 把正規化後的 `MemorySearchFilter` 組成 PostgreSQL WHERE 子句（卡 B2；兩方法共用）。
+ *
+ * `firstParamIndex` 是第一個可用的參數編號（呼叫端可能已用掉 $1..）：filter 參數會依序佔用
+ * `firstParamIndex`、`firstParamIndex+1`…；bucket 之間 OR、`kind` 與 bucket 群組 AND。
+ */
+function buildPgMemorySearchWhere(filter: NormalizedMemorySearchFilter, firstParamIndex: number): PgMemorySearchWhere {
+  const conditions = ["m.deleted_at is null"];
+  const params: unknown[] = [];
+  const placeholder = (): string => `$${firstParamIndex + params.length}`;
+
+  if (filter.kind !== undefined) {
+    conditions.push(`m.kind = ${placeholder()}`);
+    params.push(filter.kind);
+  }
+
+  const buckets = filter.buckets;
+  if (buckets !== undefined) {
+    const parts: string[] = [];
+    for (const bucket of buckets) {
+      if (bucket.scope === "global") {
+        parts.push("m.scope = 'global'");
+        continue;
+      }
+      if (bucket.scope === "project") {
+        if (bucket.project === undefined) {
+          parts.push("m.scope = 'project'");
+          continue;
+        }
+        parts.push(`(m.scope = 'project' and m.project = ${placeholder()})`);
+        params.push(bucket.project);
+        continue;
+      }
+      // scope === "agent"（正規化時已保證 agent 非空）
+      parts.push(`(m.scope = 'agent' and m.agent = ${placeholder()})`);
+      params.push(bucket.agent);
+    }
+    conditions.push(`(${parts.join(" or ")})`);
+  }
+
+  return { clause: conditions.join(" and "), params };
+}
+
 /**
  * 建表 DDL（冪等）。全部使用 schema 限定的表名。
  *
@@ -146,6 +210,7 @@ function metadataSchemaSql(schema: string): string {
       pinned boolean not null default false,
       created_at text not null,
       deleted_at text,
+      content_hash text,
       seg text,
       tsv tsvector generated always as (to_tsvector('simple', seg)) stored
     );
@@ -153,6 +218,16 @@ function metadataSchemaSql(schema: string): string {
 
     -- 既有資料庫（本卡之前建立的表）補上 pinned；冪等，重複執行無害。
     alter table ${memories} add column if not exists pinned boolean not null default false;
+
+    -- 卡 C2：寫入去重用的內容 hash（正規化後內容的 sha256；只存 hash、不含原文）。
+    alter table ${memories} add column if not exists content_hash text;
+    create index if not exists memories_content_hash_idx on ${memories}(content_hash);
+
+    -- 卡 B1：記憶向量欄位。vector 刻意「不帶維度」（換 embedder／維度時由回填流程重算，
+    -- 不在此處鎖死）；embedder 身分另存 text，換 embedder 後把舊向量視為 stale。
+    alter table ${memories} add column if not exists embedding vector;
+    alter table ${memories} add column if not exists embedding_embedder_id text;
+    alter table ${memories} add column if not exists embedding_state text not null default 'pending';
   `;
 }
 
@@ -179,8 +254,34 @@ export class PgMetadataStore implements MetadataStore {
   }
 
   async migrate(): Promise<void> {
+    // `embedding vector` 需要 pgvector 型別。本後端可能在 `PgVectorIndex.migrate()` 之前先跑
+    // （例如只跑 MetadataStore 契約測試的環境），因此自己確保擴充存在；`if not exists` 冪等，
+    // 但建立擴充需要資料庫權限（與 PgVectorIndex 既有的要求相同）。
+    await this.pool.query("create extension if not exists vector");
     // 多個 statement 以簡單查詢協定一次送出；全部 `if not exists`，可重複呼叫。
     await this.pool.query(metadataSchemaSql(this.schema));
+    // 卡 C2：既有資料列的 content_hash 回填（只在欄位為 null 時寫入，可重複呼叫）。
+    await this.backfillMemoryContentHashes();
+  }
+
+  /**
+   * 回填 `content_hash`（migration 0004 的 PostgreSQL 對應）。
+   *
+   * 在單一交易內先撈出 `content_hash is null` 的列再逐列 update（資料量小、只在升級時跑一次）；
+   * update 條件保留 `content_hash is null`，即使併發的 migrate 同時跑也不會覆寫已回填的值。
+   */
+  private async backfillMemoryContentHashes(): Promise<void> {
+    await withTransaction(this.pool, async (client) => {
+      const pending = await client.query(
+        `select id, content from ${this.memories} where content_hash is null order by id`,
+      );
+      for (const row of pending.rows) {
+        await client.query(
+          `update ${this.memories} set content_hash = $2 where id = $1 and content_hash is null`,
+          [Number(row.id), memoryContentHash(String(row.content))],
+        );
+      }
+    });
   }
 
   async addRoot(r: NewRoot): Promise<Root> {
@@ -327,10 +428,20 @@ export class PgMetadataStore implements MetadataStore {
         ]);
       }
       const result = await client.query(
-        `insert into ${this.memories}(content, kind, scope, project, agent, supersedes, created_at, deleted_at, seg)
-         values ($1, $2, $3, $4, $5, $6, $7, null, $8)
+        `insert into ${this.memories}(content, kind, scope, project, agent, supersedes, created_at, deleted_at, seg, content_hash)
+         values ($1, $2, $3, $4, $5, $6, $7, null, $8, $9)
          returning id`,
-        [m.content, m.kind, m.scope, m.project, m.agent, m.supersedes, createdAt, segmentOrNull(m.content)],
+        [
+          m.content,
+          m.kind,
+          m.scope,
+          m.project,
+          m.agent,
+          m.supersedes,
+          createdAt,
+          segmentOrNull(m.content),
+          memoryContentHash(m.content),
+        ],
       );
       return Number(result.rows[0]!.id);
     });
@@ -338,6 +449,71 @@ export class PgMetadataStore implements MetadataStore {
     const created = await this.getMemory(memoryId);
     if (created === null) throw new Error("新增記憶後讀不回資料列");
     return created;
+  }
+
+  /**
+   * 原子 insert-or-return-existing（見 `MetadataStore.addMemoryUnlessDuplicate`）。
+   *
+   * 去重 key＝（內容 hash, `scope`, `project`, `agent`），`project` 用
+   * `coalesce(project, '') = coalesce($n, '')` 做 null-safe 比較。檢查與新增在同一句
+   * `insert … select … where not exists`（單一 SQL 敘述，搭配交易處理 supersedes 與重讀），
+   * 對齊 SQLite 後端的語意。
+   */
+  async addMemoryUnlessDuplicate(m: NewMemory): Promise<{ memory: Memory; duplicate: boolean }> {
+    const createdAt = new Date().toISOString();
+    const contentHash = memoryContentHash(m.content);
+
+    const attempt = await withTransaction(this.pool, async (client) => {
+      if (m.supersedes !== null) {
+        await client.query(`update ${this.memories} set deleted_at = $1 where id = $2 and deleted_at is null`, [
+          createdAt,
+          m.supersedes,
+        ]);
+      }
+
+      const inserted = await client.query(
+        `insert into ${this.memories}(content, kind, scope, project, agent, supersedes, created_at, deleted_at, seg, content_hash)
+         select $1, $2, $3, $4, $5, $6, $7, null, $8, $9
+          where not exists (
+            select 1 from ${this.memories}
+             where content_hash = $9
+               and scope = $3
+               and coalesce(project, '') = coalesce($4::text, '')
+               and agent = $5
+               and deleted_at is null
+          )
+         returning ${MEMORY_COLUMNS}`,
+        [
+          m.content,
+          m.kind,
+          m.scope,
+          m.project,
+          m.agent,
+          m.supersedes,
+          createdAt,
+          segmentOrNull(m.content),
+          contentHash,
+        ],
+      );
+
+      if (inserted.rows.length > 0) return { memory: rowToMemory(inserted.rows[0]!), duplicate: false };
+
+      const existing = await client.query(
+        `select ${MEMORY_COLUMNS} from ${this.memories}
+          where content_hash = $1
+            and scope = $2
+            and coalesce(project, '') = coalesce($3::text, '')
+            and agent = $4
+            and deleted_at is null
+          order by id
+          limit 1`,
+        [contentHash, m.scope, m.project, m.agent],
+      );
+      if (existing.rows.length === 0) throw new Error("去重判定為重複，但讀不回既有記憶");
+      return { memory: rowToMemory(existing.rows[0]!), duplicate: true };
+    });
+
+    return attempt;
   }
 
   async getMemory(id: number): Promise<Memory | null> {
@@ -352,9 +528,226 @@ export class PgMetadataStore implements MetadataStore {
     ]);
   }
 
+  /**
+   * 冪等正規化舊版的矛盾 scope／project（語意與 SQLite 後端完全相同，見
+   * `MetadataStore.normalizeLegacyMemoryScopes`）。
+   *
+   * 兩個 UPDATE 的條件互斥，因此 `rowCount` 可以直接相加；包含已軟刪除的列（純資料一致性）。
+   * 第二次執行時條件已不成立，回傳 `updated: 0`。
+   */
+  async normalizeLegacyMemoryScopes(): Promise<{ updated: number }> {
+    return await withTransaction(this.pool, async (client) => {
+      const cleared = await client.query(
+        `update ${this.memories} set project = null where scope in ('global', 'agent') and project is not null`,
+      );
+      const promoted = await client.query(
+        `update ${this.memories}
+            set scope = 'global', project = null
+          where scope = 'project' and (project is null or btrim(project) = '')`,
+      );
+      return { updated: (cleared.rowCount ?? 0) + (promoted.rowCount ?? 0) };
+    });
+  }
+
+  /**
+   * 硬刪除記憶（見 `MetadataStore.hardDeleteMemory`）。
+   *
+   * `delete … where id` 的 `rowCount` 就是「真的有這一列」的答案；FTS 是 generated `tsv` 欄位，
+   * 與主列同存亡，不需要另外刪除。向量欄位同樣隨列消失。
+   */
+  async hardDeleteMemory(id: number): Promise<boolean> {
+    const result = await this.pool.query(`delete from ${this.memories} where id = $1`, [id]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
   /** 設定釘選（冪等）；不存在的 id 更新不到任何列，等同無操作。 */
   async setMemoryPinned(id: number, pinned: boolean): Promise<void> {
     await this.pool.query(`update ${this.memories} set pinned = $1 where id = $2`, [pinned, id]);
+  }
+
+  /**
+   * 更新記憶的 `scope`／`project`（語意與 SQLite 後端完全相同，見 `MetadataStore.updateMemory`）。
+   *
+   * 先 select 現值以套用 `normalizeMemoryPatch`（合併與正規化只有一處），再以
+   * `update … returning` 一次拿到更新後的列；`deleted_at is null` 讓「讀到之後才被軟刪除」
+   * 的競態也回 `null`（0 列），與 SQLite 端一致。內容沒動，`seg`/`tsv` 不必重算。
+   */
+  async updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null> {
+    const current = await this.getMemory(id);
+    if (current === null || current.deletedAt !== null) return null;
+
+    const next = normalizeMemoryPatch(current, patch);
+    const result = await this.pool.query(
+      `update ${this.memories}
+          set scope = $2, project = $3
+        where id = $1 and deleted_at is null
+        returning ${MEMORY_COLUMNS}`,
+      [id, next.scope, next.project],
+    );
+    return result.rows.length === 0 ? null : rowToMemory(result.rows[0]!);
+  }
+
+  /**
+   * 寫入記憶向量並設為 `ready`（語意與 SQLite 後端完全相同，見 `MetadataStore.markMemoryEmbedded`）。
+   *
+   * 以 pgvector 的文字格式（`[0.1,0.2,…]`）綁定參數、在 SQL 內 `$3::vector` 轉型；`vector`
+   * 欄位不帶維度，換 embedder／維度時由回填流程覆寫。未知 id 或已軟刪除更新不到任何列。
+   */
+  async markMemoryEmbedded(id: number, embedderId: string, vec: Float32Array): Promise<void> {
+    assertMemoryEmbeddingInput(embedderId, vec);
+    await this.pool.query(
+      `update ${this.memories}
+          set embedding = $2::vector, embedding_embedder_id = $3, embedding_state = 'ready'
+        where id = $1 and deleted_at is null`,
+      [id, toVectorLiteral(vec), embedderId],
+    );
+  }
+
+  /** 把狀態設為 `failed`／`too-long`；保留既有向量與 embedder 身分（見 `MetadataStore` 的說明）。 */
+  async markMemoryEmbeddingFailed(id: number, reason: MemoryEmbeddingFailure): Promise<void> {
+    assertMemoryEmbeddingFailure(reason);
+    await this.pool.query(
+      `update ${this.memories} set embedding_state = $1 where id = $2 and deleted_at is null`,
+      [reason, id],
+    );
+  }
+
+  /** 列出需要（重新）產生向量的未刪除記憶（見 `MetadataStore.listMemoriesNeedingEmbedding`）。 */
+  async listMemoriesNeedingEmbedding(embedderId: string, limit?: number): Promise<Memory[]> {
+    const normalized = normalizeMemoryLimit(limit);
+    if (normalized === 0) return [];
+
+    const result = await this.pool.query(
+      `select ${MEMORY_COLUMNS} from ${this.memories}
+        where deleted_at is null
+          and (embedding_state in ('pending', 'failed')
+               or (embedding_state = 'ready'
+                   and (embedding_embedder_id is null or embedding_embedder_id <> $1)))
+        order by created_at desc, id desc
+        limit $2`,
+      [embedderId, normalized],
+    );
+    return result.rows.map(rowToMemory);
+  }
+
+  /** 統計未刪除記憶的語意化狀態（見 `MetadataStore.memoryEmbeddingStats`；四個狀態數自洽）。 */
+  async memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats> {
+    const result = await this.pool.query(
+      `select
+         count(*)::int as total,
+         (count(*) filter (where embedding_state = 'pending'))::int as pending,
+         (count(*) filter (where embedding_state = 'ready'))::int as ready,
+         (count(*) filter (where embedding_state = 'failed'))::int as failed,
+         (count(*) filter (where embedding_state = 'too-long'))::int as too_long,
+         (count(*) filter (
+           where embedding_state = 'ready'
+             and (embedding_embedder_id is null or embedding_embedder_id <> $1)
+         ))::int as stale
+       from ${this.memories} where deleted_at is null`,
+      [embedderId],
+    );
+    const row = result.rows[0] ?? {};
+    const count = (value: unknown): number => Number(value ?? 0);
+    return {
+      total: count(row.total),
+      pending: count(row.pending),
+      ready: count(row.ready),
+      failed: count(row.failed),
+      tooLong: count(row.too_long),
+      stale: count(row.stale),
+    };
+  }
+
+  /**
+   * 記憶語意檢索（見 `MetadataStore.searchMemoriesByVector`）。
+   *
+   * 同一句 SQL 內先以 `deleted_at`／`ready`／embedder 身分／filter 過濾，再用 pgvector 的
+   * `<=>` 精確排序（**先過濾再排名**）。`embedding` 不帶維度，維度不符時 pgvector 會在查詢時
+   * 報錯；為維持「維度不符 → TypeError」的跨後端語意，先以 `vector_dims()` 預檢。
+   */
+  async searchMemoriesByVector(
+    queryVec: Float32Array,
+    embedderId: string,
+    filter: MemorySearchFilter,
+    k: number,
+  ): Promise<MemoryVectorHit[]> {
+    assertMemoryQueryVector(queryVec);
+    if (typeof embedderId !== "string" || embedderId.trim() === "") {
+      throw new TypeError("embedderId 必須是非空字串");
+    }
+    const limit = normalizeMemorySearchK(k);
+    if (limit === 0) return [];
+
+    const normalized = normalizeMemorySearchFilter(filter);
+    if (normalized.buckets !== undefined && normalized.buckets.length === 0) return [];
+
+    // 維度預檢：向量 $1、filter 參數 $2..；沒有可用向量時不驗（查詢自然回空）。
+    const dimWhere = buildPgMemorySearchWhere(normalized, 2);
+    const dimResult = await this.pool.query(
+      `select vector_dims(m.embedding) as dim
+         from ${this.memories} m
+        where ${dimWhere.clause}
+          and m.embedding_state = 'ready'
+          and m.embedding_embedder_id = $1
+          and m.embedding is not null
+        limit 1`,
+      [embedderId, ...dimWhere.params],
+    );
+    if (dimResult.rows.length > 0) {
+      const storedDim = Number(dimResult.rows[0]!.dim);
+      if (storedDim !== queryVec.length) {
+        throw new TypeError(`向量維度不符：查詢 ${queryVec.length} 維、記憶 ${storedDim} 維`);
+      }
+    }
+
+    const where = buildPgMemorySearchWhere(normalized, 2);
+    const embedderParam = 2 + where.params.length;
+    const limitParam = 3 + where.params.length;
+    const result = await this.pool.query(
+      `select m.id as id, 1 - (m.embedding <=> $1::vector) as score
+         from ${this.memories} m
+        where ${where.clause}
+          and m.embedding_state = 'ready'
+          and m.embedding_embedder_id = $${embedderParam}
+          and m.embedding is not null
+        order by score desc, m.id asc
+        limit $${limitParam}`,
+      [toVectorLiteral(queryVec), ...where.params, embedderId, limit],
+    );
+    return result.rows.map((row) => ({ id: Number(row.id), score: Number(row.score) }));
+  }
+
+  /**
+   * 記憶關鍵字檢索（見 `MetadataStore.searchMemoriesKeyword`）。
+   *
+   * 只查 memories 的 `tsv`（**不混 chunk**）；同一組 filter 在 SQL 先套用，再依 `ts_rank`
+   * 排名，同分以 `id` 升冪決勝（與 SQLite 端一致、可重現）。`rank` 由回傳順序從 1 起算。
+   */
+  async searchMemoriesKeyword(query: string, filter: MemorySearchFilter, k: number): Promise<MemoryKeywordHit[]> {
+    const limit = normalizeMemorySearchK(k);
+    if (limit === 0) return [];
+    const tokens = segmentText(query)
+      .split(" ")
+      .filter((token) => token.length > 0);
+    if (tokens.length === 0) return [];
+
+    const normalized = normalizeMemorySearchFilter(filter);
+    if (normalized.buckets !== undefined && normalized.buckets.length === 0) return [];
+
+    const tsquery = tokens.map((_, index) => `plainto_tsquery('simple', $${index + 1})`).join(" || ");
+    const where = buildPgMemorySearchWhere(normalized, tokens.length + 1);
+    const limitParam = 1 + tokens.length + where.params.length;
+
+    const result = await this.pool.query(
+      `with q as (select ${tsquery} as tsq)
+       select m.id as id, ts_rank(m.tsv, q.tsq) as score
+         from ${this.memories} m, q
+        where m.tsv @@ q.tsq and ${where.clause}
+        order by score desc, m.id asc
+        limit $${limitParam}`,
+      [...tokens, ...where.params, limit],
+    );
+    return result.rows.map((row, index) => ({ id: Number(row.id), rank: index + 1 }));
   }
 
   async listMemories(filter: MemoryFilter = {}): Promise<Memory[]> {
@@ -387,6 +780,20 @@ export class PgMetadataStore implements MetadataStore {
         order by created_at desc, id desc
         limit $${params.length}`,
       params,
+    );
+    return result.rows.map(rowToMemory);
+  }
+
+  /**
+   * 列出全部未刪除的記憶（見 `MetadataStore.listMemoriesForExport` 的契約）。
+   *
+   * 備份用：**不套** `limit`、排序與 `listMemories` 相反（`created_at asc, id asc`）。
+   */
+  async listMemoriesForExport(): Promise<Memory[]> {
+    const result = await this.pool.query(
+      `select ${MEMORY_COLUMNS} from ${this.memories}
+        where deleted_at is null
+        order by created_at asc, id asc`,
     );
     return result.rows.map(rowToMemory);
   }

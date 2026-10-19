@@ -5,10 +5,13 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   BINARY_SNIFF_BYTES,
   chunkText,
+  hashBytes,
   indexRoot,
   isMediaDecodeError,
   looksBinary,
+  maskSecrets,
   openDatabase,
+  REDACTED_PREFIX,
   RootNotIndexableError,
   SqliteMetadataStore,
   SqliteVectorIndex,
@@ -187,6 +190,25 @@ class ConcurrencyProbeEmbedder extends RecordingEmbedder {
   }
 }
 
+/**
+ * 記錄每次 `embedDocuments` 開始的時間。
+ *
+ * 限速的休眠發生在「上一檔處理完、下一檔開始前」，因此相鄰兩次嵌入開始時間的差
+ * 直接就是「上一檔嵌入＋寫入＋休眠＋下一檔讀取」的總和；用這個間隔當證據，
+ * 不必比較兩個獨立刻度的總耗時（負載下容易 flake）。
+ */
+class TimedEmbedder extends RecordingEmbedder {
+  readonly embedStarts: number[] = [];
+
+  override async embedDocuments(
+    inputs: readonly DocumentInput[],
+    opts?: EmbedDocumentsOptions,
+  ): Promise<Float32Array[]> {
+    this.embedStarts.push(performance.now());
+    return super.embedDocuments(inputs, opts);
+  }
+}
+
 let opened: SqliteDatabase[] = [];
 
 async function makeHarness(files: Record<string, string | Buffer>, overrides: Partial<Root> = {}): Promise<Harness> {
@@ -254,6 +276,28 @@ describe("indexRoot", () => {
     const titles = new Set(harness.embedder.documents.map((call) => call.title));
     expect(titles.has("a.md")).toBe(true);
     expect(titles.has("code/b.ts")).toBe(true);
+  });
+
+  it("S7：檔名（title）在送進 embedder 前也套用遮罩，索引鍵與 chunk 不變", async () => {
+    const token = ["gh", "p_", "0123456789abcdefghijklmn"].join("");
+    const relPath = `leak-${token}.md`;
+    const h = await makeHarness({ [relPath]: "# 標題\n\n一般內容" });
+    try {
+      const result = await indexRoot(h.root, options(h));
+      expect(result).toMatchObject({ total: 1, processed: 1 });
+
+      const titles = h.embedder.documents.map((document) => document.title ?? "");
+      expect(titles.length).toBeGreaterThan(0);
+      for (const title of titles) {
+        expect(title).not.toContain(token);
+        expect(title).toContain(`${REDACTED_PREFIX}token]`);
+      }
+
+      // 只有送出的 title 被遮罩；索引鍵（relPath）與 chunk 儲存不受影響。
+      expect(await h.store.listChunksByPath(h.root.id, relPath)).toHaveLength(1);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
   });
 
   it("文字檔每檔一次批次呼叫（檔案內不再逐塊 await）", async () => {
@@ -1143,6 +1187,248 @@ describe("逐塊進度（processedChunks／estimatedChunks）", () => {
       const result = await indexRoot(h.root, { ...options(h), concurrency: 4 });
       expect(result).toMatchObject({ total: 3, processed: 3 });
       expect(probe.maxActive).toBe(1);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("索引端機密遮罩（切塊前遮罩、maskedFiles）", () => {
+  /** 合成憑證樣本：以片段拼接組出，原始碼不出現連續、可被 secret scanner 判真的字面憑證。 */
+  function fake(...parts: string[]): string {
+    return parts.join("");
+  }
+
+  it("文字檔的憑證在切塊前遮罩：chunk 只有 placeholder、原文不存在，maskedFiles 只計命中的檔案", async () => {
+    const token = fake("s", "k-", "proj-", "abcdef0123456789abcdef");
+    const secret = fake("hunter2", "hunter2hunter2");
+    const content = `# 設定\n\napi_key = "${secret}"\n\ntoken: ${token}\n\n一般說明文字。\n`;
+
+    const h = await makeHarness({ "notes.md": content, "plain.md": "# 筆記\n\n沒有任何憑證的一般內容。\n" });
+    try {
+      const result = await indexRoot(h.root, options(h));
+      expect(result).toMatchObject({ total: 2, processed: 2, skippedUnchanged: 0, maskedFiles: 1 });
+
+      const chunks = await h.store.listChunksByPath(h.root.id, "notes.md");
+      expect(chunks.length).toBeGreaterThan(0);
+      const allText = chunks.map((chunk) => chunk.text ?? "").join("\n");
+      expect(allText).toContain(`${REDACTED_PREFIX}assignment]`);
+      expect(allText).toContain(`${REDACTED_PREFIX}token]`);
+      expect(allText).not.toContain(secret);
+      expect(allText).not.toContain(token);
+
+      // 送進 embedder 的也是遮罩後文字（切塊、嵌入、入庫是同一份內容）。
+      const embedded = h.embedder.documents.map((document) => document.text).join("\n");
+      expect(embedded).toContain(`${REDACTED_PREFIX}assignment]`);
+      expect(embedded).not.toContain(secret);
+
+      // 使用者磁碟上的檔案只讀不寫：原文逐字不變。
+      expect(await fs.readFile(path.join(h.dir, "notes.md"), "utf8")).toBe(content);
+
+      // 第二次索引：內容未變 → 整檔跳過、沒有重新遮罩（maskedFiles 只反映本輪處理）。
+      const second = await indexRoot(h.root, options(h));
+      expect(second).toMatchObject({ processed: 0, skippedUnchanged: 2, maskedFiles: 0 });
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("程式碼檔遮罩；未命中的一般內容逐字不變（negative 樣本不得回歸）", async () => {
+    const content = [
+      "// commit abcdef1234567890abcdef1234567890abcdef12 修好了",
+      "const url = \"https://example.test:8443/path?email=a@b\";",
+      "const id = application.services.authentication;",
+      "const pkg = \"sk-learn-extra-trees-classifier\";",
+      "const apiKey = process.env.API_KEY;",
+      "export const answer = 42;",
+      "",
+    ].join("\n");
+
+    const h = await makeHarness({ "src/config.ts": content });
+    try {
+      const result = await indexRoot(h.root, options(h));
+      expect(result).toMatchObject({ total: 1, processed: 1, maskedFiles: 0 });
+
+      const chunks = await h.store.listChunksByPath(h.root.id, "src/config.ts");
+      expect(chunks).toHaveLength(1);
+      // chunk 文字與「未套遮罩時」的切塊結果逐字相同。
+      expect(chunks[0]?.text).toBe(chunkText(content)[0]?.text);
+      expect(chunks[0]?.text).toBe(content.trim());
+      expect(chunks[0]?.text).not.toContain(REDACTED_PREFIX);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("媒體檔不套文字遮罩：chunk text 為 null、contentHash 仍為原始位元組 sha256、maskedFiles=0", async () => {
+    // 位元組刻意含 token 樣式字串：證明媒體路徑完全不走文字遮罩、也不改 hash 語意。
+    const token = fake("s", "k-", "proj-", "abcdef0123456789abcdef");
+    const bytes = Buffer.from(`FAKE-IMAGE ${token}`, "utf8");
+    const h = await makeHarness({ "photo.png": bytes }, { modalities: ["image"] });
+    try {
+      const result = await indexRoot(h.root, options(h));
+      expect(result).toMatchObject({ total: 1, processed: 1, skippedUnchanged: 0, maskedFiles: 0 });
+
+      const chunks = await h.store.listChunksByPath(h.root.id, "photo.png");
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]?.text).toBeNull();
+      expect(chunks[0]?.contentHash).toBe(hashBytes(bytes));
+
+      // 媒體增量行為不變：內容未變 → 下一輪跳過。
+      const second = await indexRoot(h.root, options(h));
+      expect(second).toMatchObject({ processed: 0, skippedUnchanged: 1, maskedFiles: 0 });
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("增量：只改會被遮罩的區段 → 遮罩後內容相同 → 仍 skippedUnchanged", async () => {
+    const firstSecret = fake("firstsecret", "value");
+    const secondSecret = fake("secondsecret", "value");
+    const content = (secret: string): string => `# 設定\n\npassword = "${secret}"\n\n一般說明文字。\n`;
+
+    const h = await makeHarness({ "notes.md": content(firstSecret) });
+    try {
+      const first = await indexRoot(h.root, options(h));
+      expect(first).toMatchObject({ processed: 1, maskedFiles: 1 });
+      const before = await h.store.listChunksByPath(h.root.id, "notes.md");
+
+      // 只換掉「會被遮罩值」：遮罩後文字相同 → 檔案級 hash 相同 → 不重嵌。
+      await fs.writeFile(path.join(h.dir, "notes.md"), content(secondSecret));
+      const second = await indexRoot(h.root, options(h));
+      expect(second).toMatchObject({ total: 1, processed: 0, skippedUnchanged: 1, maskedFiles: 0 });
+
+      const after = await h.store.listChunksByPath(h.root.id, "notes.md");
+      expect(after.map((chunk) => `c:${chunk.id}`)).toEqual(before.map((chunk) => `c:${chunk.id}`));
+      // 新憑證沒有進 DB：DB 仍是舊的遮罩後內容。
+      expect(after[0]?.text).not.toContain(secondSecret);
+      expect(after[0]?.text).toContain(`${REDACTED_PREFIX}assignment]`);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("增量：改一般內容會重做，並重新計算 maskedFiles", async () => {
+    const secret = fake("hunter2", "hunter2hunter2");
+    const content = (paragraph: string): string =>
+      `# 標題\n\npassword = "${secret}"\n\n${paragraph}\n`;
+
+    const h = await makeHarness({ "notes.md": content("第一版一般內容") });
+    try {
+      await indexRoot(h.root, options(h));
+      await fs.writeFile(path.join(h.dir, "notes.md"), content("第二版一般內容"));
+
+      const result = await indexRoot(h.root, options(h));
+      expect(result).toMatchObject({ total: 1, processed: 1, skippedUnchanged: 0, maskedFiles: 1 });
+
+      const chunks = await h.store.listChunksByPath(h.root.id, "notes.md");
+      expect(chunks[0]?.text).toContain("第二版一般內容");
+      expect(chunks[0]?.text).toContain(`${REDACTED_PREFIX}assignment]`);
+      expect(chunks[0]?.text).not.toContain(secret);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("既有未遮罩索引（原始位元組 hash）→ 下一次索引自動重做並改寫為遮罩後 chunk", async () => {
+    const secret = fake("legacysecret", "value");
+    const raw = `# 標題\n\npassword = "${secret}"\n\n舊版未遮罩內容\n`;
+
+    const h = await makeHarness({ "notes.md": raw });
+    try {
+      // 模擬舊版（尚未套用索引端遮罩）留下的資料：chunk 文字是原文、contentHash 是原始位元組
+      // hash，且向量齊全——否則就算 hash 相同也會因缺向量而重做，測不到 hash 的語意。
+      const legacy = await h.store.replaceChunks(h.root.id, "notes.md", [
+        { seq: 0, kind: "text", text: raw.trim(), contentHash: hashBytes(Buffer.from(raw, "utf8")) },
+      ]);
+      await h.vec.upsert([
+        {
+          key: `c:${legacy[0]!.id}`,
+          rootId: h.root.id,
+          embedderId: h.embedder.info.id,
+          vec: await h.embedder.embedQuery(raw.trim()),
+        },
+      ]);
+      expect((await h.store.listChunksByPath(h.root.id, "notes.md"))[0]?.text).toContain(secret);
+
+      const result = await indexRoot(h.root, options(h));
+      expect(result).toMatchObject({ total: 1, processed: 1, skippedUnchanged: 0, maskedFiles: 1 });
+
+      const chunks = await h.store.listChunksByPath(h.root.id, "notes.md");
+      expect(chunks[0]?.text).toContain(`${REDACTED_PREFIX}assignment]`);
+      expect(chunks[0]?.text).not.toContain(secret);
+      // hash 改用遮罩後內容計算，下一輪才會穩定跳過。
+      expect(chunks[0]?.contentHash).toBe(hashBytes(Buffer.from(maskSecrets(raw).text, "utf8")));
+      expect([...(await h.vec.existingKeys([`c:${legacy[0]!.id}`]))]).toEqual([]);
+    } finally {
+      await fs.rm(h.dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("索引限速（throttle；預設 0＝與舊版相同）", () => {
+  const files = {
+    "a.md": "# 標題\n\n第一份文件",
+    "b.md": "# 標題\n\n第二份文件",
+    "c.md": "# 標題\n\n第三份文件",
+  };
+
+  it("betweenFilesMs 在相鄰檔案批次之間形成間隔，但結果與未限速一致", async () => {
+    const plain = await makeHarness(files);
+    const throttled = await makeHarness(files);
+    const betweenFilesMs = 150;
+    try {
+      const plainResult = await indexRoot(plain.root, { ...options(plain), concurrency: 1 });
+      expect(plainResult).toMatchObject({ total: 3, processed: 3 });
+
+      const timed = new TimedEmbedder();
+      throttled.embedder = timed;
+      const slowResult = await indexRoot(throttled.root, {
+        ...options(throttled),
+        concurrency: 1,
+        throttle: { betweenFilesMs },
+      });
+      expect(slowResult).toMatchObject({ total: 3, processed: 3 });
+
+      // 三個檔案、concurrency 1 → 三次嵌入，相鄰開始時間的差直接反映「上一檔結束後休眠」。
+      // setTimeout 不會早於指定毫秒；留 10ms 給計時器精度，不用總時間差（避免負載下 flake）。
+      expect(timed.embedStarts).toHaveLength(3);
+      for (let index = 1; index < timed.embedStarts.length; index += 1) {
+        const gap = timed.embedStarts[index]! - timed.embedStarts[index - 1]!;
+        expect(gap).toBeGreaterThanOrEqual(betweenFilesMs - 10);
+      }
+
+      // 限速只影響節奏，不影響索引結果（同樣的 chunk 數與向量數）。
+      const plainChunks = await plain.store.listChunksByPath(plain.root.id, "a.md");
+      const slowChunks = await throttled.store.listChunksByPath(throttled.root.id, "a.md");
+      expect(slowChunks.map((chunk) => chunk.text)).toEqual(plainChunks.map((chunk) => chunk.text));
+      expect(await throttled.vec.count()).toBe(await plain.vec.count());
+    } finally {
+      await fs.rm(plain.dir, { recursive: true, force: true });
+      await fs.rm(throttled.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("休眠期間取消會立刻以 AbortError 結束，不等到休眠結束", async () => {
+    const h = await makeHarness({
+      "a.md": "# 標題\n\n第一份文件",
+      "b.md": "# 標題\n\n第二份文件",
+    });
+    try {
+      const controller = new AbortController();
+      const startedAt = performance.now();
+      const run = indexRoot(h.root, {
+        ...options(h),
+        concurrency: 1,
+        throttle: { betweenFilesMs: 5_000 },
+        signal: controller.signal,
+        onProgress: (progress) => {
+          // 第一檔完成後進入 5 秒休眠；在休眠中 abort，必須立即結束。
+          if (progress.processed === 1) setTimeout(() => controller.abort(), 30);
+        },
+      });
+      await expect(run).rejects.toMatchObject({ name: "AbortError" });
+      expect(performance.now() - startedAt).toBeLessThan(2_000);
     } finally {
       await fs.rm(h.dir, { recursive: true, force: true });
     }

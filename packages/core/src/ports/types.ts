@@ -66,6 +66,16 @@ export type MemoryKind = "fact" | "decision" | "pitfall" | "preference";
 /** 記憶的作用範圍。 */
 export type MemoryScope = "global" | "project" | "agent";
 
+/**
+ * 記憶向量的狀態機（卡 B1；存在 `memories.embedding_state`，**不是** `Memory` 的公開欄位）。
+ *
+ * - `pending`：待嵌入（新資料與既有資料的預設）；
+ * - `ready`：向量已產生且可信（還要 `embedding_embedder_id` 與查詢的 embedder 相符）；
+ * - `failed`：嵌入失敗，可重試（回填流程會再試）；
+ * - `too-long`：超過 embedder 的單筆輸入上限，**永久跳過**（重試也不會成功）。
+ */
+export type MemoryEmbeddingState = "pending" | "ready" | "failed" | "too-long";
+
 /** 一筆共享記憶。 */
 export interface Memory {
   id: number;
@@ -96,6 +106,22 @@ export interface Memory {
  * `MetadataStore.setMemoryPinned`（見 `Memory.pinned`）。
  */
 export type NewMemory = Omit<Memory, "id" | "createdAt" | "deletedAt" | "pinned">;
+
+/**
+ * 更新既有記憶時**可變更**的欄位（`MetadataStore.updateMemory`）。
+ *
+ * 為什麼只有這兩個：內容的變更一律走 supersede（建立新版本、舊版軟刪除），避免無痕改寫歷史；
+ * `kind`／`agent`／`supersedes`／`pinned`／`createdAt`／`deletedAt` 都是不可變欄位。
+ * 欄位未提供（`undefined`）＝該欄位不變；兩個都沒提供＝非法 patch（儲存層拋錯）。
+ *
+ * 有效結果的正規化（見 `normalizeMemoryPatch`）：
+ * - `scope === "project"` → `project` 必須是非空字串（trim 後），否則拋錯；
+ * - `scope !== "project"` → `project` 一律為 `null`（明確帶非 null 的 `project` 為非法 patch）。
+ */
+export interface MemoryPatch {
+  scope?: MemoryScope;
+  project?: string | null;
+}
 
 /** 查詢過濾條件。未指定 rootIds 表示不過濾。 */
 export interface SearchFilter {

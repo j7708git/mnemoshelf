@@ -62,16 +62,15 @@ files:
   - package.json
   - "!**/*.map"
 
-# 必須從 asar 解包的原生二進位（解開後落在 app.asar.unpacked，Electron 會透明導向）：
+# worker_threads 不能讀 asar 內的檔案：worker 入口與它 import 的依賴都必須是真實檔案。
+# 只解包入口不夠——worker 會 import `@mnemoshelf/embedder-transformers` →
+# `@huggingface/transformers`（及其純 JS／原生依賴），這些若留在 `app.asar` 內，
+# worker thread 讀不到而無法載入模型。因此 production `node_modules` 全部解包：
+# sharp／@img、sqlite-vec、onnxruntime 等原生模組也一併涵蓋（個別條目已不需要）。
+# app 自身 `dist/**` 仍留在 asar；worker 入口解包後由 worker-embedder 的 resolver
+# 改指 `app.asar.unpacked`（見 packages/server/src/worker-embedder.ts）。
 asarUnpack:
-  # sharp 官方指定的寫法：libvips 的側載檔在 @img/* 內，不是 .node，自動偵測抓不到。
-  - "**/node_modules/sharp/**"
-  - "**/node_modules/@img/**"
-  # sqlite-vec 的 loadExtension() 需要真實檔案路徑（.so／.dylib／.dll）。
-  - "**/node_modules/sqlite-vec*/**"
-  # onnxruntime-node：onnxruntime_binding.node 與 libonnxruntime.so／.dll。
-  - "**/*.node"
-  - "**/node_modules/onnxruntime-node/bin/**"
+  - "**/node_modules/**"
 
 # Web UI 靜態檔放在 asar 之外（resources/web），由 Core 服務以 MNEMOSHELF_WEB_DIR 讀取。
 # 放在 asar 內也可以（Electron 會導向），但靜態檔沒有必要進 asar，也讓「UI 是不是打包進去」

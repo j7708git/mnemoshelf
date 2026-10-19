@@ -8,10 +8,16 @@
  * - `POST /roots/:id/preview`、`POST /roots/:id/index`、`POST /roots/:id/index/cancel`
  * - `GET  /roots/:id/entries?path=`（目錄子項）、`GET /roots/:id/file?path=`（文字預覽／圖片位元組）、
  *   `GET /roots/:id/thumb?path=`（縮圖）、`GET /roots/:id/index/status`（索引进度輪詢）
- * - `GET  /diagnostics`（除錯資訊匯出：版本、平台、embedder（含執行裝置與退回原因）、每 root 統計；
- *   家目錄前綴遮罩成 `~`）
+ * - `GET  /diagnostics`（除錯資訊匯出：版本、平台、embedder（含執行裝置與退回原因）、每 root 統計、
+ *   記憶語意化狀態與背景 worker 統計；家目錄前綴遮罩成 `~`）
  * - `POST /search`（`query` 超過模型單筆輸入上限時 → `400 InputTooLongError`，見 `toHttpError`）
- * - `POST /memories`、`GET /memories`、`POST /memories/:id/pin`、`DELETE /memories/:id`
+ * - `POST /memories`（精確去重：重複回 200＋`duplicate: true`，新增回 201 並 enqueue 背景嵌入）、
+ *   `GET /memories`、`PATCH /memories/:id`、`POST /memories/:id/pin`、
+ *   `DELETE /memories/:id`（預設軟刪除；`?hard=true` 硬刪除）
+ * - `GET  /memories/export`（NDJSON 備份下載；讀取遮罩視圖、只含未刪除）
+ *   `POST /memories/import`（NDJSON 匯入；raw body 上限 32 MiB、`?dryRun=1` 只預覽、
+ *   整批先驗證，任何一行不合法就 400 且不寫）
+ * - `POST /memories/search`（記憶語意召回；先過濾再排名，語意不可用時降級關鍵字，見 `memory-search.ts`）
  *
  * 行為規則：
  * - **單一寫入者**：資料庫只被本行程開啟；本模組是唯一的寫入路徑（MCP 走 HTTP 進來的）。
@@ -38,12 +44,16 @@ import {
   DuplicateRootError,
   indexRoot,
   isBlocked,
+  type IndexRootOptions,
   type IndexRootResult,
+  MEMORY_SCOPES,
   type Memory,
   type MemoryKind,
+  type MemoryPatch,
   type MemoryScope,
   type MetadataStore,
   type Modality,
+  normalizeMemoryPatch,
   PathBlockedError,
   PathOutsideRootError,
   previewRoot,
@@ -85,11 +95,32 @@ import {
 } from "./explorer.js";
 import { requireLocalHost, requireLoopback, requireToken } from "./auth.js";
 import { unifiedSearch, type SearchMode, type UnifiedSearchResult } from "../search.js";
+import type { MemoryEmbeddingWorker } from "../memory-embedder.js";
+import { maskSecrets } from "../secret-masking.js";
+import {
+  MEMORY_SEARCH_DEFAULT_K,
+  MEMORY_SEARCH_MAX_K,
+  searchMemories,
+  type MemoryRecallResponseBody,
+} from "../memory-search.js";
+import {
+  countImportDuplicates,
+  MAX_MEMORY_CHARS,
+  MAX_MEMORY_IMPORT_BYTES,
+  MAX_MEMORY_METADATA_CHARS,
+  MEMORY_EXPORT_CONTENT_TYPE,
+  MEMORY_KINDS,
+  memoryExportFilename,
+  parseDryRunParam,
+  planMemoryImport,
+  serializeMemoriesExport,
+  type MemoryImportResponse,
+} from "../memory-export.js";
 
 /** JSON 請求主體上限。 */
 export const MAX_JSON_BODY_BYTES = 1024 * 1024;
-/** 單筆記憶內容長度上限（契約未明定，由本實作決定的濫用防護）。 */
-export const MAX_MEMORY_CHARS = 8000;
+/** 記憶召回查詢字串長度上限（UTF-16 長度；超過回 400）。 */
+export const MAX_MEMORY_QUERY_CHARS = 2000;
 /**
  * 請求 URL（request-target）長度上限。
  *
@@ -99,9 +130,11 @@ export const MAX_MEMORY_CHARS = 8000;
  */
 export const MAX_REQUEST_URL_LENGTH = 8 * 1024;
 
+// 記憶的長度上限定義在 `../memory-export.js`（REST 寫入與 NDJSON 匯入共用同一組）；
+// 這裡保持原本的公開匯出路徑，呼叫端不需要改 import。
+export { MAX_MEMORY_CHARS, MAX_MEMORY_METADATA_CHARS } from "../memory-export.js";
+
 const MODALITIES: readonly Modality[] = ["text", "code", "image", "audio", "video"];
-const MEMORY_KINDS: readonly MemoryKind[] = ["fact", "decision", "pitfall", "preference"];
-const MEMORY_SCOPES: readonly MemoryScope[] = ["global", "project", "agent"];
 
 /**
  * API 的第一段路徑前綴。
@@ -180,6 +213,45 @@ export interface RemoveRootResponse {
 /** `GET /memories` 的回應（未刪除的記憶，由新到舊）。 */
 export interface ListMemoriesResponse {
   memories: Memory[];
+  /** 記憶內容一律視為不受信任資料（agent 僅是來源標記，不是身分驗證）。 */
+  untrusted: true;
+}
+
+/**
+ * `PATCH /memories/:id` 的請求主體（共享開關）。
+ *
+ * 只接受 `scope`／`project`；其餘欄位（`content`、`kind`、`pinned` 等）一律 `400`（不靜默忽略）。
+ * 至少提供一個欄位；`scope: "project"` 時 `project` 必須明確給非空字串。
+ */
+export interface PatchMemoryRequest {
+  scope?: MemoryScope;
+  project?: string | null;
+}
+
+/**
+ * `POST /memories` 的回應（卡 C2 的 additive 欄位；`Memory` 公開型別本身不變）。
+ *
+ * - `duplicate: true` 只會出現在 `200`：已有同 key 的未刪除記憶，這次沒有新增、也沒有 enqueue。
+ * - `redacted`／`redactedCount` 描述這次**寫入前**的遮罩結果（與既有行為相同）；
+ *   重複時為 `false`／`0`（沒有寫入任何內容）。
+ */
+export interface AddMemoryResponse extends Memory {
+  duplicate: boolean;
+  redacted: boolean;
+  redactedCount: number;
+}
+
+/** `DELETE /memories/:id` 的軟刪除回應（形狀與 C2 之前相同）。 */
+export interface ForgetMemoryResponse {
+  id: number;
+  deleted: boolean;
+}
+
+/** `DELETE /memories/:id?hard=true` 的硬刪除回應。 */
+export interface HardDeleteMemoryResponse {
+  id: number;
+  deleted: true;
+  hard: true;
 }
 
 /** `POST /roots/:id/index` 的回應（`IndexRootResult` 摘要＋量測）。 */
@@ -300,6 +372,33 @@ export interface DiagnosticsResponse {
   roots: DiagnosticsRoot[];
   /** 進行中的索引任務（本行程；沒有時為空陣列）。 */
   indexing: { rootId: number; startedAt: string | null }[];
+  /** 記憶語意化的狀態與背景 worker 統計（卡 B1；additive 欄位）。 */
+  memories: DiagnosticsMemoryEmbedding;
+}
+
+/**
+ * `GET /diagnostics` 的記憶語意化統計（卡 B1）。
+ *
+ * `total`／四個狀態數／`stale` 來自 `MetadataStore.memoryEmbeddingStats`
+ * （`total = pending + ready + failed + tooLong`）；`worker.*` 是本行程 worker 的累計計數
+ * （重啟歸零，佇列長度是即時值）。
+ */
+export interface DiagnosticsMemoryEmbedding {
+  /** 未刪除的記憶總數。 */
+  total: number;
+  ready: number;
+  pending: number;
+  failed: number;
+  tooLong: number;
+  /** `ready` 但 embedder 身分與目前 embedder 不同（換 embedder 後待重嵌）。 */
+  stale: number;
+  worker: {
+    queued: number;
+    processing: number;
+    embedded: number;
+    failed: number;
+    tooLong: number;
+  };
 }
 
 /** 統一的錯誤回應格式。 */
@@ -340,6 +439,8 @@ export interface RestAppDeps {
   store: MetadataStore;
   vec: VectorIndex;
   embedder: Embedder;
+  /** 記憶向量背景 worker（卡 B1）：`POST /memories` enqueue、診斷讀 stats。 */
+  memoryEmbedder: MemoryEmbeddingWorker;
   token: string;
   /** root 加入時的「過寬」判定基準；預設 `os.homedir()`。 */
   homeDir?: string;
@@ -349,6 +450,12 @@ export interface RestAppDeps {
    * 不存在時靜態路徑一律回 404 JSON（API 不受影響）——讓「還沒 build UI」不是啟動錯誤。
    */
   webDir: string;
+  /**
+   * 索引限速（**選填**；由 `createServer` 依 `MNEMOSHELF_INDEX_RATE` 決定）。
+   *
+   * 未提供時完全沿用既有行為（檔案之間不休眠）。詳見 core 的 `IndexRootOptions.throttle`。
+   */
+  indexThrottle?: NonNullable<IndexRootOptions["throttle"]>;
 }
 
 export interface RestApp {
@@ -358,6 +465,23 @@ export interface RestApp {
   readonly indexing: ReadonlyMap<number, Promise<IndexRootResult>>;
   /** 等待中的請求全部結束（測試用：確認沒有殘留的非同步工作）。 */
   settled(): Promise<void>;
+  /**
+   * 真正傳給 `indexRoot` 的限速參數（`undefined`＝不限速）。
+   *
+   * 唯讀、僅供診斷／測試核對「設定有接到索引器」；呼叫端不應修改它。
+   */
+  readonly indexThrottle: NonNullable<IndexRootOptions["throttle"]> | undefined;
+  /**
+   * 中止所有進行中的索引（**關閉流程用**；additive）。
+   *
+   * - 對每個在途索引的 `AbortController` 送出 abort；索引會在 native 推論的下一個邊界
+   *   （最長一個檔案的嵌入批次）以 `AbortError` 結束，由 `POST /roots/:id/index` 轉成
+   *   `200 {cancelled: true}`（連線若已關閉則只是完成背景工作）。
+   * - **冪等**；呼叫後這個 app 不再啟動新的索引（之後進來的索引請求直接以 cancelled 結束），
+   *   讓 `createServer.close()` 不必等一整輪索引。
+   * - 回傳這次實際中止的索引數（已經 abort 過的不重複計數）。
+   */
+  cancelAllIndexing(): number;
 }
 
 function sendJson(response: ServerResponse, status: number, body: unknown, headers: Record<string, string> = {}): void {
@@ -552,6 +676,43 @@ async function readJsonBody(request: IncomingMessage): Promise<Record<string, un
   return parsed;
 }
 
+/**
+ * 讀取原始請求主體（文字）並套用位元組上限；空主體回空字串。
+ *
+ * 兩層上限檢查：
+ * 1. `Content-Length` 已宣告超過上限 → 立刻 413，不讀 body；
+ * 2. 串流（chunked／未帶長度）則邊讀邊計數，超過後**停止累積但把剩下位元組排空**再拋
+ *    `PayloadTooLargeError`——若像 `readJsonBody` 一樣在讀取中途 `request.destroy()`，客戶端
+ *    可能只看到連線中斷而拿不到 413。記憶體用量仍以 `limitBytes` 為界。
+ */
+async function readTextBody(request: IncomingMessage, limitBytes: number): Promise<string> {
+  // 先看 Content-Length：明顯超量時不必等下載完才拒絕（也避免惡意客戶端用超大 body 佔頻寬）。
+  // 需要排空的串流（chunked／未帶長度）仍由下方累積計數處理。
+  const declared = request.headers["content-length"];
+  if (declared !== undefined) {
+    const declaredBytes = Number(declared);
+    if (Number.isFinite(declaredBytes) && declaredBytes > limitBytes) {
+      throw new PayloadTooLargeError(limitBytes);
+    }
+  }
+
+  const chunks: Buffer[] = [];
+  let total = 0;
+  let exceeded = false;
+  for await (const chunk of request) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > limitBytes) {
+      exceeded = true;
+      chunks.length = 0;
+      continue;
+    }
+    chunks.push(buffer);
+  }
+  if (exceeded) throw new PayloadTooLargeError(limitBytes);
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 function requireString(value: unknown, field: string, options: { maxLength?: number } = {}): string {
   if (typeof value !== "string" || value.trim().length === 0) {
     throw new ValidationError(field, "必須是非空的字串");
@@ -562,9 +723,12 @@ function requireString(value: unknown, field: string, options: { maxLength?: num
   return value;
 }
 
-function optionalString(value: unknown, field: string): string | undefined {
+function optionalString(value: unknown, field: string, options: { maxLength?: number } = {}): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value !== "string") throw new ValidationError(field, "必須是字串");
+  if (options.maxLength !== undefined && value.length > options.maxLength) {
+    throw new ValidationError(field, `長度上限 ${options.maxLength} 字元`);
+  }
   return value;
 }
 
@@ -592,6 +756,32 @@ function optionalStringArray(value: unknown, field: string): string[] | undefine
   return value as string[];
 }
 
+/**
+ * 讀取路徑的記憶遮罩：對 `content`／`agent`／`project` 再套一次 `maskSecrets`（idempotent）。
+ *
+ * 既有 DB 可能存著未遮罩的舊資料，因此列表、單筆回應與召回命中都經過這裡再輸出；
+ * 已遮罩過的內容不會二次匹配（`[REDACTED:...]` 不會被規則再吃一次）。
+ */
+function maskMemoryContent(memory: Memory): Memory {
+  const content = maskSecrets(memory.content);
+  const agent = maskSecrets(memory.agent);
+  const project = memory.project === null ? null : maskSecrets(memory.project).text;
+  if (!content.redacted && !agent.redacted && project === memory.project) return memory;
+  return { ...memory, content: content.text, agent: agent.text, project };
+}
+
+/**
+ * 寫入路徑的 metadata 檢查：`agent`／`project` 若含 token-like 機密 → 拒絕（400）。
+ *
+ * 為什麼不遮而要拒絕：agent／project 是**查詢鍵**（過濾、召回 bucket 都用它精確比對）；
+ * 若在寫入時改寫，呼叫端之後用原值查不到、語意會壞掉。因此要求呼叫端換一個不含機密的值。
+ */
+function assertNoSecretInMetadata(value: string, field: "agent" | "project"): void {
+  if (maskSecrets(value).redacted) {
+    throw new ValidationError(field, "不得包含機密（偵測到可能的 token／金鑰；請移除後再寫入）");
+  }
+}
+
 function enumValue<T extends string>(value: unknown, allowed: readonly T[], field: string, fallback: T): T {
   if (value === undefined || value === null) return fallback;
   if (typeof value !== "string" || !(allowed as readonly string[]).includes(value)) {
@@ -607,6 +797,19 @@ function booleanFlag(value: string | null, field: string, fallback: boolean): bo
   if (normalized === "" || normalized === "0" || normalized === "false" || normalized === "no") return false;
   if (normalized === "1" || normalized === "true" || normalized === "yes") return true;
   throw new ValidationError(field, "必須是 1/0（或 true/false）");
+}
+
+/**
+ * 解析 `DELETE /memories/:id?hard=`（卡 C2）。
+ *
+ * 刻意比其他旗標嚴格：只接受 `true`／`1`（大小寫敏感）；未帶參數＝軟刪除；其他值（含空字串、
+ * `false`、`yes`）一律 `400`——「硬刪除」不可用模糊寫法誤觸。
+ */
+function parseHardDeleteFlag(url: URL): boolean {
+  if (!url.searchParams.has("hard")) return false;
+  const value = url.searchParams.get("hard");
+  if (value === "true" || value === "1") return true;
+  throw new ValidationError("hard", "只接受 true 或 1（未帶參數＝軟刪除；硬刪除無法復原）");
 }
 
 function parseId(raw: string, resource: string): number {
@@ -625,8 +828,11 @@ function optionalEnumParam<T extends string>(value: string | null, allowed: read
 }
 
 /** 解析查詢字串裡的文字參數；未提供（或空字串）＝不過濾。 */
-function optionalQueryString(value: string | null, field: string): string | undefined {
+function optionalQueryString(value: string | null, field: string, options: { maxLength?: number } = {}): string | undefined {
   if (value === null || value.trim() === "") return undefined;
+  if (options.maxLength !== undefined && value.length > options.maxLength) {
+    throw new ValidationError(field, `長度上限 ${options.maxLength} 字元`);
+  }
   return value;
 }
 
@@ -698,6 +904,13 @@ export function createRestApp(deps: RestAppDeps): RestApp {
    * 只放進行中的任務：`finally` 移除，因此取消已結束的任務會找不到 controller（回 404）。
    */
   const indexControllers = new Map<number, AbortController>();
+  /**
+   * 關閉流程已要求停止索引（由 `cancelAllIndexing()` 設定；只增不減）。
+   *
+   * 設定後**不再啟動**新的索引：`startIndex` 直接以 `cancelled` 結束，避免關閉過程中
+   * 又排進一輪新的索引而拖住 `createServer.close()`。
+   */
+  let indexesCancelled = false;
   const inflight = new Set<Promise<unknown>>();
   /** 索引工作狀態（行程內記憶體；供 `GET /roots/:id/index/status` 輪詢）。 */
   const indexStatus = new IndexStatusTracker();
@@ -866,6 +1079,12 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const root = await getRootOr404(id);
     if (root.mode !== "index") throw new RootNotIndexableError(root.id, root.mode);
     if (indexing.has(id)) throw new IndexInProgressError(id);
+    if (indexesCancelled) {
+      // 關閉中（或已由 cancelAllIndexing 停止）：不再啟動新索引，直接回「已取消」。
+      // 正常情況下連線已被關掉、不會走到這裡；這是關閉與請求競態時的防線。
+      const body: IndexCancelledResponse = { rootId: id, durationMs: 0, cancelled: true };
+      return { status: 200, body };
+    }
 
     const startedAt = Date.now();
     const maxFileBytes = maxFileBytesByRoot.get(id);
@@ -878,6 +1097,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       signal: controller.signal,
       onProgress: (progress) => indexStatus.report(id, progress),
       ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
+      ...(deps.indexThrottle === undefined ? {} : { throttle: deps.indexThrottle }),
     });
     indexing.set(id, run);
     indexControllers.set(id, controller);
@@ -918,6 +1138,23 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     controller.abort();
     const body: CancelIndexResponse = { rootId: id, cancelled: true };
     return { status: 200, body };
+  };
+
+  /**
+   * 中止所有進行中的索引（提供給 `createServer.close()`；見 `RestApp.cancelAllIndexing`）。
+   *
+   * 只做「送 abort」：native 推論不可從 JS 中斷，索引會在 embedder 的下一個邊界
+   * （批次視窗／下一個檔案開始前）結束；`close()` 另外有有限的寬限與放棄在途呼叫的後備。
+   */
+  const cancelAllIndexing = (): number => {
+    indexesCancelled = true;
+    let cancelled = 0;
+    for (const controller of indexControllers.values()) {
+      if (controller.signal.aborted) continue;
+      controller.abort();
+      cancelled += 1;
+    }
+    return cancelled;
   };
 
   /**
@@ -1044,6 +1281,9 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       };
     });
 
+    const memoryStats = await deps.store.memoryEmbeddingStats(deps.embedder.info.id);
+    const memoryWorkerStats = deps.memoryEmbedder.stats();
+
     const raw: DiagnosticsResponse = {
       generatedAt: new Date().toISOString(),
       app: {
@@ -1058,6 +1298,22 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       embedderRuntime: deps.embedder.runtimeStatus ?? null,
       roots: rootSummaries,
       indexing: [...indexing.keys()].map((rootId) => ({ rootId, startedAt: indexStatus.status(rootId).startedAt })),
+      memories: {
+        total: memoryStats.total,
+        ready: memoryStats.ready,
+        pending: memoryStats.pending,
+        failed: memoryStats.failed,
+        tooLong: memoryStats.tooLong,
+        stale: memoryStats.stale,
+        // 本行程累計；重啟歸零、佇列長度是即時值（卡 B1）。
+        worker: {
+          queued: memoryWorkerStats.queued,
+          processing: memoryWorkerStats.processing,
+          embedded: memoryWorkerStats.embedded,
+          failed: memoryWorkerStats.failed,
+          tooLong: memoryWorkerStats.tooLong,
+        },
+      },
     };
     // 一律遮罩家目錄前綴：不輸出使用者家目錄的絕對路徑（見 repo 隱私規範）。
     return maskDiagnostics(raw, homeDir);
@@ -1085,31 +1341,104 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   };
 
   /**
-   * `POST /memories`：新增記憶。
+   * `POST /memories`：新增記憶（卡 C2：精確去重）。
    *
    * `supersedes`（可選）為被取代的記憶 id：帶了就把該筆標記軟刪除（見 `addMemory` 的契約），
-   * UI 的「編輯」流程即以此產生新版本並取代舊版。
+   * UI 的「編輯」流程即以此產生新版本並取代舊版。**帶 `supersedes` 時跳過去重**（編輯語意優先）。
+   *
+   * `force`（可選，boolean；非 boolean → `400`）：強制新增，即使已有相同內容的未刪除記憶。
+   *
+   * 未帶 `force` 且非 `supersedes` 時走 `addMemoryUnlessDuplicate`：同一 key（正規化內容 hash＋
+   * `scope`＋`project`＋`agent`）已有未刪除的記憶 → **不新增、不 enqueue**，回 `200`＋既有記憶
+   * （讀取視圖，遮罩）＋`duplicate: true`；新增則回 `201`＋`duplicate: false`。
+   * 去重比較的是**遮罩後**內容（寫入前已遮罩），因此「憑證不同但遮罩後同文」視為重複。
    *
    * 被取代者原本若已釘選，新版本**繼承**其 `pinned`（`NewMemory` 契約仍無 `pinned`，
    * 新記憶一律 `false`；這裡是 server 端在建立後補一次 `setMemoryPinned` 的行為細節）。
+   *
+   * **O2（卡 B1）scope／project 正規化**：
+   * - `scope` 省略且有 `project` → 視為 `scope: "project"`（方便呼叫端；避免默默存出矛盾組合）；
+   * - `scope` 省略且無 `project` → `global`（維持既有預設）；
+   * - `scope: "project"` 且 `project` 缺少／空字串 → `400`（專案名 trim 後儲存）；
+   * - `scope: "global" | "agent"` 且帶非 null `project` → `400`。
+   *
+   * 建立成功後只把 id 交給背景 worker（`memoryEmbedder.enqueue`）：**不等待嵌入**，
+   * 回應仍是立即的 `201`；向量稍後就緒（狀態見 `GET /diagnostics` 的 `memories`）。
    */
   const addMemory = async (request: IncomingMessage): Promise<{ status: number; body: unknown }> => {
     const body = await readJsonBody(request);
-    const content = requireString(body.content, "content", { maxLength: MAX_MEMORY_CHARS });
-    const agent = requireString(body.agent, "agent");
+    const rawContent = requireString(body.content, "content", { maxLength: MAX_MEMORY_CHARS });
+    // 寫入前先遮罩可辨識的機密（不回傳、不記錄原文）；`redacted` 會是回應的 additive 欄位。
+    const maskedContent = maskSecrets(rawContent);
+    const content = maskedContent.text;
+    const agent = requireString(body.agent, "agent", { maxLength: MAX_MEMORY_METADATA_CHARS });
+    assertNoSecretInMetadata(agent, "agent");
     const kind = enumValue(body.kind, MEMORY_KINDS, "kind", "fact");
-    const scope = enumValue(body.scope, MEMORY_SCOPES, "scope", "global");
-    const project = optionalString(body.project, "project") ?? null;
+    // `force` 只影響寫入路徑；必須是 JSON boolean（字串 "true"、數字、null 一律 400），
+    // 避免「硬刪除／強制新增」這類不可逆操作被模糊寫法誤觸。
+    let force = false;
+    if (body.force !== undefined) {
+      if (typeof body.force !== "boolean") throw new ValidationError("force", "必須是布林值");
+      force = body.force;
+    }
+
+    const projectInput = optionalString(body.project, "project", { maxLength: MAX_MEMORY_METADATA_CHARS });
+    const hasProject = projectInput !== undefined;
+    let scope: MemoryScope;
+    if (body.scope === undefined) {
+      // 省略 scope：有 project 就視為 project，否則沿用既有預設 global。
+      scope = hasProject ? "project" : "global";
+    } else {
+      // **顯式**提供的 scope 必須是合法字串；`null`／數字／其他型別一律 400——
+      // 不把「非字串」靜默當成「未指定」（O2／O4，卡 B1）。
+      if (body.scope === null) throw new ValidationError("scope", `必須是 ${MEMORY_SCOPES.join(" / ")} 之一`);
+      scope = enumValue(body.scope, MEMORY_SCOPES, "scope", "global");
+    }
+    let project: string | null = null;
+    if (scope === "project") {
+      const trimmed = projectInput?.trim() ?? "";
+      if (trimmed === "") throw new ValidationError("project", "scope 為 project 時必須提供非空的專案名稱");
+      project = trimmed;
+    } else if (hasProject) {
+      throw new ValidationError("project", `scope 為 ${scope} 時 project 必須是 null（全域／agent 範圍沒有專案）`);
+    }
+    if (project !== null) assertNoSecretInMetadata(project, "project");
     const supersedes = optionalId(body.supersedes, "supersedes");
 
     // 先讀被取代者（若存在）的 pinned：建立新記憶會把舊版軟刪除，之後仍可讀，但先讀較清楚。
     const replaced = supersedes === null ? null : await deps.store.getMemory(supersedes);
-    let memory: Memory = await deps.store.addMemory({ content, kind, scope, project, agent, supersedes });
+    const input = { content, kind, scope, project, agent, supersedes };
+
+    // 編輯流程（supersedes）與 force 都走一般新增；其餘交給原子的 insert-or-return-existing。
+    let memory: Memory;
+    let duplicate = false;
+    if (supersedes !== null || force) {
+      memory = await deps.store.addMemory(input);
+    } else {
+      const result = await deps.store.addMemoryUnlessDuplicate(input);
+      memory = result.memory;
+      duplicate = result.duplicate;
+    }
+
+    if (duplicate) {
+      // 不新增、不 enqueue：回既有記憶的讀取視圖（遮罩後）＋additive 的 duplicate 標記。
+      return {
+        status: 200,
+        body: { ...maskMemoryContent(memory), duplicate: true, redacted: false, redactedCount: 0 },
+      };
+    }
+
     if (replaced?.pinned === true) {
       await deps.store.setMemoryPinned(memory.id, true);
       memory = (await deps.store.getMemory(memory.id)) ?? memory;
     }
-    return { status: 201, body: memory };
+    // 背景、非阻塞：回應不必等模型。supersedes 產生的新版本同樣要嵌入。
+    deps.memoryEmbedder.enqueue(memory.id);
+    // `Memory` 公開型別不變；`duplicate`／`redacted`／`redactedCount` 只是這個端點的 additive 回應欄位。
+    return {
+      status: 201,
+      body: { ...memory, duplicate: false, redacted: maskedContent.redacted, redactedCount: maskedContent.count },
+    };
   };
 
   /**
@@ -1121,17 +1450,101 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   const pinMemory = async (request: IncomingMessage, id: number): Promise<{ status: number; body: unknown }> => {
     const body = await readJsonBody(request);
     const pinned = optionalBoolean(body.pinned, "pinned") ?? true;
-    if ((await deps.store.getMemory(id)) === null) throw new NotFoundError("記憶", id);
+    const existing = await deps.store.getMemory(id);
+    if (existing === null) throw new NotFoundError("記憶", id);
     await deps.store.setMemoryPinned(id, pinned);
-    return { status: 200, body: await deps.store.getMemory(id) };
+    const updated = await deps.store.getMemory(id);
+    return { status: 200, body: updated === null ? null : maskMemoryContent(updated) };
   };
 
-  const forgetMemory = async (id: number): Promise<{ status: number; body: unknown }> => {
+  /**
+   * `DELETE /memories/:id`：預設**軟刪除**（設定 `deleted_at`，回應形狀不變）。
+   *
+   * 帶 `?hard=true`（或 `hard=1`）改成**硬刪除**：真的刪除資料列（含 FTS；向量同列欄位），
+   * 回應 `{ id, deleted: true, hard: true }`。可刪已軟刪除者；未知 id → `404`（與軟刪除一致）。
+   * `hard` 的其他值 → `400`（值域只接受 `true`／`1`，見 `parseHardDeleteFlag`）。
+   */
+  const forgetMemory = async (id: number, hard: boolean): Promise<{ status: number; body: unknown }> => {
     const memory = await deps.store.getMemory(id);
     if (memory === null) throw new NotFoundError("記憶", id);
+    if (hard) {
+      const deleted = await deps.store.hardDeleteMemory(id);
+      if (!deleted) throw new NotFoundError("記憶", id);
+      return { status: 200, body: { id, deleted: true, hard: true } };
+    }
     const alreadyDeleted = memory.deletedAt !== null;
     if (!alreadyDeleted) await deps.store.forgetMemory(id);
     return { status: 200, body: { id, deleted: !alreadyDeleted } };
+  };
+
+  /**
+   * `PATCH /memories/:id`：更新記憶的範圍與專案（共享開關）。
+   *
+   * 規格（卡 A §2）：
+   * - 主體 `{scope?, project?}`；只接受這兩個欄位，其餘（`content`、`kind`、`pinned`…）→ `400`，
+   *   不靜默忽略；至少提供一個欄位，否則 `400`。
+   * - `scope` 非合法值 → `400`；`project` 非字串／非 null → `400`。
+   * - `scope: "project"` 且 `project` 缺少／空字串 → `400`（**必須明確指定**目標專案）；
+   *   `scope: "global" | "agent"` 且帶非 null `project` → `400`。
+   * - 不存在的 id 或已軟刪除 → `404`；成功回 `200`＋更新後的完整 `Memory`。
+   *
+   * 驗證分兩層：先做請求形狀（與上述明確規則），再讀現值用 `normalizeMemoryPatch`
+   * 驗「合併後的結果」（例如只帶非 null `project` 但現值 scope 不是 project）。實際寫入仍走
+   * `store.updateMemory`（同一套正規化語意在儲存層把關）。
+   */
+  const patchMemory = async (request: IncomingMessage, id: number): Promise<{ status: number; body: unknown }> => {
+    const body = await readJsonBody(request);
+    const allowedFields: readonly string[] = ["scope", "project"];
+    for (const key of Object.keys(body)) {
+      if (!allowedFields.includes(key)) {
+        throw new ValidationError(key, "不支援的欄位（共享開關只能改 scope 與 project）");
+      }
+    }
+    if (body.scope === undefined && body.project === undefined) {
+      throw new ValidationError("body", "至少要提供 scope 或 project");
+    }
+
+    const patch: MemoryPatch = {};
+    if (body.scope !== undefined) {
+      if (typeof body.scope !== "string" || !(MEMORY_SCOPES as readonly string[]).includes(body.scope)) {
+        throw new ValidationError("scope", `必須是 ${MEMORY_SCOPES.join(" / ")} 之一`);
+      }
+      patch.scope = body.scope as MemoryScope;
+    }
+    if (body.project !== undefined) {
+      if (body.project !== null && typeof body.project !== "string") {
+        throw new ValidationError("project", "必須是字串或 null");
+      }
+      if (typeof body.project === "string" && body.project.length > MAX_MEMORY_METADATA_CHARS) {
+        throw new ValidationError("project", `長度上限 ${MAX_MEMORY_METADATA_CHARS} 字元`);
+      }
+      if (typeof body.project === "string") assertNoSecretInMetadata(body.project, "project");
+      patch.project = body.project as string | null;
+    }
+
+    // 明確規則：切成專案時一定要指定目標專案；非專案範圍不得帶專案。
+    if (patch.scope === "project") {
+      if (patch.project === undefined || patch.project === null || patch.project.trim() === "") {
+        throw new ValidationError("project", "scope 為 project 時必須提供非空的專案名稱");
+      }
+    } else if (patch.scope !== undefined && patch.project !== undefined && patch.project !== null) {
+      throw new ValidationError("project", `scope 為 ${patch.scope} 時 project 必須是 null`);
+    }
+
+    const existing = await deps.store.getMemory(id);
+    if (existing === null || existing.deletedAt !== null) throw new NotFoundError("記憶", id);
+
+    // 合併現值後再驗一次（例如 scope 未提供、卻帶了非 null project 的 patch）。
+    try {
+      normalizeMemoryPatch(existing, patch);
+    } catch (error) {
+      throw new ValidationError("patch", error instanceof Error ? error.message : "非法的 patch");
+    }
+
+    const updated = await deps.store.updateMemory(id, patch);
+    // 讀到之後才被軟刪除的競態：與未知 id 同樣回 404，不吞掉。
+    if (updated === null) throw new NotFoundError("記憶", id);
+    return { status: 200, body: maskMemoryContent(updated) };
   };
 
   const routeRoots = async (
@@ -1216,18 +1629,203 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const params = url.searchParams;
     const kind = optionalEnumParam(params.get("kind"), MEMORY_KINDS, "kind");
     const scope = optionalEnumParam(params.get("scope"), MEMORY_SCOPES, "scope");
-    const project = optionalQueryString(params.get("project"), "project");
-    const agent = optionalQueryString(params.get("agent"), "agent");
+    const project = optionalQueryString(params.get("project"), "project", {
+      maxLength: MAX_MEMORY_METADATA_CHARS,
+    });
+    const agent = optionalQueryString(params.get("agent"), "agent", { maxLength: MAX_MEMORY_METADATA_CHARS });
     const limit = queryLimit(params.get("limit"));
 
-    const memories = await deps.store.listMemories({
+    const memories = (await deps.store.listMemories({
       ...(kind === undefined ? {} : { kind }),
       ...(scope === undefined ? {} : { scope }),
       ...(project === undefined ? {} : { project }),
       ...(agent === undefined ? {} : { agent }),
       ...(limit === undefined ? {} : { limit }),
-    });
-    return { status: 200, body: { memories } };
+    })).map(maskMemoryContent);
+    // 頂層的 trust 標記：記憶內容一律視為不受信任資料（不改 `Memory` 型別）。
+    return { status: 200, body: { memories, untrusted: true } };
+  };
+
+  /**
+   * `POST /memories/search`：記憶語意召回（卡 B2）。
+   *
+   * 驗證在這裡做（形狀與 400 邊界），召回流程（bucket 組法／語意優先／關鍵字降級／minScore）
+   * 在 `memory-search.ts`（REST 與 MCP 共用同一條路徑）：
+   * - `query` 必填非空；`k` 非正整數 → 400，超過上限夾到 `MEMORY_SEARCH_MAX_K`（100）；
+   * - `scope`／`kind` 有提供時必須是合法值；`minScore` 必須在 0..1；
+   * - 未提供 `project` 且未 `includeAllProjects` → 由 bucket 組法回 400（避免不明確的召回範圍）；
+   * - 成功回 `200`＋`{query,k,degraded,degradedReason,memoryEmbedding,hits}`。
+   */
+  const searchMemoriesRoute = async (request: IncomingMessage): Promise<{ status: number; body: unknown }> => {
+    const body = await readJsonBody(request);
+    const query = requireString(body.query, "query", { maxLength: MAX_MEMORY_QUERY_CHARS });
+
+    const projectRaw = optionalString(body.project, "project", { maxLength: MAX_MEMORY_METADATA_CHARS });
+    const project = projectRaw === undefined ? undefined : projectRaw.trim();
+    const projectValue = project === "" ? undefined : project;
+
+    const includeAllProjects = optionalBoolean(body.includeAllProjects, "includeAllProjects");
+
+    let scope: MemoryScope | undefined;
+    if (body.scope !== undefined) {
+      if (typeof body.scope !== "string" || !(MEMORY_SCOPES as readonly string[]).includes(body.scope)) {
+        throw new ValidationError("scope", `必須是 ${MEMORY_SCOPES.join(" / ")} 之一`);
+      }
+      scope = body.scope as MemoryScope;
+    }
+
+    const agentRaw = optionalString(body.agent, "agent", { maxLength: MAX_MEMORY_METADATA_CHARS });
+    const agent = agentRaw === undefined || agentRaw.trim() === "" ? undefined : agentRaw;
+
+    let kind: MemoryKind | undefined;
+    if (body.kind !== undefined) {
+      if (typeof body.kind !== "string" || !(MEMORY_KINDS as readonly string[]).includes(body.kind)) {
+        throw new ValidationError("kind", `必須是 ${MEMORY_KINDS.join(" / ")} 之一`);
+      }
+      kind = body.kind as MemoryKind;
+    }
+
+    let k = MEMORY_SEARCH_DEFAULT_K;
+    if (body.k !== undefined) {
+      if (typeof body.k !== "number" || !Number.isInteger(body.k) || body.k <= 0) {
+        throw new ValidationError("k", "必須是正整數");
+      }
+      k = Math.min(body.k, MEMORY_SEARCH_MAX_K);
+    }
+
+    let minScore: number | undefined;
+    if (body.minScore !== undefined) {
+      if (
+        typeof body.minScore !== "number" ||
+        !Number.isFinite(body.minScore) ||
+        body.minScore < 0 ||
+        body.minScore > 1
+      ) {
+        throw new ValidationError("minScore", "必須是 0 到 1 之間的數字");
+      }
+      minScore = body.minScore;
+    }
+
+    const result: MemoryRecallResponseBody = await searchMemories(
+      { store: deps.store, embedder: deps.embedder },
+      {
+        query,
+        ...(projectValue === undefined ? {} : { project: projectValue }),
+        ...(includeAllProjects === undefined ? {} : { includeAllProjects }),
+        ...(scope === undefined ? {} : { scope }),
+        ...(agent === undefined ? {} : { agent }),
+        ...(kind === undefined ? {} : { kind }),
+        k,
+        ...(minScore === undefined ? {} : { minScore }),
+      },
+    );
+    return { status: 200, body: result };
+  };
+
+  /**
+   * `GET /memories/export`：把全部未刪除的記憶匯出成 NDJSON 附件。
+   *
+   * - 資料來自 `MetadataStore.listMemoriesForExport`（`createdAt` 由舊到新、不受列表上限限制）；
+   * - **讀取遮罩**：與 `GET /memories` 相同，先過 `maskMemoryContent` 再序列化——匯出檔與畫面
+   *   看到的是同一個視圖，不可能把未遮罩的舊資料帶出去；
+   * - 結尾換行；0 筆時回空檔（0 bytes）。
+   */
+  const exportMemories = async (): Promise<RouteResult> => {
+    const memories = (await deps.store.listMemoriesForExport()).map(maskMemoryContent);
+    const bytes = serializeMemoriesExport(memories);
+    return {
+      status: 200,
+      bytes,
+      contentType: MEMORY_EXPORT_CONTENT_TYPE,
+      headers: { "content-disposition": `attachment; filename="${memoryExportFilename()}"` },
+    };
+  };
+
+  /**
+   * `POST /memories/import`：匯入 NDJSON 記憶備份。
+   *
+   * 流程：解析查詢旗標 → 讀原始 body（上限 32 MiB）→ **整批驗證**（`planMemoryImport`；
+   * 內容先遮罩、metadata token-like 視為該行不合法）→ 有任何不合法就回 400、完全不寫
+   * → 合法才逐筆 `addMemoryUnlessDuplicate`（重複跳過）→ `pinned` 補設 → enqueue 背景嵌入。
+   *
+   * `dryRun=1`／`true` 只驗證與估算（`wouldCreate`），不寫入、不回報 `created`。
+   * 匯入不保留 `id`／`createdAt`／`supersedes`（新 id、匯入時間）；`pinned` 保留。
+   */
+  const importMemories = async (request: IncomingMessage, url: URL): Promise<RouteResult> => {
+    const dryRun = parseDryRunParam(url.searchParams.get("dryRun"));
+    const text = await readTextBody(request, MAX_MEMORY_IMPORT_BYTES);
+    const plan = planMemoryImport(text);
+    const valid = plan.total - plan.invalidCount;
+
+    if (plan.invalid.length > 0) {
+      // 整批拒絕：不回報任何「已寫入」的假象；錯誤含行號與原因（最多前 100 筆）。
+      const body: MemoryImportResponse & { error: { name: string; message: string } } = {
+        error: {
+          name: "ValidationError",
+          message: `匯入檔有 ${plan.invalidCount} 行不合法，未寫入任何資料`,
+        },
+        dryRun,
+        total: plan.total,
+        valid,
+        invalid: plan.invalid,
+        duplicates: 0,
+        redacted: plan.redacted,
+        created: 0,
+        wouldCreate: 0,
+      };
+      return { status: 400, body };
+    }
+
+    if (dryRun) {
+      // 讀取既有未刪除記憶以估算重複；不寫入任何東西。
+      const existing = await deps.store.listMemoriesForExport();
+      const duplicates = countImportDuplicates(plan.entries, existing);
+      const body: MemoryImportResponse = {
+        dryRun: true,
+        total: plan.total,
+        valid,
+        invalid: [],
+        duplicates,
+        redacted: plan.redacted,
+        created: 0,
+        wouldCreate: valid - duplicates,
+      };
+      return { status: 200, body };
+    }
+
+    let duplicates = 0;
+    let created = 0;
+    for (const entry of plan.entries) {
+      const result = await deps.store.addMemoryUnlessDuplicate({
+        content: entry.content,
+        kind: entry.kind,
+        scope: entry.scope,
+        project: entry.project,
+        agent: entry.agent,
+        // 匯入不保留歷史鏈：只匯出未刪除者，還原時 supersedes 一律清空。
+        supersedes: null,
+      });
+      if (result.duplicate) {
+        duplicates += 1;
+        continue;
+      }
+      if (entry.pinned) await deps.store.setMemoryPinned(result.memory.id, true);
+      // 背景、非阻塞：匯入回應不等模型；向量由 worker 重建。
+      deps.memoryEmbedder.enqueue(result.memory.id);
+      created += 1;
+    }
+
+    const body: MemoryImportResponse = {
+      dryRun: false,
+      total: plan.total,
+      valid,
+      invalid: [],
+      duplicates,
+      redacted: plan.redacted,
+      created,
+      wouldCreate: 0,
+    };
+    return { status: 200, body };
   };
 
   const routeMemories = async (
@@ -1235,15 +1833,29 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     method: string,
     segments: string[],
     url: URL,
-  ): Promise<{ status: number; body: unknown }> => {
+  ): Promise<RouteResult> => {
     if (segments.length === 1) {
       if (method === "POST") return await addMemory(request);
       if (method === "GET") return await listMemories(url);
       throw new MethodNotAllowedError(method, ["GET", "POST"]);
     }
+    // 固定字面路徑必須在 `parseId` 之前處理，否則 "export"／"import" 會被當成 id。
+    if (segments.length === 2 && segments[1] === "export") {
+      if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
+      return await exportMemories();
+    }
+    if (segments.length === 2 && segments[1] === "import") {
+      if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
+      return await importMemories(request, url);
+    }
+    if (segments.length === 2 && segments[1] === "search") {
+      if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
+      return await searchMemoriesRoute(request);
+    }
     if (segments.length === 2) {
-      if (method !== "DELETE") throw new MethodNotAllowedError(method, ["DELETE"]);
-      return await forgetMemory(parseId(segments[1]!, "記憶"));
+      if (method === "DELETE") return await forgetMemory(parseId(segments[1]!, "記憶"), parseHardDeleteFlag(url));
+      if (method === "PATCH") return await patchMemory(request, parseId(segments[1]!, "記憶"));
+      throw new MethodNotAllowedError(method, ["DELETE", "PATCH"]);
     }
     if (segments.length === 3 && segments[2] === "pin") {
       if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
@@ -1337,6 +1949,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   return {
     handler,
     indexing,
+    indexThrottle: deps.indexThrottle,
+    cancelAllIndexing,
     async settled(): Promise<void> {
       // 索引是背景工作（回應會等它），這裡等所有在途請求結束。
       while (inflight.size > 0) {

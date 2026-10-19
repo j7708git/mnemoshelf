@@ -9,7 +9,9 @@ export type {
   Chunk,
   ChunkKind,
   Memory,
+  MemoryEmbeddingState,
   MemoryKind,
+  MemoryPatch,
   MemoryScope,
   Modality,
   NewChunk,
@@ -23,12 +25,32 @@ export type {
 } from "./ports/types.js";
 
 export type { MetadataStore } from "./ports/metadata-store.js";
+export { memoryContentHash, normalizeMemoryContentForHash } from "./memory/content-normalize.js";
 export {
+  assertMemoryEmbeddingFailure,
+  assertMemoryEmbeddingInput,
+  assertMemoryQueryVector,
+  MEMORY_EMBEDDING_STATES,
   MEMORY_LIST_DEFAULT_LIMIT,
   MEMORY_LIST_MAX_LIMIT,
+  MEMORY_SCOPES,
+  MEMORY_SEARCH_MAX_K,
   normalizeMemoryLimit,
+  normalizeMemoryPatch,
+  normalizeMemorySearchFilter,
+  normalizeMemorySearchK,
 } from "./ports/metadata-store.js";
-export type { MemoryFilter } from "./ports/metadata-store.js";
+export type {
+  MemoryEmbeddingFailure,
+  MemoryEmbeddingStats,
+  MemoryFilter,
+  MemoryKeywordHit,
+  MemorySearchBucket,
+  MemorySearchFilter,
+  MemoryVectorHit,
+  NormalizedMemorySearchBucket,
+  NormalizedMemorySearchFilter,
+} from "./ports/metadata-store.js";
 export type { VectorIndex, VectorItem } from "./ports/vector-index.js";
 export type {
   DocumentInput,
@@ -52,6 +74,10 @@ export {
 } from "./errors.js";
 
 export { rrfMerge, RRF_DEFAULT_K } from "./search/rrf.js";
+
+// 機密遮罩（記憶與檔案索引共用同一組 curated 規則；卡 C1）
+export { containsRedacted, maskSecrets, REDACTED_PREFIX } from "./privacy/secret-masking.js";
+export type { MaskSecretsResult, SecretKind } from "./privacy/secret-masking.js";
 
 export { blockedReason, isBlocked } from "./roots/blacklist.js";
 export {

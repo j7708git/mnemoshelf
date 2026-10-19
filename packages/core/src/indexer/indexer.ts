@@ -5,6 +5,7 @@ import type { DocumentInput, Embedder, ImageInput } from "../ports/embedder.js";
 import type { MetadataStore } from "../ports/metadata-store.js";
 import type { ChunkKind, NewChunk, Root } from "../ports/types.js";
 import type { VectorIndex, VectorItem } from "../ports/vector-index.js";
+import { maskSecrets } from "../privacy/secret-masking.js";
 import { resolveInsideRoot } from "../roots/path-guard.js";
 import { chunkCode, chunkText } from "./chunk-text.js";
 import { RootNotIndexableError } from "./errors.js";
@@ -81,12 +82,39 @@ export interface IndexRootOptions {
   onProgress?: (progress: IndexProgress) => void;
   /** 單檔大小上限，預設 10 MB（見 scan.walkRoot）。 */
   maxFileBytes?: number;
+  /**
+   * **索引限速**（額外、預設不啟用）：每個檔案處理完、換下一個檔案之前休眠指定毫秒，
+   * 把 CPU 讓給同一台機器上的其他工作（使用者感受與常駐服務的回應性）。
+   *
+   * - 未設定或 `betweenFilesMs <= 0` 時**行為與舊版完全相同**（不建立任何 timer）。
+   * - 休眠以 `setTimeout` 實作，**可被 `signal` 立即中止**（不會拖慢取消）。
+   * - 休眠次數是「每個 worker 每處理完一個檔案就一次」：`concurrency` 為 2 時，
+   *   兩個 worker 各自節流（總 duty cycle 仍由 `betweenFilesMs` 與單檔成本決定）。
+   * - 只影響索引路徑，不影響搜尋、記憶寫入與 MCP；模型推論本身不受此選項改變。
+   */
+  throttle?: {
+    /** 檔案與檔案之間的休眠毫秒（預設 0＝不限速）。 */
+    betweenFilesMs?: number;
+  };
 }
 
 export interface IndexRootResult {
   total: number;
   processed: number;
   skippedUnchanged: number;
+  /**
+   * 本次**實際重新處理**（重新切塊並嵌入）的檔案中，**內容**至少遮罩一處機密的檔案數。
+   * title-only 遮罩不計入（檔名被遮但內容沒有）。
+   *
+   * - 只計文字／程式碼：媒體檔不套文字遮罩，永遠不計入。
+   * - 不計跳過與失敗的檔案；`skippedUnchanged` 的檔案上一輪已遮罩，這一輪沒有重新遮罩，
+   *   因此也不計入。
+   * - 大於 0 代表遮罩在這一輪確實生效；可用於驗收與診斷（不看 chunk 內容也能確認）。
+   *
+   * 型別上標成選填，是為了讓既有的 `IndexRootResult` 物件字面值（例如不涉及遮罩的測試夾具）
+   * 不必同步補欄位；`indexRoot` 的實際回傳值**一定**包含這個欄位。
+   */
+  maskedFiles?: number;
   /** 從磁碟消失、或不再納入而清除資料的檔案數。 */
   removedFiles: number;
   /**
@@ -257,21 +285,69 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
   }
 }
 
-/** 依種類把檔案內容切成要寫入的 chunk 輸入。 */
-function buildChunkInputs(file: ScanEntry, fileHash: string, bytes: Buffer): ChunkInput[] {
-  // 媒體檔每檔一個 chunk（text: null）；文字／程式碼依內容切塊。
+/** 以與 `throwIfAborted` 相同語意產生取消錯誤（供限速休眠被中止時使用）。 */
+function abortError(signal: AbortSignal): Error {
+  const reason = signal.reason;
+  if (reason instanceof Error) return reason;
+  const error = new Error("索引已取消");
+  error.name = "AbortError";
+  return error;
+}
+
+/**
+ * 可取消的 `setTimeout` 休眠（索引限速用）。
+ *
+ * - `ms <= 0`：不建立 timer，但仍然檢查一次取消（呼叫端不必自行區分）。
+ * - 休眠中 `signal` 中止：立刻清除 timer 並以取消錯誤拒絕（`AbortError`），
+ *   因此「限速」不會讓取消變慢。
+ * - 不 `unref()` timer：索引工作本身是唯一存活原因時，行程仍應等它完成（與原本的索引一致）。
+ */
+function sleepWithSignal(ms: number, signal: AbortSignal | undefined): Promise<void> {
+  if (!(ms > 0)) {
+    throwIfAborted(signal);
+    return Promise.resolve();
+  }
+  if (signal === undefined) {
+    return new Promise<void>((resolve) => {
+      setTimeout(resolve, ms);
+    });
+  }
+  throwIfAborted(signal);
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      reject(abortError(signal));
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/**
+ * 依種類把檔案內容切成要寫入的 chunk 輸入。
+ *
+ * 文字／程式碼的 `content` 必須是**已遮罩**的文字（見 `processFile`）：遮罩發生在切塊之前，
+ * 因此 chunk 文字與送進 embedder 的文字都不含可辨識憑證。`contentHash` 也必須是遮罩後
+ * 內容的 sha256，增量比對才與「遮罩後才切塊」的語意一致。
+ *
+ * 媒體檔不傳內容：每檔固定一個 chunk（`text: null`），`contentHash` 為原始位元組的 sha256。
+ */
+function buildChunkInputs(file: ScanEntry, contentHash: string, content = ""): ChunkInput[] {
+  // 媒體檔每檔一個 chunk（text: null）；文字／程式碼依（已遮罩的）內容切塊。
   if (isMediaKind(file.kind)) {
-    return [{ seq: 0, kind: file.kind, text: null, contentHash: fileHash }];
+    return [{ seq: 0, kind: file.kind, text: null, contentHash }];
   }
 
-  const content = bytes.toString("utf8");
   const pieces = file.kind === "code" ? chunkCode(content) : chunkText(content);
   return pieces.map((piece, index) => ({
     seq: index,
     kind: file.kind,
     text: piece.text,
     // 檔案級 hash（同一檔案的所有 chunk 相同）；chunk 級 hash 為後續加分項。
-    contentHash: fileHash,
+    contentHash,
   }));
 }
 
@@ -299,7 +375,10 @@ async function embedInputs(
   }
 
   // title 用相對路徑：spike 顯示帶 title 對檢索顯著有利。
-  const documents: DocumentInput[] = inputs.map((input) => ({ text: input.text ?? "", title: file.relPath }));
+  // 檔名同樣可能含 token-like 字串（例如 `leak-ghp_….md`），送進 embedder 前套同一組遮罩；
+  // 只影響送出的 title，索引鍵（relPath）與 chunk 內容不變。
+  const title = maskSecrets(file.relPath).text;
+  const documents: DocumentInput[] = inputs.map((input) => ({ text: input.text ?? "", title }));
   throwIfAborted(signal);
   return embedder.embedDocuments(documents, { signal });
 }
@@ -311,7 +390,7 @@ interface ProcessDeps {
 }
 
 type FileOutcome =
-  | { status: "processed"; chunks: number }
+  | { status: "processed"; chunks: number; masked: boolean }
   | { status: "unchanged" }
   | { status: "skipped"; reason: SkipReason };
 
@@ -380,7 +459,8 @@ async function purgeChunks(rootId: number, relPath: string, deps: ProcessDeps): 
  *
  * 順序（資料完整性優先）：
  * 1. 讀取前守衛再檢查（TOCTOU）。
- * 2. 讀檔、算檔案級 sha256。
+ * 2. 讀檔；文字／程式碼**先遮罩機密**（`maskSecrets`），再以遮罩後文字算檔案級 sha256；
+ *    媒體檔不套文字遮罩，仍用原始位元組 sha256。
  * 3. 內容層二進位偵測（僅文字／程式碼）：命中即清除該檔既有資料並記 `binary-content`。
  * 4. 增量判斷：hash 未變**且**該檔所有 `c:<id>` 向量都還在，才跳過；否則整檔重做。
  * 5. **先嵌入**（全部成功才動 DB）：embed 失敗或中止時 DB 完全不動，下一輪自動重做。
@@ -403,7 +483,6 @@ async function processFile(
   if (!target.ok) return { status: "skipped", reason: target.reason };
 
   const bytes = await fs.readFile(target.abs);
-  const fileHash = hashBytes(bytes);
 
   // 內容層防線放在增量判斷**之前**：hash 未變的舊資料也必須被清掉。
   if (
@@ -414,14 +493,35 @@ async function processFile(
     return { status: "skipped", reason: "binary-content" };
   }
 
+  // 檔案級 hash 與切塊用的內容。
+  //
+  // - 媒體檔：原始位元組 hash（不套文字遮罩，行為不變）。
+  // - 文字／程式碼：**先遮罩**，再用遮罩後文字算 hash 與切塊。好處：
+  //   ① 既有（未遮罩）索引的 hash 不同 → 升級後第一次索引自動重做，不必手動清庫；
+  //   ② 只改到會被遮罩的區段時，遮罩後內容相同 → 仍可跳過、不重嵌；
+  //   ③ 遮罩規則改進導致結果變化時，下一次索引自動重做受影響檔案。
+  //   已知取捨：無效 UTF-8 在解碼時變成 U+FFFD，重編碼後 hash 與原始位元組不同 →
+  //   升級後第一次索引會重做一次，屬預期。遮罩本身是純函式且 idempotent。
+  let contentHash: string;
+  let content = "";
+  let masked = false;
+  if (isMediaKind(file.kind)) {
+    contentHash = hashBytes(bytes);
+  } else {
+    const maskedContent = maskSecrets(bytes.toString("utf8"));
+    content = maskedContent.text;
+    contentHash = hashBytes(Buffer.from(content, "utf8"));
+    masked = maskedContent.redacted;
+  }
+
   const existing = await deps.store.listChunksByPath(root.id, file.relPath);
-  if (existing.length > 0 && existing.every((chunk) => chunk.contentHash === fileHash)) {
+  if (existing.length > 0 && existing.every((chunk) => chunk.contentHash === contentHash)) {
     const keys = existing.map((chunk) => `c:${chunk.id}`);
     const present = await deps.vec.existingKeys(keys);
     if (keys.every((key) => present.has(key))) return { status: "unchanged" };
   }
 
-  const inputs = buildChunkInputs(file, fileHash, bytes);
+  const inputs = buildChunkInputs(file, contentHash, content);
   hooks.onChunked?.(inputs.length);
   let vectors: Float32Array[];
   try {
@@ -455,14 +555,19 @@ async function processFile(
     vec: vectors[index]!,
   }));
   await deps.vec.upsert(items);
-  return { status: "processed", chunks: inputs.length };
+  return { status: "processed", chunks: inputs.length, masked };
 }
 
 /**
  * 掃描並索引一個 `mode:'index'` 的 root。
  *
- * - 增量：以檔案 sha256 與 DB 內既有 chunk 的 `contentHash` 比對；hash 未變**且**該檔向量齊全
- *   才整檔跳過，否則重做（可自癒「DB 有 hash 但缺向量」的狀態）。
+ * - 增量：文字／程式碼以**遮罩後內容**的 sha256、媒體檔以原始位元組的 sha256，與 DB 內既有
+ *   chunk 的 `contentHash` 比對；hash 未變**且**該檔向量齊全才整檔跳過，否則重做
+ *   （可自癒「DB 有 hash 但缺向量」的狀態）。
+ * - **機密遮罩**：文字／程式碼在切塊、嵌入、寫入 DB 之前套用 curated 遮罩（與記憶同一組規則），
+ *   chunk 文字不含可辨識憑證；送進 embedder 的 `title`（相對路徑檔名）也先遮罩。媒體檔不套
+ *   文字遮罩（位元組照舊送 embedder）。使用者磁碟上的檔案只讀不寫。`maskedFiles` 回報本輪
+ *   **內容**至少遮一處的檔案數（title-only 遮罩不計）。
  * - 清理：以 `listRelPaths(rootId)` 減去**本次將納入的 `files`** 為準。磁碟上已消失、或本次
  *   被跳過（排除規則、`.gitignore`、黑名單、關模態、超過大小上限等）的檔案，其 chunk 與向量
  *   一律清除——不得因為出現在 skipped 就保留索引（隱私契約：不索引、不回傳）。
@@ -477,6 +582,8 @@ async function processFile(
  * - 進度：檔案級計數（`processed`／`skippedUnchanged`／`skipped`／`failed`）整輪可對帳
  *   （四者相加 === `total`）；另有 chunk 級資訊（`processedChunks`／`estimatedChunks`），
  *   後者是逐檔切塊後累加的下界，只增不減（單一大檔的嵌入是單次批次呼叫，檔內不會有中間值）。
+ * - **限速**（`options.throttle.betweenFilesMs`，預設 0＝與舊版完全相同）：每個檔案處理完、
+ *   換下一檔之前可被 `signal` 立即中止的休眠；只降低索引佔用的 duty cycle，不改變結果。
  * - 全程唯讀使用者檔案。
  */
 export async function indexRoot(root: Root, options: IndexRootOptions): Promise<IndexRootResult> {
@@ -489,6 +596,8 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
   // 這裡是唯一的下限來源，呼叫端傳進來的 concurrency 也不得超過它。
   const serialized = embedder.runtimeStatus?.serializedInference === true;
   const concurrency = serialized ? 1 : Math.max(1, Math.floor(options.concurrency ?? 2));
+  // 限速（預設 0＝不限速、不建立 timer）：夾成非負整數，負值／NaN 一律視為 0。
+  const betweenFilesMs = Math.max(0, Math.floor(options.throttle?.betweenFilesMs ?? 0));
   const scanOptions: ScanOptions = {};
   if (options.maxFileBytes !== undefined) scanOptions.maxFileBytes = options.maxFileBytes;
   // 把 signal 一路帶進掃描層：大目錄下取消不必等整輪走訪結束（見 ScanOptions.signal）。
@@ -513,6 +622,7 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
 
   let processed = 0;
   let skippedUnchanged = 0;
+  let maskedFiles = 0;
   let failed = 0;
   let processedChunks = 0;
   let estimatedChunks = 0;
@@ -531,11 +641,18 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
 
   let cursor = 0;
   const worker = async (): Promise<void> => {
+    // 每個 worker 自己數（見 IndexRootOptions.throttle）：處理完一個檔案才在下一輪開始前休眠。
+    let handled = 0;
     for (;;) {
       const index = cursor;
       cursor += 1;
       if (index >= files.length) return;
       throwIfAborted(signal);
+      if (handled > 0) {
+        await sleepWithSignal(betweenFilesMs, signal);
+        throwIfAborted(signal);
+      }
+      handled += 1;
       const file = files[index]!;
       let outcome: FileOutcome;
       try {
@@ -557,6 +674,7 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
       if (outcome.status === "processed") {
         processed += 1;
         processedChunks += outcome.chunks;
+        if (outcome.masked) maskedFiles += 1;
       } else if (outcome.status === "unchanged") skippedUnchanged += 1;
       else skippedFiles.push({ relPath: file.relPath, reason: outcome.reason });
       report();
@@ -566,5 +684,5 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
   const workerCount = Math.min(concurrency, files.length);
   await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
-  return { total, processed, skippedUnchanged, removedFiles, skippedFiles, failedFiles };
+  return { total, processed, skippedUnchanged, maskedFiles, removedFiles, skippedFiles, failedFiles };
 }

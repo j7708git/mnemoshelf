@@ -1,14 +1,29 @@
 import { DuplicateRootError } from "../../errors.js";
+import { memoryContentHash } from "../../memory/content-normalize.js";
 import {
+  assertMemoryEmbeddingFailure,
+  assertMemoryEmbeddingInput,
+  assertMemoryQueryVector,
+  cosineSimilarity,
   normalizeMemoryLimit,
+  normalizeMemoryPatch,
+  normalizeMemorySearchFilter,
+  normalizeMemorySearchK,
+  type MemoryEmbeddingFailure,
+  type MemoryEmbeddingStats,
   type MemoryFilter,
+  type MemoryKeywordHit,
+  type MemorySearchFilter,
+  type MemoryVectorHit,
   type MetadataStore,
+  type NormalizedMemorySearchFilter,
 } from "../../ports/metadata-store.js";
 import type {
   Chunk,
   ChunkKind,
   Memory,
   MemoryKind,
+  MemoryPatch,
   MemoryScope,
   Modality,
   NewChunk,
@@ -73,6 +88,78 @@ function rowToMemory(row: Record<string, unknown>): Memory {
     createdAt: String(row.created_at),
     deletedAt: row.deleted_at === null || row.deleted_at === undefined ? null : String(row.deleted_at),
   };
+}
+
+/**
+ * 把記憶向量編碼成 SQLite BLOB（little-endian float32，與 `Float32Array` 的記憶體配置相同）。
+ *
+ * 先包成 `Uint8Array` 再交給 `Buffer.from` 是**複製**（不是共享 view）：避免呼叫端日後改寫
+ * 同一個 `Float32Array` 就悄悄改到資料庫裡的值，也避免 BLOB 參照到被回收的緩衝區。
+ * 讀回端（卡 B2）以對稱方式解碼；本卡不把向量暴露在 `Memory`。
+ */
+function encodeEmbedding(vector: Float32Array): Buffer {
+  return Buffer.from(new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength));
+}
+
+/**
+ * 解碼 SQLite BLOB 回 `Float32Array`（`encodeEmbedding` 的對稱操作）。
+ *
+ * `better-sqlite3` 回傳的 `Buffer` 是 `Uint8Array` 的子類，但它的位元組偏移不保證是 4 的倍數；
+ * 這裡先**複製**成新的 `Uint8Array` 再建立 `Float32Array`，避免未對齊的 view 在某些平台出錯。
+ * `NULL`／空值回 `null`；位元組長度不是 4 的倍數＝資料損毀 → 拋 `TypeError`。
+ */
+function decodeEmbedding(value: unknown): Float32Array | null {
+  if (!(value instanceof Uint8Array) || value.byteLength === 0) return null;
+  if (value.byteLength % 4 !== 0) throw new TypeError("記憶向量資料損毀（位元組長度不是 4 的倍數）");
+  const bytes = new Uint8Array(value);
+  return new Float32Array(bytes.buffer, 0, bytes.byteLength / 4);
+}
+
+/** SQLite 的記憶檢索 WHERE（`m` 是 memories 的別名；**先過濾、後排名**）。 */
+interface MemorySearchWhere {
+  clause: string;
+  params: unknown[];
+}
+
+/**
+ * 把正規化後的 `MemorySearchFilter` 組成 SQLite WHERE 子句（卡 B2；兩方法共用）。
+ *
+ * 參數綁定順序與 SQL 中的 `?` 出現順序一致；bucket 之間是 OR、`kind` 與 bucket 群組是 AND。
+ */
+function buildMemorySearchWhere(filter: NormalizedMemorySearchFilter): MemorySearchWhere {
+  const conditions = ["m.deleted_at is null"];
+  const params: unknown[] = [];
+
+  if (filter.kind !== undefined) {
+    conditions.push("m.kind = ?");
+    params.push(filter.kind);
+  }
+
+  const buckets = filter.buckets;
+  if (buckets !== undefined) {
+    const parts: string[] = [];
+    for (const bucket of buckets) {
+      if (bucket.scope === "global") {
+        parts.push("m.scope = 'global'");
+        continue;
+      }
+      if (bucket.scope === "project") {
+        if (bucket.project === undefined) {
+          parts.push("m.scope = 'project'");
+          continue;
+        }
+        params.push(bucket.project);
+        parts.push("(m.scope = 'project' and m.project = ?)");
+        continue;
+      }
+      // scope === "agent"（正規化時已保證 agent 非空）
+      params.push(bucket.agent);
+      parts.push("(m.scope = 'agent' and m.agent = ?)");
+    }
+    conditions.push(`(${parts.join(" or ")})`);
+  }
+
+  return { clause: conditions.join(" and "), params };
 }
 
 /**
@@ -266,10 +353,10 @@ export class SqliteMetadataStore implements MetadataStore {
       }
       const info = this.db
         .prepare(
-          `insert into memories(content, kind, scope, project, agent, supersedes, created_at, deleted_at)
-           values (?, ?, ?, ?, ?, ?, ?, null)`,
+          `insert into memories(content, kind, scope, project, agent, supersedes, created_at, deleted_at, content_hash)
+           values (?, ?, ?, ?, ?, ?, ?, null, ?)`,
         )
-        .run(m.content, m.kind, m.scope, m.project, m.agent, m.supersedes, createdAt);
+        .run(m.content, m.kind, m.scope, m.project, m.agent, m.supersedes, createdAt, memoryContentHash(m.content));
       const memoryId = Number(info.lastInsertRowid);
       if (m.content.trim().length > 0) {
         this.db.prepare("insert into memories_fts(rowid, seg) values (?, ?)").run(memoryId, segmentText(m.content));
@@ -283,6 +370,81 @@ export class SqliteMetadataStore implements MetadataStore {
     return created;
   }
 
+  /**
+   * 原子 insert-or-return-existing（見 `MetadataStore.addMemoryUnlessDuplicate`）。
+   *
+   * 去重 key＝（內容 hash, `scope`, `project`, `agent`），以 `project is ?` 做 null-safe 比較；
+   * **檢查與新增在同一句 `insert … select … where not exists`**：SQLite 的單一寫入者＋同步交易下，
+   * 不會出現「檢查後、插入前被別人插隊」的視窗。
+   *
+   * `supersedes` 與 `addMemory` 相同，會先標記被取代者；若該列剛好是唯一的重複列，標記後它已
+   * 不在去重範圍（`deleted_at is null`），因此仍會新增（與「編輯流程優先」的語意一致）。
+   * 重複時**不**寫 FTS（既有列的 FTS 本來就在），也不新增任何列。
+   */
+  async addMemoryUnlessDuplicate(m: NewMemory): Promise<{ memory: Memory; duplicate: boolean }> {
+    const createdAt = new Date().toISOString();
+    const contentHash = memoryContentHash(m.content);
+
+    const attempt = this.db.transaction((): { id: number; duplicate: boolean } => {
+      if (m.supersedes !== null) {
+        this.db
+          .prepare("update memories set deleted_at = ? where id = ? and deleted_at is null")
+          .run(createdAt, m.supersedes);
+      }
+
+      const info = this.db
+        .prepare(
+          `insert into memories(content, kind, scope, project, agent, supersedes, created_at, deleted_at, content_hash)
+           select ?, ?, ?, ?, ?, ?, ?, null, ?
+            where not exists (
+              select 1 from memories
+               where content_hash = ? and scope = ? and project is ? and agent = ? and deleted_at is null
+            )`,
+        )
+        .run(
+          m.content,
+          m.kind,
+          m.scope,
+          m.project,
+          m.agent,
+          m.supersedes,
+          createdAt,
+          contentHash,
+          contentHash,
+          m.scope,
+          m.project,
+          m.agent,
+        );
+
+      if (Number(info.changes) === 0) {
+        const existing = selectRow(
+          this.db,
+          `select ${MEMORY_COLUMNS} from memories
+            where content_hash = ? and scope = ? and project is ? and agent = ? and deleted_at is null
+            order by id
+            limit 1`,
+          contentHash,
+          m.scope,
+          m.project,
+          m.agent,
+        );
+        if (existing === undefined) throw new Error("去重判定為重複，但讀不回既有記憶");
+        return { id: Number(existing.id), duplicate: true };
+      }
+
+      const memoryId = Number(info.lastInsertRowid);
+      if (m.content.trim().length > 0) {
+        this.db.prepare("insert into memories_fts(rowid, seg) values (?, ?)").run(memoryId, segmentText(m.content));
+      }
+      return { id: memoryId, duplicate: false };
+    });
+
+    const { id, duplicate } = attempt();
+    const memory = await this.getMemory(id);
+    if (memory === null) throw new Error("新增記憶後讀不回資料列");
+    return { memory, duplicate };
+  }
+
   async getMemory(id: number): Promise<Memory | null> {
     const row = selectRow(this.db, `select ${MEMORY_COLUMNS} from memories where id = ?`, id);
     return row === undefined ? null : rowToMemory(row);
@@ -292,9 +454,227 @@ export class SqliteMetadataStore implements MetadataStore {
     this.db.prepare("update memories set deleted_at = ? where id = ? and deleted_at is null").run(new Date().toISOString(), id);
   }
 
+  /**
+   * 冪等正規化舊版留下的矛盾 scope／project（見 `MetadataStore.normalizeLegacyMemoryScopes`）。
+   *
+   * 兩個 UPDATE 的條件互斥（`scope in ('global','agent')` vs `scope = 'project'`），因此更新列數
+   * 可以直接相加；包含已軟刪除的列（純資料一致性，不影響可見性）。第二次執行時條件已不成立，
+   * 回傳 `updated: 0`。回傳的是**實際被改動的列數**（SQLite 的 `changes`）。
+   */
+  async normalizeLegacyMemoryScopes(): Promise<{ updated: number }> {
+    const normalize = this.db.transaction((): number => {
+      const clearedProject = this.db
+        .prepare("update memories set project = null where scope in ('global', 'agent') and project is not null")
+        .run();
+      const promotedScope = this.db
+        .prepare(
+          `update memories
+              set scope = 'global', project = null
+            where scope = 'project' and (project is null or trim(project) = '')`,
+        )
+        .run();
+      return Number(clearedProject.changes) + Number(promotedScope.changes);
+    });
+
+    return { updated: normalize() };
+  }
+
+  /**
+   * 硬刪除記憶（見 `MetadataStore.hardDeleteMemory`）。
+   *
+   * 先確認列存在（未知 id → `false`，不拋錯），再刪 FTS 列與主列；向量是同列的 BLOB 欄位，
+   * 隨主列消失。`memories_fts` 可能在內容為空白時沒有對應列，DELETE 不到任何列是正常情況。
+   */
+  async hardDeleteMemory(id: number): Promise<boolean> {
+    const remove = this.db.transaction((): boolean => {
+      const existing = selectRow(this.db, "select id from memories where id = ?", id);
+      if (existing === undefined) return false;
+      this.db.prepare("delete from memories_fts where rowid = ?").run(id);
+      this.db.prepare("delete from memories where id = ?").run(id);
+      return true;
+    });
+    return remove();
+  }
+
   /** 設定釘選（冪等）；不存在的 id 更新不到任何列，等同無操作。 */
   async setMemoryPinned(id: number, pinned: boolean): Promise<void> {
     this.db.prepare("update memories set pinned = ? where id = ?").run(pinned ? 1 : 0, id);
+  }
+
+  /**
+   * 更新記憶的 `scope`／`project`（見 `MetadataStore.updateMemory`）。
+   *
+   * 先讀回現值再套 patch（`normalizeMemoryPatch`）——合併與正規化語意只有一處，
+   * 不寫成 `coalesce(?, …)` 這種 SQL 表達；`deleted_at is null` 讓「讀到之後才被軟刪除」
+   * 的競態也回 `null`，與 PG 端的 `returning` 語意一致。內容沒動，因此 FTS 列不必更新。
+   */
+  async updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null> {
+    const existing = await this.getMemory(id);
+    if (existing === null || existing.deletedAt !== null) return null;
+
+    const next = normalizeMemoryPatch(existing, patch);
+    this.db
+      .prepare("update memories set scope = ?, project = ? where id = ? and deleted_at is null")
+      .run(next.scope, next.project, id);
+    return await this.getMemory(id);
+  }
+
+  /**
+   * 寫入記憶向量並設為 `ready`（見 `MetadataStore.markMemoryEmbedded`）。
+   *
+   * `deleted_at is null` 讓「讀到之後才被軟刪除」的競態變成 no-op；未知 id 同樣更新不到任何列。
+   * 狀態與向量在同一個 UPDATE 寫入，不會觀察到「ready 但沒有向量」的中間狀態。
+   */
+  async markMemoryEmbedded(id: number, embedderId: string, vec: Float32Array): Promise<void> {
+    assertMemoryEmbeddingInput(embedderId, vec);
+    this.db
+      .prepare(
+        `update memories
+            set embedding = ?, embedding_embedder_id = ?, embedding_state = 'ready'
+          where id = ? and deleted_at is null`,
+      )
+      .run(encodeEmbedding(vec), embedderId, id);
+  }
+
+  /**
+   * 把狀態設為 `failed`／`too-long`（見 `MetadataStore.markMemoryEmbeddingFailed`）。
+   *
+   * 刻意**不**清掉既有 `embedding`／`embedding_embedder_id`：卡 B2 的召回端只採 `ready` 且
+   * embedder 相符者，保留舊向量可讓「同一 embedder 重試成功」時省一次寫入，也便於診斷。
+   */
+  async markMemoryEmbeddingFailed(id: number, reason: MemoryEmbeddingFailure): Promise<void> {
+    assertMemoryEmbeddingFailure(reason);
+    this.db
+      .prepare("update memories set embedding_state = ? where id = ? and deleted_at is null")
+      .run(reason, id);
+  }
+
+  /**
+   * 列出需要（重新）產生向量的未刪除記憶（見 `MetadataStore.listMemoriesNeedingEmbedding`）。
+   *
+   * `embedding_embedder_id is null` 也視為 stale：`ready` 正常一定有 embedder id，但防禦
+   * 早期手動改資料或未來遷移留下的半套狀態。
+   */
+  async listMemoriesNeedingEmbedding(embedderId: string, limit?: number): Promise<Memory[]> {
+    const normalized = normalizeMemoryLimit(limit);
+    if (normalized === 0) return [];
+
+    return selectRows(
+      this.db,
+      `select ${MEMORY_COLUMNS} from memories
+        where deleted_at is null
+          and (embedding_state in ('pending', 'failed')
+               or (embedding_state = 'ready'
+                   and (embedding_embedder_id is null or embedding_embedder_id <> ?)))
+        order by created_at desc, id desc
+        limit ?`,
+      embedderId,
+      normalized,
+    ).map(rowToMemory);
+  }
+
+  /** 統計未刪除記憶的語意化狀態（見 `MetadataStore.memoryEmbeddingStats`；四個狀態數自洽）。 */
+  async memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats> {
+    const row = selectRow(
+      this.db,
+      `select
+         count(*) as total,
+         sum(case when embedding_state = 'pending' then 1 else 0 end) as pending,
+         sum(case when embedding_state = 'ready' then 1 else 0 end) as ready,
+         sum(case when embedding_state = 'failed' then 1 else 0 end) as failed,
+         sum(case when embedding_state = 'too-long' then 1 else 0 end) as too_long,
+         sum(case
+               when embedding_state = 'ready'
+                and (embedding_embedder_id is null or embedding_embedder_id <> ?)
+               then 1 else 0
+             end) as stale
+       from memories where deleted_at is null`,
+      embedderId,
+    );
+
+    const count = (value: unknown): number => Number(value ?? 0);
+    return {
+      total: count(row?.total),
+      pending: count(row?.pending),
+      ready: count(row?.ready),
+      failed: count(row?.failed),
+      tooLong: count(row?.too_long),
+      stale: count(row?.stale),
+    };
+  }
+
+  /**
+   * 記憶語意檢索（見 `MetadataStore.searchMemoriesByVector`）。
+   *
+   * SQL 先套 filter 與 `ready`／embedder 身分條件，**再**在 JS 算 cosine（精確、O(n)）——
+   * 不會出現「先取 top-k 再過濾」而少給結果的問題。`linear scan` 對千～萬筆記憶可接受（卡 B2 的取捨）。
+   */
+  async searchMemoriesByVector(
+    queryVec: Float32Array,
+    embedderId: string,
+    filter: MemorySearchFilter,
+    k: number,
+  ): Promise<MemoryVectorHit[]> {
+    assertMemoryQueryVector(queryVec);
+    if (typeof embedderId !== "string" || embedderId.trim() === "") {
+      throw new TypeError("embedderId 必須是非空字串");
+    }
+    const limit = normalizeMemorySearchK(k);
+    if (limit === 0) return [];
+
+    const normalized = normalizeMemorySearchFilter(filter);
+    if (normalized.buckets !== undefined && normalized.buckets.length === 0) return [];
+    const where = buildMemorySearchWhere(normalized);
+
+    const rows = selectRows(
+      this.db,
+      `select m.id as id, m.embedding as embedding
+         from memories m
+        where ${where.clause}
+          and m.embedding_state = 'ready'
+          and m.embedding_embedder_id = ?`,
+      ...where.params,
+      embedderId,
+    );
+
+    const scored: MemoryVectorHit[] = [];
+    for (const row of rows) {
+      const vector = decodeEmbedding(row.embedding);
+      if (vector === null) continue;
+      // 維度不同時 cosineSimilarity 會拋 TypeError（不得默默跳過損壞的向量資料）。
+      scored.push({ id: Number(row.id), score: cosineSimilarity(queryVec, vector) });
+    }
+    scored.sort((a, b) => (b.score !== a.score ? b.score - a.score : a.id - b.id));
+    return scored.slice(0, limit);
+  }
+
+  /**
+   * 記憶關鍵字檢索（見 `MetadataStore.searchMemoriesKeyword`）。
+   *
+   * 只查 `memories_fts`（**不混 chunk**）；同一組 filter 在 SQL 先套用，再依 bm25 排名，
+   * 同分以 `id` 升冪決勝（可重現）。`rank` 由回傳順序從 1 起算。
+   */
+  async searchMemoriesKeyword(query: string, filter: MemorySearchFilter, k: number): Promise<MemoryKeywordHit[]> {
+    const limit = normalizeMemorySearchK(k);
+    if (limit === 0) return [];
+    const matchExpression = buildMatchExpression(query);
+    if (matchExpression === null) return [];
+
+    const normalized = normalizeMemorySearchFilter(filter);
+    if (normalized.buckets !== undefined && normalized.buckets.length === 0) return [];
+    const where = buildMemorySearchWhere(normalized);
+
+    return selectRows(
+      this.db,
+      `select m.id as id, bm25(memories_fts) as score
+         from memories_fts join memories m on m.id = memories_fts.rowid
+        where memories_fts match ? and ${where.clause}
+        order by score, m.id
+        limit ?`,
+      matchExpression,
+      ...where.params,
+      limit,
+    ).map((row, index) => ({ id: Number(row.id), rank: index + 1 }));
   }
 
   /**
@@ -331,6 +711,19 @@ export class SqliteMetadataStore implements MetadataStore {
       `select ${MEMORY_COLUMNS} from memories where ${conditions.join(" and ")} order by created_at desc, id desc limit ?`,
       ...params,
       limit,
+    ).map(rowToMemory);
+  }
+
+  /**
+   * 列出全部未刪除的記憶（見 `MetadataStore.listMemoriesForExport` 的契約）。
+   *
+   * 備份用：刻意**不套** `normalizeMemoryLimit`（沒有 `limit`），排序與 `listMemories` 相反
+   * （`created_at asc, id asc`），讓匯入端依相同順序重建相對先後。
+   */
+  async listMemoriesForExport(): Promise<Memory[]> {
+    return selectRows(
+      this.db,
+      `select ${MEMORY_COLUMNS} from memories where deleted_at is null order by created_at asc, id asc`,
     ).map(rowToMemory);
   }
 
