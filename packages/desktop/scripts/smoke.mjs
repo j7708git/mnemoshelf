@@ -448,7 +448,13 @@ async function main() {
         })),
       };
       if (result.code !== 0 || report?.ok !== true) summary.ok = false;
-      if (!autostartTransitions.some((item) => item.exists) || !autostartTransitions.some((item) => !item.exists)) {
+      // 出現／消失的轉移只證明 autostart 情境跑過；用 `--only` 跑子集（例如 bootstrap,index）
+      // 時本來就不會碰自啟開關，記錄仍保留在報告裡，但不該拿來判定成敗。
+      const scenarioList = scenarios.trim() === "all" ? ["autostart"] : scenarios.split(",").map((item) => item.trim());
+      if (
+        scenarioList.includes("autostart") &&
+        (!autostartTransitions.some((item) => item.exists) || !autostartTransitions.some((item) => !item.exists))
+      ) {
         summary.ok = false;
       }
     }

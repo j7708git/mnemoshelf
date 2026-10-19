@@ -98,6 +98,8 @@ jobs:
             test-summary.txt
             test-output.txt
           if-no-files-found: warn
+          # private repo 的 Actions artifact 額度有限（免費方案 500 MB）；短保留期避免舊產物堆滿。
+          retention-days: 7
 
   # 三平台建置。打包後在 Linux runner 上跑 headless smoke（xvfb 內啟動、驗 /health 與 token 驗證）。
   build:
@@ -172,6 +174,24 @@ jobs:
         if: matrix.smoke
         run: node packages/desktop/scripts/smoke.mjs headless --out .tmp/desktop-ci
 
+      # 模型快取：index smoke 首次會下載 embedding 模型（約 300 MB），之後的 run 直接沿用。
+      # 路徑與下方 `--user-data` 一致；`gui` 只清 userData 的 `data`，不會清 `models`。
+      - name: 快取 embedding 模型（index smoke）
+        if: matrix.platform == 'linux-x64'
+        uses: actions/cache@v4
+        with:
+          path: .tmp/desktop-ci-index/userData/models
+          key: mnemoshelf-model-embeddinggemma-2-onnx-v1
+
+      # 打包後真正索引 smoke（僅 Linux x64）：headless smoke 只驗 `/health` 與 token 驗證，
+      # 不會觸發索引；這一步跑 `bootstrap,index` 才會真的啟動 worker／embedder 並建立索引。
+      # smoke.mjs 自己會用 xvfb-run 啟動，這裡不要再包一層。第一次要下載模型（約 300 MB），
+      # 之後靠上面的快取；索引本身可能較久，給 45 分鐘。
+      - name: 打包後索引 smoke（Linux x64）
+        if: matrix.platform == 'linux-x64'
+        timeout-minutes: 45
+        run: node packages/desktop/scripts/smoke.mjs gui --only bootstrap,index --user-data .tmp/desktop-ci-index/userData --out .tmp/desktop-ci-index --skip-build
+
       # 授權清單：以 desktop 為主的 production 相依閉包（含 @img/sharp-libvips-*／sqlite-vec-*），
       # 各平台各產生一份（內容反映該平台實際隨附的套件）。
       #
@@ -193,6 +213,8 @@ jobs:
           path: |
             ${{ matrix.artifacts }}
             packages/desktop/dist-app/third-party-licenses-${{ matrix.platform }}.txt
+          # private repo 的 Actions artifact 額度有限（免費方案 500 MB）；短保留期避免舊產物堆滿。
+          retention-days: 7
 
   # 只有推送 v* tag 才發布；workflow_dispatch 不會走到這裡。
   release:
