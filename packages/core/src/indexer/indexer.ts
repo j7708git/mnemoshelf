@@ -103,7 +103,8 @@ export interface IndexRootResult {
   processed: number;
   skippedUnchanged: number;
   /**
-   * 本次**實際重新處理**（重新切塊並嵌入）的檔案中，至少遮罩一處機密的檔案數。
+   * 本次**實際重新處理**（重新切塊並嵌入）的檔案中，**內容**至少遮罩一處機密的檔案數。
+   * title-only 遮罩不計入（檔名被遮但內容沒有）。
    *
    * - 只計文字／程式碼：媒體檔不套文字遮罩，永遠不計入。
    * - 不計跳過與失敗的檔案；`skippedUnchanged` 的檔案上一輪已遮罩，這一輪沒有重新遮罩，
@@ -566,7 +567,7 @@ async function processFile(
  * - **機密遮罩**：文字／程式碼在切塊、嵌入、寫入 DB 之前套用 curated 遮罩（與記憶同一組規則），
  *   chunk 文字不含可辨識憑證；送進 embedder 的 `title`（相對路徑檔名）也先遮罩。媒體檔不套
  *   文字遮罩（位元組照舊送 embedder）。使用者磁碟上的檔案只讀不寫。`maskedFiles` 回報本輪
- *   至少遮一處的檔案數。
+ *   **內容**至少遮一處的檔案數（title-only 遮罩不計）。
  * - 清理：以 `listRelPaths(rootId)` 減去**本次將納入的 `files`** 為準。磁碟上已消失、或本次
  *   被跳過（排除規則、`.gitignore`、黑名單、關模態、超過大小上限等）的檔案，其 chunk 與向量
  *   一律清除——不得因為出現在 skipped 就保留索引（隱私契約：不索引、不回傳）。

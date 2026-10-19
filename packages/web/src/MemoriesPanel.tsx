@@ -449,7 +449,7 @@ export function MemoriesPanel() {
             </span>
           </h2>
           <p className="mt-0.5 text-xs text-muted">
-            釘選的記憶會優先顯示；編輯會產生新版本並取代舊版。共享開關只在專案與全域之間切換，agent 範圍為唯讀。
+            釘選的記憶會優先顯示；編輯會產生新版本並取代舊版。共享開關只在專案與全域之間切換；此面板不提供 agent 範圍切換（REST 仍可設定）。
           </p>
           <p className="mt-0.5 text-[11px] text-muted">
             「刪除」是軟刪除（內容仍在資料庫）；「永久刪除」會真的移除資料列、無法復原，
@@ -755,7 +755,7 @@ export function MemoriesPanel() {
                   </button>
                   {memory.scope === "agent" ? (
                     <span className="rounded-md border border-line px-2.5 py-1 text-xs text-muted">
-                      agent 範圍（唯讀）
+                      agent 範圍
                     </span>
                   ) : memory.scope === "project" ? (
                     <button

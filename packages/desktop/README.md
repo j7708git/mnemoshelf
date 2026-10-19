@@ -34,8 +34,10 @@ electron-builder 打包（`--dir` 產物供本機實跑驗收）。
   `app.getPath("userData")/models`，並讓 Core 服務走同一條設定路徑。
 - **Web UI 放在 asar 之外**：`extraResources` 把 `packages/web/dist` 複製到 `resources/web`，
   由 Core 服務以 `MNEMOSHELF_WEB_DIR` 同源服務。
-- **原生模組 asar 解包**：`asarUnpack` 讓 better-sqlite3／sqlite-vec／onnxruntime-node／sharp
-  的原生二進位落在 `app.asar.unpacked`（Electron 對 `require`／`process.dlopen` 會透明導向）。
+- **production node_modules asar 解包**：`worker_threads` 不能讀 asar 內的檔案；`asarUnpack`
+  把整個 production `node_modules` 解包到 `app.asar.unpacked`，涵蓋 worker 的 JS 依賴
+  （`@mnemoshelf/embedder-transformers`、`@huggingface/transformers`）與 better-sqlite3／
+  sqlite-vec／onnxruntime-node／sharp 的原生二進位。app 自身 `dist/**` 仍留在 asar。
 - **sqlite-vec 的路徑修正（唯一的繞道）**：`sqlite-vec` 用 `import.meta.resolve()` 算出擴充檔路徑，
   打包後是 asar 內的路徑；但 SQLite 的 C 層 `load_extension()` 直接開檔、不經過 Electron 的 fs 補丁，
   所以會得到 `ENOTDIR`。`src/asar-paths.ts` 在 `better-sqlite3` 的 `loadExtension` 上包一層，
@@ -165,5 +167,6 @@ node packages/desktop/scripts/smoke.mjs all        # 以上四個依序跑
   `basic_text` 後端、`safeStorage` 不可用；桌面殼偵測到這種情況會明確指定 libsecret 後端，
   仍失敗時才降級成「本次執行有效的 token」。
 - 圖片縮圖在 Linux 會印出 sharp 的 glib 訊息（縮圖本身正確），來源是 Electron／sharp 的已知問題。
-- `app.asar.unpacked` 的 `.node`／`.so` 由 electron-builder 的 `asarUnpack` 產生；`sharp` 的
-  libvips 側載檔不是 `.node`，**必須**顯式列出（已列在 `electron-builder.yml`）。
+- `app.asar.unpacked` 目前由 `asarUnpack: "**/node_modules/**"` 產生：production `node_modules`
+  全部解包（worker 的 JS 依賴也必須是真實檔案，不只原生 `.node`／`.so`）；新增依賴時不必再
+  逐項列出，但要注意它們都會落在 unpacked。
