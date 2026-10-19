@@ -182,11 +182,26 @@ jobs:
       # 模型快取：index smoke 首次會下載 embedding 模型（約 300 MB），之後的 run 直接沿用。
       # 路徑與下方 `--user-data` 一致；`gui` 只清 userData 的 `data`，不會清 `models`。
       - name: 快取 embedding 模型（index smoke）
+        id: model-cache
         if: matrix.platform == 'linux-x64'
         uses: actions/cache@v4
         with:
           path: .tmp/desktop-ci-index/userData/models
           key: mnemoshelf-model-embeddinggemma-2-onnx-v1
+
+      # cache miss 時從內部 Release 還原（release asset 不佔 Actions artifact 額度）。
+      # 這個 Release 是 CI 用的模型快取，不是產品版本；見 tag model-cache-q4-v1。
+      - name: 還原 embedding 模型（cache miss 時）
+        if: matrix.platform == 'linux-x64' && steps.model-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/desktop-ci-index/userData
+          rm -f .tmp/desktop-ci-index/models-q4.tar.gz
+          gh release download model-cache-q4-v1 --pattern 'models-q4.tar.gz' -D .tmp/desktop-ci-index
+          tar -xzf .tmp/desktop-ci-index/models-q4.tar.gz -C .tmp/desktop-ci-index/userData
 
       # 打包後真正索引 smoke（僅 Linux x64）：headless smoke 只驗 `/health` 與 token 驗證，
       # 不會觸發索引；這一步跑 `bootstrap,index` 才會真的啟動 worker／embedder 並建立索引。

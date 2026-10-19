@@ -112,7 +112,8 @@ pnpm --filter "@mnemoshelf/desktop..." licenses list --prod --long
 - 推送 `v*` tag（例如 `v0.1.0`）：四條管線（Linux x64／Linux arm64／macOS arm64／Windows x64）
   各以原生 runner 建置，Linux 打包後會跑一次 headless smoke（在 xvfb 內啟動並檢查 `/health`
   與 token 驗證）；Linux x64 另外會跑 `bootstrap,index` 的真正索引 smoke（會觸發 worker／
-  embedder，首次需下載模型，CI 有快取），最後由獨立的 release job 建立 GitHub Release 並附上安裝檔與授權資料。
+  embedder；模型優先從 Actions cache 還原，cache miss 時從內部 Release `model-cache-q4-v1`
+  下載固定快取，避免每次重新連 Hugging Face），最後由獨立的 release job 建立 GitHub Release 並附上安裝檔與授權資料。
   建置前會先跑 `pnpm typecheck`、`pnpm build`、`pnpm test`（verify job），全綠才發布。
 - 手動觸發（`workflow_dispatch`）：**不**建立正式 Release、也不上傳 artifacts（避開 Actions
   artifact 額度）；macOS arm64 會把 dmg 與授權清單放進 **草稿 Release**（tag 為
