@@ -95,7 +95,7 @@ preference）、`scope`（global／project／agent）、`project`、`agent`（�
 | `MNEMOSHELF_EMBED_ORT_LOG` | `0`–`4` | 未設定（不覆寫） | ONNX Runtime 的 log 等級（`0`＝verbose、`4`＝fatal），只用於除錯：`0` 會印出內部配置訊息（含 arena 的擴張量），可診斷「單一配置有多大」。訊息量大、會拖慢啟動，平時不要開；非法值會直接拒絕啟動。 |
 | `MNEMOSHELF_MEMORY_BACKFILL` | `on`／`off` | `on` | 啟動時是否回填既有記憶的向量。`off` 只停**啟動回填**（新寫入的記憶仍會嵌入）；非法值會直接拒絕啟動。 |
 | `MNEMOSHELF_INDEX_RATE` | `off`／`normal`／`low` | `off` | **索引限速**：`normal`／`low` 會在「每處理完一個檔案、換下一檔之前」休眠（`normal` 50ms、`low` 250ms）。索引總時間會變長，但同一台機器上的其他工作（UI、影片、其他程式）比較不會被索引吃滿。`off` 是現行行為（不休眠）。限速**只作用於檔案與檔案之間**，同一個大檔的嵌入批次仍會一次跑完。推論在 worker thread，健康檢查與一般 HTTP 不受影響，但**需要嵌入的請求會排隊**（見下節）。非法值會直接拒絕啟動。 |
-| `MNEMOSHELF_PROJECT` | 專案名稱 | 未設定 | MCP 記憶工具的預設專案（`remember`／`search_memories` 在參數未帶 `project` 時使用）。 |
+| `MNEMOSHELF_PROJECT` | 專案名稱 | 未設定 | MCP 的 `remember`／`search_memories` 的預設專案（參數未帶 `project` 時使用）。 |
 
 ## 索引進行中與關閉
 

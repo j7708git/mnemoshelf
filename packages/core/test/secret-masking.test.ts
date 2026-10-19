@@ -248,6 +248,66 @@ describe("maskSecrets：規則命中（真陽性）", () => {
     expect(second.count).toBe(0);
   });
 
+  it("M1-R：未引號的全大寫字面值仍遮罩（不再被當成常數名）", () => {
+    const secret = fake("ABCD", "EF01", "2345", "6789");
+    const placeholder = `${REDACTED_PREFIX}assignment]`;
+    const cases: [string, string][] = [
+      [`DB_PASSWORD=${secret}`, `DB_PASSWORD=${placeholder}`],
+      [`password=${secret}`, `password=${placeholder}`],
+      [`TOKEN=${secret}`, `TOKEN=${placeholder}`],
+    ];
+    for (const [input, expected] of cases) {
+      const result = maskSecrets(input);
+      expect(result.text, input).toBe(expected);
+      expect(result.text, input).not.toContain(secret);
+      expect(result.count, input).toBe(1);
+    }
+  });
+
+  it("M1-R：SECRET_KEY 系列（含引號、DJANGO_ 前綴、_BASE 後綴）都命中", () => {
+    const secret = fake("ABCD", "EF01", "2345", "6789");
+    const placeholder = `${REDACTED_PREFIX}assignment]`;
+    const cases: [string, string][] = [
+      [`SECRET_KEY=${secret}`, `SECRET_KEY=${placeholder}`],
+      [`SECRET_KEY='${secret}'`, `SECRET_KEY='${placeholder}'`],
+      [`DJANGO_SECRET_KEY=${secret}`, `DJANGO_SECRET_KEY=${placeholder}`],
+      [`SECRET_KEY_BASE=${secret}`, `SECRET_KEY_BASE=${placeholder}`],
+    ];
+    for (const [input, expected] of cases) {
+      const result = maskSecrets(input);
+      expect(result.text, input).toBe(expected);
+      expect(result.count, input).toBe(1);
+    }
+  });
+
+  it("M1-R：未引號的全大寫常數參考仍不遮（PASSWORD_MIN_LENGTH）", () => {
+    const text = "password = PASSWORD_MIN_LENGTH";
+    const result = maskSecrets(text);
+    expect(result.redacted).toBe(false);
+    expect(result.text).toBe(text);
+  });
+
+  it("M1-R：新命中結果再跑一次不變（idempotent）", () => {
+    const secret = fake("ABCD", "EF01", "2345", "6789");
+    const text = [
+      `DB_PASSWORD=${secret}`,
+      `password=${secret}`,
+      `TOKEN=${secret}`,
+      `SECRET_KEY=${secret}`,
+      `SECRET_KEY='${secret}'`,
+      `DJANGO_SECRET_KEY=${secret}`,
+      `SECRET_KEY_BASE=${secret}`,
+    ].join("\n");
+    const first = maskSecrets(text);
+    expect(first.redacted).toBe(true);
+    expect(first.count).toBe(7);
+
+    const second = maskSecrets(first.text);
+    expect(second.text).toBe(first.text);
+    expect(second.redacted).toBe(false);
+    expect(second.count).toBe(0);
+  });
+
   it("同一段文字的多個機密都遮，count 反應命中次數", () => {
     const text = `${samples.openAiStyle} 與 ${samples.awsStyle}`;
     const result = maskSecrets(text);

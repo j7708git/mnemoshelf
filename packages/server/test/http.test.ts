@@ -731,6 +731,33 @@ describe("REST：PATCH /memories/:id（共享開關）", () => {
     expect(filtered.memories.map((item) => item.id)).toEqual([memory.id]);
   });
 
+  it("project → agent：200、scope=agent、project 清為 null，原寫入者不變", async () => {
+    server = await startTestServer();
+    const memory = await createMemory({ scope: "project", project: "proj-agent" });
+    expect(memory.agent).toBe("agent-share");
+
+    const patched = await api(server.instance, "PATCH", `/memories/${memory.id}`, { body: { scope: "agent" } });
+    expect(patched.status).toBe(200);
+    expect(patched.body).toMatchObject({
+      id: memory.id,
+      content: memory.content,
+      kind: memory.kind,
+      agent: memory.agent,
+      scope: "agent",
+      project: null,
+    });
+
+    // 寫入者是不可變欄位：呼叫端不能經此端點指定新寫入者，原值必須保留。
+    expect((patched.body as Memory).agent).toBe("agent-share");
+
+    const listed = (await api(server.instance, "GET", "/memories")).body as ListMemoriesResponse;
+    expect(listed.memories.find((item) => item.id === memory.id)).toMatchObject({
+      scope: "agent",
+      project: null,
+      agent: memory.agent,
+    });
+  });
+
   it("只帶 project（現值 scope 是 project）→ 更新專案名稱；只帶非 null project 而現值不是 project → 400", async () => {
     server = await startTestServer();
     const projectMemory = await createMemory({ scope: "project", project: "proj-old" });

@@ -51,7 +51,9 @@ interface MaskRule {
  * （`my_token=[REDACTED:assignment]`，而不是 `my_[REDACTED:assignment]`）。
  */
 const SECRET_KEY_PATTERN =
-  "client[_-]?secret|access[_-]?token|refresh[_-]?token|private[_-]?key|api[_-]?key|apikey|auth[_-]?token|secret|token|password|passwd|pwd";
+  // `secret[_-]?key(?:[_-]base)?` 放在單獨的 `secret` 之前：`SECRET_KEY`／`DJANGO_SECRET_KEY`／
+  // `SECRET_KEY_BASE` 必須取最長匹配，否則只會匹配到 `secret` 而卡在後面的底線（`\b` 不成立）。
+  "client[_-]?secret|secret[_-]?key(?:[_-]base)?|access[_-]?token|refresh[_-]?token|private[_-]?key|api[_-]?key|apikey|auth[_-]?token|secret|token|password|passwd|pwd";
 
 const RULES: readonly MaskRule[] = [
   // 1) PEM 私鑰區塊（含常見的 `RSA`／`EC`／`OPENSSH` 等標頭）。
@@ -111,7 +113,9 @@ const RULES: readonly MaskRule[] = [
  */
 function looksLikeCodeReference(value: string): boolean {
   if (/^(?:process\.env|import\.meta\.env|req\.|request\.|ctx\.|this\.)/.test(value)) return true;
-  if (/^[A-Z][A-Z0-9_]*$/.test(value)) return true; // 常數／環境變數名
+  // 全大寫常數／環境變數名（例如 `PASSWORD_MIN_LENGTH`）：必須含底線分段才算識別字。
+  // 純大寫英數字面值（例如未引號的十六進位字串）不是識別字，不能豁免，否則假密鑰會漏遮。
+  if (/^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(value)) return true;
   if (/^\$/.test(value)) return true; // shell 變數
   if (/^[A-Za-z_$][\w$]*(?:\.[\w$]+)+$/.test(value)) return true; // dotted property access
   return false;

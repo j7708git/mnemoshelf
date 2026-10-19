@@ -5,7 +5,8 @@
  *
  * 記憶由 AI agent 透過 `remember` 寫入，這個畫面是管理面：不直接改動既有列，
  * 「編輯」一律建立新版本並把舊版標記軟刪除（`POST /memories` 帶 `supersedes`）。
- * 共享開關只允許 `project` ↔ `global`（`PATCH /memories/:id`）；`agent` 範圍在本版唯讀。
+ * 共享開關只允許 `project` ↔ `global`（`PATCH /memories/:id`）；此 UI 不提供 `agent` 範圍切換，
+ * REST `PATCH` 仍可設定。
  *
  * 寫入去重（卡 C2）：若 `POST /memories` 回 `200`＋`duplicate: true`，代表已有完全相同內容的
  * 記憶；這裡只提示既有 id，**不新增卡片**。
