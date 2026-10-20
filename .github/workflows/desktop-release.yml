@@ -309,7 +309,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PREV=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+          PREV=$(git describe --tags --match 'v*' --abbrev=0 "${TAG}^" 2>/dev/null || true)
           RANGE="${TAG}"
           if [ -n "${PREV}" ]; then RANGE="${PREV}..${TAG}"; fi
           {
