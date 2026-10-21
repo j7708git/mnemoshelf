@@ -1,0 +1,1225 @@
+{
+  "$comment": "D3 評估題目。expected_ids／acceptable_ids／forbidden_ids 都是 cards.json 的 slug；執行時由 harness 換成 server 的數字 id。query 刻意不照抄卡片文字（identifier 題除外）。",
+  "schemaVersion": 1,
+  "questions": [
+    {
+      "id": "q001",
+      "project": "alpha",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "arc 的建置快取放在哪個目錄？要清掉快取該用什麼指令？",
+      "expected_ids": ["alpha-build-cache-dir"],
+      "identifier": true,
+      "notes": "指令 arc cache clean"
+    },
+    {
+      "id": "q002",
+      "project": "alpha",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "arc.lock 到底要不要提交到版本控制？CI 會檢查它嗎？",
+      "expected_ids": ["alpha-lockfile-commit"],
+      "identifier": true
+    },
+    {
+      "id": "q003",
+      "project": "alpha",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "跑建置時出現 ARC_E102，通常是什麼原因？我該先查哪裡？",
+      "expected_ids": ["alpha-error-e102"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q004",
+      "project": "alpha",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "只想重建這次改到的套件，arc build 要帶哪個參數？它會連帶重建依賴嗎？",
+      "expected_ids": ["alpha-arc-since-flag"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q005",
+      "project": "alpha",
+      "category": "single",
+      "split": "dev",
+      "lang": "en",
+      "query": "Does the file watcher still miss rename-on-save events, or was that fixed?",
+      "expected_ids": ["alpha-watch-rename-fixed"]
+    },
+    {
+      "id": "q006",
+      "project": "alpha",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "寫 arc 外掛時，現在該用哪些生命週期鉤子？舊的鉤子還能用多久？",
+      "expected_ids": ["alpha-plugin-api-v2"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q007",
+      "project": "alpha",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "alpha 發版前的檢查清單有哪幾項？",
+      "expected_ids": ["alpha-pin-release-checklist"],
+      "identifier": true
+    },
+    {
+      "id": "q008",
+      "project": "beta",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "quota 擋下請求時回什麼狀態碼與錯誤字串？為什麼不該回 503？",
+      "expected_ids": ["beta-429-code"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q009",
+      "project": "beta",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "quota 現在用哪種限流演算法？為什麼不繼續用固定視窗？",
+      "expected_ids": ["beta-limiter-sliding"]
+    },
+    {
+      "id": "q010",
+      "project": "beta",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "quota 的計數資料存在哪裡？欄位長什麼樣子？",
+      "expected_ids": ["beta-bucket-window"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q011",
+      "project": "beta",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "quota 服務預設監聽哪個位址與埠？可以直接對外開放嗎？",
+      "expected_ids": ["beta-port-bind"]
+    },
+    {
+      "id": "q012",
+      "project": "beta",
+      "category": "single",
+      "split": "dev",
+      "lang": "en",
+      "query": "Which rate-limit headers does quota return now, and is the old one gone?",
+      "expected_ids": ["beta-header-ratelimit"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q013",
+      "project": "beta",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "quota 的資料庫檔案放在哪個路徑？測試時要怎麼換成暫存目錄？",
+      "expected_ids": ["beta-bucket-file"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q014",
+      "project": "beta",
+      "category": "single",
+      "split": "dev",
+      "lang": "en",
+      "query": "How should quota's integration tests pick a port so they don't collide with a local instance?",
+      "expected_ids": ["beta-test-port-conflict"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q015",
+      "project": "gamma",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 讀 CSV 時用什麼編碼？遇到 BOM 會怎麼處理？",
+      "expected_ids": ["gamma-encoding-utf8"]
+    },
+    {
+      "id": "q016",
+      "project": "gamma",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 碰到空白欄位和字面上的 NULL 分別會存成什麼？加引號的空字串呢？",
+      "expected_ids": ["gamma-null-empty"]
+    },
+    {
+      "id": "q017",
+      "project": "gamma",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 輸出格式的 schema 版本現在是多少？跟上一版比多了什麼？",
+      "expected_ids": ["gamma-schema-v2"]
+    },
+    {
+      "id": "q018",
+      "project": "gamma",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "上游改用分號分隔，sift 需要先轉檔嗎？可以強制指定分隔符嗎？",
+      "expected_ids": ["gamma-delimiter-sniff"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q019",
+      "project": "gamma",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 輸出欄位的順序可以重排嗎？新增欄位要放哪？",
+      "expected_ids": ["gamma-pin-schema"]
+    },
+    {
+      "id": "q020",
+      "project": "alpha",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "這個工作區的 commit message 該用什麼語言寫？",
+      "expected_ids": ["global-commit-lang"]
+    },
+    {
+      "id": "q021",
+      "project": "beta",
+      "category": "single",
+      "split": "dev",
+      "lang": "en",
+      "query": "Which package manager should I use in this workspace, and what does CI run?",
+      "expected_ids": ["global-pnpm"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q022",
+      "project": "alpha",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "alpha 的 CLI 支援哪些 Node 版本？版本太舊會怎樣？",
+      "expected_ids": ["alpha-node-min"]
+    },
+    {
+      "id": "q023",
+      "project": "beta",
+      "category": "single",
+      "split": "dev",
+      "lang": "en",
+      "query": "How should quota code get the current time so tests can control it?",
+      "expected_ids": ["beta-clock-source"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q024",
+      "project": "gamma",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 處理很大的 CSV 會不會把整個檔讀進記憶體？用 --sort 有什麼代價？",
+      "expected_ids": ["gamma-large-file"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q025",
+      "project": "alpha",
+      "category": "single",
+      "split": "dev",
+      "lang": "zh",
+      "query": "進版控的檔案裡，哪一類內容是絕對不能出現的？",
+      "expected_ids": ["global-privacy"]
+    },
+
+    {
+      "id": "q026",
+      "project": "alpha",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "arc 的建置快取 key 是怎麼算出來的？跟以前用 mtime 有什麼不同？",
+      "expected_ids": ["alpha-cache-key-hash"]
+    },
+    {
+      "id": "q027",
+      "project": "alpha",
+      "category": "single",
+      "split": "test",
+      "lang": "en",
+      "query": "What log format does the build tool emit now, and which flag gives human-readable output?",
+      "expected_ids": ["alpha-log-jsonl"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q028",
+      "project": "alpha",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "建置快取會一直長大嗎？有上限或淘汰機制嗎？",
+      "expected_ids": ["alpha-cache-evic-lru"]
+    },
+    {
+      "id": "q029",
+      "project": "alpha",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "codemod 會動到哪些目錄？跑之前可以先預覽嗎？",
+      "expected_ids": ["alpha-codemod-rewrite"],
+      "identifier": true
+    },
+    {
+      "id": "q030",
+      "project": "alpha",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "arc 可以共用遠端快取嗎？上傳預設是開的嗎？",
+      "expected_ids": ["alpha-remote-cache-readonly"]
+    },
+    {
+      "id": "q031",
+      "project": "alpha",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "arc 在 Windows 上有沒有遇過路徑分隔符造成的問題？",
+      "expected_ids": ["alpha-windows-sep"]
+    },
+    {
+      "id": "q032",
+      "project": "alpha",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "依賴圖出現環的時候，arc build 會回哪個錯誤碼？怎麼解？",
+      "expected_ids": ["alpha-dep-graph-cycle"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q033",
+      "project": "beta",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "quota 的 burst 上限怎麼算？可以每個 route 分別設嗎？",
+      "expected_ids": ["beta-burst-config"]
+    },
+    {
+      "id": "q034",
+      "project": "beta",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "被 quota 擋下的請求會留下紀錄嗎？要打哪個端點看？",
+      "expected_ids": ["beta-denial-cache-ttl"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q035",
+      "project": "beta",
+      "category": "single",
+      "split": "test",
+      "lang": "en",
+      "query": "What is quota's metric naming convention for total requests and denials?",
+      "expected_ids": ["beta-metrics-prefix"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q036",
+      "project": "beta",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "quota 為什麼把重活放到 worker thread？之前踩過什麼坑？",
+      "expected_ids": ["beta-node-worker"]
+    },
+    {
+      "id": "q037",
+      "project": "beta",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "quota 的 access log 會不會記到使用者的原始字串或來源位址？",
+      "expected_ids": ["beta-log-pii"]
+    },
+    {
+      "id": "q038",
+      "project": "beta",
+      "category": "single",
+      "split": "test",
+      "lang": "en",
+      "query": "Can a retried consume request double-charge? What header prevents it?",
+      "expected_ids": ["beta-idempotency"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q039",
+      "project": "beta",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "quota 的 health 端點會檢查資料庫嗎？回什麼內容？",
+      "expected_ids": ["beta-health-card-a"],
+      "acceptable_ids": ["beta-health-card-b"],
+      "notes": "近似重複卡（force 建立）；兩張內容等價，另一張不算 FP。"
+    },
+    {
+      "id": "q040",
+      "project": "gamma",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 遇到欄位數不符的列，strict 模式跟預設模式差在哪？",
+      "expected_ids": ["gamma-strict-flag"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q041",
+      "project": "gamma",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "匯入時看到 SIFT_COL_07 是什麼意思？訊息裡有帶什麼線索？",
+      "expected_ids": ["gamma-col-error"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q042",
+      "project": "gamma",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 輸出的日期格式是什麼？時區怎麼處理？",
+      "expected_ids": ["gamma-date-iso"]
+    },
+    {
+      "id": "q043",
+      "project": "gamma",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 會怎麼處理表頭的空白與大小寫？原始表頭還留著嗎？",
+      "expected_ids": ["gamma-header-trim"]
+    },
+    {
+      "id": "q044",
+      "project": "gamma",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 有沒有只驗證不寫檔的模式？CI 怎麼用它？",
+      "expected_ids": ["gamma-dry-run"]
+    },
+    {
+      "id": "q045",
+      "project": "gamma",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 的輸出是 JSON 陣列還是別的形式？下游該怎麼讀？",
+      "expected_ids": ["gamma-output-ndjson"]
+    },
+    {
+      "id": "q046",
+      "project": "gamma",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 解析失敗的列會被寫到哪裡？",
+      "expected_ids": ["gamma-reject-card-a"],
+      "acceptable_ids": ["gamma-reject-card-b"],
+      "notes": "近似重複卡（force 建立）。"
+    },
+    {
+      "id": "q047",
+      "project": "alpha",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "這個工作區的 TypeScript 設定有什麼硬性要求？",
+      "expected_ids": ["global-ts-strict"]
+    },
+    {
+      "id": "q048",
+      "project": "beta",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "我可以自己加一個新的 npm 套件來解決問題嗎？",
+      "expected_ids": ["global-no-new-deps"]
+    },
+    {
+      "id": "q049",
+      "project": "gamma",
+      "category": "single",
+      "split": "test",
+      "lang": "zh",
+      "query": "對外的規格文件跟內部工作紀錄分別該放哪裡？",
+      "expected_ids": ["global-docs-path"]
+    },
+    {
+      "id": "q050",
+      "project": "beta",
+      "category": "single",
+      "split": "test",
+      "lang": "en",
+      "query": "Which response header tells clients which behavior version quota is running?",
+      "expected_ids": ["beta-version-header"],
+      "identifier": true,
+      "code_identifier": true
+    },
+
+    {
+      "id": "q051",
+      "project": "alpha",
+      "category": "multi",
+      "split": "dev",
+      "lang": "zh",
+      "query": "arc 的快取 key 怎麼算？快取又寫在專案的哪個位置？",
+      "expected_ids": ["alpha-cache-key-hash", "alpha-build-cache-dir"]
+    },
+    {
+      "id": "q052",
+      "project": "alpha",
+      "category": "multi",
+      "split": "dev",
+      "lang": "zh",
+      "query": "我要一次改寫多個目錄的程式碼，並只重建受影響的套件，該用哪些指令與參數？",
+      "expected_ids": ["alpha-codemod-rewrite", "alpha-arc-since-flag"]
+    },
+    {
+      "id": "q053",
+      "project": "beta",
+      "category": "multi",
+      "split": "dev",
+      "lang": "zh",
+      "query": "quota 用什麼演算法限流？計數實際存在哪張表？",
+      "expected_ids": ["beta-limiter-sliding", "beta-bucket-window"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q054",
+      "project": "beta",
+      "category": "multi",
+      "split": "dev",
+      "lang": "en",
+      "query": "When quota denies a request, what status, error code, and headers should the client see?",
+      "expected_ids": ["beta-429-code", "beta-header-ratelimit"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q055",
+      "project": "gamma",
+      "category": "multi",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 讀檔時的編碼與分隔符規則是什麼？",
+      "expected_ids": ["gamma-encoding-utf8", "gamma-delimiter-sniff"]
+    },
+    {
+      "id": "q056",
+      "project": "gamma",
+      "category": "multi",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 對空值的處理，以及輸出 schema 這一版有什麼變動？",
+      "expected_ids": ["gamma-null-empty", "gamma-schema-v2"]
+    },
+    {
+      "id": "q057",
+      "project": "alpha",
+      "category": "multi",
+      "split": "dev",
+      "lang": "en",
+      "query": "Which package manager does this workspace use, and does alpha commit its lock file?",
+      "expected_ids": ["global-pnpm", "alpha-lockfile-commit"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q058",
+      "project": "alpha",
+      "category": "multi",
+      "split": "dev",
+      "lang": "zh",
+      "query": "alpha 發版前要跑哪些檢查？最後產生 changelog 與 tag 的是哪一步？",
+      "expected_ids": ["alpha-pin-release-checklist", "alpha-release-card-a"],
+      "acceptable_ids": ["alpha-release-card-b"],
+      "identifier": true
+    },
+    {
+      "id": "q059",
+      "project": "beta",
+      "category": "multi",
+      "split": "dev",
+      "lang": "zh",
+      "query": "quota 改設定後怎麼生效？服務預設綁在哪個位址？",
+      "expected_ids": ["beta-config-watch", "beta-port-bind"]
+    },
+    {
+      "id": "q060",
+      "project": "gamma",
+      "category": "multi",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 遇到壞列時 strict 模式會怎麼做？錯誤訊息帶哪個代碼？",
+      "expected_ids": ["gamma-strict-flag", "gamma-col-error"],
+      "identifier": true,
+      "code_identifier": true
+    },
+
+    {
+      "id": "q061",
+      "project": "alpha",
+      "category": "multi",
+      "split": "test",
+      "lang": "zh",
+      "query": "arc 的日誌格式與快取上限分別是什麼？",
+      "expected_ids": ["alpha-log-jsonl", "alpha-cache-evic-lru"]
+    },
+    {
+      "id": "q062",
+      "project": "alpha",
+      "category": "multi",
+      "split": "test",
+      "lang": "zh",
+      "query": "arc 的遠端快取怎麼用？本機快取又放在哪？",
+      "expected_ids": ["alpha-remote-cache-readonly", "alpha-build-cache-dir"]
+    },
+    {
+      "id": "q063",
+      "project": "alpha",
+      "category": "multi",
+      "split": "test",
+      "lang": "zh",
+      "query": "寫 arc 外掛要用哪些鉤子？外掛的測試資料該放哪？",
+      "expected_ids": ["alpha-plugin-api-v2", "alpha-test-fixtures"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q064",
+      "project": "beta",
+      "category": "multi",
+      "split": "test",
+      "lang": "zh",
+      "query": "quota 的限流演算法與 burst 上限怎麼搭配？",
+      "expected_ids": ["beta-limiter-sliding", "beta-burst-config"]
+    },
+    {
+      "id": "q065",
+      "project": "beta",
+      "category": "multi",
+      "split": "test",
+      "lang": "en",
+      "query": "How are denied requests recorded, and which metrics expose them?",
+      "expected_ids": ["beta-denial-cache-ttl", "beta-metrics-prefix"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q066",
+      "project": "beta",
+      "category": "multi",
+      "split": "test",
+      "lang": "en",
+      "query": "How does quota avoid double-charging retries and concurrent counter overwrites?",
+      "expected_ids": ["beta-idempotency", "beta-distributed-lock"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q067",
+      "project": "gamma",
+      "category": "multi",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 的輸出欄位順序與日期格式各有什麼契約？",
+      "expected_ids": ["gamma-pin-schema", "gamma-date-iso"]
+    },
+    {
+      "id": "q068",
+      "project": "gamma",
+      "category": "multi",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 處理大檔的記憶體策略與寫入批次是怎麼運作的？",
+      "expected_ids": ["gamma-large-file", "gamma-batch-size"]
+    },
+    {
+      "id": "q069",
+      "project": "beta",
+      "category": "multi",
+      "split": "test",
+      "lang": "zh",
+      "query": "內部工作紀錄與對外文件放哪？PR 大小有什麼慣例？",
+      "expected_ids": ["global-docs-path", "global-review"]
+    },
+    {
+      "id": "q070",
+      "project": "gamma",
+      "category": "multi",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 表頭正規化後對不上，SIFT_COL_07 要怎麼查？",
+      "expected_ids": ["gamma-header-trim", "gamma-col-error"],
+      "identifier": true,
+      "code_identifier": true
+    },
+
+    {
+      "id": "q071",
+      "project": "alpha",
+      "category": "update",
+      "split": "dev",
+      "lang": "zh",
+      "query": "arc watch 現在還會漏掉存檔改名的事件嗎？需要手動重跑嗎？",
+      "expected_ids": ["alpha-watch-rename-fixed"],
+      "forbidden_ids": ["alpha-watch-rename-bug"]
+    },
+    {
+      "id": "q072",
+      "project": "alpha",
+      "category": "update",
+      "split": "dev",
+      "lang": "zh",
+      "query": "arc 外掛的鉤子現在叫什麼？舊的鉤子還支援到什麼時候？",
+      "expected_ids": ["alpha-plugin-api-v2"],
+      "forbidden_ids": ["alpha-plugin-api"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q073",
+      "project": "alpha",
+      "category": "update",
+      "split": "dev",
+      "lang": "zh",
+      "query": "arc 的快取 key 現在用什麼當依據？還會因為 checkout 舊版而誤用快取嗎？",
+      "expected_ids": ["alpha-cache-key-hash"],
+      "forbidden_ids": ["alpha-cache-key-format"]
+    },
+    {
+      "id": "q074",
+      "project": "beta",
+      "category": "update",
+      "split": "dev",
+      "lang": "zh",
+      "query": "quota 現在用固定視窗還是別的演算法？為什麼改？",
+      "expected_ids": ["beta-limiter-sliding"],
+      "forbidden_ids": ["beta-limiter-algo"]
+    },
+    {
+      "id": "q075",
+      "project": "beta",
+      "category": "update",
+      "split": "dev",
+      "lang": "en",
+      "query": "Which rate-limit headers does quota send now, and is X-Quota-Left still there?",
+      "expected_ids": ["beta-header-ratelimit"],
+      "forbidden_ids": ["beta-header-name"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q076",
+      "project": "beta",
+      "category": "update",
+      "split": "dev",
+      "lang": "zh",
+      "query": "改 quota.toml 後還需要重啟嗎？解析失敗會怎樣？",
+      "expected_ids": ["beta-config-watch"],
+      "forbidden_ids": ["beta-config-reload"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q077",
+      "project": "gamma",
+      "category": "update",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 現在預設用什麼編碼讀檔？在 Windows 上也一樣嗎？",
+      "expected_ids": ["gamma-encoding-utf8"],
+      "forbidden_ids": ["gamma-encoding-default"]
+    },
+    {
+      "id": "q078",
+      "project": "gamma",
+      "category": "update",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 還需要手動把分號轉成逗號嗎？",
+      "expected_ids": ["gamma-delimiter-sniff"],
+      "forbidden_ids": ["gamma-delimiter"]
+    },
+    {
+      "id": "q079",
+      "project": "gamma",
+      "category": "update",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 的進度訊息現在印到哪裡？stdout 還會混進進度嗎？",
+      "expected_ids": ["gamma-progress-stderr"],
+      "forbidden_ids": ["gamma-progress-log"]
+    },
+    {
+      "id": "q080",
+      "project": "gamma",
+      "category": "update",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 輸出第一行寫的 schema 版本，現在是哪一版？",
+      "expected_ids": ["gamma-schema-v2"],
+      "forbidden_ids": ["gamma-schema-version"],
+      "identifier": true
+    },
+
+    {
+      "id": "q081",
+      "project": "alpha",
+      "category": "update",
+      "split": "test",
+      "lang": "zh",
+      "query": "arc 的日誌現在是什麼格式？還是純文字嗎？",
+      "expected_ids": ["alpha-log-jsonl"],
+      "forbidden_ids": ["alpha-log-format"]
+    },
+    {
+      "id": "q082",
+      "project": "alpha",
+      "category": "update",
+      "split": "test",
+      "lang": "zh",
+      "query": "arc 的快取現在有上限嗎？超過會怎麼淘汰？",
+      "expected_ids": ["alpha-cache-evic-lru"],
+      "forbidden_ids": ["alpha-cache-evic"]
+    },
+    {
+      "id": "q083",
+      "project": "alpha",
+      "category": "update",
+      "split": "test",
+      "lang": "zh",
+      "query": "arc 的 codemod 現在會處理 test 目錄嗎？",
+      "expected_ids": ["alpha-codemod-rewrite"],
+      "forbidden_ids": ["alpha-codemod-scope"],
+      "identifier": true
+    },
+    {
+      "id": "q084",
+      "project": "alpha",
+      "category": "update",
+      "split": "test",
+      "lang": "zh",
+      "query": "arc 支援遠端快取嗎？上傳預設是開還是關？",
+      "expected_ids": ["alpha-remote-cache-readonly"],
+      "forbidden_ids": ["alpha-remote-cache-off"]
+    },
+    {
+      "id": "q085",
+      "project": "beta",
+      "category": "update",
+      "split": "test",
+      "lang": "zh",
+      "query": "quota 的 burst 上限現在怎麼算？",
+      "expected_ids": ["beta-burst-config"],
+      "forbidden_ids": ["beta-burst"]
+    },
+    {
+      "id": "q086",
+      "project": "beta",
+      "category": "update",
+      "split": "test",
+      "lang": "zh",
+      "query": "quota 被擋的請求現在記在哪裡、留多久？",
+      "expected_ids": ["beta-denial-cache-ttl"],
+      "forbidden_ids": ["beta-denial-cache"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q087",
+      "project": "beta",
+      "category": "update",
+      "split": "test",
+      "lang": "en",
+      "query": "What are quota's metric names now for requests and denials?",
+      "expected_ids": ["beta-metrics-prefix"],
+      "forbidden_ids": ["beta-metrics-name"],
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q088",
+      "project": "gamma",
+      "category": "update",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 現在怎麼區分空字串與 NULL？",
+      "expected_ids": ["gamma-null-empty"],
+      "forbidden_ids": ["gamma-null-handling"]
+    },
+    {
+      "id": "q089",
+      "project": "gamma",
+      "category": "update",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 的日期輸出格式與時區，現在是哪一種？",
+      "expected_ids": ["gamma-date-iso"],
+      "forbidden_ids": ["gamma-date-format"]
+    },
+    {
+      "id": "q090",
+      "project": "gamma",
+      "category": "update",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 還會保留表頭原樣嗎？做了哪些正規化？",
+      "expected_ids": ["gamma-header-trim"],
+      "forbidden_ids": ["gamma-header-normalize"]
+    },
+
+    {
+      "id": "q091",
+      "project": "alpha",
+      "category": "negative",
+      "split": "dev",
+      "lang": "zh",
+      "query": "明天台北會不會下雨？該帶傘嗎？",
+      "expected_ids": []
+    },
+    {
+      "id": "q092",
+      "project": "alpha",
+      "category": "negative",
+      "split": "dev",
+      "lang": "zh",
+      "query": "幫我寫一首關於秋天的五行詩。",
+      "expected_ids": []
+    },
+    {
+      "id": "q093",
+      "project": "beta",
+      "category": "negative",
+      "split": "dev",
+      "lang": "zh",
+      "query": "準備半程馬拉松，一週跑幾公里比較合適？",
+      "expected_ids": []
+    },
+    {
+      "id": "q094",
+      "project": "beta",
+      "category": "negative",
+      "split": "dev",
+      "lang": "zh",
+      "query": "番茄炒蛋要加糖嗎？",
+      "expected_ids": []
+    },
+    {
+      "id": "q095",
+      "project": "gamma",
+      "category": "negative",
+      "split": "dev",
+      "lang": "zh",
+      "query": "世界上最高的山是哪一座？高度多少？",
+      "expected_ids": []
+    },
+    {
+      "id": "q096",
+      "project": "gamma",
+      "category": "negative",
+      "split": "dev",
+      "lang": "zh",
+      "query": "怎麼把 0.75 換算成分數？",
+      "expected_ids": []
+    },
+    {
+      "id": "q097",
+      "project": "alpha",
+      "category": "negative",
+      "split": "dev",
+      "lang": "en",
+      "query": "Recommend a few science fiction films from the 1990s.",
+      "expected_ids": []
+    },
+    {
+      "id": "q098",
+      "project": "beta",
+      "category": "negative",
+      "split": "dev",
+      "lang": "zh",
+      "query": "護照過期了要怎麼換發？",
+      "expected_ids": []
+    },
+    {
+      "id": "q099",
+      "project": "gamma",
+      "category": "negative",
+      "split": "test",
+      "lang": "zh",
+      "query": "今天股市為什麼下跌？",
+      "expected_ids": []
+    },
+    {
+      "id": "q100",
+      "project": "alpha",
+      "category": "negative",
+      "split": "test",
+      "lang": "zh",
+      "query": "幫我規劃三天的京都自由行行程。",
+      "expected_ids": []
+    },
+    {
+      "id": "q101",
+      "project": "beta",
+      "category": "negative",
+      "split": "test",
+      "lang": "en",
+      "query": "My cat keeps scratching the sofa. What should I do?",
+      "expected_ids": []
+    },
+    {
+      "id": "q102",
+      "project": "gamma",
+      "category": "negative",
+      "split": "test",
+      "lang": "zh",
+      "query": "一杯咖啡大約含多少咖啡因？",
+      "expected_ids": []
+    },
+    {
+      "id": "q103",
+      "project": "alpha",
+      "category": "negative",
+      "split": "test",
+      "lang": "zh",
+      "query": "怎麼用吉他彈 C 大調音階？",
+      "expected_ids": []
+    },
+    {
+      "id": "q104",
+      "project": "beta",
+      "category": "negative",
+      "split": "test",
+      "lang": "en",
+      "query": "Why is the sky blue?",
+      "expected_ids": []
+    },
+    {
+      "id": "q105",
+      "project": "gamma",
+      "category": "negative",
+      "split": "test",
+      "lang": "zh",
+      "query": "推薦幾種適合新手的盆栽植物。",
+      "expected_ids": []
+    },
+
+    {
+      "id": "q106",
+      "project": "alpha",
+      "category": "cross",
+      "split": "dev",
+      "lang": "zh",
+      "query": "quota 服務預設綁在哪個位址？可以直接對外開放嗎？",
+      "expected_ids": [],
+      "forbidden_ids": ["beta-port-bind"],
+      "cross_check_id": "beta-port-bind"
+    },
+    {
+      "id": "q107",
+      "project": "beta",
+      "category": "cross",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 的輸出欄位順序可以重排嗎？",
+      "expected_ids": [],
+      "forbidden_ids": ["gamma-pin-schema"],
+      "cross_check_id": "gamma-pin-schema"
+    },
+    {
+      "id": "q108",
+      "project": "gamma",
+      "category": "cross",
+      "split": "dev",
+      "lang": "zh",
+      "query": "alpha 的 arc.lock 需不需要提交到 git？",
+      "expected_ids": [],
+      "forbidden_ids": ["alpha-lockfile-commit"],
+      "cross_check_id": "alpha-lockfile-commit"
+    },
+    {
+      "id": "q109",
+      "project": "alpha",
+      "category": "cross",
+      "split": "dev",
+      "lang": "zh",
+      "query": "sift 讀 CSV 預設用什麼編碼？",
+      "expected_ids": [],
+      "forbidden_ids": ["gamma-encoding-utf8"],
+      "cross_check_id": "gamma-encoding-utf8"
+    },
+    {
+      "id": "q110",
+      "project": "beta",
+      "category": "cross",
+      "split": "dev",
+      "lang": "zh",
+      "query": "arc 出現 ARC_E102 要查什麼？",
+      "expected_ids": [],
+      "forbidden_ids": ["alpha-error-e102"],
+      "cross_check_id": "alpha-error-e102",
+      "identifier": true,
+      "code_identifier": true
+    },
+    {
+      "id": "q111",
+      "project": "gamma",
+      "category": "cross",
+      "split": "dev",
+      "lang": "zh",
+      "query": "quota 現在用哪些限流標頭？",
+      "expected_ids": [],
+      "forbidden_ids": ["beta-header-ratelimit"],
+      "cross_check_id": "beta-header-ratelimit"
+    },
+    {
+      "id": "q112",
+      "project": "alpha",
+      "category": "cross",
+      "split": "dev",
+      "lang": "en",
+      "query": "Can a retried consume request double-charge in quota?",
+      "expected_ids": [],
+      "forbidden_ids": ["beta-idempotency"],
+      "cross_check_id": "beta-idempotency"
+    },
+    {
+      "id": "q113",
+      "project": "gamma",
+      "category": "cross",
+      "split": "test",
+      "lang": "zh",
+      "query": "arc watch 現在還會漏掉改名事件嗎？",
+      "expected_ids": [],
+      "forbidden_ids": ["alpha-watch-rename-fixed"],
+      "cross_check_id": "alpha-watch-rename-fixed"
+    },
+    {
+      "id": "q114",
+      "project": "alpha",
+      "category": "cross",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 輸出 schema 現在是第幾版？",
+      "expected_ids": [],
+      "forbidden_ids": ["gamma-schema-v2"],
+      "cross_check_id": "gamma-schema-v2"
+    },
+    {
+      "id": "q115",
+      "project": "beta",
+      "category": "cross",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 有只驗證不寫檔的模式嗎？",
+      "expected_ids": [],
+      "forbidden_ids": ["gamma-dry-run"],
+      "cross_check_id": "gamma-dry-run"
+    },
+    {
+      "id": "q116",
+      "project": "alpha",
+      "category": "cross",
+      "split": "test",
+      "lang": "en",
+      "query": "How should quota code obtain the current time so tests can control it?",
+      "expected_ids": [],
+      "forbidden_ids": ["beta-clock-source"],
+      "cross_check_id": "beta-clock-source"
+    },
+    {
+      "id": "q117",
+      "project": "gamma",
+      "category": "cross",
+      "split": "test",
+      "lang": "zh",
+      "query": "arc 的建置快取 key 是怎麼算的？",
+      "expected_ids": [],
+      "forbidden_ids": ["alpha-cache-key-hash"],
+      "cross_check_id": "alpha-cache-key-hash"
+    },
+    {
+      "id": "q118",
+      "project": "beta",
+      "category": "cross",
+      "split": "test",
+      "lang": "zh",
+      "query": "arc 支援遠端共享快取嗎？",
+      "expected_ids": [],
+      "forbidden_ids": ["alpha-remote-cache-readonly"],
+      "cross_check_id": "alpha-remote-cache-readonly"
+    },
+    {
+      "id": "q119",
+      "project": "gamma",
+      "category": "cross",
+      "split": "test",
+      "lang": "zh",
+      "query": "quota 為什麼把重活放到 worker thread？",
+      "expected_ids": [],
+      "forbidden_ids": ["beta-node-worker"],
+      "cross_check_id": "beta-node-worker"
+    },
+    {
+      "id": "q120",
+      "project": "alpha",
+      "category": "cross",
+      "split": "test",
+      "lang": "zh",
+      "query": "sift 的失敗列會寫到哪個檔案？",
+      "expected_ids": [],
+      "forbidden_ids": ["gamma-reject-card-a"],
+      "cross_check_id": "gamma-reject-card-a",
+      "acceptable_ids": ["gamma-reject-card-b"]
+    }
+  ]
+}

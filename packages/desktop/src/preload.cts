@@ -19,6 +19,8 @@ const CHANNELS = {
   bootstrapUpdate: "mnemoshelf:bootstrap:update",
   settingsGet: "mnemoshelf:settings:get",
   settingsSetAutostart: "mnemoshelf:settings:set-autostart",
+  settingsSetAgentDiscovery: "mnemoshelf:settings:set-agent-discovery",
+  settingsCopyConnectionInfo: "mnemoshelf:settings:copy-connection-info",
 };
 
 const api = {
@@ -41,6 +43,8 @@ const api = {
   settings: {
     get: () => ipcRenderer.invoke(CHANNELS.settingsGet),
     setAutostart: (enabled: unknown) => ipcRenderer.invoke(CHANNELS.settingsSetAutostart, enabled === true),
+    setAgentDiscovery: (enabled: unknown) => ipcRenderer.invoke(CHANNELS.settingsSetAgentDiscovery, enabled === true),
+    copyConnectionInfo: () => ipcRenderer.invoke(CHANNELS.settingsCopyConnectionInfo),
   },
 };
 

@@ -28,6 +28,12 @@ export interface SettingsPanelProps {
   /** 匯出失敗訊息；沒有時為 null。 */
   diagnosticsError: string | null;
   onToggleAutostart: (enabled: boolean) => void;
+  /** 切換「寫出 agent 連線資訊檔」；關閉時 main process 會立即刪檔。 */
+  onToggleAgentDiscovery: (enabled: boolean) => void;
+  /** 「複製連線資訊」：由 main process 把 `{url, token}` 放進剪貼簿。 */
+  onCopyConnectionInfo: () => void;
+  /** 複製結果的提示（含 token 警語在固定文案裡）。 */
+  connectionNotice: string | null;
   onExportDiagnostics: () => void;
   onClose: () => void;
 }
@@ -103,11 +109,23 @@ export function SettingsPanel({
   diagnosticsNotice,
   diagnosticsError,
   onToggleAutostart,
+  onToggleAgentDiscovery,
+  onCopyConnectionInfo,
+  connectionNotice,
   onExportDiagnostics,
   onClose,
 }: SettingsPanelProps) {
   const autostart = settings?.autostart ?? null;
   const token = settings?.token ?? null;
+  const agentDiscovery = settings?.agentDiscovery ?? null;
+
+  /** 連線資訊檔的狀態文字（不顯示 token）。 */
+  const agentDiscoveryStatus = (discovery: NonNullable<DesktopSettingsState["agentDiscovery"]>): string => {
+    if (!discovery.enabled) return discovery.present ? "設定已關閉，但檔案仍存在" : "已關閉（不會寫出連線資訊檔）";
+    if (discovery.present) return "可用（同機程式可讀取）";
+    if (!discovery.active) return "重新啟動 Mnemoshelf 後生效";
+    return "尚未寫出";
+  };
 
   return (
     <section id="mnemoshelf-settings" aria-label="設定" className="space-y-4 rounded-lg border border-line bg-white p-5">
@@ -140,6 +158,62 @@ export function SettingsPanel({
                 {autostart.detail}
                 {autostart.location !== null && `（${autostart.location}）`}
               </p>
+            </>
+          )}
+        </div>
+      )}
+
+      {settings !== null && (
+        <div className="space-y-2">
+          <h3 className="text-sm font-medium text-ink">Agent 連線資訊</h3>
+          <p className="text-xs text-muted">
+            寫出一份 <code>runtime.json</code>，讓同一台機器的 agent（OpenCode／OpenChamber 外掛、MCP client）
+            自動取得網址與 token，不必手動複製。檔案含 token（等於本機全權），僅供同使用者讀取。
+          </p>
+          {agentDiscovery === null ? (
+            <p className="text-xs text-muted">讀取中…</p>
+          ) : (
+            <>
+              <label className="flex items-center gap-2 text-sm text-ink">
+                <input
+                  id="mnemoshelf-agent-discovery"
+                  type="checkbox"
+                  checked={agentDiscovery.enabled}
+                  disabled={busy}
+                  onChange={(event) => onToggleAgentDiscovery(event.target.checked)}
+                  className="h-4 w-4"
+                />
+                寫出連線資訊檔（關閉時立即刪除）
+              </label>
+              <p id="mnemoshelf-agent-discovery-status" className="text-xs text-muted">
+                狀態：{agentDiscoveryStatus(agentDiscovery)}
+                {agentDiscovery.file !== "" && `（${agentDiscovery.file}）`}
+              </p>
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  id="mnemoshelf-agent-copy"
+                  type="button"
+                  onClick={onCopyConnectionInfo}
+                  disabled={!agentDiscovery.present}
+                  className="rounded-md border border-line px-3 py-1.5 text-sm text-ink disabled:opacity-40"
+                >
+                  複製連線資訊
+                </button>
+                {connectionNotice !== null && (
+                  <span role="status" className="text-xs text-muted">
+                    {connectionNotice}
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-muted">
+                複製的內容是 <code>{'{"url","token"}'}</code>，<strong>包含 token</strong>：只貼給信任的程式，
+                不要放進版本控制、共用的設定檔或聊天訊息。
+              </p>
+              {agentDiscovery.error !== null && (
+                <p role="alert" className="text-sm text-red-600">
+                  {agentDiscovery.error}
+                </p>
+              )}
             </>
           )}
         </div>

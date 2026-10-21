@@ -2,7 +2,9 @@
  * REST 路由（`node:http` 手寫，JSON in／JSON out；不引框架）。
  *
  * 契約（任務卡 §REST API）：
- * - `GET  /health`（免 token）→ `{status:"ok"}`
+ * - `GET  /health`（免 token）→ `{status:"ok", service:"mnemoshelf", appVersion:"<版本>"}`
+ *   （`service`／`appVersion` 是 additive 欄位；agent 外掛用它確認連到的是 Mnemoshelf，
+ *   避免把 token 送到佔用同一埠的無關程式）
  * - `POST /roots`、`GET /roots`、`GET /roots/:id`、`PATCH /roots/:id`（改 `modalities`）、
  *   `DELETE /roots/:id?deleteData=1`
  * - `POST /roots/:id/preview`、`POST /roots/:id/index`、`POST /roots/:id/index/cancel`
@@ -650,6 +652,13 @@ function readPackageVersion(): string {
 
 /** 服務版本（行程啟動時讀一次）。 */
 export const APP_VERSION = readPackageVersion();
+
+/**
+ * 服務身分（`GET /health` 的 `service`）。
+ *
+ * agent 外掛在使用 runtime 檔之前會比對這個欄位，避免把 token 送到佔用同一埠的無關程式。
+ */
+export const SERVICE_NAME = "mnemoshelf";
 
 /** 讀取並解析 JSON 請求主體；空主體視為 `{}`。 */
 async function readJsonBody(request: IncomingMessage): Promise<Record<string, unknown>> {
@@ -1873,7 +1882,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const method = (request.method ?? "GET").toUpperCase();
 
     if (method === "GET" && segments.length === 1 && segments[0] === "health") {
-      sendJson(response, 200, { status: "ok" });
+      // 免 token；只放服務身分與版本，沒有任何機密。
+      sendJson(response, 200, { status: "ok", service: SERVICE_NAME, appVersion: APP_VERSION });
       return;
     }
 

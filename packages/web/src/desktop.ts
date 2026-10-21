@@ -68,6 +68,15 @@ export interface DesktopSettingsState {
     location: string | null;
     detail: string;
   };
+  /** Agent 連線資訊（`runtime.json`）的設定與狀態；**不含 token**。 */
+  agentDiscovery: {
+    enabled: boolean;
+    /** 這次執行的 server 是否已套用（變更要重新啟動才生效）。 */
+    active: boolean;
+    file: string;
+    present: boolean;
+    error: string | null;
+  };
 }
 
 /** preload 暴露的窄介面。 */
@@ -83,6 +92,10 @@ export interface DesktopBridge {
   settings: {
     get(): Promise<DesktopSettingsState>;
     setAutostart(enabled: boolean): Promise<DesktopSettingsState>;
+    /** 設定是否寫出 `runtime.json`；關閉時立即刪除既有檔案。 */
+    setAgentDiscovery(enabled: boolean): Promise<DesktopSettingsState>;
+    /** 把 `{url, token}` 放進剪貼簿（使用者點擊才呼叫）；回傳不含 token。 */
+    copyConnectionInfo(): Promise<{ copied: boolean; url: string | null }>;
   };
 }
 

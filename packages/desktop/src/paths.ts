@@ -21,6 +21,14 @@ export interface DesktopPaths {
   webDir: string;
   /** token 密文檔位置（由 `safeStorage` 加密後落地，見 `token-store.ts`）。 */
   tokenFile: string;
+  /**
+   * 桌面設定檔（目前只有 `agentDiscovery`；`0600`）。
+   *
+   * 桌面版沒有通用的 settings 機制，這是刻意的最小持久化（見 `agent-settings.ts`）。
+   */
+  settingsFile: string;
+  /** Agent 連線資訊檔（server 寫出，含 token；`<dataDir>/runtime.json`）。 */
+  runtimeFile: string;
 }
 
 /** 由 userData 與 `resourcesPath` 組出執行期路徑。 */
@@ -31,12 +39,15 @@ export function resolveDesktopPaths(input: {
   webDir?: string;
 }): DesktopPaths {
   const userData = path.resolve(input.userData);
+  const dataDir = path.join(userData, "data");
   return {
     userData,
-    dataDir: path.join(userData, "data"),
+    dataDir,
     modelDir: path.join(userData, "models"),
     webDir: input.webDir === undefined ? path.join(path.resolve(input.resourcesPath), "web") : path.resolve(input.webDir),
     tokenFile: path.join(userData, "token.bin"),
+    settingsFile: path.join(userData, "agentSettings.json"),
+    runtimeFile: path.join(dataDir, "runtime.json"),
   };
 }
 
@@ -64,6 +75,10 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
  *
  * `MNEMOSHELF_PORT` 預設 0（由 OS 指派隨機埠，只綁 127.0.0.1）；外部若明確指定
  * （例如 headless 驗收要用固定埠 curl）則沿用該值。
+ *
+ * **桌面開關優先於 shell 環境變數**：`agentDiscovery` 一律覆寫
+ * `MNEMOSHELF_AGENT_DISCOVERY`，`runtimeFile` 也明確指定（桌面設定頁要能顯示與刪除
+ * 同一個檔案；不讓外部環境變數把檔案指到桌面不知道的位置）。
  */
 export function buildServerEnv(input: {
   base: NodeJS.ProcessEnv;
@@ -71,6 +86,10 @@ export function buildServerEnv(input: {
   dataDir: string;
   modelDir: string;
   webDir: string;
+  /** `agentSettings.agentDiscovery`（桌面設定）。 */
+  agentDiscovery: boolean;
+  /** 連線資訊檔路徑（`<dataDir>/runtime.json`）。 */
+  runtimeFile: string;
 }): NodeJS.ProcessEnv {
   const port = input.base.MNEMOSHELF_PORT;
   return {
@@ -80,5 +99,7 @@ export function buildServerEnv(input: {
     MNEMOSHELF_MODEL_DIR: input.modelDir,
     MNEMOSHELF_WEB_DIR: input.webDir,
     MNEMOSHELF_PORT: port === undefined || port.trim() === "" ? "0" : port,
+    MNEMOSHELF_AGENT_DISCOVERY: input.agentDiscovery ? "on" : "off",
+    MNEMOSHELF_RUNTIME_FILE: input.runtimeFile,
   };
 }

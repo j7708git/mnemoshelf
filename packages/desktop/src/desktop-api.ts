@@ -20,6 +20,8 @@ export const DESKTOP_CHANNELS = {
   bootstrapUpdate: "mnemoshelf:bootstrap:update",
   settingsGet: "mnemoshelf:settings:get",
   settingsSetAutostart: "mnemoshelf:settings:set-autostart",
+  settingsSetAgentDiscovery: "mnemoshelf:settings:set-agent-discovery",
+  settingsCopyConnectionInfo: "mnemoshelf:settings:copy-connection-info",
 } as const;
 
 /** `contextBridge` 掛在 renderer 上的全域名稱，以及 API 版本。 */
@@ -39,12 +41,31 @@ export interface DesktopAppInfo {
   isPackaged: boolean;
 }
 
+/**
+ * Agent 連線資訊（`runtime.json`）的設定與狀態。
+ *
+ * **不含 token**：token 只在 main process；「複製連線資訊」由 main 直接寫剪貼簿。
+ */
+export interface DesktopAgentDiscoveryState {
+  /** 使用者設定（持久化在 `agentSettings.json`）。 */
+  enabled: boolean;
+  /** 這次執行的 server 是否已套用（變更開關要重新啟動才會生效）。 */
+  active: boolean;
+  /** 連線資訊檔的路徑（`<userData>/data/runtime.json`）。 */
+  file: string;
+  /** 檔案目前是否存在（外部程式現在是否讀得到）。 */
+  present: boolean;
+  /** 寫檔失敗或刪檔失敗的說明；沒有時為 null。 */
+  error: string | null;
+}
+
 /** `settings.get()` 的回應。 */
 export interface DesktopSettingsState {
   app: DesktopAppInfo;
   /** token 的保存狀態（**不含 token**）。 */
   token: TokenInfo;
   autostart: AutostartState;
+  agentDiscovery: DesktopAgentDiscoveryState;
 }
 
 /** renderer 看到的 desktop API（`window.mnemoshelfDesktop`）。 */
@@ -67,5 +88,13 @@ export interface DesktopBridge {
   settings: {
     get(): Promise<DesktopSettingsState>;
     setAutostart(enabled: boolean): Promise<DesktopSettingsState>;
+    /** 設定是否寫出 `runtime.json`；關閉時立即刪除既有檔案。 */
+    setAgentDiscovery(enabled: boolean): Promise<DesktopSettingsState>;
+    /**
+     * 把 `{url, token}` 放進剪貼簿（由使用者主動點擊）。
+     *
+     * token 只在 main process；回傳不含 token，renderer 只拿到「是否成功」與網址。
+     */
+    copyConnectionInfo(): Promise<{ copied: boolean; url: string | null }>;
   };
 }
