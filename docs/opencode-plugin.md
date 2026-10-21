@@ -291,6 +291,10 @@ pid 死亡、找不到設定，以及 `/health` 有回應但**不是 mnemoshelf*
 - 之後只有訊息含明示線索才查：`記得`、`還記得`、`之前`、`上次`、`先前`、`以前`、
   `早先`、`remember`、`recall`、`previously`、`last time`、`earlier`。
 
+「第一輪」只計入**非 synthetic** 的 user 訊息：`type:"synthetic"`／`synthetic:true`，或文字以
+`<system-reminder>` 開頭的訊息（例如 OpenChamber Plan mode 在真正 prompt 前插入的提醒、
+`/memory` 的狀態輸出、標題生成）都不算一輪，因此不影響第一則 prompt 的召回。
+
 `trigger: "every-turn"` 每輪都查（給 D3 對照用；token 成本較高）。
 
 topic-change 偵測不在 v1。

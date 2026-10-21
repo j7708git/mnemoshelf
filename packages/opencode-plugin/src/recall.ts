@@ -77,6 +77,10 @@ interface MessageLike {
   id?: unknown;
   content?: unknown;
   text?: unknown;
+  /** 宿主標記 synthetic 訊息的方式之一（session export／context）。 */
+  type?: unknown;
+  /** 宿主標記 synthetic 訊息的方式之一（布林旗標）。 */
+  synthetic?: unknown;
 }
 
 interface ParsedMessage {
@@ -121,14 +125,38 @@ export function findLatestUserMessage(messages: unknown[]): ParsedMessage | null
   return null;
 }
 
-/** 這個 session 目前是不是第一個使用者回合（`event.messages` 只有一則 user）。 */
+/** 舊版宿主沒有 `type`／`synthetic` 欄位時，Plan mode 提醒訊息的固定開頭。 */
+export const SYSTEM_REMINDER_PREFIX = "<system-reminder>";
+
+/**
+ * 這則訊息是否是宿主插入的 synthetic user 訊息（不是使用者真的打的）。
+ *
+ * 為什麼需要判斷：synthetic 訊息在 `event.messages` 也是 `role: "user"`。
+ * 若把它算進「第一輪」，OpenChamber Plan mode 在真正 prompt 前插入的
+ * `<system-reminder>` 會讓第一則真 prompt 被判定成第二輪，`first-turn+explicit`
+ * 於是完全不召回（log `skipped:"trigger"`）。
+ *
+ * 這裡**不改變** `findLatestUserMessage` 的行為：注入位置與 `isStatusText` 判斷仍需
+ * 看到最新一則 user（包含 synthetic），否則 `/memory` 的狀態輸出會回頭拿上一則
+ * 真 prompt 去召回。
+ */
+export function isSyntheticMessage(message: unknown): boolean {
+  if (typeof message !== "object" || message === null) return false;
+  const record = message as MessageLike;
+  if (record.type === "synthetic") return true;
+  if (record.synthetic === true) return true;
+  return messageText(message).trimStart().startsWith(SYSTEM_REMINDER_PREFIX);
+}
+
+/** 這個 session 目前是不是第一個使用者回合（只計入非 synthetic 的 user 訊息）。 */
 export function isFirstUserTurn(messages: unknown[]): boolean {
   let users = 0;
   for (const message of messages) {
-    if (typeof message === "object" && message !== null && (message as MessageLike).role === "user") {
-      users += 1;
-      if (users > 1) return false;
-    }
+    if (typeof message !== "object" || message === null) continue;
+    if ((message as MessageLike).role !== "user") continue;
+    if (isSyntheticMessage(message)) continue;
+    users += 1;
+    if (users > 1) return false;
   }
   return users === 1;
 }

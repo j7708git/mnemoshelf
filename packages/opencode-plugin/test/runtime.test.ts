@@ -195,6 +195,33 @@ describe("context hook 召回", () => {
     expect(event.system).toHaveLength(0);
   });
 
+  it("Plan mode 的 synthetic system-reminder 不影響第一輪召回", async () => {
+    const harness = await setup();
+    const event: ContextEventLike = {
+      sessionID: "session-1",
+      messages: [
+        {
+          id: "s1",
+          role: "user",
+          type: "synthetic",
+          content: [{ type: "text", text: "<system-reminder>Plan mode 進行中，請先產生計畫。</system-reminder>" }],
+        },
+        {
+          id: "u1",
+          role: "user",
+          content: [{ type: "text", text: "請把目前的測試全部跑過一次並整理失敗原因與修正建議" }],
+        },
+      ],
+      system: [],
+    };
+    await harness.handler(event);
+
+    expect(harness.fetchCalls).toHaveLength(1);
+    expect(harness.fetchCalls[0].body.query).toBe("請把目前的測試全部跑過一次並整理失敗原因與修正建議");
+    expect(latestText(event)).toContain('<memory-context source="mnemoshelf"');
+    expect(harness.logs.some((line) => line.includes('"skipped":"trigger"'))).toBe(false);
+  });
+
   it("同一個 user turn 的 tool 續跑只查一次、每次都注入同一塊", async () => {
     const harness = await setup();
     const first = userEvent(FIRST_QUERY, "m1");

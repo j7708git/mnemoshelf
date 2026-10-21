@@ -11,6 +11,7 @@ import {
   isDuplicate,
   isFirstUserTurn,
   isStatusText,
+  isSyntheticMessage,
   messageText,
   planRecall,
   scoreLabel,
@@ -78,6 +79,56 @@ describe("訊息解析", () => {
     expect(isFirstUserTurn([{ role: "user" }, { role: "assistant" }])).toBe(true);
     expect(isFirstUserTurn([{ role: "user" }, { role: "assistant" }, { role: "user" }])).toBe(false);
     expect(isFirstUserTurn([])).toBe(false);
+  });
+
+  it("synthetic system-reminder 不計入第一輪（Plan mode）", () => {
+    const messages = [
+      {
+        id: "s1",
+        role: "user",
+        content: [{ type: "text", text: "<system-reminder>Plan mode 進行中，請先產生計畫。</system-reminder>" }],
+      },
+      { id: "u1", role: "user", content: [{ type: "text", text: "請說明這個專案的自動召回設計" }] },
+    ];
+    expect(isSyntheticMessage(messages[0])).toBe(true);
+    expect(isFirstUserTurn(messages)).toBe(true);
+  });
+
+  it("synthetic 訊息（type／synthetic 旗標）同樣不計入", () => {
+    expect(isSyntheticMessage({ role: "user", type: "synthetic", content: "狀態" })).toBe(true);
+    expect(isSyntheticMessage({ role: "user", synthetic: true, content: [{ type: "text", text: "狀態" }] })).toBe(true);
+    expect(isSyntheticMessage({ role: "user", content: [{ type: "text", text: "真的問題" }] })).toBe(false);
+    expect(
+      isFirstUserTurn([
+        { id: "s1", role: "user", type: "synthetic", content: [{ type: "text", text: "標題生成" }] },
+        { id: "u1", role: "user", content: [{ type: "text", text: "真正的第一則" }] },
+      ]),
+    ).toBe(true);
+  });
+
+  it("synthetic + 兩則真 user 不是第一輪", () => {
+    const messages = [
+      { id: "s1", role: "user", type: "synthetic", content: [{ type: "text", text: "狀態" }] },
+      { id: "u1", role: "user", content: [{ type: "text", text: "第一則真 user" }] },
+      { id: "a1", role: "assistant", content: [{ type: "text", text: "回答" }] },
+      { id: "u2", role: "user", content: [{ type: "text", text: "第二則真 user" }] },
+    ];
+    expect(isFirstUserTurn(messages)).toBe(false);
+  });
+
+  it("只有 synthetic user 不算第一輪", () => {
+    expect(isFirstUserTurn([{ id: "s1", role: "user", synthetic: true, content: [{ type: "text", text: "狀態" }] }])).toBe(
+      false,
+    );
+    expect(
+      isFirstUserTurn([
+        {
+          id: "s1",
+          role: "user",
+          content: [{ type: "text", text: "<system-reminder>提醒</system-reminder>" }],
+        },
+      ]),
+    ).toBe(false);
   });
 });
 
