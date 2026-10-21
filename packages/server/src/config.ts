@@ -10,6 +10,8 @@
  * | `MNEMOSHELF_WEB_DIR` | Web UI 靜態檔目錄 | 本 repo 的 `packages/web/dist` |
  * | `MNEMOSHELF_MEMORY_BACKFILL` | 啟動時是否回填既有記憶向量（`on`／`off`） | `on` |
  * | `MNEMOSHELF_INDEX_RATE` | 索引限速 `off`／`normal`／`low`（索引時每檔之間休眠） | `off` |
+ * | `MNEMOSHELF_AGENT_DISCOVERY` | 是否寫出 agent 連線資訊檔（`on`／`off`；檔案含 token） | `off` |
+ * | `MNEMOSHELF_RUNTIME_FILE` | 連線資訊檔路徑（覆寫 `<dataDir>/runtime.json`） | `<dataDir>/runtime.json` |
  *
  * MCP stdio 入口（`loadMcpConfig`）另有自己的三個變數：`MNEMOSHELF_URL`、`MNEMOSHELF_TOKEN`
  * （皆必填）與 `MNEMOSHELF_PROJECT`（選配的預設專案名稱；供 `remember` 在工具參數沒帶
@@ -78,6 +80,20 @@ export interface ServerConfig {
    * （見 `INDEX_RATE_BETWEEN_FILES_MS`）。非法值直接拒絕啟動。
    */
   indexRate: IndexRate;
+  /**
+   * 是否寫出 agent 連線資訊檔（`MNEMOSHELF_AGENT_DISCOVERY=on|off`，預設 `off`）。
+   *
+   * 檔案含 Bearer token；只有使用者（或桌面版設定）明確開啟時才寫。關閉時啟動會順便清除
+   * 上次殘留的檔案，避免「已關閉」的功能仍留下有效 token。
+   */
+  agentDiscovery: boolean;
+  /**
+   * 連線資訊檔路徑（`MNEMOSHELF_RUNTIME_FILE`，預設 `<dataDir>/runtime.json`）。
+   *
+   * 自訂 `MNEMOSHELF_DATA_DIR` 的外部程式要能算出同一個位置；算不出來時請明確設定這個變數
+   * （見 `docs/agent-integration.md`）。
+   */
+  runtimeFile: string;
 }
 
 /**
@@ -154,6 +170,24 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     indexRate = normalized;
   }
 
+  // Agent 連線資訊檔（預設 off）：檔案含全權 token，只在明確開啟時寫出。
+  // 與其他 on／off 開關一致：非法值直接拒絕啟動（大小寫不拘）。
+  const discoverySetting = env.MNEMOSHELF_AGENT_DISCOVERY;
+  let agentDiscovery = false;
+  if (discoverySetting !== undefined && discoverySetting.trim() !== "") {
+    const normalized = discoverySetting.trim().toLowerCase();
+    if (normalized !== "on" && normalized !== "off") {
+      throw new ValidationError("MNEMOSHELF_AGENT_DISCOVERY", "必須是 on 或 off");
+    }
+    agentDiscovery = normalized === "on";
+  }
+
+  const runtimeFileSetting = env.MNEMOSHELF_RUNTIME_FILE;
+  const runtimeFile =
+    runtimeFileSetting !== undefined && runtimeFileSetting.trim() !== ""
+      ? path.resolve(runtimeFileSetting)
+      : path.join(dataDir, "runtime.json");
+
   return {
     dataDir,
     dbPath: path.join(dataDir, "mnemoshelf.db"),
@@ -163,6 +197,8 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     webDir,
     memoryBackfill,
     indexRate,
+    agentDiscovery,
+    runtimeFile,
   };
 }
 

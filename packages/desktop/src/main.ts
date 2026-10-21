@@ -18,7 +18,7 @@
  * onnxruntime-node／sharp）都是 N-API／Node-API，不需 `@electron/rebuild`；真正要處理的是
  * asar 解包（見 `electron-builder.yml` 的 `asarUnpack`）與 sharp 在 Linux 的 glib 風險。
  */
-import { BrowserWindow, Menu, Tray, app, ipcMain, safeStorage, session, type IpcMainInvokeEvent } from "electron";
+import { BrowserWindow, Menu, Tray, app, clipboard, ipcMain, safeStorage, session, type IpcMainInvokeEvent } from "electron";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -27,6 +27,14 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { createServer, type MnemoshelfServer } from "@mnemoshelf/server";
 import { installLoadExtensionAsarShim } from "./asar-paths.js";
+import {
+  defaultAgentSettings,
+  readAgentSettings,
+  resolveStartupDiscovery,
+  runtimeFileExists,
+  setAgentDiscovery,
+  type AgentSettings,
+} from "./agent-settings.js";
 import { autostartFilePath, openedAtLogin, readAutostartState, setAutostart, type AutostartOptions, type AutostartState } from "./autostart.js";
 import {
   DESKTOP_API_VERSION,
@@ -56,6 +64,17 @@ let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let bootstrap: ModelBootstrap | null = null;
 let tokenInfo: TokenInfo | null = null;
+/** 目前的存取 token（只在 main process；複製連線資訊時直接寫剪貼簿，不經過 renderer）。 */
+let tokenValue: string | null = null;
+/** 本次啟動解析出的路徑（`settingsState()` 與 IPC 會用到）。 */
+let desktopPaths: DesktopPaths | null = null;
+/** Agent 連線發現的持久化設定（`agentSettings.json`）。 */
+let agentSettings: AgentSettings = defaultAgentSettings();
+/** 這次執行的 server 是否以 discovery=on 啟動（變更設定要重啟才生效）。 */
+let agentDiscoveryActive = false;
+/** 寫檔失敗／刪檔失敗的說明（設定頁顯示）。 */
+let agentDiscoveryWriteError: string | null = null;
+let agentDiscoveryDeleteError: string | null = null;
 let quitting = false;
 let allowWindowClose = false;
 /** `--hidden`（登入時自啟）時不要主動顯示視窗；macOS 另由 `wasOpenedAtLogin` 推導（見 main()）。 */
@@ -321,6 +340,8 @@ function autostartOptions(): AutostartOptions {
 
 async function settingsState(): Promise<DesktopSettingsState> {
   const autostart: AutostartState = await readAutostartState(autostartOptions());
+  const runtimeFile = desktopPaths?.runtimeFile ?? "";
+  const present = runtimeFile === "" ? false : await runtimeFileExists(runtimeFile);
   return {
     app: appInfo(),
     token:
@@ -332,6 +353,13 @@ async function settingsState(): Promise<DesktopSettingsState> {
         notice: "尚未初始化 token。",
       },
     autostart,
+    agentDiscovery: {
+      enabled: agentSettings.agentDiscovery,
+      active: agentDiscoveryActive,
+      file: runtimeFile,
+      present,
+      error: agentDiscoveryDeleteError ?? agentDiscoveryWriteError,
+    },
   };
 }
 
@@ -367,6 +395,46 @@ function registerIpcHandlers(): void {
     log(`開機自啟${next.enabled ? "已開啟" : "已關閉"}${next.location === null ? "" : `：${next.location}`}`);
     return settingsState();
   });
+  ipcMain.handle(
+    DESKTOP_CHANNELS.settingsSetAgentDiscovery,
+    async (event, enabled: unknown): Promise<DesktopSettingsState> => {
+      assertTrustedSender(event);
+      const paths = desktopPaths;
+      if (paths === null) throw new Error("桌面設定尚未初始化");
+      const value = enabled === true;
+      const result = await setAgentDiscovery({
+        settingsFile: paths.settingsFile,
+        runtimeFile: paths.runtimeFile,
+        enabled: value,
+        log,
+      });
+      agentSettings = result.settings;
+      // 執行中的 server 不會因為這個開關而改變行為：任何變更都要重啟才生效，
+      // 因此 active=false 讓設定頁顯示「重新啟動後生效」（關閉時檔案已立即刪除）。
+      agentDiscoveryActive = false;
+      // 關閉時：刪檔失敗的訊息要留著；開啟時清掉舊錯誤（重啟後才會重新寫檔）。
+      agentDiscoveryDeleteError = result.error;
+      agentDiscoveryWriteError = null;
+      log(
+        value
+          ? "Agent 連線發現已開啟（重新啟動後才會寫出連線資訊檔）"
+          : `Agent 連線發現已關閉（連線資訊檔${result.runtimeFileRemoved ? "已刪除" : "未清除"}）`,
+      );
+      return settingsState();
+    },
+  );
+  ipcMain.handle(
+    DESKTOP_CHANNELS.settingsCopyConnectionInfo,
+    async (event): Promise<{ copied: boolean; url: string | null }> => {
+      assertTrustedSender(event);
+      if (server === null || tokenValue === null) return { copied: false, url: null };
+      // 只有使用者按下按鈕才會走到這裡；內容含 token（設定頁文案已明示）。
+      // Electron 44 的 clipboard 是 Promise API：要等寫入完成才回報成功。
+      await clipboard.writeText(JSON.stringify({ url: server.url, token: tokenValue }));
+      log("已將連線資訊複製到剪貼簿（含 token；不寫進 log）");
+      return { copied: true, url: server.url };
+    },
+  );
   log(`已註冊 desktop shell API v${DESKTOP_API_VERSION}（bridge：window.${DESKTOP_BRIDGE_NAME}）`);
 }
 
@@ -378,6 +446,10 @@ async function main(): Promise<void> {
     resourcesPath: process.resourcesPath,
     ...(process.env.MNEMOSHELF_WEB_DIR === undefined ? {} : { webDir: process.env.MNEMOSHELF_WEB_DIR }),
   });
+  desktopPaths = paths;
+  // Agent 連線發現的桌面設定（預設 on；桌面值優先於 shell 的 MNEMOSHELF_AGENT_DISCOVERY）。
+  agentSettings = await readAgentSettings(paths.settingsFile, log);
+  log(`Agent 連線發現設定：${agentSettings.agentDiscovery ? "on" : "off"}（${paths.settingsFile}）`);
   const webDir = await resolveWebDir(paths.webDir, appPath);
 
   // macOS 的自啟走 SMAppService，`path`／`args` 是 Windows-only，登入時收不到 `--hidden`：
@@ -415,8 +487,12 @@ async function main(): Promise<void> {
     log,
   });
   tokenInfo = toTokenInfo(tokenState);
+  tokenValue = tokenState.token;
   if (tokenInfo.notice !== null) log(`token 注意事項：${tokenInfo.notice}`);
 
+  // 啟動期間 IPC 可能改掉 `agentSettings`：這裡先把「這次 server 實際用的值」固定下來，
+  // 後面才不會用新值覆寫 active／誤報寫檔失敗（真正原因是「要重啟」）。
+  const startupAgentDiscovery = agentSettings.agentDiscovery;
   try {
     server = await createServer({
       env: buildServerEnv({
@@ -425,6 +501,9 @@ async function main(): Promise<void> {
         dataDir: paths.dataDir,
         modelDir: paths.modelDir,
         webDir,
+        // 桌面設定優先：這裡一律覆寫 shell 環境變數（含 runtime 檔路徑，設定頁才能刪同一個檔）。
+        agentDiscovery: startupAgentDiscovery,
+        runtimeFile: paths.runtimeFile,
       }),
     });
   } catch (error) {
@@ -435,6 +514,27 @@ async function main(): Promise<void> {
   }
 
   log(`Core 服務已啟動：${server.url}（只綁 127.0.0.1；token 不寫進 log）`);
+  const discoveryDecision = resolveStartupDiscovery({
+    startup: startupAgentDiscovery,
+    current: agentSettings.agentDiscovery,
+  });
+  agentDiscoveryActive = discoveryDecision.active;
+  if (discoveryDecision.verifyFile) {
+    // 寫檔失敗不會阻止 server 啟動（server 只記 warning）：這裡確認一下，設定頁才能明示。
+    const written = await runtimeFileExists(paths.runtimeFile);
+    agentDiscoveryWriteError = written ? null : "無法寫出連線資訊（可能是權限或磁碟問題）";
+    log(
+      written
+        ? `Agent 連線資訊檔已寫出：${paths.runtimeFile}（內容含 token，不寫進 log）`
+        : `Agent 連線資訊檔未寫出：${paths.runtimeFile}（服務照常執行）`,
+    );
+  } else {
+    // 啟動時關閉，或啟動期間改過設定：這次執行沒有可檢查的寫檔結果（要重啟才生效）。
+    agentDiscoveryWriteError = null;
+    if (agentSettings.agentDiscovery !== startupAgentDiscovery) {
+      log("Agent 連線發現設定在啟動期間被變更：重新啟動後生效");
+    }
+  }
   installTokenInjection(server.url, tokenState.token);
   registerIpcHandlers();
 
@@ -502,6 +602,7 @@ async function runAutotestIfRequested(context: {
     tray,
     trayMenuItems: TRAY_MENU_ITEMS,
     autostartFile: process.platform === "linux" ? autostartFilePath(autostartOptions()) : null,
+    runtimeFile: context.paths.runtimeFile,
     outputDir: process.env.MNEMOSHELF_AUTOTEST_OUT ?? path.join(app.getPath("temp"), "mnemoshelf-desktop-autotest"),
     sampleRoot: process.env.MNEMOSHELF_AUTOTEST_SAMPLE_ROOT ?? "",
     sampleTextName: process.env.MNEMOSHELF_AUTOTEST_TEXT ?? "hello.txt",

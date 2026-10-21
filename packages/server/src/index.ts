@@ -18,6 +18,7 @@ import {
   type SqliteDatabase,
   type VectorIndex,
 } from "@mnemoshelf/core";
+import { createAgentDiscovery } from "./agent-discovery.js";
 import {
   INDEX_RATE_BETWEEN_FILES_MS,
   LOOPBACK_HOST,
@@ -54,6 +55,12 @@ export interface CreateServerOptions {
     MemoryEmbeddingWorkerOptions,
     "batchSize" | "retryAttempts" | "retryDelayMs" | "backfillOnStart"
   >;
+  /**
+   * 測試注入：listen 成功、連線資訊檔寫出之後、`createServer()` 回傳之前執行的鉤子。
+   *
+   * 用來驗證「啟動後段失敗時不留含 token 的 runtime 檔」——正式路徑不會使用。
+   */
+  afterStart?: () => void | Promise<void>;
 }
 
 export interface MnemoshelfServer {
@@ -198,6 +205,15 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
   // 設定只有一處驗證來源（loadServerConfig）；覆寫值也走同一條路徑。
   const config: ServerConfig = loadServerConfig(env);
 
+  // Agent 連線資訊檔（預設 off）：關閉時先清掉上次 SIGKILL／當機留下的檔，
+  // 不讓「已關閉」的功能仍留下有效 token。開啟時在 listen 成功後才寫（見下方）。
+  const discovery = createAgentDiscovery({
+    enabled: config.agentDiscovery,
+    file: config.runtimeFile,
+    appVersion: APP_VERSION,
+  });
+  await discovery.clearStale();
+
   await fs.mkdir(config.dataDir, { recursive: true });
 
   const db: SqliteDatabase = openDatabase(config.dbPath);
@@ -253,6 +269,46 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
   // 監聽成功後才啟動背景回填（啟動失敗時不留背景工作）。
   memoryEmbedder.start();
 
+  /**
+   * 最後一步：寫出 agent 連線資訊檔（只在 discovery=on）。
+   *
+   * 放在 listen 與 `memoryEmbedder.start()` 都成功之後：外部程式拿到檔案時，服務一定已經
+   * 可以接受請求。若「寫檔之後、`createServer()` 回傳之前」還有步驟失敗（`afterStart` 注入，
+   * 或未來新增的啟動後段），先刪檔再收掉資源並拋錯——不能留下指向半死服務的 token 檔。
+   * 單純的寫檔失敗（權限／磁碟）已在 `discovery.write()` 內降級成 warning，不阻止啟動。
+   */
+  try {
+    if (discovery.enabled) {
+      await discovery.write({ url: `http://${LOOPBACK_HOST}:${port}`, token: config.token });
+    }
+    await options.afterStart?.();
+  } catch (error) {
+    await discovery.remove();
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    // 與 `close()` 對稱：先中止在途索引，再等它們（與記憶嵌入）真的收尾，最後才關 DB。
+    // 少了這段，啟動後段失敗時在途索引可能寫進已關閉的資料庫（或留下未處理的 rejection）。
+    const cancelled = app.cancelAllIndexing();
+    if (cancelled > 0) {
+      console.error(`[mnemoshelf] 啟動失敗回滾：已取消 ${cancelled} 個在途索引`);
+    }
+    const settled = Promise.all([app.settled(), memoryEmbedder.close()]).then(() => undefined);
+    const drainable = drainableEmbedder(embedder);
+    const drained =
+      drainable === null
+        ? await settlesWithin(settled, CLOSE_GRACE_MS)
+        : await settlesWithin(
+            Promise.all([settled, drainable.drain()]).then(() => undefined),
+            CLOSE_DRAIN_TIMEOUT_MS,
+          );
+    if (!drained) {
+      console.error("[mnemoshelf] 啟動失敗回滾：背景工作未在期限內結束，仍繼續關閉（不 hang）");
+    }
+    await embedder.dispose().catch(() => undefined);
+    db.close();
+    throw error;
+  }
+
   let closed = false;
   return {
     server,
@@ -268,6 +324,9 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     async close(): Promise<void> {
       if (closed) return;
       closed = true;
+      // 先移除連線資訊檔（只刪自己 pid 的檔；失敗只記錄，不讓關閉失敗）。
+      // 放在最前面：token 檔存在的時間越短越好，即使後面的關閉流程較久。
+      await discovery.removeIfOwned();
       // 先停止接受新連線並把既有連線收乾淨（含 keep-alive），否則 server.close() 會一直等。
       server.closeAllConnections();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -332,6 +391,20 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
 
 export { LOOPBACK_HOST, loadMcpConfig, loadServerConfig } from "./config.js";
 export type { IndexRate, McpConfig, ServerConfig } from "./config.js";
+export {
+  AGENT_RUNTIME_SCHEMA_VERSION,
+  createAgentDiscovery,
+  readRuntimeFile,
+  removeRuntimeFile,
+  removeRuntimeFileIfOwned,
+  writeRuntimeFile,
+} from "./agent-discovery.js";
+export type {
+  AgentDiscovery,
+  AgentRuntimeFile,
+  AgentRuntimeWriteInput,
+  CreateAgentDiscoveryOptions,
+} from "./agent-discovery.js";
 export {
   EmbedderWorkerClosedError,
   EmbedderWorkerCrashError,
@@ -398,6 +471,7 @@ export {
   MAX_MEMORY_QUERY_CHARS,
   MAX_REQUEST_URL_LENGTH,
   parseRequestTarget,
+  SERVICE_NAME,
   STATIC_CSP,
   toHttpError,
 } from "./http/app.js";

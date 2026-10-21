@@ -4,35 +4,126 @@
   "meta": {
     "title": "Mnemoshelf 架構",
     "output": "architecture.html",
-    "quality_profile": "showcase"
+    "quality_profile": "showcase",
+    "viewBox": [
+      1360,
+      540
+    ]
   },
   "components": [
     {
-      "id": "agents",
+      "id": "host",
       "type": "external",
-      "label": "AI Agents",
-      "sublabel": "OpenCode / Hermes 等",
+      "label": "OpenChamber / OpenCode",
+      "sublabel": "plugin host（2.1.1）",
       "pos": [
         30,
         60
       ],
       "size": [
-        140,
-        64
+        170,
+        76
       ]
     },
     {
-      "id": "mcp",
-      "type": "backend",
-      "label": "MCP 入口",
-      "sublabel": "stdio，不碰資料庫",
+      "id": "plugin",
+      "type": "frontend",
+      "label": "@mnemoshelf/opencode-plugin",
+      "sublabel": "自動召回；context hook",
+      "tag": "context hook",
       "pos": [
-        210,
+        265,
         60
       ],
       "size": [
-        140,
-        64
+        196,
+        76
+      ]
+    },
+    {
+      "id": "runtime",
+      "type": "security",
+      "label": "runtime.json",
+      "sublabel": "url／token／pid（0600）",
+      "tag": "0600",
+      "pos": [
+        505,
+        60
+      ],
+      "size": [
+        160,
+        72
+      ]
+    },
+    {
+      "id": "rest",
+      "type": "backend",
+      "label": "mnemoshelf REST",
+      "sublabel": "Core 常駐服務，唯一寫入者",
+      "tag": "127.0.0.1 + token",
+      "pos": [
+        705,
+        190
+      ],
+      "size": [
+        170,
+        76
+      ]
+    },
+    {
+      "id": "roots",
+      "type": "security",
+      "label": "Roots 閘門",
+      "sublabel": "自選目錄 / 黑名單",
+      "pos": [
+        945,
+        60
+      ],
+      "size": [
+        150,
+        72
+      ]
+    },
+    {
+      "id": "fs",
+      "type": "external",
+      "label": "使用者的資料夾",
+      "sublabel": "預設不掃任何目錄",
+      "pos": [
+        1160,
+        60
+      ],
+      "size": [
+        160,
+        72
+      ]
+    },
+    {
+      "id": "indexer",
+      "type": "backend",
+      "label": "Indexer",
+      "sublabel": "切塊 / 增量 / 限速",
+      "pos": [
+        945,
+        190
+      ],
+      "size": [
+        150,
+        76
+      ]
+    },
+    {
+      "id": "embedder",
+      "type": "cloud",
+      "label": "Embedder",
+      "sublabel": "僅限多模態",
+      "pos": [
+        1160,
+        190
+      ],
+      "size": [
+        160,
+        76
       ]
     },
     {
@@ -42,64 +133,21 @@
       "sublabel": "Electron + React",
       "pos": [
         30,
-        260
-      ],
-      "size": [
-        140,
-        64
-      ]
-    },
-    {
-      "id": "core",
-      "type": "backend",
-      "label": "Core 常駐服務",
-      "sublabel": "REST，唯一寫入者",
-      "pos": [
-        420,
-        160
+        250
       ],
       "size": [
         150,
         72
-      ],
-      "tag": "127.0.0.1 + token"
-    },
-    {
-      "id": "roots",
-      "type": "security",
-      "label": "Roots 閘門",
-      "sublabel": "自選目錄 / 黑名單",
-      "pos": [
-        650,
-        60
-      ],
-      "size": [
-        150,
-        64
       ]
     },
     {
-      "id": "fs",
+      "id": "agents",
       "type": "external",
-      "label": "使用者的資料夾",
-      "sublabel": "預設不掃任何目錄",
+      "label": "AI Agents",
+      "sublabel": "OpenCode / Hermes 等",
       "pos": [
-        860,
-        60
-      ],
-      "size": [
-        150,
-        64
-      ]
-    },
-    {
-      "id": "indexer",
-      "type": "backend",
-      "label": "Indexer",
-      "sublabel": "切塊 / 增量 / 限速",
-      "pos": [
-        650,
-        160
+        30,
+        420
       ],
       "size": [
         150,
@@ -107,13 +155,13 @@
       ]
     },
     {
-      "id": "embedder",
-      "type": "cloud",
-      "label": "Embedder",
-      "sublabel": "僅限多模態",
+      "id": "mcp",
+      "type": "backend",
+      "label": "MCP",
+      "sublabel": "stdio，不碰資料庫",
       "pos": [
-        860,
-        160
+        265,
+        400
       ],
       "size": [
         150,
@@ -126,12 +174,12 @@
       "label": "MetadataStore",
       "sublabel": "SQLite / PostgreSQL",
       "pos": [
-        420,
-        360
+        705,
+        400
       ],
       "size": [
-        150,
-        64
+        170,
+        72
       ]
     },
     {
@@ -140,16 +188,45 @@
       "label": "VectorIndex",
       "sublabel": "sqlite-vec / pgvector",
       "pos": [
-        650,
-        360
+        945,
+        400
       ],
       "size": [
         150,
-        64
+        72
       ]
     }
   ],
   "connections": [
+    {
+      "id": "host-plugin",
+      "from": "host",
+      "to": "plugin",
+      "label": "載入外掛",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "plugin-runtime",
+      "from": "plugin",
+      "to": "runtime",
+      "label": "讀取",
+      "fromSide": "right",
+      "toSide": "left"
+    },
+    {
+      "id": "rest-runtime",
+      "from": "rest",
+      "to": "runtime",
+      "label": "啟動時寫出",
+      "variant": "dashed"
+    },
+    {
+      "id": "plugin-rest",
+      "from": "plugin",
+      "to": "rest",
+      "label": "召回查詢（fail-open）"
+    },
     {
       "id": "agents-mcp",
       "from": "agents",
@@ -157,20 +234,20 @@
       "label": "MCP"
     },
     {
-      "id": "mcp-core",
+      "id": "mcp-rest",
       "from": "mcp",
-      "to": "core",
+      "to": "rest",
       "label": "HTTP 本機"
     },
     {
-      "id": "ui-core",
+      "id": "ui-rest",
       "from": "ui",
-      "to": "core",
+      "to": "rest",
       "label": "HTTP 本機"
     },
     {
-      "id": "core-roots",
-      "from": "core",
+      "id": "rest-roots",
+      "from": "rest",
       "to": "roots",
       "label": "每次存取先驗證",
       "fromSide": "top",
@@ -184,8 +261,8 @@
       "variant": "dashed"
     },
     {
-      "id": "core-indexer",
-      "from": "core",
+      "id": "rest-indexer",
+      "from": "rest",
       "to": "indexer",
       "label": "索引排程"
     },
@@ -205,8 +282,8 @@
       "labelDy": 40
     },
     {
-      "id": "core-meta",
-      "from": "core",
+      "id": "rest-meta",
+      "from": "rest",
       "to": "meta",
       "label": "查詢 + RRF",
       "fromSide": "bottom",
@@ -220,8 +297,18 @@
       "dot": "cyan",
       "title": "入口",
       "items": [
+        "OpenCode／OpenChamber 外掛在模型請求前自動召回，只召回、不寫入",
         "agent 走 MCP，不支援者用 REST 或 skill",
-        "UI 與 MCP 都只透過本機 HTTP 連 Core"
+        "UI 與 MCP 都只透過本機 HTTP 連 REST"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "連線發現",
+      "items": [
+        "runtime.json 由服務啟動時寫出，權限 0600、內含全權 token",
+        "桌面版預設開啟，可關；關閉即刪除檔案",
+        "外掛先驗 /health 身分與 pid 才送出 token"
       ]
     },
     {
@@ -237,7 +324,8 @@
       "title": "安全",
       "items": [
         "預設不掃任何目錄，必須逐一加入 root",
-        "realpath 驗證與黑名單，機密先遮罩再索引"
+        "realpath 驗證與黑名單，機密先遮罩再索引",
+        "召回內容不進 session 歷史；逾時或索引中 fail-open"
       ]
     }
   ]

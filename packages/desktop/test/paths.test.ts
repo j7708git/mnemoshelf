@@ -13,6 +13,8 @@ describe("resolveDesktopPaths", () => {
     expect(paths.modelDir).toBe(path.join(path.resolve(USER_DATA), "models"));
     expect(paths.dataDir).toBe(path.join(path.resolve(USER_DATA), "data"));
     expect(paths.tokenFile).toBe(path.join(path.resolve(USER_DATA), "token.bin"));
+    expect(paths.settingsFile).toBe(path.join(path.resolve(USER_DATA), "agentSettings.json"));
+    expect(paths.runtimeFile).toBe(path.join(path.resolve(USER_DATA), "data", "runtime.json"));
   });
 
   it("Web UI 預設在 resources/web（asar 之外）", () => {
@@ -49,12 +51,16 @@ describe("buildServerEnv", () => {
       dataDir: "/data",
       modelDir: "/models",
       webDir: "/web",
+      agentDiscovery: true,
+      runtimeFile: "/data/runtime.json",
     });
     expect(env.PATH).toBe("/usr/bin");
     expect(env.MNEMOSHELF_TOKEN).toBe("tok");
     expect(env.MNEMOSHELF_DATA_DIR).toBe("/data");
     expect(env.MNEMOSHELF_MODEL_DIR).toBe("/models");
     expect(env.MNEMOSHELF_WEB_DIR).toBe("/web");
+    expect(env.MNEMOSHELF_AGENT_DISCOVERY).toBe("on");
+    expect(env.MNEMOSHELF_RUNTIME_FILE).toBe("/data/runtime.json");
     // 預設由 OS 指派隨機埠（只綁 127.0.0.1），不沿用外部帶進來的埠。
     expect(env.MNEMOSHELF_PORT).toBe("0");
   });
@@ -66,8 +72,11 @@ describe("buildServerEnv", () => {
       dataDir: "/data",
       modelDir: "/models",
       webDir: "/web",
+      agentDiscovery: false,
+      runtimeFile: "/data/runtime.json",
     });
     expect(env.MNEMOSHELF_PORT).toBe("8799");
+    expect(env.MNEMOSHELF_AGENT_DISCOVERY).toBe("off");
   });
 
   it("埠變數是空字串時回到隨機埠", () => {
@@ -77,7 +86,23 @@ describe("buildServerEnv", () => {
       dataDir: "/data",
       modelDir: "/models",
       webDir: "/web",
+      agentDiscovery: true,
+      runtimeFile: "/data/runtime.json",
     });
     expect(env.MNEMOSHELF_PORT).toBe("0");
+  });
+
+  it("桌面設定優先於 shell 環境變數（agentDiscovery 與 runtime 檔）", () => {
+    const env = buildServerEnv({
+      base: { MNEMOSHELF_AGENT_DISCOVERY: "on", MNEMOSHELF_RUNTIME_FILE: "/elsewhere/runtime.json" },
+      token: "tok",
+      dataDir: "/data",
+      modelDir: "/models",
+      webDir: "/web",
+      agentDiscovery: false,
+      runtimeFile: "/data/runtime.json",
+    });
+    expect(env.MNEMOSHELF_AGENT_DISCOVERY).toBe("off");
+    expect(env.MNEMOSHELF_RUNTIME_FILE).toBe("/data/runtime.json");
   });
 });

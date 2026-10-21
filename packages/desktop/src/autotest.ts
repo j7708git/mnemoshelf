@@ -12,6 +12,8 @@
  * - `index`：加入測試資料夾 → 索引 → 文字預覽 → 搜尋（沿用 M4 打包 spike 的流程）。
  *   不含圖片縮圖：樣本圖片的模態預設未開，不會被索引，縮圖端點由 spike 卡單獨驗過。
  * - `autostart`：設定介面的開機自啟開關（開啟／關閉，並檢查落地檔案）。
+ * - `agent`：設定頁的 Agent 連線資訊（預設開啟、狀態顯示可用、複製內容含 url 與 token、
+ *   關閉後立即刪除 runtime 檔、重新開啟需重啟才寫出）。複製到的 token 只用於斷言，不進報告。
  * - `hidden`：以 `--hidden` 啟動時，視窗建好、UI 載入完、第一次 `ready-to-show` 之後
  *   仍不可見（開機自啟不彈出視窗）。**必須**以 `--hidden` 啟動才會通過，因此不在 `all` 裡。
  * - `tray`：關窗縮到系統匣（程序存活、視窗隱藏）→ 從系統匣選單「離開」整個結束。
@@ -19,7 +21,7 @@
 import { promises as fs } from "node:fs";
 import type { Dirent } from "node:fs";
 import path from "node:path";
-import { BrowserWindow, type Tray } from "electron";
+import { BrowserWindow, clipboard, type Tray } from "electron";
 import type { BootstrapState } from "./model-bootstrap.js";
 
 /** 單一步驟的結果。 */
@@ -44,6 +46,8 @@ export interface AutotestOptions {
   trayMenuItems: readonly string[];
   /** Linux 的 autostart 檔路徑（`autostart` 情境直接檢查它真的被寫出／刪掉）。 */
   autostartFile: string | null;
+  /** Agent 連線資訊檔路徑（`agent` 情境檢查寫出／立即刪除）。 */
+  runtimeFile: string;
   outputDir: string;
   sampleRoot: string;
   sampleTextName: string;
@@ -80,7 +84,7 @@ export interface AutotestResult {
 }
 
 /** 全部情境（`all` 展開後的順序；`tray` 一定最後，因為它會結束行程）。 */
-export const ALL_SCENARIOS = ["bootstrap", "app", "single", "browser", "index", "autostart", "tray"] as const;
+export const ALL_SCENARIOS = ["bootstrap", "app", "single", "browser", "index", "autostart", "agent", "tray"] as const;
 
 /**
  * 只在特定啟動方式下才成立的情境，**不**含在 `all` 裡（跑 `all` 的啟動方式不一定符合前提）：
@@ -631,6 +635,85 @@ export async function runAutotest(options: AutotestOptions): Promise<AutotestRes
       const stillThere = await fs.stat(file).then(() => true).catch(() => false);
       if (stillThere) throw new Error(`關閉後 ${file} 仍然存在`);
       return `開關已關閉；${file} 已刪除`;
+    });
+  }
+
+  if (scenarios.includes("agent")) {
+    await run("agent", "Agent 連線資訊：預設開啟、狀態可用、複製含 token", async () => {
+      const win = requireWindow();
+      // 先等主畫面出現（UI 還在「正在連線」時按「設定」會按不到）。
+      await waitFor(
+        win,
+        `document.body.innerText.includes("已連線到本機服務") && ${buttonExistsExpression("設定")}`,
+        "UI 進入已連線狀態",
+        options.stepTimeoutMs,
+      );
+      // 前面的情境可能已把設定頁打開；不要重複點「設定」把它關掉。
+      const panelOpen = await evaluate<boolean>(win, `document.querySelector("#mnemoshelf-settings") !== null`);
+      if (!panelOpen) await evaluate(win, clickByTextExpression("設定"));
+      await waitFor(
+        win,
+        `document.querySelector("#mnemoshelf-agent-discovery") !== null`,
+        "設定頁出現 Agent 連線資訊區塊",
+        options.stepTimeoutMs,
+      );
+
+      const initial = await evaluate<{ checked: boolean; disabled: boolean; status: string }>(
+        win,
+        `(() => {
+  const toggle = document.querySelector("#mnemoshelf-agent-discovery");
+  const status = document.querySelector("#mnemoshelf-agent-discovery-status");
+  return { checked: toggle.checked, disabled: toggle.disabled, status: status ? status.innerText : "" };
+})()`,
+      );
+      if (!initial.checked) throw new Error("Agent 連線資訊的預設狀態應該是開啟");
+      if (initial.disabled) throw new Error("Agent 連線資訊開關不該在初始狀態被停用");
+      const status = initial.status.replace(/\s+/g, " ");
+      if (!status.includes("可用")) throw new Error(`狀態列沒有顯示「可用」：${status}`);
+      if (!status.includes(options.runtimeFile)) throw new Error("狀態列沒有顯示連線資訊檔路徑");
+
+      const raw = await fs.readFile(options.runtimeFile, "utf8").catch(() => null);
+      if (raw === null) throw new Error(`預設開啟時沒有寫出 ${options.runtimeFile}`);
+      const record = JSON.parse(raw) as { url?: unknown; token?: unknown };
+      if (record.url !== options.serverUrl) throw new Error("runtime 檔的 url 與目前服務不一致");
+      // 讓設定頁完成第一次繪製再截圖（capturePage 偶爾會拿到上一個畫面）。
+      await delay(300);
+      shots.push(await shoot(win, options.outputDir, "13-agent-discovery-on.png"));
+
+      // 「複製連線資訊」→ 剪貼簿必須含目前的 url 與 token；token 不寫進報告或 log。
+      await evaluate(win, clickSelectorExpression("#mnemoshelf-agent-copy"));
+      await waitFor(win, `document.body.innerText.includes("已複製")`, "複製成功提示出現", options.stepTimeoutMs);
+      let copied: { url?: unknown; token?: unknown } | null = null;
+      try {
+        copied = JSON.parse(await clipboard.readText()) as { url?: unknown; token?: unknown };
+      } catch {
+        throw new Error("剪貼簿內容不是合法的 JSON");
+      }
+      if (copied === null || copied.url !== options.serverUrl) throw new Error("剪貼簿的 url 與目前服務不一致");
+      if (options.browserToken === null || copied.token !== options.browserToken) {
+        throw new Error("剪貼簿的 token 與目前服務不一致");
+      }
+      shots.push(await shoot(win, options.outputDir, "14-agent-discovery-copied.png"));
+
+      // 關閉 → 立即刪檔（即使 server 還在同一行程裡跑）。
+      await evaluate(win, clickSelectorExpression("#mnemoshelf-agent-discovery"));
+      await waitFor(win, `document.querySelector("#mnemoshelf-agent-discovery").checked === false`, "開關切成關閉", options.stepTimeoutMs);
+      await waitFor(win, `!document.querySelector("#mnemoshelf-agent-discovery").disabled`, "設定完成", options.stepTimeoutMs);
+      const afterOff = await fs.stat(options.runtimeFile).then(() => true).catch(() => false);
+      if (afterOff) throw new Error("關閉連線資訊後 runtime 檔仍然存在");
+      shots.push(await shoot(win, options.outputDir, "15-agent-discovery-off.png"));
+
+      // 重新開啟 → 這次執行不會補寫（要重啟 server），但設定已持久化。
+      await evaluate(win, clickSelectorExpression("#mnemoshelf-agent-discovery"));
+      await waitFor(win, `document.querySelector("#mnemoshelf-agent-discovery").checked === true`, "開關切成開啟", options.stepTimeoutMs);
+      await waitFor(win, `!document.querySelector("#mnemoshelf-agent-discovery").disabled`, "設定完成", options.stepTimeoutMs);
+      const afterOn = await fs.stat(options.runtimeFile).then(() => true).catch(() => false);
+      if (afterOn) throw new Error("重新開啟後不該在未重啟 server 時寫出 runtime 檔");
+      shots.push(await shoot(win, options.outputDir, "16-agent-discovery-reenabled.png"));
+
+      // 收尾：關掉設定頁，避免影響後續情境（tray）。
+      await evaluate(win, clickByTextExpression("關閉"));
+      return "預設開啟且狀態顯示可用；複製內容含 url 與 token（未寫入報告）；關閉後檔案立即刪除；重新開啟需重啟才寫出";
     });
   }
 

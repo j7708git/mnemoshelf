@@ -1,0 +1,609 @@
+{
+  "$comment": "D3 評估用的合成記憶卡。全部為虛構專案與虛構內容；不得加入真實資料、真名、email、憑證或本機絕對路徑。",
+  "schemaVersion": 1,
+  "projects": ["alpha", "beta", "gamma"],
+  "cards": [
+    {
+      "id": "alpha-build-cache-dir",
+      "project": "alpha",
+      "kind": "fact",
+      "content": "arc 的建置快取放在專案根目錄的 `.arc-cache/`，不放在系統暫存目錄；要清掉快取用 `arc cache clean`，不要手動刪目錄。"
+    },
+    {
+      "id": "alpha-cache-key-format",
+      "project": "alpha",
+      "kind": "decision",
+      "content": "建置快取的 key 由任務名稱加上來源檔的修改時間（mtime）組成。",
+      "superseded": true
+    },
+    {
+      "id": "alpha-cache-key-hash",
+      "project": "alpha",
+      "kind": "decision",
+      "content": "建置快取的 key 改用來源檔內容的 sha256 前 16 碼，不再用 mtime；換分支或 checkout 舊版時不會誤用快取。",
+      "supersedes": "alpha-cache-key-format"
+    },
+    {
+      "id": "alpha-lockfile-commit",
+      "project": "alpha",
+      "kind": "decision",
+      "pinned": true,
+      "content": "alpha 的 `arc.lock` 必須進版控；它記錄插件版本與快取格式版本，CI 會比對 lock 與實際解析結果，不一致就讓建置失敗。"
+    },
+    {
+      "id": "alpha-node-min",
+      "project": "alpha",
+      "kind": "fact",
+      "content": "alpha 的 CLI 只支援 Node 22 以上；`arc doctor` 會檢查目前執行版本，低於 22 直接結束並提示升級。"
+    },
+    {
+      "id": "alpha-pnpm-only",
+      "project": "alpha",
+      "kind": "preference",
+      "content": "alpha 只用 pnpm，不用 npm 或 yarn；`arc install` 內部呼叫 `pnpm install --frozen-lockfile`。"
+    },
+    {
+      "id": "alpha-error-e102",
+      "project": "alpha",
+      "kind": "pitfall",
+      "content": "看到 `ARC_E102` 表示快取目錄權限不足或不可寫；先確認 `.arc-cache/` 的擁有者，不要直接改成所有人可寫。"
+    },
+    {
+      "id": "alpha-arc-since-flag",
+      "project": "alpha",
+      "kind": "fact",
+      "content": "只重建有變動的套件用 `arc build --since origin/main`；它會沿依賴圖往上展開，被依賴的套件也會一起重建。"
+    },
+    {
+      "id": "alpha-watch-rename-bug",
+      "project": "alpha",
+      "kind": "pitfall",
+      "content": "`arc watch` 在編輯器以「存檔改名」方式寫入時會漏掉變更，需要手動重跑。",
+      "superseded": true
+    },
+    {
+      "id": "alpha-watch-rename-fixed",
+      "project": "alpha",
+      "kind": "pitfall",
+      "content": "`arc watch` 已修正「存檔改名」漏事件：現在同時監看目錄與 inode，改名後 200ms 內會重建；不需要再手動重跑。",
+      "supersedes": "alpha-watch-rename-bug"
+    },
+    {
+      "id": "alpha-config-path",
+      "project": "alpha",
+      "kind": "fact",
+      "content": "arc 的設定檔固定是專案根目錄的 `arc.config.json`；不支援把設定內嵌進 `package.json`。"
+    },
+    {
+      "id": "alpha-plugin-api",
+      "project": "alpha",
+      "kind": "decision",
+      "content": "arc 的插件 API 只暴露 `onBuildStart` 與 `onBuildEnd` 兩個鉤子。",
+      "superseded": true
+    },
+    {
+      "id": "alpha-plugin-api-v2",
+      "project": "alpha",
+      "kind": "decision",
+      "content": "插件 API v2 改成 `beforeTask`／`afterTask`，並新增 `onCacheHit`；v1 的 `onBuildStart`／`onBuildEnd` 只保留到 0.5 版。",
+      "supersedes": "alpha-plugin-api"
+    },
+    {
+      "id": "alpha-test-fixtures",
+      "project": "alpha",
+      "kind": "preference",
+      "content": "alpha 的測試 fixture 一律放 `test/fixtures/<case>/`，不要從網路下載；每個 fixture 要有一個 `expected.json`。"
+    },
+    {
+      "id": "alpha-ci-timeout",
+      "project": "alpha",
+      "kind": "fact",
+      "content": "alpha 的 CI 單一 job 上限 20 分鐘；超過就會被取消，`arc build` 在 CI 會自動開 4 個 worker。"
+    },
+    {
+      "id": "alpha-windows-sep",
+      "project": "alpha",
+      "kind": "pitfall",
+      "content": "arc 在 Windows 上曾因硬寫斜線拼路徑而找不到設定檔；所有路徑一律用 `node:path`，這是回歸測試涵蓋的項目。"
+    },
+    {
+      "id": "alpha-log-format",
+      "project": "alpha",
+      "kind": "preference",
+      "content": "arc 的日誌輸出是一行一人類可讀的純文字，方便直接看。",
+      "superseded": true
+    },
+    {
+      "id": "alpha-log-jsonl",
+      "project": "alpha",
+      "kind": "preference",
+      "content": "arc 的日誌改成 JSONL：每行一個 JSON 物件，含 `task`、`status`、`durationMs`；人類可讀輸出用 `--pretty` 另外開。",
+      "supersedes": "alpha-log-format"
+    },
+    {
+      "id": "alpha-cache-evic",
+      "project": "alpha",
+      "kind": "fact",
+      "content": "快取沒有上限，會一直長大，需要定期手動清理。",
+      "superseded": true
+    },
+    {
+      "id": "alpha-cache-evic-lru",
+      "project": "alpha",
+      "kind": "fact",
+      "content": "快取預設上限 2 GB，超過後依最後使用時間（LRU）淘汰；上限可用 `cache.maxBytes` 調整。",
+      "supersedes": "alpha-cache-evic"
+    },
+    {
+      "id": "alpha-codemod-scope",
+      "project": "alpha",
+      "kind": "decision",
+      "content": "codemod 只處理 `src/` 底下的檔案。",
+      "superseded": true
+    },
+    {
+      "id": "alpha-codemod-rewrite",
+      "project": "alpha",
+      "kind": "decision",
+      "content": "codemod 現在會處理 `src/`、`test/` 與 `scripts/`，但跳過 `vendor/`；執行前先用 `--dry-run` 看變更清單。",
+      "supersedes": "alpha-codemod-scope"
+    },
+    {
+      "id": "alpha-remote-cache-off",
+      "project": "alpha",
+      "kind": "decision",
+      "content": "arc 不支援遠端共享快取，快取只在本機。",
+      "superseded": true
+    },
+    {
+      "id": "alpha-remote-cache-readonly",
+      "project": "alpha",
+      "kind": "decision",
+      "content": "arc 支援唯讀遠端快取（HTTP GET，以內容雜湊為路徑）；上傳預設關閉，要開啟必須先設定簽章金鑰。",
+      "supersedes": "alpha-remote-cache-off"
+    },
+    {
+      "id": "alpha-release-card-a",
+      "project": "alpha",
+      "kind": "fact",
+      "content": "alpha 的 release 流程最後一步是用 `arc release --tag` 產生 changelog 與 tag。"
+    },
+    {
+      "id": "alpha-release-card-b",
+      "project": "alpha",
+      "kind": "fact",
+      "force": true,
+      "content": "alpha 的 release 最後一步是 `arc release --tag`：它會產生 changelog 並建立 tag。"
+    },
+    {
+      "id": "alpha-pin-release-checklist",
+      "project": "alpha",
+      "kind": "decision",
+      "pinned": true,
+      "content": "alpha 發版前必跑三件事：`arc test`、`arc build --since origin/main`、`arc release --dry-run`；三者都綠才打 tag。"
+    },
+    {
+      "id": "alpha-dep-graph-cycle",
+      "project": "alpha",
+      "kind": "pitfall",
+      "content": "套件依賴圖出現環時 `arc build` 會回 `ARC_E210` 並列出環上的套件；把共用型別抽到 `packages/types` 就能解。"
+    },
+    {
+      "id": "beta-limiter-algo",
+      "project": "beta",
+      "kind": "decision",
+      "content": "quota 的限流用固定視窗（fixed window），每 60 秒歸零。",
+      "superseded": true
+    },
+    {
+      "id": "beta-limiter-sliding",
+      "project": "beta",
+      "kind": "decision",
+      "content": "quota 的限流改成滑動視窗日誌（sliding window log），精度 1 秒；固定視窗在視窗邊界會放行兩倍流量，已淘汰。",
+      "supersedes": "beta-limiter-algo"
+    },
+    {
+      "id": "beta-bucket-window",
+      "project": "beta",
+      "kind": "fact",
+      "content": "quota 每個 key 的計數存在本機 SQLite 的 `buckets` 表，欄位是 `key`、`window_start`、`count`；不依賴外部快取服務。"
+    },
+    {
+      "id": "beta-quota-config",
+      "project": "beta",
+      "kind": "fact",
+      "content": "quota 的設定檔是 `quota.toml`，每個 route 一節，欄位有 `limit` 與 `windowSec`。"
+    },
+    {
+      "id": "beta-429-code",
+      "project": "beta",
+      "kind": "pitfall",
+      "content": "超過限制回 429，錯誤碼是 `QUOTA_429`；不要回 503，客戶端會誤判服務掛掉而觸發重試風暴。"
+    },
+    {
+      "id": "beta-port-bind",
+      "project": "beta",
+      "kind": "decision",
+      "pinned": true,
+      "content": "quota 只綁 `127.0.0.1:8085`，不對外開放；要對外一律走反向代理。"
+    },
+    {
+      "id": "beta-header-name",
+      "project": "beta",
+      "kind": "fact",
+      "content": "quota 用 `X-Quota-Left` 回報剩餘次數。",
+      "superseded": true
+    },
+    {
+      "id": "beta-header-ratelimit",
+      "project": "beta",
+      "kind": "fact",
+      "content": "quota 改用標準的 `RateLimit-Limit`／`RateLimit-Remaining`／`RateLimit-Reset` 三個標頭；舊的 `X-Quota-Left` 已移除。",
+      "supersedes": "beta-header-name"
+    },
+    {
+      "id": "beta-clock-source",
+      "project": "beta",
+      "kind": "pitfall",
+      "content": "quota 的時間一律取注入的 clock，測試用假時鐘推進；不要在業務邏輯直接呼叫 `Date.now()`。"
+    },
+    {
+      "id": "beta-metrics-name",
+      "project": "beta",
+      "kind": "preference",
+      "content": "quota 的計數指標叫 `quota_hits`。",
+      "superseded": true
+    },
+    {
+      "id": "beta-metrics-prefix",
+      "project": "beta",
+      "kind": "preference",
+      "content": "quota 的指標統一加 `quota_` 前綴：計數叫 `quota_requests_total`，被擋的叫 `quota_denied_total`。",
+      "supersedes": "beta-metrics-name"
+    },
+    {
+      "id": "beta-test-clock",
+      "project": "beta",
+      "kind": "preference",
+      "content": "quota 的測試用 `test/helpers/clock.ts` 的 `FakeClock`；每個測試結束要呼叫 `clock.restore()`。"
+    },
+    {
+      "id": "beta-bucket-file",
+      "project": "beta",
+      "kind": "fact",
+      "content": "quota 的 SQLite 檔在 `data/quota.db`，路徑可由 `QUOTA_DB` 覆寫；測試一律指向暫存目錄。"
+    },
+    {
+      "id": "beta-burst",
+      "project": "beta",
+      "kind": "fact",
+      "content": "quota 的 burst 上限等於 limit。",
+      "superseded": true
+    },
+    {
+      "id": "beta-burst-config",
+      "project": "beta",
+      "kind": "fact",
+      "content": "quota 的 burst 上限是 `limit + burst`，`burst` 預設 5，可 per-route 設定。",
+      "supersedes": "beta-burst"
+    },
+    {
+      "id": "beta-denial-cache",
+      "project": "beta",
+      "kind": "pitfall",
+      "content": "被擋的請求不記錄，避免寫入放大。",
+      "superseded": true
+    },
+    {
+      "id": "beta-denial-cache-ttl",
+      "project": "beta",
+      "kind": "pitfall",
+      "content": "被擋的請求只記在記憶體 ring buffer（最近 1000 筆，保留 5 分鐘），不寫 DB；用 `/debug/denials` 看。",
+      "supersedes": "beta-denial-cache"
+    },
+    {
+      "id": "beta-distributed-lock",
+      "project": "beta",
+      "kind": "decision",
+      "content": "quota 的計數更新用單一交易序列化，不做跨行程鎖；部署時只跑一個實例。"
+    },
+    {
+      "id": "beta-health-card-a",
+      "project": "beta",
+      "kind": "fact",
+      "content": "quota 的 `/health` 回 `{\"ok\":true}`，不檢查 DB。"
+    },
+    {
+      "id": "beta-health-card-b",
+      "project": "beta",
+      "kind": "fact",
+      "force": true,
+      "content": "quota 的 health 端點固定回 `{\"ok\":true}`，刻意不檢查資料庫。"
+    },
+    {
+      "id": "beta-pin-cutover",
+      "project": "beta",
+      "kind": "decision",
+      "pinned": true,
+      "content": "quota 切換新版前要先跑 `quota migrate --dry-run`，確認要搬移的筆數為 0 才切。"
+    },
+    {
+      "id": "beta-node-worker",
+      "project": "beta",
+      "kind": "pitfall",
+      "content": "quota 的重活都放 worker thread，主執行緒不做同步檔案 IO；曾因同步讀檔卡住健康檢查。"
+    },
+    {
+      "id": "beta-config-reload",
+      "project": "beta",
+      "kind": "fact",
+      "content": "改 `quota.toml` 後要重啟服務才會生效。",
+      "superseded": true
+    },
+    {
+      "id": "beta-config-watch",
+      "project": "beta",
+      "kind": "fact",
+      "content": "改 `quota.toml` 後服務會在 1 秒內自動重載（送 SIGHUP 也可以）；解析失敗會保留舊設定並記 warning。",
+      "supersedes": "beta-config-reload"
+    },
+    {
+      "id": "beta-log-pii",
+      "project": "beta",
+      "kind": "pitfall",
+      "content": "quota 的 access log 只記 key 的雜湊前 8 碼，不記原始字串或來源 IP。"
+    },
+    {
+      "id": "beta-test-port-conflict",
+      "project": "beta",
+      "kind": "preference",
+      "content": "quota 的整合測試一律用 `listen(0)` 拿隨機埠，不要硬寫 8085，否則本機同時跑會撞埠。"
+    },
+    {
+      "id": "beta-version-header",
+      "project": "beta",
+      "kind": "fact",
+      "content": "quota 的回應帶 `X-Quota-Version`（目前 `2.1`），方便 client 判斷行為差異。"
+    },
+    {
+      "id": "beta-idempotency",
+      "project": "beta",
+      "kind": "decision",
+      "content": "quota 對 `POST /v1/consume` 支援 `Idempotency-Key`；同一個 key 在 10 分鐘內重送只扣一次。"
+    },
+    {
+      "id": "gamma-encoding-default",
+      "project": "gamma",
+      "kind": "decision",
+      "content": "sift 讀 CSV 預設用系統編碼（Windows 上是 Big5）。",
+      "superseded": true
+    },
+    {
+      "id": "gamma-encoding-utf8",
+      "project": "gamma",
+      "kind": "decision",
+      "content": "sift 讀 CSV 一律以 UTF-8 解碼，遇到 BOM 會自動去掉；其他編碼要用 `--encoding` 明確指定。",
+      "supersedes": "gamma-encoding-default"
+    },
+    {
+      "id": "gamma-strict-flag",
+      "project": "gamma",
+      "kind": "fact",
+      "content": "`sift import --strict` 會在第一個欄位數不符的列就中止並印出列號；預設（非 strict）是跳過該列並計數。"
+    },
+    {
+      "id": "gamma-col-error",
+      "project": "gamma",
+      "kind": "pitfall",
+      "content": "`SIFT_COL_07` 表示某列的欄位數與表頭不一致；錯誤訊息會帶 `line` 與 `expected`／`actual`。"
+    },
+    {
+      "id": "gamma-importer-path",
+      "project": "gamma",
+      "kind": "fact",
+      "content": "sift 的匯入邏輯在 `src/importer.ts` 的 `importRows()`；格式判斷在 `src/detect.ts`。"
+    },
+    {
+      "id": "gamma-null-handling",
+      "project": "gamma",
+      "kind": "decision",
+      "content": "空字串欄位一律存成空字串。",
+      "superseded": true
+    },
+    {
+      "id": "gamma-null-empty",
+      "project": "gamma",
+      "kind": "decision",
+      "content": "空白與 `NULL` 字面值都轉成 null，只有加引號的空字串保留為空字串；這是為了讓下游 SQL 的 `IS NULL` 有意義。",
+      "supersedes": "gamma-null-handling"
+    },
+    {
+      "id": "gamma-large-file",
+      "project": "gamma",
+      "kind": "pitfall",
+      "content": "sift 逐行串流處理，不會把整個檔讀進記憶體；但 `--sort` 會把資料寫到暫存檔再排序，大檔要注意磁碟空間。"
+    },
+    {
+      "id": "gamma-schema-version",
+      "project": "gamma",
+      "kind": "fact",
+      "content": "sift 的輸出 schema 版本是 `1`，寫在輸出的第一行。",
+      "superseded": true
+    },
+    {
+      "id": "gamma-schema-v2",
+      "project": "gamma",
+      "kind": "fact",
+      "content": "sift 的輸出 schema 版本升到 `2`：新增 `ingestedAt` 與 `rowHash` 兩個欄位，舊的 `1` 仍可讀但不再產生。",
+      "supersedes": "gamma-schema-version"
+    },
+    {
+      "id": "gamma-date-format",
+      "project": "gamma",
+      "kind": "preference",
+      "content": "sift 的日期輸出用 `YYYY/MM/DD`。",
+      "superseded": true
+    },
+    {
+      "id": "gamma-date-iso",
+      "project": "gamma",
+      "kind": "preference",
+      "content": "sift 的日期輸出改用 ISO 8601（`YYYY-MM-DD`），時區一律 UTC；`--local-time` 才轉本地。",
+      "supersedes": "gamma-date-format"
+    },
+    {
+      "id": "gamma-dry-run",
+      "project": "gamma",
+      "kind": "fact",
+      "pinned": true,
+      "content": "sift 支援 `--dry-run`：只驗證與統計，不寫入輸出檔；CI 用它檢查上游格式有沒有壞。"
+    },
+    {
+      "id": "gamma-delimiter",
+      "project": "gamma",
+      "kind": "pitfall",
+      "content": "sift 只支援逗號分隔，分號要自己先轉。",
+      "superseded": true
+    },
+    {
+      "id": "gamma-delimiter-sniff",
+      "project": "gamma",
+      "kind": "pitfall",
+      "content": "sift 會自動偵測逗號、分號與 Tab（取樣前 100 行），也可用 `--delimiter` 強制指定。",
+      "supersedes": "gamma-delimiter"
+    },
+    {
+      "id": "gamma-dup-rows",
+      "project": "gamma",
+      "kind": "fact",
+      "content": "sift 預設保留重複列；要折疊重複得加 `--dedupe --key <欄位>`。"
+    },
+    {
+      "id": "gamma-batch-size",
+      "project": "gamma",
+      "kind": "fact",
+      "content": "sift 寫入批次大小預設 500 列，可用 `--batch-size` 調整；太大會讓失敗時的重試成本變高。"
+    },
+    {
+      "id": "gamma-header-normalize",
+      "project": "gamma",
+      "kind": "decision",
+      "content": "sift 保留表頭原樣，不修剪空白。",
+      "superseded": true
+    },
+    {
+      "id": "gamma-header-trim",
+      "project": "gamma",
+      "kind": "decision",
+      "content": "sift 會 trim 表頭空白、把內部連續空白換成單一底線，並轉小寫；原始表頭記在輸出的 `_source_header`。",
+      "supersedes": "gamma-header-normalize"
+    },
+    {
+      "id": "gamma-memory-limit",
+      "project": "gamma",
+      "kind": "pitfall",
+      "content": "sift 遇到超過 200 MB 的單一欄位會回 `SIFT_SIZE_11`；這是保護，不要用 `--no-limit` 繞過，先確認上游格式。"
+    },
+    {
+      "id": "gamma-reject-card-a",
+      "project": "gamma",
+      "kind": "fact",
+      "content": "sift 的失敗列會寫到 `<output>.rejects.ndjson`。"
+    },
+    {
+      "id": "gamma-reject-card-b",
+      "project": "gamma",
+      "kind": "fact",
+      "force": true,
+      "content": "sift 把無法解析的列寫進 `<output>.rejects.ndjson`，每行一筆。"
+    },
+    {
+      "id": "gamma-pin-schema",
+      "project": "gamma",
+      "kind": "decision",
+      "pinned": true,
+      "content": "sift 的輸出欄位順序是契約的一部分（下游用位置解析）；新增欄位只能加在最後，不可重排。"
+    },
+    {
+      "id": "gamma-output-ndjson",
+      "project": "gamma",
+      "kind": "fact",
+      "content": "sift 的輸出是 NDJSON（每行一個 JSON），不是 JSON 陣列；下游要逐行讀。"
+    },
+    {
+      "id": "gamma-progress-log",
+      "project": "gamma",
+      "kind": "fact",
+      "content": "sift 每 10000 列印一次進度到 stdout。",
+      "superseded": true
+    },
+    {
+      "id": "gamma-progress-stderr",
+      "project": "gamma",
+      "kind": "fact",
+      "content": "sift 的進度訊息改印到 stderr（每 10000 列），stdout 只留資料，方便管線使用。",
+      "supersedes": "gamma-progress-log"
+    },
+    {
+      "id": "global-commit-lang",
+      "scope": "global",
+      "kind": "preference",
+      "pinned": true,
+      "content": "本工作區的 commit message 一律用繁體中文，說明範圍與重點；不要只寫 `fix`。"
+    },
+    {
+      "id": "global-pnpm",
+      "scope": "global",
+      "kind": "preference",
+      "content": "所有 JavaScript／TypeScript 專案一律用 pnpm，不用 npm 或 yarn；CI 也用 `pnpm install --frozen-lockfile`。"
+    },
+    {
+      "id": "global-ts-strict",
+      "scope": "global",
+      "kind": "decision",
+      "content": "TypeScript 一律開 `strict: true` 與 ESM；不為了趕時間關掉 strict。"
+    },
+    {
+      "id": "global-vitest",
+      "scope": "global",
+      "kind": "fact",
+      "content": "單元測試用 vitest；每個公開函式至少一個測試，有契約的介面要有契約測試。"
+    },
+    {
+      "id": "global-no-new-deps",
+      "scope": "global",
+      "kind": "decision",
+      "content": "不引入新依賴，除非任務卡明確允許；需要時先列「套件、版本、理由、替代方案」給 PM。"
+    },
+    {
+      "id": "global-node22",
+      "scope": "global",
+      "kind": "fact",
+      "content": "執行環境是 Node 22 以上；不要用只有更新版本才有的 API。"
+    },
+    {
+      "id": "global-docs-path",
+      "scope": "global",
+      "kind": "preference",
+      "content": "對外的規格與教學放 repo 的 `docs/`；工作紀錄（計畫、進度、研究）放內部的 project-notes，不進程式碼 repo。"
+    },
+    {
+      "id": "global-privacy",
+      "scope": "global",
+      "kind": "decision",
+      "content": "任何進版控的內容都不得含憑證、真名、私人 email 或本機絕對路徑；範例一律用 placeholder。"
+    },
+    {
+      "id": "global-branch",
+      "scope": "global",
+      "kind": "preference",
+      "content": "分支命名用 `<前綴>/<主題>`（例如 `feat/recall-eval`），不直接在 main 上 commit。"
+    },
+    {
+      "id": "global-review",
+      "scope": "global",
+      "kind": "preference",
+      "content": "PR 盡量小（單一目的、可獨立回滾）；變更說明要寫「為什麼」，不只寫「改了什麼」。"
+    }
+  ]
+}

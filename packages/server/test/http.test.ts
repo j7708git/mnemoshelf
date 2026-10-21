@@ -47,7 +47,9 @@ describe("REST：health 與授權", () => {
     server = await startTestServer();
     const response = await api(server.instance, "GET", "/health", { token: null });
     expect(response.status).toBe(200);
-    expect(response.body).toEqual({ status: "ok" });
+    // additive 欄位（agent 發現用）：service 供外掛確認身分，appVersion 供版本比對。
+    expect(response.body).toMatchObject({ status: "ok", service: "mnemoshelf" });
+    expect((response.body as { appVersion?: unknown }).appVersion).toBeTypeOf("string");
   });
 
   it("無 token 的寫入與讀取 → 401（含錯誤格式）", async () => {

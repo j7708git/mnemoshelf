@@ -73,6 +73,8 @@ export function App() {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  /** 「複製連線資訊」的結果提示（桌面模式）。 */
+  const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
   /** 匯出診斷資訊的狀態（與桌面設定無關，兩種模式都能用）。 */
   const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
   const [diagnosticsNotice, setDiagnosticsNotice] = useState<string | null>(null);
@@ -170,6 +172,14 @@ export function App() {
   }, [showSettings]);
 
   /**
+   * 設定頁關閉時清掉「複製連線資訊」的提示：提示只屬於當次操作，重新開啟面板時不該
+   * 還留著上一次的結果（切換開關／再次複製時也會各自清一次）。
+   */
+  useEffect(() => {
+    if (!showSettings) setConnectionNotice(null);
+  }, [showSettings]);
+
+  /**
    * 只有「真的在下載（或下載失敗）」才擋住介面。
    *
    * `checking`／`idle` 也擋的話，模型本來就在磁碟上的使用者每次啟動都會閃一下下載畫面；
@@ -263,6 +273,45 @@ export function App() {
     },
     [desktop],
   );
+
+  /**
+   * 切換 agent 連線資訊檔（桌面模式）。
+   *
+   * 關閉時 main process 會立即刪檔；開啟則要重新啟動 server 才會寫出，提示文字由 main 的狀態
+   * （`active`）決定。失敗時把錯誤顯示在設定頁（不改整個畫面）。
+   */
+  const toggleAgentDiscovery = useCallback(
+    async (enabled: boolean): Promise<void> => {
+      if (desktop === null) return;
+      setSettingsBusy(true);
+      setSettingsError(null);
+      setConnectionNotice(null);
+      try {
+        setSettings(await desktop.settings.setAgentDiscovery(enabled));
+      } catch (error) {
+        setSettingsError(error instanceof Error ? error.message : "設定連線資訊失敗");
+      } finally {
+        setSettingsBusy(false);
+      }
+    },
+    [desktop],
+  );
+
+  /** 複製連線資訊：token 只在 main process，這裡只拿「是否成功」與網址。 */
+  const copyConnectionInfo = useCallback(async (): Promise<void> => {
+    if (desktop === null) return;
+    setConnectionNotice(null);
+    try {
+      const result = await desktop.settings.copyConnectionInfo();
+      setConnectionNotice(
+        result.copied
+          ? `已複製 ${result.url ?? ""} 與 token 到剪貼簿（只貼給信任的程式）`
+          : "目前沒有可複製的連線資訊，請確認開關已開啟且服務正在執行。",
+      );
+    } catch (error) {
+      setConnectionNotice(error instanceof Error ? error.message : "複製連線資訊失敗");
+    }
+  }, [desktop]);
 
   /** 匯出診斷資訊：抓 `GET /diagnostics` 後以檔名觸發下載。 */
   const exportDiagnostics = useCallback(async (): Promise<void> => {
@@ -450,6 +499,9 @@ export function App() {
               diagnosticsNotice={diagnosticsNotice}
               diagnosticsError={diagnosticsError}
               onToggleAutostart={(enabled) => void toggleAutostart(enabled)}
+              onToggleAgentDiscovery={(enabled) => void toggleAgentDiscovery(enabled)}
+              onCopyConnectionInfo={() => void copyConnectionInfo()}
+              connectionNotice={connectionNotice}
               onExportDiagnostics={() => void exportDiagnostics()}
               onClose={() => setShowSettings(false)}
             />

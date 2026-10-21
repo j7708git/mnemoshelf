@@ -1,6 +1,6 @@
 # Mnemoshelf
 
-> 狀態：v0.3.0（開發進行中，功能仍可能變動）。本版重點＝**記憶功能第一版（專案共享／語意召回）＋安全硬化＋記憶衛生＋索引不阻塞**；桌面版安裝檔與版本請見 GitHub Releases。
+> 狀態：v0.4.0（開發中，功能仍可能變動）。本版重點＝**OpenChamber／OpenCode 自動召回**（外掛在模型請求前召回相關記憶，只召回、不自動寫入）；桌面版安裝檔與版本請見 GitHub Releases。
 
 Mnemoshelf 是一個本機桌面應用程式，目標有兩個：
 
@@ -56,6 +56,13 @@ preference）、`scope`（global／project／agent）、`project`、`agent`（�
   使用者確認後才正式寫入。下載的備份檔由使用者保管（可能含專案內部資訊）。
 - **MCP**（stdio 入口）：六個工具 `search`、`remember`、`recall`、`forget`、`list_roots`、
   `search_memories`。MCP 只轉發本機 REST，不直接開資料庫（備份匯出／匯入也**沒有** MCP 工具）。
+- **自動召回（OpenChamber／OpenCode）**：`@mnemoshelf/opencode-plugin` 在每次模型請求前，用
+  最新的使用者訊息查詢本機 REST（`context` hook），把相關記憶注入**當次**請求。**只召回、
+  不自動寫入**：v1 不會新增、修改或刪除記憶；注入不進 session 歷史；逾時、連線失敗或索引中
+  一律 fail-open（該輪不注入）。預設只查「本專案＋global」，跨專案僅能用 `/memory-all` 一次性
+  查詢；`scope=agent` 的記憶不會被自動召回。連線沿用 `runtime.json` 或 `MNEMOSHELF_URL`／
+  `MNEMOSHELF_TOKEN`；v1 需由使用者**手動**把外掛加進 OpenCode 設定（不自動改設定）。安裝、
+  參數與疑難排解見 [docs/opencode-plugin.md](docs/opencode-plugin.md)。
 - **專案範圍**：MCP 的 `remember`／`search_memories` 預設以「目前專案」為範圍；`recall` 是
   **跨專案列表**（可用 `project`／`scope` 篩選，不套用預設專案解析）。專案名稱解析順序
   （適用 `remember`／`search_memories`）為工具參數 `project` → 環境變數 `MNEMOSHELF_PROJECT` →
@@ -64,6 +71,9 @@ preference）、`scope`（global／project／agent）、`project`、`agent`（�
 - **信任模型（重要）**：目前是**本機單一 owner 全權**——一組 token 就能讀寫全部記憶；
   `agent` 只是來源標記、不是身分驗證，`scope=agent` 不是安全邊界。不要把 token 分享給
   不受信任的程式；需要 per-agent 隔離時必須先擴充身分模型（尚未實作）。
+  桌面版執行時可能在本機資料目錄留下含全權 token 的 `runtime.json`（連線發現，預設開啟；
+  可在設定頁關閉並立即刪除）；CLI 需以 `MNEMOSHELF_AGENT_DISCOVERY=on` 明確開啟。詳見
+  [docs/agent-integration.md](docs/agent-integration.md)。
 - **安全防護**：記憶內容在寫入前與讀取時都會用 curated 規則遮蔽可辨識的機密（私鑰、常見
   token 前綴、JWT、`Bearer`、敏感名稱賦值、連線字串帳密）。同一組規則也用於**檔案索引**：
   文字／程式碼在切塊、嵌入前先遮罩，索引後的 chunk 不含可辨識憑證（媒體檔不套文字遮罩；
@@ -96,6 +106,8 @@ preference）、`scope`（global／project／agent）、`project`、`agent`（�
 | `MNEMOSHELF_MEMORY_BACKFILL` | `on`／`off` | `on` | 啟動時是否回填既有記憶的向量。`off` 只停**啟動回填**（新寫入的記憶仍會嵌入）；非法值會直接拒絕啟動。 |
 | `MNEMOSHELF_INDEX_RATE` | `off`／`normal`／`low` | `off` | **索引限速**：`normal`／`low` 會在「每處理完一個檔案、換下一檔之前」休眠（`normal` 50ms、`low` 250ms）。索引總時間會變長，但同一台機器上的其他工作（UI、影片、其他程式）比較不會被索引吃滿。`off` 是現行行為（不休眠）。限速**只作用於檔案與檔案之間**，同一個大檔的嵌入批次仍會一次跑完。推論在 worker thread，健康檢查與一般 HTTP 不受影響，但**需要嵌入的請求會排隊**（見下節）。非法值會直接拒絕啟動。 |
 | `MNEMOSHELF_PROJECT` | 專案名稱 | 未設定 | MCP 的 `remember`／`search_memories` 的預設專案（參數未帶 `project` 時使用）。 |
+| `MNEMOSHELF_AGENT_DISCOVERY` | `on`／`off` | `off`（桌面版由設定頁控制，預設開啟） | 是否寫出 agent 連線資訊檔 `runtime.json`（含全權 token；POSIX 權限 `0600`）。CLI 需明確設 `on`；桌面版的設定頁優先於此變數，關閉開關會立即刪除檔案。非法值會直接拒絕啟動。詳見 [docs/agent-integration.md](docs/agent-integration.md)。 |
+| `MNEMOSHELF_RUNTIME_FILE` | 路徑 | `<dataDir>/runtime.json` | 覆寫連線資訊檔的位置（服務寫出與外掛讀取都用這個名稱）。自訂 `MNEMOSHELF_DATA_DIR`／XDG 時，外掛不一定算得出預設路徑，請明確指定。 |
 
 ## 索引進行中與關閉
 
