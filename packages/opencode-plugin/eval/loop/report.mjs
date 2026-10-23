@@ -75,12 +75,18 @@ function statusLabel(status) {
  * 報告欄位用的安全序列化：一般物件走 JSON，其餘維持 `String()` 的既有呈現。
  *
  * `renderChecks()` 與 `printCaseResult()` 過去直接 `String()`，物件會被印成
- * `[object Object]`。這裡只改「非 null、非陣列、typeof === "object"」的呈現，
- * 基本型別與陣列（仍是 `a,b,c`）保持不變，既有報告文字不會大改。
+ * `[object Object]`。這裡只改「物件」的呈現，基本型別與陣列（仍是 `a,b,c`）保持不變，
+ * 既有報告文字不會大改；陣列內含物件時，元素各自走同一套序列化。
  */
 export function formatReportValue(value) {
   if (value === null || typeof value !== "object") return String(value);
-  if (Array.isArray(value)) return String(value);
+  if (Array.isArray(value)) {
+    // 陣列維持既有的逗號接法（與 String(array) 相同），但元素若是物件要各自序列化，
+    // 否則 String(array) 會印出 [object Object]。
+    return value
+      .map((item) => (item === null || item === undefined ? "" : formatReportValue(item)))
+      .join(",");
+  }
   try {
     const text = JSON.stringify(value);
     return typeof text === "string" ? text : String(value);

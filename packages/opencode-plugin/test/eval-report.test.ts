@@ -118,6 +118,31 @@ describe("L2 迴圈報告：check 值的安全序列化", () => {
     expect(markdown).toContain("| ✓ | 空值 |  |  |");
   });
 
+  it("陣列內含物件時元素各自序列化；純字串陣列仍維持 a,b,c", async () => {
+    const { renderMarkdown } = await importLoopReportModule();
+    const markdown = renderMarkdown(
+      makeLoopReport([
+        makeLoopCase([
+          {
+            name: "物件陣列",
+            ok: true,
+            expected: [{ score: 0.82, source: "semantic" }],
+            actual: [{ score: 0.82 }, { source: "semantic" }],
+          },
+          { name: "字串陣列", ok: true, expected: ["a", "b", "c"], actual: ["a", "b", "c"] },
+        ]),
+      ]),
+    );
+
+    // 舊寫法 String([{...}]) 會得到 [object Object]；元素必須各自走物件序列化。
+    expect(markdown).not.toContain("[object Object]");
+    expect(markdown).toContain(
+      '| ✓ | 物件陣列 | {"score":0.82,"source":"semantic"} | {"score":0.82},{"source":"semantic"} |',
+    );
+    // 既有呈現不得改變：純字串陣列仍是逗號接法。
+    expect(markdown).toContain("| ✓ | 字串陣列 | a,b,c | a,b,c |");
+  });
+
   it("主控台摘要（printCaseResult）也不再印出 [object Object]", async () => {
     const { printCaseResult } = await importLoopReportModule();
     const logs: string[] = [];

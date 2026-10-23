@@ -8,6 +8,14 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
+/**
+ * 記憶卡內容的禁用樣式（真實 email、憑證、本機絕對路徑）。
+ *
+ * 清單本身在 `test/forbidden-patterns.ts`：卡片與查詢題庫兩邊共用同一份，
+ * 才不會再各自漂移。樣式的自我驗證在 `forbidden-patterns.test.ts`。
+ */
+import { FORBIDDEN_PATTERNS } from "./forbidden-patterns.js";
+
 interface Card {
   id: string;
   project?: string;
@@ -34,28 +42,6 @@ interface Question {
   code_identifier?: boolean;
   cross_check_id?: string;
 }
-
-/**
- * 記憶卡內容的禁用樣式（真實 email、憑證、本機絕對路徑）。
- *
- * 家目錄路徑刻意保留兩種規則：
- * - 舊規則（要求結尾斜線／雙反斜線）全數保留，不弱化既有覆蓋。
- * - 新規則補上「結尾沒有斜線的 Unix 家目錄」與「單反斜線的 Windows 家目錄前綴」。
- */
-const FORBIDDEN_PATTERNS: readonly RegExp[] = [
-  /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/,
-  /\bsk-[A-Za-z0-9_-]{20,}/,
-  /\bgh[pousr]_[A-Za-z0-9]{10,}/,
-  /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}/,
-  /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
-  /\/home\/[^/\s]+\//,
-  /\/Users\/[^/\s]+\//,
-  /\/home\/[^/\s"']+/,
-  /\/Users\/[^/\s"']+/,
-  /[A-Za-z]:\\\\Users\\\\/,
-  /[A-Za-z]:\\Users\\[^\\\s"']+/,
-  /\bAKIA[0-9A-Z]{16}\b/,
-];
 
 const fixturesDir = new URL("../eval/fixtures/", import.meta.url);
 
@@ -152,51 +138,15 @@ describe("D3 fixtures：卡片", () => {
 
   it("不得含真實 email、憑證、本機絕對路徑", () => {
     for (const card of cards) {
-      for (const pattern of FORBIDDEN_PATTERNS) {
+      for (const { name, pattern } of FORBIDDEN_PATTERNS) {
         const match = pattern.exec(card.content);
         // 失敗訊息要指出是哪張卡、哪條樣式（而不是只丟整段內容）。
         expect(
           match === null ? undefined : match[0],
-          `卡片 ${card.id} 命中禁用樣式 ${String(pattern)}`,
+          `卡片 ${card.id} 命中禁用樣式 ${name}`,
         ).toBeUndefined();
       }
     }
-  });
-});
-
-describe("D3 fixtures：禁用樣式的自我驗證", () => {
-  /** 回傳命中的樣式（沒有命中就是空陣列）。 */
-  const hitPatterns = (text: string): RegExp[] => FORBIDDEN_PATTERNS.filter((pattern) => pattern.test(text));
-
-  it("抓得到真正的 Windows 家目錄（單反斜線，尾端有無反斜線都要命中）", () => {
-    // TS 字串常值用兩個反斜線表示執行期的一個反斜線。
-    const samples = ["C:\\Users\\alice", "C:\\Users\\alice\\notes.txt", "C:\\Users\\alice\\"];
-    for (const sample of samples) {
-      expect(hitPatterns(sample).length, `樣本應命中：${sample}`).toBeGreaterThan(0);
-    }
-  });
-
-  it("抓得到結尾沒有斜線的 Unix 家目錄路徑", () => {
-    expect(hitPatterns("/home/alice").length, "裸的 home 路徑應命中").toBeGreaterThan(0);
-    expect(hitPatterns("/Users/alice").length, "裸的 Users 路徑應命中").toBeGreaterThan(0);
-    // 有結尾斜線的舊形式仍要命中（既有覆蓋不得弱化）；路徑用串接避開掃描器的字面比對。
-    expect(hitPatterns("/home/alice" + "/data").length).toBeGreaterThan(0);
-  });
-
-  it("保留舊的雙反斜線規則", () => {
-    // 執行期字串是 `C:\\Users\\alice`（反斜線各兩個），由舊規則負責。
-    expect(hitPatterns("C:\\\\Users\\\\alice").length).toBeGreaterThan(0);
-  });
-
-  it("不抓無害字串：使用者目錄簡寫、一般中文、非家目錄的路由", () => {
-    const harmless = [
-      "設定檔放在 ~/.config/Mnemoshelf/data/runtime.json。",
-      "文件在自己家目錄下的 notes.md。",
-      "這個專案把設定放在使用者目錄中，路徑由程式推導。",
-      "網頁路由 /homepage 與 /users/list 只是普通路徑。",
-      "Windows 的資料目錄通常在 AppData\\Roaming 底下。",
-    ];
-    for (const sample of harmless) expect(hitPatterns(sample).map(String)).toEqual([]);
   });
 });
 

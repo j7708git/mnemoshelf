@@ -3,8 +3,9 @@
  *
  * 題庫本身的用處是「讓人看得懂的回歸案例」；這裡負責兩件事：
  * 1. 題庫不得說謊：`chars`、`expectedSkipReason`、`expectedRecall` 都拿實際規則重算。
- * 2. 題庫不得夾帶隱私資料：沿用 `test/eval-fixtures.test.ts` 的 forbidden regex 清單，
- *    命中時只顯示遮罩後的片段。
+ * 2. 題庫不得夾帶隱私資料：走 `test/forbidden-patterns.ts` 的共用清單
+ *    （與 `test/eval-fixtures.test.ts` 同一份，兩邊不會再各自漂移），
+ *    命中時只顯示遮罩後的片段與規則名稱。
  */
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -13,6 +14,7 @@ import { describe, expect, it } from "vitest";
 
 import { readSettings } from "../../src/config.js";
 import { decideTrigger, hasExplicitCue, skipReason } from "../../src/recall.js";
+import { FORBIDDEN_PATTERNS } from "../forbidden-patterns.js";
 
 interface RegressionQuery {
   id: string;
@@ -36,24 +38,6 @@ const RAW = readFileSync(fileURLToPath(FIXTURE_PATH), "utf8");
 const fixture = JSON.parse(RAW) as RegressionFixture;
 const queries = fixture.queries;
 const settings = readSettings({});
-
-/**
- * 既有 fixture 隱私掃描用的 forbidden 清單（與 `test/eval-fixtures.test.ts` 一致），
- * 另外補一條單反斜線的 Windows 家目錄路徑——既有清單那條要求雙反斜線，抓不到
- * 真正的 `C:\Users\<name>` 字串。
- */
-const FORBIDDEN: ReadonlyArray<{ name: string; pattern: RegExp }> = [
-  { name: "email", pattern: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/ },
-  { name: "openai-key", pattern: /\bsk-[A-Za-z0-9_-]{20,}/ },
-  { name: "github-token", pattern: /\bgh[pousr]_[A-Za-z0-9]{10,}/ },
-  { name: "bearer-token", pattern: /\bBearer\s+[A-Za-z0-9._~+/=-]{20,}/ },
-  { name: "private-key", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
-  { name: "home-path", pattern: /\/home\/[^/\s]+\// },
-  { name: "users-path", pattern: /\/Users\/[^/\s]+\// },
-  { name: "windows-users-path", pattern: /[A-Za-z]:\\\\Users\\\\/ },
-  { name: "windows-users-path-single", pattern: /[A-Za-z]:\\+Users\\+/ },
-  { name: "aws-access-key", pattern: /\bAKIA[0-9A-Z]{16}\b/ },
-];
 
 /** 只顯示前 6 個字元；避免把疑似憑證整段寫進測試輸出。 */
 function maskSnippet(snippet: string): string {
@@ -143,7 +127,7 @@ describe("合成查詢題庫：隱私掃描", () => {
   it("不得含 email、憑證、本機絕對路徑（命中片段先遮罩）", () => {
     const violations: string[] = [];
     const scan = (id: string, field: string, text: string): void => {
-      for (const { name, pattern } of FORBIDDEN) {
+      for (const { name, pattern } of FORBIDDEN_PATTERNS) {
         const match = pattern.exec(text);
         if (match === null) continue;
         violations.push(
