@@ -34,7 +34,8 @@ TypeScript、Node.js、pnpm、Electron、React。預設儲存為 SQLite（FTS5 +
 ## Agent 記憶（REST／MCP）
 
 記憶是跨 agent 共用的小型知識庫：每筆記憶有 `content`、`kind`（fact／decision／pitfall／
-preference）、`scope`（global／project／agent）、`project`、`agent`（寫入者標記）與 `pinned`。
+preference）、`scope`（global／project／agent）、`project`、`agent`（寫入者標記）、
+`sourceSession`／`sourceMessage`（寫入來源；可空、舊資料與未提供者為 `null`）與 `pinned`。
 
 - **REST**（皆需 `Authorization: Bearer <token>`；服務只綁 `127.0.0.1`）：
   - `POST /memories`：寫入。內容在寫入前會遮蔽可辨識的機密，回應帶 `redacted`／`redactedCount`；

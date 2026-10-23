@@ -41,7 +41,8 @@ import { buildMatchExpression, segmentText } from "./segment.js";
 
 const ROOT_COLUMNS = "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at";
 const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash";
-const MEMORY_COLUMNS = "id, content, kind, scope, project, agent, supersedes, pinned, created_at, deleted_at";
+const MEMORY_COLUMNS =
+  "id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at";
 
 function parseStringArray(value: unknown): string[] {
   if (typeof value !== "string") return [];
@@ -85,6 +86,8 @@ function rowToMemory(row: Record<string, unknown>): Memory {
     agent: String(row.agent),
     supersedes: row.supersedes === null || row.supersedes === undefined ? null : Number(row.supersedes),
     pinned: Number(row.pinned) !== 0,
+    sourceSession: row.source_session === null || row.source_session === undefined ? null : String(row.source_session),
+    sourceMessage: row.source_message === null || row.source_message === undefined ? null : String(row.source_message),
     createdAt: String(row.created_at),
     deletedAt: row.deleted_at === null || row.deleted_at === undefined ? null : String(row.deleted_at),
   };
@@ -353,10 +356,21 @@ export class SqliteMetadataStore implements MetadataStore {
       }
       const info = this.db
         .prepare(
-          `insert into memories(content, kind, scope, project, agent, supersedes, created_at, deleted_at, content_hash)
-           values (?, ?, ?, ?, ?, ?, ?, null, ?)`,
+          `insert into memories(content, kind, scope, project, agent, supersedes, source_session, source_message, created_at, deleted_at, content_hash)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?)`,
         )
-        .run(m.content, m.kind, m.scope, m.project, m.agent, m.supersedes, createdAt, memoryContentHash(m.content));
+        .run(
+          m.content,
+          m.kind,
+          m.scope,
+          m.project,
+          m.agent,
+          m.supersedes,
+          m.sourceSession ?? null,
+          m.sourceMessage ?? null,
+          createdAt,
+          memoryContentHash(m.content),
+        );
       const memoryId = Number(info.lastInsertRowid);
       if (m.content.trim().length > 0) {
         this.db.prepare("insert into memories_fts(rowid, seg) values (?, ?)").run(memoryId, segmentText(m.content));
@@ -394,8 +408,8 @@ export class SqliteMetadataStore implements MetadataStore {
 
       const info = this.db
         .prepare(
-          `insert into memories(content, kind, scope, project, agent, supersedes, created_at, deleted_at, content_hash)
-           select ?, ?, ?, ?, ?, ?, ?, null, ?
+          `insert into memories(content, kind, scope, project, agent, supersedes, source_session, source_message, created_at, deleted_at, content_hash)
+           select ?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?
             where not exists (
               select 1 from memories
                where content_hash = ? and scope = ? and project is ? and agent = ? and deleted_at is null
@@ -408,6 +422,8 @@ export class SqliteMetadataStore implements MetadataStore {
           m.project,
           m.agent,
           m.supersedes,
+          m.sourceSession ?? null,
+          m.sourceMessage ?? null,
           createdAt,
           contentHash,
           contentHash,

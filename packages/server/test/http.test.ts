@@ -488,6 +488,77 @@ describe("REST：記憶", () => {
     expect(errorName(missingContent.body)).toBe("ValidationError");
   });
 
+  it("POST /memories 的來源欄位：trim 後儲存、未帶為 null；空白／超長／非字串／token-like → 400；PATCH 不可改", async () => {
+    server = await startTestServer();
+    const instance = server.instance;
+    // 合成 token（原始碼不出現連續的憑證字面值）。
+    const tokenLike = ["gh", "p_", "0123456789abcdefghijklmn"].join("");
+
+    const created = await api(instance, "POST", "/memories", {
+      body: {
+        content: "來源欄位的合成記憶",
+        agent: "opencode-plugin@0.1.0",
+        sourceSession: "  ses_synthetic_0001  ",
+        sourceMessage: "msg_synthetic_0001",
+      },
+    });
+    expect(created.status).toBe(201);
+    const memory = created.body as Memory;
+    expect(memory).toMatchObject({
+      sourceSession: "ses_synthetic_0001",
+      sourceMessage: "msg_synthetic_0001",
+    });
+
+    const plain = (await api(instance, "POST", "/memories", {
+      body: { content: "沒有來源的合成記憶", agent: "agent-plain" },
+    })).body as Memory;
+    expect(plain).toMatchObject({ sourceSession: null, sourceMessage: null });
+
+    // 列表（additive）也帶出來源。
+    const listed = await api(instance, "GET", "/memories");
+    expect((listed.body as ListMemoriesResponse).memories.find((item) => item.id === memory.id)).toMatchObject({
+      sourceSession: "ses_synthetic_0001",
+      sourceMessage: "msg_synthetic_0001",
+    });
+
+    // 召回（additive）也帶出來源欄位。
+    const recalled = await api(instance, "POST", "/memories/search", {
+      body: { query: "來源欄位的合成記憶", includeAllProjects: true },
+    });
+    expect(recalled.status).toBe(200);
+    const hits = (recalled.body as { hits: { id: number; sourceSession: string | null; sourceMessage: string | null }[] })
+      .hits;
+    expect(hits.find((hit) => hit.id === memory.id)).toMatchObject({
+      sourceSession: "ses_synthetic_0001",
+      sourceMessage: "msg_synthetic_0001",
+    });
+
+    // 來源欄位不可變：PATCH 只接受 scope／project。
+    const patched = await api(instance, "PATCH", `/memories/${memory.id}`, { body: { sourceSession: "other" } });
+    expect(patched.status).toBe(400);
+    expect(errorName(patched.body)).toBe("ValidationError");
+    expect((await api(instance, "GET", "/memories")).body).toMatchObject({
+      memories: expect.arrayContaining([expect.objectContaining({ id: memory.id, sourceSession: "ses_synthetic_0001" })]),
+    });
+
+    // 非法值：空白、超長、非字串、token-like → 400，且不建立資料列。
+    const before = (await api(instance, "GET", "/memories")).body as ListMemoriesResponse;
+    const invalid: { field: string; value: unknown }[] = [
+      { field: "sourceSession", value: "   " },
+      { field: "sourceSession", value: "x".repeat(201) },
+      { field: "sourceMessage", value: 42 },
+      { field: "sourceMessage", value: `msg ${tokenLike}` },
+    ];
+    for (const { field, value } of invalid) {
+      const response = await api(instance, "POST", "/memories", {
+        body: { content: `非法來源（${field}）`, agent: "agent-plain", [field]: value },
+      });
+      expect(response.status, `${field}=${String(value)}`).toBe(400);
+      expect(errorName(response.body)).toBe("ValidationError");
+    }
+    expect((await api(instance, "GET", "/memories")).body).toEqual(before);
+  });
+
   it("GET /memories 列出未刪除的記憶（新的在前），支援 filter 與 limit", async () => {
     server = await startTestServer();
     const instance = server.instance;

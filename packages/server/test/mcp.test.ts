@@ -301,6 +301,42 @@ describe("MCP stdio 入口", () => {
     expect(textOf(bad)).toContain("ValidationError");
   });
 
+  it("recall 與 remember 的回應帶來源欄位（sourceSession／sourceMessage；additive）", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+
+    // 由 REST（自動寫入者的路徑）寫入一筆帶來源的記憶；MCP 只負責轉發與呈現。
+    const created = await api(rest.instance, "POST", "/memories", {
+      body: {
+        content: "MCP 來源欄位測試 recall-marker-provenance",
+        agent: "opencode-plugin@0.1.0",
+        scope: "global",
+        sourceSession: "ses_mcp_0001",
+        sourceMessage: "msg_mcp_0001",
+      },
+    });
+    expect(created.status).toBe(201);
+    const createdId = (created.body as { id: number }).id;
+
+    const listed = await mcp.client.callTool({ name: "recall", arguments: {} });
+    expect(listed.isError).toBeFalsy();
+    const memories = jsonOf<{
+      memories: { id: number; agent: string; sourceSession: string | null; sourceMessage: string | null }[];
+    }>(listed).memories;
+    expect(memories.find((memory) => memory.id === createdId)).toMatchObject({
+      agent: "opencode-plugin@0.1.0",
+      sourceSession: "ses_mcp_0001",
+      sourceMessage: "msg_mcp_0001",
+    });
+
+    // MCP remember 沒有 session 資訊：來源欄位存在但為 null（不是空字串）。
+    const remembered = jsonOf<{ sourceSession: string | null; sourceMessage: string | null }>(
+      await mcp.client.callTool({ name: "remember", arguments: { content: "MCP 寫入沒有來源", scope: "global" } }),
+    );
+    expect(remembered).toMatchObject({ sourceSession: null, sourceMessage: null });
+  });
+
   it("工具參數不合法時回報 REST 的錯誤（不吞掉）", async () => {
     const harness = await startMcp();
     rest = harness.rest;

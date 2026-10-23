@@ -9,6 +9,7 @@ import {
   describeConnectionFailure,
   isProcessAlive,
   normalizeBaseUrl,
+  parseDigestModel,
   parseRuntimeFile,
   readSettings,
   resolveConnection,
@@ -78,6 +79,131 @@ describe("readSettings", () => {
     expect(settings.trigger).toBe("every-turn");
     expect(settings.kMax).toBe(6);
     expect(settings.minScore).toBe(0.55);
+  });
+
+  it("timeoutMs 上限放寬到 2000（1000 生效、3000 夾到 2000）", () => {
+    expect(readSettings({ timeoutMs: 1000 }).timeoutMs).toBe(1000);
+    expect(readSettings({ timeoutMs: 2000 }).timeoutMs).toBe(2000);
+    expect(readSettings({ timeoutMs: 3000 }).timeoutMs).toBe(2000);
+    expect(readSettings({ timeoutMs: 1 }).timeoutMs).toBe(100);
+    // 沒設定時行為不變。
+    expect(readSettings({}).timeoutMs).toBe(DEFAULT_SETTINGS.timeoutMs);
+    expect(DEFAULT_SETTINGS.timeoutMs).toBe(150);
+  });
+
+  it("digestTimeoutMs 預設 45000、可設 30000、夾在 3000–120000", () => {
+    expect(readSettings({}).digestTimeoutMs).toBe(45000);
+    expect(readSettings({ digestTimeoutMs: 30000 }).digestTimeoutMs).toBe(30000);
+    expect(readSettings({ digestTimeoutMs: 119999 }).digestTimeoutMs).toBe(119999);
+    expect(readSettings({ digestTimeoutMs: 2999 }).digestTimeoutMs).toBe(3000);
+    expect(readSettings({ digestTimeoutMs: 120001 }).digestTimeoutMs).toBe(120000);
+    expect(readSettings({ digestTimeoutMs: "2500" }).digestTimeoutMs).toBe(3000);
+  });
+
+  it("recentTurns 預設 3、夾在 0–5（0＝關閉）", () => {
+    expect(readSettings({}).recentTurns).toBe(3);
+    expect(readSettings({ recentTurns: 0 }).recentTurns).toBe(0);
+    expect(readSettings({ recentTurns: 5 }).recentTurns).toBe(5);
+    expect(readSettings({ recentTurns: -1 }).recentTurns).toBe(0);
+    expect(readSettings({ recentTurns: 9 }).recentTurns).toBe(5);
+    const warnings: { key: string; reason: string }[] = [];
+    readSettings({ recentTurns: 9 }, (warning) => warnings.push(warning));
+    expect(warnings).toEqual([{ key: "recentTurns", reason: "out-of-range" }]);
+    const invalid: { key: string; reason: string }[] = [];
+    readSettings({ recentTurns: "很多" }, (warning) => invalid.push(warning));
+    expect(invalid).toEqual([{ key: "recentTurns", reason: "invalid" }]);
+  });
+
+  it("digestTimeoutMs 超範圍會回報 out-of-range、非法型別回報 invalid", () => {
+    const outOfRange: { key: string; reason: string }[] = [];
+    readSettings({ digestTimeoutMs: 1000 }, (warning) => outOfRange.push(warning));
+    expect(outOfRange).toEqual([{ key: "digestTimeoutMs", reason: "out-of-range" }]);
+
+    const invalid: { key: string; reason: string }[] = [];
+    readSettings({ digestTimeoutMs: "很久" }, (warning) => invalid.push(warning));
+    expect(invalid).toEqual([{ key: "digestTimeoutMs", reason: "invalid" }]);
+  });
+
+  it("digest 預設關閉、沒有模型", () => {
+    const settings = readSettings(undefined);
+    expect(settings.digestEnabled).toBe(false);
+    expect(settings.digestModel).toBeNull();
+    expect(settings.digestMaxPerTurn).toBe(3);
+    expect(settings.digestMaxPerSession).toBe(20);
+    expect(settings.digestMaxPerDay).toBe(100);
+    expect(settings.digestOnInterrupted).toBe(false);
+  });
+
+  it("digest 設定值夾在範圍內並回報 out-of-range", () => {
+    const warnings: { key: string; reason: string }[] = [];
+    const settings = readSettings(
+      {
+        digestEnabled: true,
+        digestModel: "cheap/test-model",
+        digestMaxPerTurn: 99,
+        digestMaxPerSession: 1000,
+        digestMaxPerDay: 5000,
+        digestOnInterrupted: true,
+      },
+      (warning) => warnings.push(warning),
+    );
+    expect(settings.digestEnabled).toBe(true);
+    expect(settings.digestModel).toBe("cheap/test-model");
+    expect(settings.digestMaxPerTurn).toBe(5);
+    expect(settings.digestMaxPerSession).toBe(100);
+    expect(settings.digestMaxPerDay).toBe(1000);
+    expect(settings.digestOnInterrupted).toBe(true);
+    expect(warnings.map((warning) => warning.key).sort()).toEqual([
+      "digestMaxPerDay",
+      "digestMaxPerSession",
+      "digestMaxPerTurn",
+    ]);
+    expect(warnings.every((warning) => warning.reason === "out-of-range")).toBe(true);
+  });
+
+  it("digest 非法型別回退預設並記 warning（不含值）", () => {
+    const warnings: { key: string; reason: string }[] = [];
+    const settings = readSettings(
+      {
+        digestEnabled: "yes",
+        digestModel: "沒有斜線的模型",
+        digestMaxPerTurn: "很多",
+        digestOnInterrupted: 1,
+      },
+      (warning) => warnings.push(warning),
+    );
+    expect(settings.digestEnabled).toBe(false);
+    expect(settings.digestModel).toBeNull();
+    expect(settings.digestMaxPerTurn).toBe(3);
+    expect(settings.digestOnInterrupted).toBe(false);
+    expect(warnings.map((warning) => warning.key).sort()).toEqual([
+      "digestEnabled",
+      "digestMaxPerTurn",
+      "digestModel",
+      "digestOnInterrupted",
+    ]);
+    expect(warnings.every((warning) => warning.reason === "invalid")).toBe(true);
+  });
+});
+
+describe("parseDigestModel", () => {
+  it("只在第一個斜線切分", () => {
+    expect(parseDigestModel("cheap/test-model")).toEqual({ providerID: "cheap", id: "test-model" });
+    expect(parseDigestModel("openrouter/anthropic/claude-x")).toEqual({
+      providerID: "openrouter",
+      id: "anthropic/claude-x",
+    });
+    expect(parseDigestModel("  provider/model  ")).toEqual({ providerID: "provider", id: "model" });
+  });
+
+  it("格式不符一律 null", () => {
+    expect(parseDigestModel(undefined)).toBeNull();
+    expect(parseDigestModel(null)).toBeNull();
+    expect(parseDigestModel("")).toBeNull();
+    expect(parseDigestModel("no-slash")).toBeNull();
+    expect(parseDigestModel("/model")).toBeNull();
+    expect(parseDigestModel("provider/")).toBeNull();
+    expect(parseDigestModel("pro vider/model")).toBeNull();
   });
 });
 

@@ -47,7 +47,8 @@ export interface PgMetadataStoreOptions {
 const ROOT_COLUMNS =
   "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at";
 const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash";
-const MEMORY_COLUMNS = "id, content, kind, scope, project, agent, supersedes, pinned, created_at, deleted_at";
+const MEMORY_COLUMNS =
+  "id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at";
 
 /** `pg` 的 unique violation 錯誤碼（SQLite 是字串比對，PostgreSQL 是 SQLSTATE）。 */
 const UNIQUE_VIOLATION = "23505";
@@ -98,6 +99,8 @@ function rowToMemory(row: Record<string, unknown>): Memory {
     agent: String(row.agent),
     supersedes: row.supersedes === null || row.supersedes === undefined ? null : Number(row.supersedes),
     pinned: row.pinned === true,
+    sourceSession: row.source_session === null || row.source_session === undefined ? null : String(row.source_session),
+    sourceMessage: row.source_message === null || row.source_message === undefined ? null : String(row.source_message),
     createdAt: String(row.created_at),
     deletedAt: row.deleted_at === null || row.deleted_at === undefined ? null : String(row.deleted_at),
   };
@@ -208,6 +211,8 @@ function metadataSchemaSql(schema: string): string {
       agent text not null,
       supersedes integer,
       pinned boolean not null default false,
+      source_session text,
+      source_message text,
       created_at text not null,
       deleted_at text,
       content_hash text,
@@ -228,6 +233,10 @@ function metadataSchemaSql(schema: string): string {
     alter table ${memories} add column if not exists embedding vector;
     alter table ${memories} add column if not exists embedding_embedder_id text;
     alter table ${memories} add column if not exists embedding_state text not null default 'pending';
+
+    -- D4a：記憶的來源欄位（可空、additive；既有資料列為 NULL）。
+    alter table ${memories} add column if not exists source_session text;
+    alter table ${memories} add column if not exists source_message text;
   `;
 }
 
@@ -428,8 +437,8 @@ export class PgMetadataStore implements MetadataStore {
         ]);
       }
       const result = await client.query(
-        `insert into ${this.memories}(content, kind, scope, project, agent, supersedes, created_at, deleted_at, seg, content_hash)
-         values ($1, $2, $3, $4, $5, $6, $7, null, $8, $9)
+        `insert into ${this.memories}(content, kind, scope, project, agent, supersedes, source_session, source_message, created_at, deleted_at, seg, content_hash)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, null, $10, $11)
          returning id`,
         [
           m.content,
@@ -438,6 +447,8 @@ export class PgMetadataStore implements MetadataStore {
           m.project,
           m.agent,
           m.supersedes,
+          m.sourceSession ?? null,
+          m.sourceMessage ?? null,
           createdAt,
           segmentOrNull(m.content),
           memoryContentHash(m.content),
@@ -472,11 +483,11 @@ export class PgMetadataStore implements MetadataStore {
       }
 
       const inserted = await client.query(
-        `insert into ${this.memories}(content, kind, scope, project, agent, supersedes, created_at, deleted_at, seg, content_hash)
-         select $1, $2, $3, $4, $5, $6, $7, null, $8, $9
+        `insert into ${this.memories}(content, kind, scope, project, agent, supersedes, source_session, source_message, created_at, deleted_at, seg, content_hash)
+         select $1, $2, $3, $4, $5, $6, $7, $8, $9, null, $10, $11
           where not exists (
             select 1 from ${this.memories}
-             where content_hash = $9
+             where content_hash = $11
                and scope = $3
                and coalesce(project, '') = coalesce($4::text, '')
                and agent = $5
@@ -490,6 +501,8 @@ export class PgMetadataStore implements MetadataStore {
           m.project,
           m.agent,
           m.supersedes,
+          m.sourceSession ?? null,
+          m.sourceMessage ?? null,
           createdAt,
           segmentOrNull(m.content),
           contentHash,
@@ -682,22 +695,25 @@ export class PgMetadataStore implements MetadataStore {
     if (normalized.buckets !== undefined && normalized.buckets.length === 0) return [];
 
     // 維度預檢：向量 $1、filter 參數 $2..；沒有可用向量時不驗（查詢自然回空）。
+    // 用 `distinct … limit 2`：同一 embedder 下可能混入不同維度的損壞資料，只驗第一列會讓
+    // 主查詢踩到 pgvector 的原始錯誤；這裡只要發現「存在與查詢不同的維度」就拋 TypeError。
+    // 成本與主查詢同級（掃同一組符合條件的列；memories.embedding 沒有索引可用），只多一次去重。
     const dimWhere = buildPgMemorySearchWhere(normalized, 2);
     const dimResult = await this.pool.query(
-      `select vector_dims(m.embedding) as dim
+      `select distinct vector_dims(m.embedding) as dim
          from ${this.memories} m
         where ${dimWhere.clause}
           and m.embedding_state = 'ready'
           and m.embedding_embedder_id = $1
           and m.embedding is not null
-        limit 1`,
+        limit 2`,
       [embedderId, ...dimWhere.params],
     );
-    if (dimResult.rows.length > 0) {
-      const storedDim = Number(dimResult.rows[0]!.dim);
-      if (storedDim !== queryVec.length) {
-        throw new TypeError(`向量維度不符：查詢 ${queryVec.length} 維、記憶 ${storedDim} 維`);
-      }
+    const mismatchedDim = dimResult.rows
+      .map((row) => Number(row.dim))
+      .find((storedDim) => storedDim !== queryVec.length);
+    if (mismatchedDim !== undefined) {
+      throw new TypeError(`向量維度不符：查詢 ${queryVec.length} 維、記憶 ${mismatchedDim} 維`);
     }
 
     const where = buildPgMemorySearchWhere(normalized, 2);

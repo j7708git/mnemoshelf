@@ -46,6 +46,9 @@ export interface MemoryExportRecord {
   scope: MemoryScope;
   project: string | null;
   agent: string;
+  /** 寫入來源（session／訊息；D4a）。舊備份沒有這兩個欄位，匯入時補 `null`。 */
+  sourceSession: string | null;
+  sourceMessage: string | null;
   pinned: boolean;
   createdAt: string;
   supersedes: number | null;
@@ -60,6 +63,9 @@ export interface MemoryImportEntry {
   scope: MemoryScope;
   project: string | null;
   agent: string;
+  /** 來源欄位（舊備份缺欄位＝`null`；有值時已 trim 並驗證長度／機密）。 */
+  sourceSession: string | null;
+  sourceMessage: string | null;
   pinned: boolean;
   /** 這一行的 `content` 是否被遮罩過。 */
   redacted: boolean;
@@ -119,6 +125,8 @@ export function memoryExportRecord(memory: Memory): MemoryExportRecord {
     scope: memory.scope,
     project: memory.project,
     agent: memory.agent,
+    sourceSession: memory.sourceSession,
+    sourceMessage: memory.sourceMessage,
     pinned: memory.pinned,
     createdAt: memory.createdAt,
     supersedes: memory.supersedes,
@@ -168,11 +176,34 @@ function requireImportString(value: unknown, field: string, maxLength: number): 
   return value;
 }
 
-/** agent／project 是查詢鍵：含 token-like 機密時整行不合法（不遮罩改寫）。 */
-function assertImportMetadataClean(value: string, field: "agent" | "project"): void {
+/** agent／project／來源欄位是查詢鍵或識別值：含 token-like 機密時整行不合法（不遮罩改寫）。 */
+function assertImportMetadataClean(
+  value: string,
+  field: "agent" | "project" | "sourceSession" | "sourceMessage",
+): void {
   if (maskSecrets(value).redacted) {
     lineError(`${field} 不得包含機密（偵測到可能的 token／金鑰；請移除後再匯入）`);
   }
+}
+
+/**
+ * 解析可選的來源欄位（`sourceSession`／`sourceMessage`；D4a）。
+ *
+ * - 省略或 `null` → `null`（舊備份沒有這兩個欄位時就是這條路徑）；
+ * - 有值必須是字串；trim 後為空 → 該行不合法（不靜默改成 `null`）；
+ * - 長度上限 `MAX_MEMORY_METADATA_CHARS`（以 trim 後計），超過不截斷、整行不合法；
+ * - 含 token-like 機密 → 整行不合法（與 agent／project 相同理由：識別值不遮罩改寫）。
+ */
+function optionalImportSourceRef(value: unknown, field: "sourceSession" | "sourceMessage"): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") lineError(`${field} 必須是字串或 null`);
+  const trimmed = value.trim();
+  if (trimmed === "") lineError(`${field} 不得是空字串（沒有來源請省略或給 null）`);
+  if (trimmed.length > MAX_MEMORY_METADATA_CHARS) {
+    lineError(`${field} 長度上限 ${MAX_MEMORY_METADATA_CHARS} 字元`);
+  }
+  assertImportMetadataClean(trimmed, field);
+  return trimmed;
 }
 
 /**
@@ -185,7 +216,9 @@ function assertImportMetadataClean(value: string, field: "agent" | "project"): v
  *   （`project: null` 視同未提供，匯出檔的全域列就是這樣）；
  * - `agent` 必填、≤ `MAX_MEMORY_METADATA_CHARS`；agent／project 不得 token-like；
  * - `pinned` 可省略（預設 false），有提供就必須是 boolean；
- * - `schemaVersion` 可省略，有提供就必須是 1；
+ * - `sourceSession`／`sourceMessage` 可省略（D4a；省略或 `null` → `null`），有值必須是
+ *   非空、≤ 200 字元的字串（trim 後儲存），且不得是 token-like 機密；
+ * - `schemaVersion` 可省略，有提供就必須是 1（來源欄位是 additive，因此**不升版**）；
  * - `id`／`createdAt`／`supersedes` 與未知欄位一律忽略（不保留）。
  */
 function parseImportLine(record: unknown, line: number): MemoryImportEntry {
@@ -239,6 +272,9 @@ function parseImportLine(record: unknown, line: number): MemoryImportEntry {
     lineError(`scope 為 ${scope} 時 project 必須是 null（全域／agent 範圍沒有專案）`);
   }
 
+  const sourceSession = optionalImportSourceRef(record.sourceSession, "sourceSession");
+  const sourceMessage = optionalImportSourceRef(record.sourceMessage, "sourceMessage");
+
   let pinned = false;
   if (record.pinned !== undefined) {
     if (typeof record.pinned !== "boolean") lineError("pinned 必須是布林值");
@@ -252,6 +288,8 @@ function parseImportLine(record: unknown, line: number): MemoryImportEntry {
     scope,
     project,
     agent,
+    sourceSession,
+    sourceMessage,
     pinned,
     redacted: masked.redacted,
   };

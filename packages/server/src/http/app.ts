@@ -766,17 +766,29 @@ function optionalStringArray(value: unknown, field: string): string[] | undefine
 }
 
 /**
- * 讀取路徑的記憶遮罩：對 `content`／`agent`／`project` 再套一次 `maskSecrets`（idempotent）。
+ * 讀取路徑的記憶遮罩：對 `content`／`agent`／`project`／來源欄位再套一次 `maskSecrets`（idempotent）。
  *
  * 既有 DB 可能存著未遮罩的舊資料，因此列表、單筆回應與召回命中都經過這裡再輸出；
- * 已遮罩過的內容不會二次匹配（`[REDACTED:...]` 不會被規則再吃一次）。
+ * 來源欄位（`sourceSession`／`sourceMessage`）雖然在寫入時已拒絕 token-like 值，
+ * 仍以同一組規則防禦直接寫入 DB 的資料。已遮罩過的內容不會二次匹配
+ * （`[REDACTED:...]` 不會被規則再吃一次）。
  */
 function maskMemoryContent(memory: Memory): Memory {
   const content = maskSecrets(memory.content);
   const agent = maskSecrets(memory.agent);
   const project = memory.project === null ? null : maskSecrets(memory.project).text;
-  if (!content.redacted && !agent.redacted && project === memory.project) return memory;
-  return { ...memory, content: content.text, agent: agent.text, project };
+  const sourceSession = memory.sourceSession === null ? null : maskSecrets(memory.sourceSession).text;
+  const sourceMessage = memory.sourceMessage === null ? null : maskSecrets(memory.sourceMessage).text;
+  if (
+    !content.redacted &&
+    !agent.redacted &&
+    project === memory.project &&
+    sourceSession === memory.sourceSession &&
+    sourceMessage === memory.sourceMessage
+  ) {
+    return memory;
+  }
+  return { ...memory, content: content.text, agent: agent.text, project, sourceSession, sourceMessage };
 }
 
 /**
@@ -785,10 +797,38 @@ function maskMemoryContent(memory: Memory): Memory {
  * 為什麼不遮而要拒絕：agent／project 是**查詢鍵**（過濾、召回 bucket 都用它精確比對）；
  * 若在寫入時改寫，呼叫端之後用原值查不到、語意會壞掉。因此要求呼叫端換一個不含機密的值。
  */
-function assertNoSecretInMetadata(value: string, field: "agent" | "project"): void {
+function assertNoSecretInMetadata(
+  value: string,
+  field: "agent" | "project" | "sourceSession" | "sourceMessage",
+): void {
   if (maskSecrets(value).redacted) {
     throw new ValidationError(field, "不得包含機密（偵測到可能的 token／金鑰；請移除後再寫入）");
   }
+}
+
+/**
+ * 解析 `POST /memories` 的可選來源欄位（D4a；`sourceSession`／`sourceMessage`）。
+ *
+ * 契約（見 docs/storage-ports.md §記憶的來源欄位）：
+ * - 未提供（`undefined`／`null`）→ `null`（不是空字串）；
+ * - 必須是字串；trim 後為空 → `400`（不靜默改成 `null`，避免呼叫端誤以為已記錄來源）；
+ * - trim 後長度上限 `MAX_MEMORY_METADATA_CHARS`（200）→ 超過回 `400`，**不截斷**；
+ * - 含 token-like 機密 → `400`（與 agent／project 相同：識別值不遮罩改寫）。
+ *
+ * 儲存的是 trim 後的值（前後空白沒有意義）。
+ */
+function optionalSourceRef(value: unknown, field: "sourceSession" | "sourceMessage"): string | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string") throw new ValidationError(field, "必須是字串或 null");
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    throw new ValidationError(field, "不得是空字串（沒有來源請省略或給 null）");
+  }
+  if (trimmed.length > MAX_MEMORY_METADATA_CHARS) {
+    throw new ValidationError(field, `長度上限 ${MAX_MEMORY_METADATA_CHARS} 字元`);
+  }
+  assertNoSecretInMetadata(trimmed, field);
+  return trimmed;
 }
 
 function enumValue<T extends string>(value: unknown, allowed: readonly T[], field: string, fallback: T): T {
@@ -1371,6 +1411,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
    * - `scope: "project"` 且 `project` 缺少／空字串 → `400`（專案名 trim 後儲存）；
    * - `scope: "global" | "agent"` 且帶非 null `project` → `400`。
    *
+   * **D4a（來源欄位，additive）**：可選的 `sourceSession`／`sourceMessage`（各 ≤ 200 字元，
+   * 超長或空白 → `400`，不截斷）；未提供或 `null` → 存 `null`。兩者都是不透明識別值、
+   * 不是安全邊界，也**不參與**去重 key；寫入後不可經 `PATCH` 變更。
+   *
    * 建立成功後只把 id 交給背景 worker（`memoryEmbedder.enqueue`）：**不等待嵌入**，
    * 回應仍是立即的 `201`；向量稍後就緒（狀態見 `GET /diagnostics` 的 `memories`）。
    */
@@ -1413,10 +1457,13 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     }
     if (project !== null) assertNoSecretInMetadata(project, "project");
     const supersedes = optionalId(body.supersedes, "supersedes");
+    // D4a：來源欄位（可選、additive）；未提供存 null，不影響去重 key。
+    const sourceSession = optionalSourceRef(body.sourceSession, "sourceSession");
+    const sourceMessage = optionalSourceRef(body.sourceMessage, "sourceMessage");
 
     // 先讀被取代者（若存在）的 pinned：建立新記憶會把舊版軟刪除，之後仍可讀，但先讀較清楚。
     const replaced = supersedes === null ? null : await deps.store.getMemory(supersedes);
-    const input = { content, kind, scope, project, agent, supersedes };
+    const input = { content, kind, scope, project, agent, supersedes, sourceSession, sourceMessage };
 
     // 編輯流程（supersedes）與 force 都走一般新增；其餘交給原子的 insert-or-return-existing。
     let memory: Memory;
@@ -1758,7 +1805,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
    * → 合法才逐筆 `addMemoryUnlessDuplicate`（重複跳過）→ `pinned` 補設 → enqueue 背景嵌入。
    *
    * `dryRun=1`／`true` 只驗證與估算（`wouldCreate`），不寫入、不回報 `created`。
-   * 匯入不保留 `id`／`createdAt`／`supersedes`（新 id、匯入時間）；`pinned` 保留。
+   * 匯入不保留 `id`／`createdAt`／`supersedes`（新 id、匯入時間）；`pinned` 與來源欄位
+   * （`sourceSession`／`sourceMessage`；舊備份沒有＝`null`）保留。
    */
   const importMemories = async (request: IncomingMessage, url: URL): Promise<RouteResult> => {
     const dryRun = parseDryRunParam(url.searchParams.get("dryRun"));
@@ -1813,6 +1861,9 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         agent: entry.agent,
         // 匯入不保留歷史鏈：只匯出未刪除者，還原時 supersedes 一律清空。
         supersedes: null,
+        // D4a：來源欄位保留（舊備份沒有＝null）；不影響去重 key。
+        sourceSession: entry.sourceSession,
+        sourceMessage: entry.sourceMessage,
       });
       if (result.duplicate) {
         duplicates += 1;

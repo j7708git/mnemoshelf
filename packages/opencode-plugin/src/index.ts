@@ -2,7 +2,7 @@
  * `@mnemoshelf/opencode-plugin` 的入口。
  *
  * `id` 會出現在 `opencode plugin list`；`setup` 只註冊 hook 與指令，連線檢查在背景進行，
- * 因此不會拖慢 OpenCode 的 location 啟動。所有召回失敗都 fail-open。
+ * 因此不會拖慢 OpenCode 的 location 啟動。所有召回與 digest 失敗都 fail-open。
  */
 import { Plugin } from "@opencode/plugin";
 
@@ -21,4 +21,11 @@ export default Plugin.define({
 export { createMemoryRuntime } from "./recall.js";
 export { injectMemoryBlock } from "./inject.js";
 export { resolveProjectName, normalizeProjectName } from "./project.js";
-export { readSettings, resolveConnection, runtimeCandidates } from "./config.js";
+export { parseDigestModel, readSettings, resolveConnection, runtimeCandidates } from "./config.js";
+export {
+  buildDigestPrompt,
+  createDigestRuntime,
+  parseDigestItems,
+  resolveDigestTurn,
+  stripMemoryContext,
+} from "./digest.js";

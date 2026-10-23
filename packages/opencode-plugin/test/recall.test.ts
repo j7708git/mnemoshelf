@@ -5,6 +5,7 @@ import {
   decideTrigger,
   escapeAttribute,
   escapeMemoryText,
+  fetchRecentTurns,
   findLatestUserMessage,
   hasExplicitCue,
   isCodeHeavy,
@@ -18,11 +19,12 @@ import {
   skipReason,
   statusText,
   truncateChars,
+  buildRecentTurnsUrl,
 } from "../src/recall.js";
 import { STATUS_SENTINEL, pruneDedupe } from "../src/recall.js";
 import type { DedupeEntry } from "../src/recall.js";
 import { DEFAULT_SETTINGS, readSettings } from "../src/config.js";
-import type { RecallHit, Settings } from "../src/types.js";
+import type { RecallHit, RecallTurn, Settings } from "../src/types.js";
 
 function settings(overrides: Partial<Settings> = {}): Settings {
   return { ...readSettings(undefined), ...overrides };
@@ -133,10 +135,21 @@ describe("訊息解析", () => {
 });
 
 describe("跳過條件", () => {
-  it("空字串／slash command／少於 20 字", () => {
+  it("空字串／slash command／少於 6 字", () => {
     expect(skipReason("   ")).toBe("empty");
     expect(skipReason("/memory-all 查詢")).toBe("slash");
     expect(skipReason("太短了")).toBe("short");
+  });
+
+  it("短訊息門檻為 6：招呼／確認跳過，正常短問題召回", () => {
+    for (const greeting of ["好", "繼續", "早安", "嗯", "謝謝"]) {
+      expect(skipReason(greeting)).toBe("short");
+    }
+    // 5 字仍跳過、6 字放行（邊界）。
+    expect(skipReason("測試五個字")).toBe("short");
+    expect(skipReason("測試六個字元")).toBeNull();
+    // 實跑誤跳的 15 字問題現在要召回（明示線索由 hasExplicitCue 判斷）。
+    expect(skipReason("你還記得剛剛討論的摘要模型嗎?")).toBeNull();
   });
 
   it("一般長句不跳過", () => {
@@ -165,6 +178,12 @@ describe("跳過條件", () => {
     expect(hasExplicitCue("你還記得我們上次的決定嗎")).toBe(true);
     expect(hasExplicitCue("請 remember 這個偏好")).toBe(true);
     expect(hasExplicitCue("幫我改這個函式")).toBe(false);
+  });
+
+  it("明示線索含「剛剛／剛才」", () => {
+    expect(hasExplicitCue("剛剛討論了什麼")).toBe(true);
+    expect(hasExplicitCue("你剛才說的摘要模型是哪一個")).toBe(true);
+    expect(hasExplicitCue("幫我看這個")).toBe(false);
   });
 });
 
@@ -472,5 +491,165 @@ describe("planRecall", () => {
     expect(DEFAULT_SETTINGS.maxItems).toBe(4);
     expect(DEFAULT_SETTINGS.minScore).toBe(0.65);
     expect(DEFAULT_SETTINGS.dedupeTTL).toBe(8);
+  });
+});
+
+describe("最近回合紀錄（recent turns）", () => {
+  const connection = { baseUrl: "http://127.0.0.1:43117", token: "test-token", source: "env" as const };
+  const now = new Date("2026-10-22T03:04:05.000Z");
+
+  function turnRecord(id: number, content: string, createdAt = "2026-10-20T00:00:00.000Z"): RecallTurn {
+    return { id, content, createdAt };
+  }
+
+  function jsonResponse(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), {
+      status,
+      headers: { "content-type": "application/json" },
+    });
+  }
+
+  it("專案查詢帶 scope=project&project=<name>&agent=…&limit=…", () => {
+    expect(
+      buildRecentTurnsUrl(connection.baseUrl, { scope: "project", project: "mnemoshelf", limit: 3 }),
+    ).toBe(
+      "http://127.0.0.1:43117/memories?scope=project&project=mnemoshelf&agent=opencode-plugin%2Fturn&limit=3",
+    );
+  });
+
+  it("聊天查詢帶 scope=global 且不帶 project", () => {
+    const url = buildRecentTurnsUrl(connection.baseUrl, { scope: "global", limit: 5 });
+    expect(url).toContain("scope=global");
+    expect(url).not.toContain("project=");
+    expect(url).toContain("agent=opencode-plugin%2Fturn");
+    expect(url).toContain("limit=5");
+  });
+
+  it("解析 GET /memories 的 memories（保留 server 的由新到舊順序）與授權標頭", async () => {
+    let seen: { url: string; authorization: string | null; method: string | undefined } | undefined;
+    const fetchImpl: typeof fetch = async (input, init) => {
+      seen = {
+        url: String(input),
+        authorization: new Headers(init?.headers).get("authorization"),
+        method: init?.method,
+      };
+      return jsonResponse({
+        memories: [
+          { id: 11, content: "最新回合", createdAt: "2026-10-22T00:00:00.000Z" },
+          { id: 10, content: "較舊回合", createdAt: "2026-10-21T00:00:00.000Z" },
+          { id: "bad", content: "沒有 id" },
+        ],
+      });
+    };
+    const result = await fetchRecentTurns({
+      connection,
+      scope: "project",
+      project: "mnemoshelf",
+      limit: 3,
+      timeoutMs: 100,
+      fetchImpl,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.turns.map((turn) => turn.id)).toEqual([11, 10]);
+    expect(seen?.method).toBe("GET");
+    expect(seen?.authorization).toBe("Bearer test-token");
+  });
+
+  it("HTTP 錯誤與逾時都回 ok:false（不拋錯）", async () => {
+    const httpError = await fetchRecentTurns({
+      connection,
+      scope: "global",
+      limit: 3,
+      timeoutMs: 100,
+      fetchImpl: async () => jsonResponse({ error: "boom" }, 500),
+    });
+    expect(httpError).toMatchObject({ ok: false, reason: "http", status: 500 });
+
+    const timedOut = await fetchRecentTurns({
+      connection,
+      scope: "global",
+      limit: 3,
+      timeoutMs: 10,
+      fetchImpl: (_input, init) =>
+        new Promise((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          );
+        }),
+    });
+    expect(timedOut).toMatchObject({ ok: false, reason: "timeout" });
+
+    const badShape = await fetchRecentTurns({
+      connection,
+      scope: "global",
+      limit: 3,
+      timeoutMs: 100,
+      fetchImpl: async () => jsonResponse({ hits: [] }),
+    });
+    expect(badShape).toMatchObject({ ok: false, reason: "bad-response" });
+  });
+
+  it("注入順序：回合紀錄（舊→新）先，語意命中後；同 id 只出現一次", () => {
+    const result = planRecall({
+      hits: [
+        hit({ id: 102, content: "同一筆也在語意命中裡", score: 0.9 }),
+        hit({ id: 5, content: "其他語意命中", score: 0.8 }),
+      ],
+      turns: [
+        turnRecord(101, "最新回合", "2026-10-22T00:00:00.000Z"),
+        turnRecord(102, "中間回合", "2026-10-21T00:00:00.000Z"),
+        turnRecord(103, "最舊回合", "2026-10-20T00:00:00.000Z"),
+      ],
+      settings: settings(),
+      project: "mnemoshelf",
+      dedupe: new Map(),
+      turn: 1,
+      now,
+    });
+
+    const oldest = result.block.indexOf("最舊回合");
+    const middle = result.block.indexOf("中間回合");
+    const newest = result.block.indexOf("最新回合");
+    const semantic = result.block.indexOf("其他語意命中");
+    expect(oldest).toBeGreaterThan(-1);
+    expect(oldest).toBeLessThan(middle);
+    expect(middle).toBeLessThan(newest);
+    expect(newest).toBeLessThan(semantic);
+    expect(result.block.match(/中間回合/g)).toHaveLength(1);
+    expect(result.block).not.toContain("同一筆也在語意命中裡");
+    expect(result.block).toContain("- [turn][2026-10-20][最近] 最舊回合");
+    expect(result.block).toContain("回合紀錄與背景資料");
+    expect(result.stats.turns).toBe(3);
+    expect(result.injected.map((item) => item.id)).toEqual([103, 102, 101, 5]);
+  });
+
+  it("回合紀錄優先保留：預算不足時先丟語意命中", () => {
+    const result = planRecall({
+      hits: [hit({ id: 5, content: "語".repeat(200), score: 0.9 })],
+      turns: [turnRecord(11, "第一回合內容"), turnRecord(12, "第二回合內容"), turnRecord(13, "第三回合內容")],
+      settings: settings({ softChars: 150, hardChars: 1200 }),
+      project: "mnemoshelf",
+      dedupe: new Map(),
+      turn: 1,
+      now,
+    });
+    expect(result.block).toContain("第三回合內容");
+    expect(result.block).not.toContain("語語語");
+    expect(result.stats.turns).toBe(3);
+  });
+
+  it("沒有回合紀錄時 intro 維持原本句子", () => {
+    const result = planRecall({
+      hits: [hit({ id: 1, content: "一般記憶", score: 0.9 })],
+      settings: settings(),
+      project: "mnemoshelf",
+      dedupe: new Map(),
+      turn: 1,
+      now,
+    });
+    expect(result.block).toContain("以下是本專案先前留下的背景資料");
+    expect(result.block).not.toContain("回合紀錄");
+    expect(result.stats.turns).toBe(0);
   });
 });

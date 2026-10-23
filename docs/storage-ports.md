@@ -33,6 +33,10 @@
 > 2026-10-19 新增 §記憶的匯出／匯入：`MetadataStore.listMemoriesForExport()` 與 REST
 > `GET /memories/export`／`POST /memories/import`（NDJSON、`dryRun`、32 MiB 上限）——兩後端皆實作、
 > 通過同一組契約測試；本版**只做記憶**（不含 chunk／向量）。設計規則 6 同步改為誠實版本。
+>
+> 2026-10-21 新增 §記憶的來源欄位：`Memory.sourceSession`／`sourceMessage`（additive、可空）與
+> SQLite 遷移 `0005_memory_provenance`；匯出 `schemaVersion` **維持 1**（舊備份缺欄位可匯入，
+> 補 `null`）。既有欄位語意、去重 key、排序與搜尋都不變。
 
 | 介面 | 職責 | 預設實作 | 預計的替代實作 |
 |---|---|---|---|
@@ -216,8 +220,9 @@ at-rest 仍明文、無加密），見 `docs/roots-and-privacy.md` §資料存�
 
 - **匯出（讀取路徑）**：`GET /memories/export` → `application/x-ndjson; charset=utf-8` 附件
   `memories-YYYYMMDD.ndjson`；一行一筆，欄位固定為
-  `{schemaVersion:1, id, content, kind, scope, project, agent, pinned, createdAt, supersedes}`；
-  結尾換行；0 筆時是 0 bytes 的空檔。順序與 `listMemoriesForExport` 相同。
+  `{schemaVersion:1, id, content, kind, scope, project, agent, sourceSession, sourceMessage, pinned,
+  createdAt, supersedes}`（`sourceSession`／`sourceMessage` 為 2026-10-21 新增的來源欄位，
+  見 §記憶的來源欄位）；結尾換行；0 筆時是 0 bytes 的空檔。順序與 `listMemoriesForExport` 相同。
 - **匯出的遮罩語意**：匯出是**讀取遮罩後視圖**，與 `GET /memories` 用同一組 `maskSecrets`
   （`content`、`agent`、`project`）；資料庫裡的舊資料即使未遮罩，匯出檔也不會出現可辨識憑證的
   原文。還原的是**遮罩後內容**，不是原文；備份檔由使用者保管，可能含專案內部資訊。
@@ -230,17 +235,73 @@ at-rest 仍明文、無加密），見 `docs/roots-and-privacy.md` §資料存�
   `kind` ∈ fact／decision／pitfall／preference（可省略，預設 `fact`）、
   `scope` ∈ global／project／agent（可省略：有 `project` 視為 `project`，否則 `global`）、
   scope／project 組合規則一致、`agent` 必填且 ≤ 200 字元；
-  `schemaVersion` 可省略（有值必須是 1）、`pinned` 可選 boolean；未知欄位與
-  `id`／`createdAt`／`supersedes` 一律忽略。`agent`／`project` 是查詢鍵，含 token-like 機密時
-  該行不合法（不遮罩改寫）。
+  `schemaVersion` 可省略（有值必須是 1）、`pinned` 可選 boolean；`sourceSession`／`sourceMessage`
+  可省略（省略或 `null` → `null`；有值必須是 trim 後非空、≤ 200 字元、且非 token-like 的字串，
+  否則該行不合法）；未知欄位與 `id`／`createdAt`／`supersedes` 一律忽略。
+  `agent`／`project` 是查詢鍵，含 token-like 機密時該行不合法（不遮罩改寫）。
 - **寫入流程**：內容先 `maskSecrets`（回應的 `redacted` 以**筆**計）→ metadata token-like 檢查
   → `addMemoryUnlessDuplicate`（重複跳過、計入 `duplicates`）→ `pinned` 時 `setMemoryPinned`
   → `memoryEmbedder.enqueue`（不阻塞回應）。**不保留** `id`／`createdAt`／`supersedes`
-  （新 id、匯入時間、無歷史鏈）；`pinned` 保留。同批次內較早的重複也計入 `duplicates`。
+  （新 id、匯入時間、無歷史鏈）；`pinned` 與來源欄位（`sourceSession`／`sourceMessage`）保留。
+  同批次內較早的重複也計入 `duplicates`。
 - **回應**：`{dryRun, total, valid, invalid, duplicates, redacted, created, wouldCreate}`。
   dry-run 時 `created = 0`、`wouldCreate` 是預計新增數；正式匯入時 `wouldCreate = 0`。
   空檔（0 行）→ `200`＋全 0。
 - **不做**：加密、自動排程備份、串流下載、MCP 工具、chunk／向量／整庫搬遷。
+
+## 記憶的來源欄位（2026-10-21，D4a）
+
+讓每筆記憶能回答「誰寫的（`agent`）、哪個 session／訊息、什麼時候（`createdAt`）」。本節只加
+**兩個可空欄位**與呈現，不做摘要、不呼叫模型、不改既有欄位語意。
+
+| 公開欄位（`Memory`） | SQLite | PostgreSQL | 說明 |
+|---|---|---|---|
+| `sourceSession` | `source_session text`（nullable） | `source_session text` | 寫入端的 session 識別（不透明字串） |
+| `sourceMessage` | `source_message text`（nullable） | `source_message text` | 寫入端的訊息識別（不透明字串） |
+
+- **`Memory` 公開型別是 additive 擴充**：兩個欄位一律存在，值為 `string | null`；未提供或舊資料
+  一律 `null`（**不是空字串**）。`NewMemory` 的這兩個欄位是**選填**（`?: string | null`），
+  因此既有呼叫端不必修改。
+- **不是安全邊界**：與 `agent` 一樣只是來源標記；不參與權限判斷、不參與去重 key
+  （同內容＋同 `scope`／`project`／`agent` 就是重複，來源不同不算新記憶）。
+- **不可變**：`MemoryPatch`（`updateMemory`／`PATCH /memories/:id`）仍只有 `scope`／`project`；
+  來源欄位只在建立時寫入，之後不能改（REST 對未知欄位回 `400`）。
+- **SQLite**：遷移 `0005_memory_provenance` 以 `alter table … add column` 補兩欄（先查
+  `pragma table_info`，冪等）。**不重建表、不動既有資料列**，既有列兩欄為 `NULL`；沒有 down
+  migration（與 0001～0004 的慣例一致）。
+- **PostgreSQL**：`create table` 帶兩欄，另以 `alter table … add column if not exists` 補既有
+  資料庫（冪等），與 SQLite 對齊。
+
+### 寫入與讀取（REST／MCP）
+
+- **`POST /memories`** 接受可選的 `sourceSession`／`sourceMessage`：
+  - 未提供或 `null` → 存 `null`；
+  - 必須是字串；`trim` 後儲存（前後空白沒有意義），trim 後為空 → `400`；
+  - 長度上限 **200 字元**（以 trim 後計）；超過回 **`400`，不截斷**（與 `agent`／`project`
+    的既有風格一致，避免靜默改寫）；
+  - 含 token-like 機密 → `400`（與 `agent`／`project` 相同：識別值不遮罩改寫）。
+- **讀取路徑**（`GET /memories`、`POST /memories/search` 命中、MCP `recall`／`search_memories`）
+  都帶出這兩個欄位（additive），且與 `content`／`agent`／`project` 一樣再套一次 `maskSecrets`
+  （防禦直接寫入 DB、繞過 REST 驗證的舊資料；正常寫入路徑已拒絕 token-like 值）；MCP `remember` 的回應也帶，但值為 `null`——MCP 工具沒有 session
+  資訊，自動寫入者（D4b）走 REST 自行提供。**沒有** `GET /memories/:id` 端點（本版現況；
+  單筆讀取請用列表或召回，伺服器端以 `getMemory` 取得完整資料）。
+- **匯出／匯入**：匯出列固定帶 `sourceSession`／`sourceMessage`（順序見 §記憶的匯出／匯入），
+  `schemaVersion` **維持 1**；匯入時缺欄位的舊備份成功、補 `null`，帶欄位的新備份保留值
+  （驗證規則同 `POST /memories`）。這是 additive 變更，舊版讀新備份時未知欄位會被忽略。
+
+### UI（Web）
+
+記憶列表每張卡顯示寫入者（`agent`，自動寫入者另標「（自動）」）、來源 session（縮短顯示，
+完整值在 `title` 與「看來源」面板）與建立時間；「看來源」面板另列 `sourceMessage`。
+工具列提供「來源」篩選：**全部**／**只看自動寫入**（`agent` 以 `opencode-plugin` 開頭）。
+這個篩選純粹是顯示輔助，**不是**安全邊界。
+
+### 契約測試
+
+`runMetadataStoreContract` 新增一例：帶兩個欄位寫入 → `getMemory`／`listMemories`／
+`listMemoriesForExport` 讀回一致；未帶或明示 `null` → `null`；`addMemoryUnlessDuplicate` 同樣
+寫入且來源不在去重 key 內；`updateMemory` 不改來源。SQLite 與 PostgreSQL 兩個後端都跑同一組測試
+（PostgreSQL 需 `MNEMOSHELF_PG=1`）。
 
 ## 記憶的語意化（2026-10-18）
 

@@ -27,7 +27,7 @@ import {
   type MemoryRecallResult,
   type MemoryScope,
 } from "./api";
-import { formatDateTime, MEMORY_KIND_LABEL, MEMORY_SCOPE_LABEL } from "./format";
+import { formatDateTime, MEMORY_KIND_LABEL, MEMORY_SCOPE_LABEL, shortenSourceId } from "./format";
 
 type LoadState =
   | { kind: "loading" }
@@ -44,6 +44,21 @@ type RecallState =
 /** 篩選值：`"all"` 表示不過濾。 */
 type ScopeFilter = MemoryScope | "all";
 const ALL_PROJECTS = "all";
+
+/**
+ * 來源篩選（D4a）：`all`＝全部、`auto`＝只看自動寫入。
+ *
+ * 判準是 `agent` 以 `opencode-plugin` 開頭（v1 自動寫入者的標記，例如
+ * `opencode-plugin`、`opencode-plugin@0.x`）。`agent` **只是來源標記、不是安全邊界**，
+ * 這個篩選是顯示輔助，不是權限控制。
+ */
+type OriginFilter = "all" | "auto";
+const AUTOMATIC_AGENT_PREFIX = "opencode-plugin";
+
+/** 這筆記憶是否由自動寫入者建立（`agent` 以 `opencode-plugin` 開頭）。 */
+function isAutomaticMemory(memory: Memory): boolean {
+  return memory.agent.startsWith(AUTOMATIC_AGENT_PREFIX);
+}
 
 /** 釘選者優先，其次依 createdAt 由新到舊（伺服器已給新到舊，這裡穩定排序）。 */
 function sortMemories(memories: Memory[]): Memory[] {
@@ -122,6 +137,8 @@ export function MemoriesPanel() {
   const [scopeFilter, setScopeFilter] = useState<ScopeFilter>("all");
   /** 專案篩選（`all`＝全部專案；其餘為專案名稱）。 */
   const [projectFilter, setProjectFilter] = useState<string>(ALL_PROJECTS);
+  /** 來源篩選（D4a；`all`＝全部、`auto`＝只看自動寫入）。 */
+  const [originFilter, setOriginFilter] = useState<OriginFilter>("all");
   /** 每筆「改回專案」目前選定的目標專案（未選時用清單第一個可選專案）。 */
   const [shareTargets, setShareTargets] = useState<Record<number, string>>({});
   /** 記憶搜尋（卡 B2）：查詢字串、「找全部專案」與結果狀態。 */
@@ -431,7 +448,8 @@ export function MemoriesPanel() {
   const filteredMemories = state.memories.filter(
     (memory) =>
       (scopeFilter === "all" || memory.scope === scopeFilter) &&
-      (projectFilter === ALL_PROJECTS || memory.project === projectFilter),
+      (projectFilter === ALL_PROJECTS || memory.project === projectFilter) &&
+      (originFilter === "all" || isAutomaticMemory(memory)),
   );
 
   return (
@@ -461,6 +479,10 @@ export function MemoriesPanel() {
           </p>
           <p className="mt-0.5 text-[11px] text-muted">
             備份只含未刪除的記憶（不含向量）；匯出是遮罩後視圖，下載的檔案由你保管，可能含專案內部資訊。
+          </p>
+          <p className="mt-0.5 text-[11px] text-muted">
+            每張卡顯示寫入者（agent）、來源 session（縮短）與建立時間；可用「來源」篩選只看自動寫入
+            （agent 以 <code>opencode-plugin</code> 開頭）。
           </p>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
@@ -615,6 +637,18 @@ export function MemoriesPanel() {
             </select>
           </label>
           <label className="flex items-center gap-1.5">
+            來源
+            <select
+              aria-label="依來源篩選"
+              value={originFilter}
+              onChange={(event) => setOriginFilter(event.target.value as OriginFilter)}
+              className="rounded-md border border-line bg-white px-2 py-1 text-xs text-ink"
+            >
+              <option value="all">全部</option>
+              <option value="auto">只看自動寫入</option>
+            </select>
+          </label>
+          <label className="flex items-center gap-1.5">
             範圍
             <select
               aria-label="依範圍篩選"
@@ -628,12 +662,13 @@ export function MemoriesPanel() {
               <option value="agent">agent</option>
             </select>
           </label>
-          {(scopeFilter !== "all" || projectFilter !== ALL_PROJECTS) && (
+          {(scopeFilter !== "all" || projectFilter !== ALL_PROJECTS || originFilter !== "all") && (
             <button
               type="button"
               onClick={() => {
                 setScopeFilter("all");
                 setProjectFilter(ALL_PROJECTS);
+                setOriginFilter("all");
               }}
               className="rounded-md border border-line px-2 py-1 text-xs text-ink"
             >
@@ -686,6 +721,21 @@ export function MemoriesPanel() {
                   <span className="rounded bg-surface px-1.5 py-0.5 text-[11px] text-muted">
                     專案 {memory.project ?? "全域"}
                   </span>
+                  <span
+                    className="max-w-full break-all rounded bg-surface px-1.5 py-0.5 text-[11px] text-muted"
+                    title={memory.agent}
+                  >
+                    寫入者 {memory.agent}
+                    {isAutomaticMemory(memory) ? "（自動）" : ""}
+                  </span>
+                  {memory.sourceSession !== null && (
+                    <span
+                      className="rounded bg-surface px-1.5 py-0.5 text-[11px] text-muted"
+                      title={memory.sourceSession}
+                    >
+                      session {shortenSourceId(memory.sourceSession)}
+                    </span>
+                  )}
                   <span className="text-[11px] text-muted">#{memory.id}</span>
                   <span className="ml-auto text-[11px] text-muted">{formatDateTime(memory.createdAt)}</span>
                 </div>
@@ -819,7 +869,14 @@ export function MemoriesPanel() {
                 {showSource && (
                   <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-md bg-surface px-3 py-2 text-xs text-muted">
                     <dt>寫入者</dt>
-                    <dd className="break-all text-ink">{memory.agent}</dd>
+                    <dd className="break-all text-ink">
+                      {memory.agent}
+                      {isAutomaticMemory(memory) ? "（自動寫入）" : ""}
+                    </dd>
+                    <dt>來源 session</dt>
+                    <dd className="break-all text-ink">{memory.sourceSession ?? "—"}</dd>
+                    <dt>來源訊息</dt>
+                    <dd className="break-all text-ink">{memory.sourceMessage ?? "—"}</dd>
                     <dt>種類</dt>
                     <dd className="text-ink">{MEMORY_KIND_LABEL[memory.kind]}</dd>
                     <dt>範圍</dt>

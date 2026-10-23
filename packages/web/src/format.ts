@@ -16,6 +16,19 @@ export function formatDateTime(iso: string): string {
   return Number.isNaN(date.getTime()) ? iso : date.toLocaleString("zh-TW");
 }
 
+/**
+ * 縮短來源識別（session／訊息 id）供列表顯示：只留前 `max` 個字元，其餘以「…」帶過。
+ *
+ * 完整值仍放在 `title` 與「看來源」面板，列表只求可辨識；以 code point 切，避免切壞代理對。
+ * 空白或空字串回空字串（呼叫端據此不顯示）。
+ */
+export function shortenSourceId(value: string, max = 8): string {
+  const trimmed = value.trim();
+  const characters = [...trimmed];
+  if (characters.length <= max) return trimmed;
+  return `${characters.slice(0, max).join("")}…`;
+}
+
 /** 記憶種類的中文標籤。 */
 export const MEMORY_KIND_LABEL: Record<MemoryKind, string> = {
   fact: "事實",

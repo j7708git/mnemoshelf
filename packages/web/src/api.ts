@@ -616,6 +616,10 @@ export interface Memory {
   supersedes: number | null;
   /** 是否釘選（釘選者在清單優先顯示）。 */
   pinned: boolean;
+  /** 寫入這筆記憶的 session 識別（來源；未提供或舊資料為 null）。 */
+  sourceSession: string | null;
+  /** 寫入這筆記憶的訊息識別（來源；未提供或舊資料為 null）。 */
+  sourceMessage: string | null;
   createdAt: string;
   deletedAt: string | null;
 }
@@ -714,6 +718,9 @@ export async function addMemory(input: {
   scope?: MemoryScope;
   project?: string | null;
   supersedes?: number | null;
+  /** 可選的來源欄位（D4a）；省略或 null 表示沒有來源資訊。 */
+  sourceSession?: string | null;
+  sourceMessage?: string | null;
 }): Promise<AddMemoryResponse> {
   const response = await apiFetch("/memories", {
     method: "POST",

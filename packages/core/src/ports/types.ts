@@ -93,6 +93,16 @@ export interface Memory {
    * 這是管理面的標記，**不影響**搜尋排名或 `listMemories` 的排序（UI 自行把釘選者排前面）。
    */
   pinned: boolean;
+  /**
+   * 寫入這筆記憶的 session 識別（來源；D4a 擴充）。
+   *
+   * 由寫入端自行提供的不透明字串（例如自動寫入者的 session id），**不是**安全邊界，
+   * 也不參與去重 key。未提供或舊資料一律 `null`（不是空字串）；寫入後不可變更
+   * （`MemoryPatch` 不含此欄位）。
+   */
+  sourceSession: string | null;
+  /** 寫入這筆記憶的訊息識別（來源；D4a 擴充）。未提供或舊資料一律 `null`；不可變更。 */
+  sourceMessage: string | null;
   /** ISO 8601 時間字串。 */
   createdAt: string;
   /** ISO 8601 時間字串；未刪除時為 null。 */
@@ -104,14 +114,24 @@ export interface Memory {
  *
  * `pinned` 刻意**不在**輸入內：新增的記憶一律 `false`，要釘選請用
  * `MetadataStore.setMemoryPinned`（見 `Memory.pinned`）。
+ *
+ * `sourceSession`／`sourceMessage` 是**選填**（未提供或 `null` → 儲存為 `null`）：
+ * 這樣既有的呼叫端不必改，也讓舊資料與新資料共用同一個型別（D4a 是 additive 擴充）。
  */
-export type NewMemory = Omit<Memory, "id" | "createdAt" | "deletedAt" | "pinned">;
+export type NewMemory = Omit<
+  Memory,
+  "id" | "createdAt" | "deletedAt" | "pinned" | "sourceSession" | "sourceMessage"
+> & {
+  sourceSession?: string | null;
+  sourceMessage?: string | null;
+};
 
 /**
  * 更新既有記憶時**可變更**的欄位（`MetadataStore.updateMemory`）。
  *
  * 為什麼只有這兩個：內容的變更一律走 supersede（建立新版本、舊版軟刪除），避免無痕改寫歷史；
- * `kind`／`agent`／`supersedes`／`pinned`／`createdAt`／`deletedAt` 都是不可變欄位。
+ * `kind`／`agent`／`supersedes`／`pinned`／`sourceSession`／`sourceMessage`／`createdAt`／
+ * `deletedAt` 都是不可變欄位。
  * 欄位未提供（`undefined`）＝該欄位不變；兩個都沒提供＝非法 patch（儲存層拋錯）。
  *
  * 有效結果的正規化（見 `normalizeMemoryPatch`）：

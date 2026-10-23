@@ -77,7 +77,8 @@ export const MCP_TOOLS: Tool[] = [
       `精確去重：同一範圍（scope／project／agent）已有相同內容時不新增，回應是既有記憶並帶 duplicate: true；` +
       `要強制新增請帶 force: true。內容編輯（產生新版本並取代舊版）仍用 REST 的 supersedes 語意。` +
       `內容在寫入前會遮蔽可辨識的機密（API key／token／私鑰等），回應帶 redacted／redactedCount。` +
-      `${UNTRUSTED_DATA_WARNING}`,
+      `回應的來源欄位 sourceSession／sourceMessage 一律為 null（MCP 工具沒有 session 資訊；` +
+      `自動寫入者走 REST 自行提供）。${UNTRUSTED_DATA_WARNING}`,
     inputSchema: {
       type: "object",
       properties: {
@@ -106,6 +107,7 @@ export const MCP_TOOLS: Tool[] = [
     description:
       `列出未刪除的記憶（由新到舊），可帶 filter：kind／scope／project／agent／limit` +
       `（limit 預設 100、上限 500）。內容在讀取時會再遮一次機密。` +
+      `每筆帶來源欄位：agent（寫入者標記）與 sourceSession／sourceMessage（寫入來源，可為 null）。` +
       `${TRUST_MODEL_WARNING}${UNTRUSTED_DATA_WARNING}`,
     inputSchema: {
       type: "object",
@@ -125,8 +127,9 @@ export const MCP_TOOLS: Tool[] = [
       `預設範圍＝目前專案＋全域共享（＋自己的 agent 範圍）；要跨所有專案請設 includeAllProjects=true。` +
       `project 未提供時依 remember 的規則解析（參數 > 環境變數 MNEMOSHELF_PROJECT > 行程 cwd 的資料夾名稱）。` +
       `scope：global／project／agent（agent 只含自己的）；kind 選填；k 預設 10、上限 100；` +
-      `minScore 0..1 只過濾語意結果。每筆命中帶 score／rank／source、untrusted 與完整記憶欄位；` +
-      `內容在讀取時會再遮一次機密。${TRUST_MODEL_WARNING}${UNTRUSTED_DATA_WARNING}`,
+      `minScore 0..1 只過濾語意結果。每筆命中帶 score／rank／source、untrusted 與完整記憶欄位` +
+      `（含來源：agent、sourceSession、sourceMessage）；內容在讀取時會再遮一次機密。` +
+      `${TRUST_MODEL_WARNING}${UNTRUSTED_DATA_WARNING}`,
     inputSchema: {
       type: "object",
       properties: {

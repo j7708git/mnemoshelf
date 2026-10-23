@@ -1359,7 +1359,7 @@ function buildAnswers({ variants, crossHit, crossTotal, skipStats, productionRes
     : `${issues.join("；")}。` +
       (recallNearTarget && injectionBad
         ? `召回（${fmtPct(recall)}）離目標的差距在 60 題 CI（±12–13pp）內；**主要問題仍是「不該注入的卡被注入」**。` +
-          `套用 skip 後 negative／cross 仍有 ${productionResidual.length} 題被注入（${skippedNegCross} 題因 query <20 字被跳過），` +
+          `套用 skip 後 negative／cross 仍有 ${productionResidual.length} 題被注入（${skippedNegCross} 題因 query <6 字被跳過），` +
           "其餘是 cosine 尺度與 keyword 補位造成；見 §8.5 的 D3b。"
         : "在改演算法（RRF 等）之前，先確認是不是門檻與注入範圍的問題。");
 
@@ -1384,7 +1384,7 @@ function buildAnswers({ variants, crossHit, crossTotal, skipStats, productionRes
       "問題 2：negative 題是否 0 注入？":
         `retrieval：negative ${fmtPct(retrieval.negativeInjectionRate)}、cross ${fmtPct(retrieval.crossInjectionRate)}、abstention ${fmtPct(retrieval.abstention)}。` +
         `**production：negative ${fmtPct(negProd)}、cross ${fmtPct(crossProd)}、abstention ${fmtPct(production.abstention)}**；` +
-        `negative／cross 共 ${skipStats.byCategory.negative?.skipped ?? 0}+${skipStats.byCategory.cross?.skipped ?? 0} 題因 query <20 字被 skip。` +
+        `negative／cross 共 ${skipStats.byCategory.negative?.skipped ?? 0}+${skipStats.byCategory.cross?.skipped ?? 0} 題因 query <6 字被 skip。` +
         `剩下仍被注入的是 ${productionResidual.length} 題（dev）；cross 用 includeAllProjects 重查可命中目標卡 ${crossHit}/${crossTotal}，` +
         `代表 cross 的 0 注入不是「查不到」。`,
       "問題 3：identifier／中文子集 Recall@5？":

@@ -24,6 +24,10 @@ interface Harness {
   logs: string[];
   cleanup: () => Promise<void>;
   fetchCalls: { url: string; body: Record<string, unknown>; authorization: string | null }[];
+  /** 只取 `POST /memories/search`（其餘請求也是 fetchCalls 的一部分）。 */
+  searchCalls: () => { url: string; body: Record<string, unknown>; authorization: string | null }[];
+  /** 只取 `GET /memories`（最近回合紀錄）。 */
+  listCalls: () => { url: string; body: Record<string, unknown>; authorization: string | null }[];
 }
 
 const ENV = {
@@ -150,7 +154,17 @@ async function setup(
   // 等背景連線解析完成（env 來源只需要 microtask）。
   await new Promise((resolve) => setTimeout(resolve, 0));
   if (handler === undefined) throw new Error("context hook 未註冊");
-  return { ctx, handler, commands, synthetic, logs, cleanup, fetchCalls };
+  return {
+    ctx,
+    handler,
+    commands,
+    synthetic,
+    logs,
+    cleanup,
+    fetchCalls,
+    searchCalls: () => fetchCalls.filter((call) => call.url.endsWith("/memories/search")),
+    listCalls: () => fetchCalls.filter((call) => call.url.includes("/memories?")),
+  };
 }
 
 function userEvent(text: string, id = "m1", kind?: string): ContextEventLike {
@@ -178,21 +192,44 @@ describe("context hook 召回", () => {
     const event = userEvent(FIRST_QUERY);
     await harness.handler(event);
 
-    expect(harness.fetchCalls).toHaveLength(1);
-    expect(harness.fetchCalls[0].url).toBe("http://127.0.0.1:43117/memories/search");
-    expect(harness.fetchCalls[0].body).toEqual({
+    expect(harness.searchCalls()).toHaveLength(1);
+    expect(harness.searchCalls()[0].url).toBe("http://127.0.0.1:43117/memories/search");
+    expect(harness.searchCalls()[0].body).toEqual({
       query: FIRST_QUERY,
       project: "mnemoshelf",
       k: 8,
       minScore: 0.65,
     });
-    expect(harness.fetchCalls[0].body).not.toHaveProperty("includeAllProjects");
+    expect(harness.searchCalls()[0].body).not.toHaveProperty("includeAllProjects");
 
     const text = latestText(event);
     expect(text).toContain('<memory-context source="mnemoshelf"');
     expect(text).toContain("[decision][2026-10-18][0.82]");
     expect(text).toContain("[pitfall][2026-10-19][kw]");
     expect(event.system).toHaveLength(0);
+  });
+
+  it("OpenChamber 聊天 session：只查 global，不帶 project／includeAllProjects", async () => {
+    const chatLocation =
+      "/work/.config/openchamber/chats/2026-10-22/session-7a4cbf23-fe33-4fa1-8e10-f0be38497381";
+    const harness = await setup({}, undefined, { directory: chatLocation });
+    const event = userEvent(FIRST_QUERY);
+    await harness.handler(event);
+
+    expect(harness.searchCalls()).toHaveLength(1);
+    expect(harness.searchCalls()[0].body).toEqual({
+      query: FIRST_QUERY,
+      scope: "global",
+      k: 8,
+      minScore: 0.65,
+    });
+    expect(harness.searchCalls()[0].body).not.toHaveProperty("project");
+    expect(harness.searchCalls()[0].body).not.toHaveProperty("includeAllProjects");
+    expect(harness.logs.join("\n")).not.toContain("project-unresolved");
+
+    const text = latestText(event);
+    expect(text).toContain('<memory-context source="mnemoshelf"');
+    expect(text).toContain('project="global"');
   });
 
   it("Plan mode 的 synthetic system-reminder 不影響第一輪召回", async () => {
@@ -216,8 +253,8 @@ describe("context hook 召回", () => {
     };
     await harness.handler(event);
 
-    expect(harness.fetchCalls).toHaveLength(1);
-    expect(harness.fetchCalls[0].body.query).toBe("請把目前的測試全部跑過一次並整理失敗原因與修正建議");
+    expect(harness.searchCalls()).toHaveLength(1);
+    expect(harness.searchCalls()[0].body.query).toBe("請把目前的測試全部跑過一次並整理失敗原因與修正建議");
     expect(latestText(event)).toContain('<memory-context source="mnemoshelf"');
     expect(harness.logs.some((line) => line.includes('"skipped":"trigger"'))).toBe(false);
   });
@@ -229,7 +266,7 @@ describe("context hook 召回", () => {
     await harness.handler(first);
     await harness.handler(second);
 
-    expect(harness.fetchCalls).toHaveLength(1);
+    expect(harness.searchCalls()).toHaveLength(1);
     expect(latestText(first)).toContain("<memory-context");
     expect(latestText(second)).toContain("<memory-context");
   });
@@ -250,7 +287,7 @@ describe("context hook 召回", () => {
       system: [],
     };
     await harness.handler(event);
-    expect(harness.fetchCalls).toHaveLength(0);
+    expect(harness.searchCalls()).toHaveLength(0);
     expect(latestText(event)).toBe("請把目前的測試全部跑過一次並整理失敗原因與修正建議");
   });
 
@@ -270,7 +307,7 @@ describe("context hook 召回", () => {
       system: [],
     };
     await harness.handler(event);
-    expect(harness.fetchCalls).toHaveLength(1);
+    expect(harness.searchCalls()).toHaveLength(1);
     expect(latestText(event)).toContain("<memory-context");
   });
 
@@ -290,7 +327,7 @@ describe("context hook 召回", () => {
       system: [],
     };
     await harness.handler(event);
-    expect(harness.fetchCalls).toHaveLength(1);
+    expect(harness.searchCalls()).toHaveLength(1);
     expect(latestText(event)).toContain("<memory-context");
   });
 
@@ -298,26 +335,52 @@ describe("context hook 召回", () => {
     const harness = await setup();
     const skipped = userEvent(FIRST_QUERY, "m1", "compaction");
     await harness.handler(skipped);
-    expect(harness.fetchCalls).toHaveLength(0);
+    expect(harness.searchCalls()).toHaveLength(0);
 
     const normal = userEvent(FIRST_QUERY, "m2");
     await harness.handler(normal);
-    expect(harness.fetchCalls).toHaveLength(1);
+    expect(harness.searchCalls()).toHaveLength(1);
   });
 
-  it("少於 20 字與 slash command 不召回", async () => {
+  it("少於 6 字與 slash command 不召回", async () => {
     const harness = await setup();
     await harness.handler(userEvent("太短了"));
     const first = userEvent("/memory-all 查詢一些很長的東西", "m2");
     await harness.handler(first);
-    expect(harness.fetchCalls).toHaveLength(0);
+    expect(harness.searchCalls()).toHaveLength(0);
+  });
+
+  it("第二輪 15 字的「剛剛」問題仍召回（不再誤判 short）", async () => {
+    const harness = await setup({
+      // 只驗觸發與查詢，不讓回合紀錄干擾斷言。
+      recentTurns: 0,
+    });
+    const event: ContextEventLike = {
+      sessionID: "session-1",
+      messages: [
+        { id: "u1", role: "user", content: [{ type: "text", text: FIRST_QUERY }] },
+        { id: "a1", role: "assistant", content: [{ type: "text", text: "回答" }] },
+        {
+          id: "u2",
+          role: "user",
+          content: [{ type: "text", text: "你還記得剛剛討論的摘要模型嗎?" }],
+        },
+      ],
+      system: [],
+    };
+    await harness.handler(event);
+    expect(harness.searchCalls()).toHaveLength(1);
+    expect(harness.searchCalls()[0].body.query).toBe("你還記得剛剛討論的摘要模型嗎?");
+    expect(harness.logs.join("\n")).not.toContain('"skipped":"short"');
+    expect(harness.logs.join("\n")).not.toContain('"skipped":"trigger"');
+    expect(latestText(event)).toContain("<memory-context");
   });
 
   it("幾乎全是程式碼的訊息不召回", async () => {
     const harness = await setup();
     const text = ["```ts", "const a = 1", "const b = 2", "const c = 3", "```"].join("\n");
     await harness.handler(userEvent(text));
-    expect(harness.fetchCalls).toHaveLength(0);
+    expect(harness.searchCalls()).toHaveLength(0);
   });
 
   it("空召回完全不注入", async () => {
@@ -359,15 +422,15 @@ describe("context hook 召回", () => {
     for (let i = 1; i <= 33; i += 1) {
       await harness.handler(userEvent(text, `m${i}`));
     }
-    expect(harness.fetchCalls).toHaveLength(33);
+    expect(harness.searchCalls()).toHaveLength(33);
 
     // 最近的一筆還在快取：同一個 user turn 的 tool 續跑不重打 server。
     await harness.handler(userEvent(text, "m33"));
-    expect(harness.fetchCalls).toHaveLength(33);
+    expect(harness.searchCalls()).toHaveLength(33);
 
     // 最舊的一筆（m1）已被淘汰：新的 user turn 會重新查詢。
     await harness.handler(userEvent(text, "m1"));
-    expect(harness.fetchCalls).toHaveLength(34);
+    expect(harness.searchCalls()).toHaveLength(34);
   });
 
   it("去重 TTL：未過期保留、過期後重新注入", async () => {
@@ -444,7 +507,7 @@ describe("context hook 召回", () => {
     const harness = await setup({}, undefined, undefined, {});
     const event = userEvent(FIRST_QUERY);
     await expect(harness.handler(event)).resolves.toBeUndefined();
-    expect(harness.fetchCalls).toHaveLength(0);
+    expect(harness.searchCalls()).toHaveLength(0);
     expect(latestText(event)).toBe(FIRST_QUERY);
     expect(harness.logs.join("\n")).toContain("offline");
     expect(harness.logs.join("\n")).not.toContain(FIRST_QUERY);
@@ -492,8 +555,175 @@ describe("context hook 召回", () => {
     });
     const event = userEvent(FIRST_QUERY);
     await harness.handler(event);
-    expect(harness.fetchCalls).toHaveLength(0);
+    expect(harness.searchCalls()).toHaveLength(0);
     expect(harness.logs.join("\n")).toContain("project-unresolved");
+  });
+});
+
+describe("最近回合紀錄召回", () => {
+  /** 假 server 的 `GET /memories` 回應（由新到舊）。 */
+  function turnList(): Response {
+    return jsonResponse({
+      untrusted: true,
+      memories: [
+        { id: 303, content: "第三回合：結論 C，下一步 D。", createdAt: "2026-10-22T03:00:00.000Z" },
+        { id: 302, content: "第二回合：結論 B。", createdAt: "2026-10-22T02:00:00.000Z" },
+        { id: 301, content: "第一回合：結論 A。", createdAt: "2026-10-22T01:00:00.000Z" },
+      ],
+    });
+  }
+
+  it("專案 session：帶 scope=project&project=<name>、agent=…%2Fturn、limit=recentTurns", async () => {
+    const harness = await setup({}, async (_input, init) =>
+      init?.method === "GET" ? turnList() : jsonResponse(memoryHits()),
+    );
+    const event = userEvent(FIRST_QUERY);
+    await harness.handler(event);
+
+    const lists = harness.listCalls();
+    expect(lists).toHaveLength(1);
+    expect(lists[0].url).toBe(
+      "http://127.0.0.1:43117/memories?scope=project&project=mnemoshelf&agent=opencode-plugin%2Fturn&limit=3",
+    );
+    expect(lists[0].authorization).toBe("Bearer test-token-value");
+    expect(lists[0].body).toEqual({});
+
+    // 回合紀錄（舊→新）先，語意命中後。
+    const text = latestText(event);
+    const first = text.indexOf("第一回合：結論 A。");
+    const second = text.indexOf("第二回合：結論 B。");
+    const third = text.indexOf("第三回合：結論 C，下一步 D。");
+    const semantic = text.indexOf("記憶向量改存");
+    expect(first).toBeGreaterThan(-1);
+    expect(first).toBeLessThan(second);
+    expect(second).toBeLessThan(third);
+    expect(third).toBeLessThan(semantic);
+    expect(text).toContain("- [turn][2026-10-22][最近]");
+    expect(text).toContain("回合紀錄與背景資料");
+  });
+
+  it("聊天 session：帶 scope=global 且不帶 project", async () => {
+    const chatLocation =
+      "/work/.config/openchamber/chats/2026-10-22/session-7a4cbf23-fe33-4fa1-8e10-f0be38497381";
+    const harness = await setup(
+      {},
+      async (_input, init) => (init?.method === "GET" ? turnList() : jsonResponse(memoryHits())),
+      { directory: chatLocation },
+    );
+    const event = userEvent(FIRST_QUERY);
+    await harness.handler(event);
+
+    const lists = harness.listCalls();
+    expect(lists).toHaveLength(1);
+    expect(lists[0].url).toContain("scope=global");
+    expect(lists[0].url).not.toContain("project=");
+    expect(lists[0].url).toContain("agent=opencode-plugin%2Fturn");
+    expect(lists[0].url).toContain("limit=3");
+  });
+
+  it("recentTurns=0 時完全不打 GET /memories", async () => {
+    const harness = await setup({ recentTurns: 0 });
+    const event = userEvent(FIRST_QUERY);
+    await harness.handler(event);
+    expect(harness.listCalls()).toHaveLength(0);
+    expect(latestText(event)).toContain("記憶向量改存");
+  });
+
+  it("最近查詢失敗（500／timeout）仍注入語意結果、不拋錯", async () => {
+    for (const failure of ["http", "timeout"] as const) {
+      const harness = await setup({}, async (_input, init) => {
+        if (init?.method !== "GET") return jsonResponse(memoryHits());
+        if (failure === "http") return jsonResponse({ error: "boom" }, 500);
+        return await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          );
+        });
+      });
+      const event = userEvent(FIRST_QUERY);
+      await expect(harness.handler(event)).resolves.toBeUndefined();
+      expect(latestText(event)).toContain("記憶向量改存");
+      expect(harness.logs.join("\n")).toContain('"recentTurnsFailed":"' + failure + '"');
+    }
+  });
+
+  it("語意搜尋失敗（500／timeout）但最近回合有 2 筆：仍注入 2 筆回合紀錄", async () => {
+    for (const failure of ["http", "timeout"] as const) {
+      const harness = await setup(
+        { timeoutMs: 50 },
+        async (_input, init) => {
+          if (init?.method === "GET") {
+            return jsonResponse({
+              memories: [
+                { id: 401, content: "最近回合甲", createdAt: "2026-10-22T03:00:00.000Z" },
+                { id: 402, content: "最近回合乙", createdAt: "2026-10-22T02:00:00.000Z" },
+              ],
+            });
+          }
+          if (failure === "http") return jsonResponse({ error: "boom" }, 500);
+          return await new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+            );
+          });
+        },
+      );
+      const event = userEvent(FIRST_QUERY);
+      await expect(harness.handler(event)).resolves.toBeUndefined();
+
+      const text = latestText(event);
+      expect(text).toContain("<memory-context");
+      expect(text.match(/- \[turn\]/g)).toHaveLength(2);
+      expect(text).toContain("最近回合甲");
+      expect(text).toContain("最近回合乙");
+
+      // log 要同時記 degraded（語意失敗）與原因，不能只像成功路徑。
+      const joined = harness.logs.join("\n");
+      expect(joined).toContain('"degraded":true');
+      expect(joined).toContain(`"recallFailure":"${failure}"`);
+
+      // /memory 狀態同時說出語意失敗與仍注入的回合筆數。
+      await harness.commands.get("memory")?.execute({ sessionID: "session-1", prompt: { text: "" } });
+      const status = harness.synthetic.at(-1)?.text ?? "";
+      expect(status).toContain(`最近召回：失敗（${failure}）；仍注入 2 筆回合紀錄`);
+    }
+  });
+
+  it("語意失敗且回合為空：不注入、不拋錯", async () => {
+    const harness = await setup({}, async (_input, init) =>
+      init?.method === "GET" ? jsonResponse({ memories: [] }) : jsonResponse({ error: "boom" }, 500),
+    );
+    const event = userEvent(FIRST_QUERY);
+    await expect(harness.handler(event)).resolves.toBeUndefined();
+    expect(latestText(event)).toBe(FIRST_QUERY);
+    expect(event.system).toHaveLength(0);
+
+    const joined = harness.logs.join("\n");
+    expect(joined).toContain('"skipped":"http"');
+    expect(joined).not.toContain("recallFailure");
+
+    await harness.commands.get("memory")?.execute({ sessionID: "session-1", prompt: { text: "" } });
+    const status = harness.synthetic.at(-1)?.text ?? "";
+    expect(status).toContain("跳過 http");
+    expect(status).not.toContain("仍注入");
+  });
+
+  it("同一 id 已以回合紀錄注入時，語意命中不重複注入", async () => {
+    const harness = await setup({}, async (_input, init) => {
+      if (init?.method !== "GET") return jsonResponse(memoryHits());
+      return jsonResponse({
+        memories: [{ id: 1, content: "回合紀錄版本", createdAt: "2026-10-22T01:00:00.000Z" }],
+      });
+    });
+    const event = userEvent(FIRST_QUERY);
+    await harness.handler(event);
+
+    const text = latestText(event);
+    expect(text).toContain("回合紀錄版本");
+    expect(text.match(/回合紀錄版本/g)).toHaveLength(1);
+    expect(text).not.toContain("記憶向量改存");
+    // 其他語意命中照常。
+    expect(text).toContain("舊索引要重跑");
   });
 });
 
@@ -765,16 +995,17 @@ describe("指令", () => {
     const status = harness.synthetic.at(-1)?.text ?? "";
     expect(status.startsWith(STATUS_SENTINEL)).toBe(true);
 
-    const before = harness.fetchCalls.length;
+    const before = harness.searchCalls().length;
     const statusEvent = userEvent(status, "status-1");
     await harness.handler(statusEvent);
+    expect(harness.searchCalls()).toHaveLength(before);
     expect(harness.fetchCalls).toHaveLength(before);
     expect(harness.logs.join("\n")).toContain('"skipped":"status"');
     expect(latestText(statusEvent)).toBe(status);
 
     // 一般訊息照常召回。
     await harness.handler(userEvent(FIRST_QUERY, "m1"));
-    expect(harness.fetchCalls).toHaveLength(before + 1);
+    expect(harness.searchCalls()).toHaveLength(before + 1);
   });
 
   it("/memory-all 只送 includeAllProjects，不帶 project", async () => {
@@ -783,14 +1014,14 @@ describe("指令", () => {
     expect(command).toBeDefined();
     await command?.execute({ sessionID: "session-1", prompt: { text: "向量表 決定" } });
 
-    expect(harness.fetchCalls).toHaveLength(1);
-    expect(harness.fetchCalls[0].body).toEqual({
+    expect(harness.searchCalls()).toHaveLength(1);
+    expect(harness.searchCalls()[0].body).toEqual({
       query: "向量表 決定",
       includeAllProjects: true,
       k: 8,
       minScore: 0.65,
     });
-    expect(harness.fetchCalls[0].body).not.toHaveProperty("project");
+    expect(harness.searchCalls()[0].body).not.toHaveProperty("project");
     const output = harness.synthetic.at(-1)?.text ?? "";
     expect(output.startsWith(STATUS_SENTINEL)).toBe(true);
     expect(output).toContain("跨專案查詢");
@@ -809,7 +1040,7 @@ describe("指令", () => {
   it("/memory-all 沒有參數時給用法、不打 server", async () => {
     const harness = await setup();
     await harness.commands.get("memory-all")?.execute({ sessionID: "session-1", prompt: { text: "  " } });
-    expect(harness.fetchCalls).toHaveLength(0);
+    expect(harness.searchCalls()).toHaveLength(0);
     expect(harness.synthetic.at(-1)?.text).toContain("需要查詢文字");
   });
 });

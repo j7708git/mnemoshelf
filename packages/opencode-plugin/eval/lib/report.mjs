@@ -151,7 +151,7 @@ export function renderMarkdown(report) {
   lines.push("");
   lines.push(
     "**兩種口徑（F1）**：`retrieval`＝假設每一題都會觸發召回（看檢索器與裝箱的好壞上限）；" +
-      "`production`＝先套用外掛真正的 skip 判斷（query <20 字、slash、幾乎全程式碼等），被跳過的題目算 0 注入。" +
+      "`production`＝先套用外掛真正的 skip 判斷（query <6 字、slash、幾乎全程式碼等），被跳過的題目算 0 注入。" +
       "生產環境的誤注入率要讀 production；retrieval 只用來定位問題在檢索還是注入。",
   );
   lines.push("");
@@ -264,7 +264,7 @@ export function renderMarkdown(report) {
   lines.push("### 2.1 外掛 skip 的題目（F1）");
   lines.push("");
   lines.push(
-    `外掛的 \`skipReason\` 會跳過空字串、slash、少於 20 字與幾乎全程式碼的訊息；本資料集共 ` +
+    `外掛的 \`skipReason\` 會跳過空字串、slash、少於 6 字與幾乎全程式碼的訊息；本資料集共 ` +
       `${skipStats.skipped}/${skipStats.total} 題會被跳過（${JSON.stringify(skipStats.byReason)}）。` +
       `被跳過的題目在 production 口徑算「0 注入」，但仍列入 retrieval 口徑的分布。`,
   );
@@ -301,7 +301,7 @@ export function renderMarkdown(report) {
     );
     lines.push("");
     lines.push(
-      "原因分兩層：這些題目都沒有被 skip（≥20 字），且在 0.40 下注入**全部是語意命中**——" +
+      "原因分兩層：這些題目都沒有被 skip，且在 0.40 下注入**全部是語意命中**——" +
         "模型對「無關文字」的 cosine 本來就高於 0.40（見 §4.8）；把門檻拉到 0.70 後 negative 歸零，" +
         "剩下的 cross 主要由 keyword 補位貢獻（§8.5），而 keyword 命中不受 minScore 約束。",
     );

@@ -338,6 +338,58 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       expect(await store.listMemories()).toEqual([]);
     });
 
+    it("記憶來源欄位：帶 sourceSession／sourceMessage 寫入→讀回一致、未帶→null、updateMemory 不改來源", async () => {
+      // 帶來源：addMemory 與 getMemory／listMemories／listMemoriesForExport 都一致。
+      const withSource = await store.addMemory(
+        memoryInput({ content: "帶來源的記憶", sourceSession: "session-alpha", sourceMessage: "message-alpha" }),
+      );
+      expect(withSource.sourceSession).toBe("session-alpha");
+      expect(withSource.sourceMessage).toBe("message-alpha");
+      expect(await store.getMemory(withSource.id)).toMatchObject({
+        sourceSession: "session-alpha",
+        sourceMessage: "message-alpha",
+      });
+      expect((await store.listMemories()).find((item) => item.id === withSource.id)).toMatchObject({
+        sourceSession: "session-alpha",
+        sourceMessage: "message-alpha",
+      });
+      expect((await store.listMemoriesForExport()).find((item) => item.id === withSource.id)).toMatchObject({
+        sourceSession: "session-alpha",
+        sourceMessage: "message-alpha",
+      });
+
+      // 未帶（或 null）→ 一律 null（不是空字串）。
+      const plain = await store.addMemory(memoryInput({ content: "沒有來源的記憶" }));
+      expect(plain.sourceSession).toBeNull();
+      expect(plain.sourceMessage).toBeNull();
+      const explicitNull = await store.addMemory(
+        memoryInput({ content: "明示 null 的來源", sourceSession: null, sourceMessage: null }),
+      );
+      expect(explicitNull).toMatchObject({ sourceSession: null, sourceMessage: null });
+
+      // 去重路徑同樣寫入／帶回來源；且來源**不在**去重 key 內（同內容不同來源＝重複）。
+      const dedup = await store.addMemoryUnlessDuplicate(
+        memoryInput({ content: "去重路徑帶來源", sourceSession: "session-beta", sourceMessage: null }),
+      );
+      expect(dedup.duplicate).toBe(false);
+      expect(dedup.memory).toMatchObject({ sourceSession: "session-beta", sourceMessage: null });
+      const sameContent = await store.addMemoryUnlessDuplicate(
+        memoryInput({ content: "去重路徑帶來源", sourceSession: "session-gamma" }),
+      );
+      expect(sameContent.duplicate).toBe(true);
+      expect(sameContent.memory.id).toBe(dedup.memory.id);
+      expect(sameContent.memory.sourceSession).toBe("session-beta");
+
+      // 來源欄位不可變：updateMemory 只改 scope／project，來源原樣保留。
+      const updated = await store.updateMemory(withSource.id, { scope: "global", project: null });
+      expect(updated).toMatchObject({
+        sourceSession: "session-alpha",
+        sourceMessage: "message-alpha",
+        scope: "global",
+        project: null,
+      });
+    });
+
     it("updateMemory 更新 scope／project 並回傳更新後的完整記憶（不可變欄位原樣保留）", async () => {
       const previous = await store.addMemory(
         memoryInput({ content: "被取代的舊記憶", kind: "decision", scope: "global", project: null }),

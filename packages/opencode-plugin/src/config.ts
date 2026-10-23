@@ -23,6 +23,17 @@ import type {
   Settings,
 } from "./types.js";
 
+/** digest 模型呼叫／模型清單檢查的 timeout：預設值（毫秒）。 */
+export const DEFAULT_DIGEST_TIMEOUT_MS = 45000;
+
+/** `digestTimeoutMs` 的合法範圍（毫秒）。 */
+export const DIGEST_TIMEOUT_MIN_MS = 3000;
+export const DIGEST_TIMEOUT_MAX_MS = 120000;
+
+/** `recentTurns` 的預設值與範圍（0＝關閉回合紀錄召回）。 */
+export const DEFAULT_RECENT_TURNS = 3;
+export const RECENT_TURNS_MAX = 5;
+
 /** 預設值（與 `docs/opencode-plugin.md` 的參數表一致）。 */
 export const DEFAULT_SETTINGS: Readonly<Settings> = {
   trigger: "first-turn+explicit",
@@ -35,6 +46,14 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = {
   softChars: 900,
   hardChars: 1200,
   dedupeTTL: 8,
+  recentTurns: DEFAULT_RECENT_TURNS,
+  digestEnabled: false,
+  digestModel: null,
+  digestMaxPerTurn: 3,
+  digestMaxPerSession: 20,
+  digestMaxPerDay: 100,
+  digestOnInterrupted: false,
+  digestTimeoutMs: DEFAULT_DIGEST_TIMEOUT_MS,
 };
 
 /** 驗證 runtime 檔時 `GET /health` 的 timeout。 */
@@ -61,12 +80,78 @@ function clampInt(value: unknown, fallback: number, min: number, max: number): n
   return Math.floor(clampNumber(value, fallback, min, max));
 }
 
-/** 解析 plugin options；非法值回退預設並夾在可用範圍。 */
-export function readSettings(options: unknown): Settings {
+/** 設定值被回退／夾住的原因（只帶鍵名，不帶值——避免把使用者填錯的敏感字串寫進 log）。 */
+export interface SettingsWarning {
+  key: string;
+  reason: "invalid" | "out-of-range";
+}
+
+export type SettingsWarnFn = (warning: SettingsWarning) => void;
+
+/** 解析 `digestModel`（`<providerID>/<modelID>`）；格式不符回 `null`（呼叫端跳過 digest）。 */
+export function parseDigestModel(
+  value: string | null | undefined,
+): { providerID: string; id: string } | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  // 只在**第一個** `/` 切：model id 本身可能含 `/`（例如某些 provider 的 `vendor/model`）。
+  const slash = trimmed.indexOf("/");
+  if (slash <= 0 || slash === trimmed.length - 1) return null;
+  const providerID = trimmed.slice(0, slash).trim();
+  const id = trimmed.slice(slash + 1).trim();
+  if (providerID === "" || id === "" || /\s/.test(providerID)) return null;
+  return { providerID, id };
+}
+
+function readDigestBoolean(
+  value: unknown,
+  fallback: boolean,
+  key: string,
+  warn: SettingsWarnFn | undefined,
+): boolean {
+  if (value === undefined) return fallback;
+  if (typeof value === "boolean") return value;
+  warn?.({ key, reason: "invalid" });
+  return fallback;
+}
+
+function readDigestInt(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+  key: string,
+  warn: SettingsWarnFn | undefined,
+): number {
+  if (value === undefined) return fallback;
+  const num = readFiniteNumber(value);
+  if (num === undefined) {
+    warn?.({ key, reason: "invalid" });
+    return fallback;
+  }
+  if (num < min || num > max) warn?.({ key, reason: "out-of-range" });
+  return Math.min(max, Math.max(min, Math.floor(num)));
+}
+
+/**
+ * 解析 plugin options；非法值回退預設並夾在可用範圍。
+ *
+ * `warn` 只收到鍵名與原因（不含值）：digest 相關鍵若填錯，呼叫端會記一行 warning。
+ */
+export function readSettings(options: unknown, warn?: SettingsWarnFn): Settings {
   const raw = (options ?? {}) as Record<string, unknown>;
   const trigger = raw.trigger === "every-turn" ? "every-turn" : "first-turn+explicit";
   const softChars = clampInt(raw.softChars, DEFAULT_SETTINGS.softChars, 200, 2000);
   const hardChars = clampInt(raw.hardChars, DEFAULT_SETTINGS.hardChars, softChars, 4000);
+  let digestModel: string | null = null;
+  if (raw.digestModel !== undefined && raw.digestModel !== null) {
+    const normalized = readNonEmptyString(raw.digestModel);
+    if (normalized === undefined || parseDigestModel(normalized) === null) {
+      warn?.({ key: "digestModel", reason: "invalid" });
+    } else {
+      digestModel = normalized;
+    }
+  }
   return {
     ...(readNonEmptyString(raw.baseUrl) === undefined ? {} : { baseUrl: readNonEmptyString(raw.baseUrl) }),
     ...(readNonEmptyString(raw.token) === undefined ? {} : { token: readNonEmptyString(raw.token) }),
@@ -78,12 +163,60 @@ export function readSettings(options: unknown): Settings {
     kMax: clampInt(raw.kMax, DEFAULT_SETTINGS.kMax, 1, 20),
     maxItems: clampInt(raw.maxItems, DEFAULT_SETTINGS.maxItems, 1, 8),
     minScore: clampNumber(raw.minScore, DEFAULT_SETTINGS.minScore, 0, 1),
-    timeoutMs: clampInt(raw.timeoutMs, DEFAULT_SETTINGS.timeoutMs, 100, 500),
+    timeoutMs: clampInt(raw.timeoutMs, DEFAULT_SETTINGS.timeoutMs, 100, 2000),
     maxFactChars: clampInt(raw.maxFactChars, DEFAULT_SETTINGS.maxFactChars, 40, 1000),
     maxOtherChars: clampInt(raw.maxOtherChars, DEFAULT_SETTINGS.maxOtherChars, 40, 1000),
     softChars,
     hardChars,
     dedupeTTL: clampInt(raw.dedupeTTL, DEFAULT_SETTINGS.dedupeTTL, 8, 10),
+    recentTurns: readDigestInt(
+      raw.recentTurns,
+      DEFAULT_SETTINGS.recentTurns,
+      0,
+      RECENT_TURNS_MAX,
+      "recentTurns",
+      warn,
+    ),
+    digestEnabled: readDigestBoolean(raw.digestEnabled, DEFAULT_SETTINGS.digestEnabled, "digestEnabled", warn),
+    digestModel,
+    digestMaxPerTurn: readDigestInt(
+      raw.digestMaxPerTurn,
+      DEFAULT_SETTINGS.digestMaxPerTurn,
+      0,
+      5,
+      "digestMaxPerTurn",
+      warn,
+    ),
+    digestMaxPerSession: readDigestInt(
+      raw.digestMaxPerSession,
+      DEFAULT_SETTINGS.digestMaxPerSession,
+      0,
+      100,
+      "digestMaxPerSession",
+      warn,
+    ),
+    digestMaxPerDay: readDigestInt(
+      raw.digestMaxPerDay,
+      DEFAULT_SETTINGS.digestMaxPerDay,
+      0,
+      1000,
+      "digestMaxPerDay",
+      warn,
+    ),
+    digestOnInterrupted: readDigestBoolean(
+      raw.digestOnInterrupted,
+      DEFAULT_SETTINGS.digestOnInterrupted,
+      "digestOnInterrupted",
+      warn,
+    ),
+    digestTimeoutMs: readDigestInt(
+      raw.digestTimeoutMs,
+      DEFAULT_SETTINGS.digestTimeoutMs,
+      DIGEST_TIMEOUT_MIN_MS,
+      DIGEST_TIMEOUT_MAX_MS,
+      "digestTimeoutMs",
+      warn,
+    ),
   };
 }
 

@@ -177,6 +177,8 @@ describe("記憶匯出：GET /memories/export", () => {
       scope: "global",
       project: null,
       agent: "agent-c3",
+      sourceSession: null,
+      sourceMessage: null,
       pinned: false,
       createdAt: (keptFirst.body as { createdAt: string }).createdAt,
       supersedes: null,
@@ -190,6 +192,8 @@ describe("記憶匯出：GET /memories/export", () => {
       "scope",
       "project",
       "agent",
+      "sourceSession",
+      "sourceMessage",
       "pinned",
       "createdAt",
       "supersedes",
@@ -232,6 +236,17 @@ describe("記憶匯出：GET /memories/export", () => {
       agent: `agent ${GITHUB_STYLE_TOKEN}`,
       supersedes: null,
     });
+    // 來源欄位同理（REST 會拒絕，但直接寫 DB 的資料仍可能在讀取路徑被遮罩）。
+    const legacySource = await instance.store.addMemory({
+      content: "舊資料的來源欄位未遮罩",
+      kind: "fact",
+      scope: "global",
+      project: null,
+      agent: "agent-legacy",
+      supersedes: null,
+      sourceSession: `session ${GITHUB_STYLE_TOKEN}`,
+      sourceMessage: `message ${GITHUB_STYLE_TOKEN}`,
+    });
 
     const exported = await exportMemories(instance);
     expect(exported.status).toBe(200);
@@ -243,6 +258,36 @@ describe("記憶匯出：GET /memories/export", () => {
     const metadataRow = rows.find(({ record }) => record.id === legacyMetadata.id)?.record;
     expect(metadataRow?.agent).not.toContain(GITHUB_STYLE_TOKEN);
     expect(metadataRow?.project).not.toContain(GITHUB_STYLE_TOKEN);
+    const sourceRow = rows.find(({ record }) => record.id === legacySource.id)?.record;
+    expect(sourceRow?.sourceSession).not.toContain(GITHUB_STYLE_TOKEN);
+    expect(sourceRow?.sourceMessage).not.toContain(GITHUB_STYLE_TOKEN);
+  });
+
+  it("來源欄位：帶 sourceSession／sourceMessage 的記憶匯出時一併帶出（schemaVersion 維持 1）", async () => {
+    server = await startTestServer();
+    const instance = server.instance;
+
+    const created = await postMemory(instance, {
+      content: "自動寫入的合成記憶",
+      agent: "opencode-plugin@0.1.0",
+      // 前後空白由 REST 正規化後儲存。
+      sourceSession: "  ses_synthetic_0001  ",
+      sourceMessage: "msg_synthetic_0001",
+    });
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({
+      sourceSession: "ses_synthetic_0001",
+      sourceMessage: "msg_synthetic_0001",
+    });
+
+    const exported = await exportMemories(instance);
+    expect(exported.status).toBe(200);
+    const record = parseExportLines(exported.text)[0]!.record;
+    expect(record.schemaVersion).toBe(MEMORY_EXPORT_SCHEMA_VERSION);
+    expect(record).toMatchObject({
+      sourceSession: "ses_synthetic_0001",
+      sourceMessage: "msg_synthetic_0001",
+    });
   });
 });
 
@@ -262,6 +307,8 @@ describe("記憶匯入：POST /memories/import", () => {
           agent: "agent-c3",
           scope: "project",
           project: "proj-roundtrip",
+          sourceSession: "session-roundtrip",
+          sourceMessage: "message-roundtrip",
         },
         pinned: true,
       },
@@ -304,6 +351,8 @@ describe("記憶匯入：POST /memories/import", () => {
           scope: created.scope,
           project: created.project,
           agent: created.agent,
+          sourceSession: created.sourceSession,
+          sourceMessage: created.sourceMessage,
         },
       });
     }
@@ -338,7 +387,15 @@ describe("記憶匯入：POST /memories/import", () => {
     expect(restored).toHaveLength(originals.length);
     const byContent = new Map(restored.map((memory) => [memory.content, memory]));
     for (const original of originals) {
-      const tuple = original.tuple as { content: string; kind: string; scope: string; project: string | null; agent: string };
+      const tuple = original.tuple as {
+        content: string;
+        kind: string;
+        scope: string;
+        project: string | null;
+        agent: string;
+        sourceSession: string | null;
+        sourceMessage: string | null;
+      };
       const memory = byContent.get(tuple.content);
       expect(memory, tuple.content).toBeDefined();
       expect({
@@ -347,6 +404,8 @@ describe("記憶匯入：POST /memories/import", () => {
         scope: memory!.scope,
         project: memory!.project,
         agent: memory!.agent,
+        sourceSession: memory!.sourceSession,
+        sourceMessage: memory!.sourceMessage,
       }).toEqual(tuple);
       expect(memory!.pinned).toBe(original.pinned);
       // 不保留 id／createdAt／supersedes。
@@ -358,6 +417,62 @@ describe("記憶匯入：POST /memories/import", () => {
     expect(restored.every((memory) => !originals.some((original) => original.id === memory.id))).toBe(true);
     // 兩筆 pinned 真的有保留。
     expect(restored.filter((memory) => memory.pinned)).toHaveLength(2);
+  });
+
+  it("來源欄位：舊格式（無欄位）補 null、帶欄位的新備份保留；空白／超長／token-like → 整批 400", async () => {
+    server = await startTestServer();
+    const instance = server.instance;
+
+    // 舊格式：完全沒有 sourceSession／sourceMessage 這兩個鍵（模擬 D4a 之前的備份）。
+    const legacyRecord = {
+      schemaVersion: MEMORY_EXPORT_SCHEMA_VERSION,
+      content: "舊格式備份的合成記憶",
+      kind: "fact",
+      scope: "global",
+      project: null,
+      agent: "agent-legacy",
+      pinned: false,
+    };
+    const imported = await importNdjson(
+      instance,
+      ndjson([
+        legacyRecord,
+        importRecord({
+          content: "新格式備份的合成記憶",
+          agent: "opencode-plugin@0.1.0",
+          sourceSession: "ses_synthetic_0002",
+          sourceMessage: "msg_synthetic_0002",
+        }),
+      ]),
+    );
+    expect(imported.status).toBe(200);
+    expect((imported.body as MemoryImportResponse).created).toBe(2);
+
+    const rows = await listMemoryRows(instance);
+    expect(rows.find((memory) => memory.content === legacyRecord.content)).toMatchObject({
+      sourceSession: null,
+      sourceMessage: null,
+    });
+    expect(rows.find((memory) => memory.content === "新格式備份的合成記憶")).toMatchObject({
+      sourceSession: "ses_synthetic_0002",
+      sourceMessage: "msg_synthetic_0002",
+    });
+
+    // 不合法：空白、超長、token-like → 整批 400（完全不寫）。
+    const baseline = await listMemoryRows(instance);
+    const rejected = await importNdjson(
+      instance,
+      ndjson([
+        importRecord({ content: "這一筆合法但整批不能寫", agent: "agent-legacy" }),
+        importRecord({ content: "空白來源", sourceSession: "   " }),
+        importRecord({ content: "超長來源", sourceSession: "x".repeat(201) }),
+        importRecord({ content: "來源帶憑證", sourceMessage: `msg ${GITHUB_STYLE_TOKEN}` }),
+      ]),
+    );
+    expect(rejected.status).toBe(400);
+    expect(errorName(rejected.body)).toBe("ValidationError");
+    expect((rejected.body as MemoryImportResponse).invalid.map((item) => item.line)).toEqual([2, 3, 4]);
+    expect(await listMemoryRows(instance)).toEqual(baseline);
   });
 
   it("匯入遮罩：內容先遮罩才寫入；agent／project token-like → 整批 400 不寫", async () => {
@@ -574,6 +689,8 @@ describe("記憶備份純函式", () => {
       agent: "agent-c3",
       supersedes: null,
       pinned: false,
+      sourceSession: null,
+      sourceMessage: null,
       createdAt: "2026-10-19T00:00:00.000Z",
       deletedAt: null,
       ...overrides,
