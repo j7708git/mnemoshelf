@@ -202,7 +202,11 @@ async function callOpenAi(entry, connection, prompt, signal) {
     body: JSON.stringify({
       model: entry.model,
       temperature: entry.temperature ?? 0,
-      max_tokens: entry.maxTokens ?? 1024,
+      // 預設不可以是 1024：會先思考（reasoning）的模型把思考 token 也算進 max_tokens，
+      // 額度太小會全部用在思考、finish_reason=length 且 content 為空，介面只能記成
+      // empty-text，整個模型被判定失敗卻看不出原因。完整說明見 matrix-models.json 的
+      // tokenBudgetNote；這裡取保守的 4096，只是放寬上限，不影響模型實際輸出量。
+      max_tokens: entry.maxTokens ?? 4096,
       messages: [{ role: "user", content: prompt }],
     }),
     signal,
