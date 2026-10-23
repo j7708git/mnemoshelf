@@ -154,7 +154,8 @@ Mnemoshelf 的 MCP 入口是 local stdio 程式，只把請求轉發給本機 RE
 
 - **`runtime.json` 只給外掛自動發現用**：MCP 入口目前不讀這個檔，仍要自己把 `url`／`token`
   寫進 MCP client 設定（值可從 `runtime.json` 抄出，見本文前面的 Node 讀檔範例）。
-- **外掛不做自動寫入**：要留下記憶，請用 MCP 工具或 REST（見 README「Agent 記憶」）。
+- **外掛不做自動寫入**：要留下記憶，請用 MCP 工具或 REST（見 README 的功能說明與
+  `docs/operations.md` §REST 端點速查）。
   v1.5 才會評估自動摘要寫入。
 - 兩者可以同時開：外掛負責「不用問就帶進背景」，MCP 負責「agent 想查或想寫時自己動手」。
 - 詳細安裝、參數與疑難排解見 [opencode-plugin.md](opencode-plugin.md)。
@@ -177,5 +178,5 @@ Mnemoshelf 的 MCP 入口是 local stdio 程式，只把請求轉發給本機 RE
 
 - 服務綁定位址、root 驗證與機密遮罩：`docs/roots-and-privacy.md`。
 - 桌面版的 token 保存（safeStorage 密文）與 renderer 可見範圍：`packages/desktop/src/token-store.ts`
-  與 README 的「信任模型」。
-- MCP 工具語意：README 的「Agent 記憶（REST／MCP）」。
+  與 `docs/roots-and-privacy.md` §信任模型。
+- MCP 工具語意：`docs/operations.md` §MCP 工具。

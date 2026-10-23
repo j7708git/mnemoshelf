@@ -96,6 +96,13 @@ interface EmbedderFallbackReason {
 }
 ```
 
+**ONNX Runtime log 等級（`MNEMOSHELF_EMBED_ORT_LOG`，選配、純診斷）**：設定後覆寫推論 session 的
+`logSeverityLevel`；值是 `0`–`4`（`0`＝verbose、`1`＝info、`2`＝warning、`3`＝error、`4`＝fatal），
+未設定＝**不覆寫** ONNX Runtime 的預設。`0` 會印出 ORT 內部的配置訊息，**包括 arena 每一次擴張的
+`num_bytes`**，是「單一配置到底多大」唯一的直接讀數（配置護欄見「批次方法」一節）。代價是訊息量
+很大、會拖慢啟動，**平時不要開**；非法值（不是 `0`–`4`）直接拒絕啟動，不會靜默回退預設。
+它只是診斷開關，不參與任何裝置決策，也不改變 `selfTest` 的結果。
+
 ## 加速器自我測試（`runtimeStatus.selfTest`，選配）
 
 > 本節於 **2026-10-16 經使用者核准新增**。這只是一個**選配**的診斷欄位：不提供它的實作
@@ -160,6 +167,12 @@ interface EmbedderSelfTestStatus {
 **明示 `coreml` 的語意**：只有 `auto` 會跑自我測試並讀寫決定快取；**明示** `coreml`
 （環境變數或建構子選項）代表「忽略已快取的決定、強制嘗試」，因此**不執行自我測試、也不讀寫
 決定快取**——載入失敗時 `selfTest` 只反映該次載入的結果、不落地。
+這個模式**只供單次驗證，不要當成日常設定**：上游的 `onnxruntime#28005`（CoreML EP＋external
+data、以檔案路徑建 session 的 `SIGBUS`）仍未修，可能在**任何一次**載入時直接結束行程（證據見
+`packages/embedder-transformers/src/self-test.ts` 的模組註解與自我測試入口），而明示模式也
+**不套用**下方「載入期的崩潰政策」段落的存活標記護欄（沒有決定快取就沒有可寫的 marker，見
+`packages/embedder-transformers/src/embedder.ts` 的 `loadCoreMl` 分岔註解），等於少了自我測試
+那次的量測把關。macOS 的 CoreML EP 對這種量化模型也**沒有實測過的加速證據**。
 
 **已判定 `usable` 後的載入失敗**：該次載入失敗會把決定改寫成 `unusable`／`load-failed`，
 之後不再自動嘗試；重測只可能發生在**應用程式版本變更**或**明示 `coreml`** 時。

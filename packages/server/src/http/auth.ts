@@ -60,7 +60,7 @@ export function requireLoopback(request: IncomingMessage): void {
  * 標準緩解是驗證 `Host`（`requireLoopback` 只看連線來源 IP，擋不住）。
  *
  * `*.localhost` 放行理由：RFC 6761 要求解析器把整個 `.localhost` 網域視為 loopback，
- * 現代瀏覽器也強制如此，因此 DNS rebinding 利用不到這個後綴（詳見 README 的安全說明）。
+ * 現代瀏覽器也強制如此，因此 DNS rebinding 利用不到這個後綴（詳見 docs/roots-and-privacy.md 的信任模型一節）。
  */
 export function isLocalHostHeader(host: string | undefined): boolean {
   if (typeof host !== "string") return false;

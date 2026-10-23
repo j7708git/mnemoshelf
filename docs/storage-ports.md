@@ -209,6 +209,17 @@ updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null>;
 其他值 `400`；未帶參數維持軟刪除）。**不做取證級抹除**（SQLite WAL／檔案系統頁面可能殘留、
 at-rest 仍明文、無加密），見 `docs/roots-and-privacy.md` §資料存放與刪除。
 
+### UI（面板）行為
+
+記憶管理面板的卡片提供「永久刪除」（走 `DELETE /memories/:id?hard=true`）：**二次確認**，
+確認文案明示無法復原，且 WAL／檔案系統頁面可能有殘留——與同節 §硬刪除 的「不做取證級抹除」一致。
+
+`POST /memories` 的重複提示（`duplicate: true`）在面板端是**防禦性處理**：目前 UI **沒有**
+新增記憶表單，記憶主要由 agent 經 REST／MCP 寫入，所以這個回應不是面板的主要互動路徑；
+面板的編輯流程一律帶 `supersedes`（走編輯路徑、不套用去重）。面板端對 `duplicate: true` 也有
+一段防禦性分支（只提示「已有完全相同內容」、不新增卡片），但正常走不到；對直接呼叫 REST
+的呼叫端（含 agent）才是主要情境。
+
 ## 記憶的匯出／匯入（2026-10-19）
 
 備份的範圍**只有記憶**：NDJSON（JSON Lines，一行一筆），**不含** chunk／向量與已刪除的歷史版本；
@@ -247,6 +258,14 @@ at-rest 仍明文、無加密），見 `docs/roots-and-privacy.md` §資料存�
 - **回應**：`{dryRun, total, valid, invalid, duplicates, redacted, created, wouldCreate}`。
   dry-run 時 `created = 0`、`wouldCreate` 是預計新增數；正式匯入時 `wouldCreate = 0`。
   空檔（0 行）→ `200`＋全 0。
+- **UI（面板）流程**：記憶管理面板的工具列提供「匯出備份」與「匯入備份」。匯出即下載上面
+  `GET /memories/export` 產生的檔案（遮罩後視圖），由使用者自行保管，可能含專案內部資訊。
+  匯入時面板先讓使用者選檔（`.ndjson`／`.jsonl`／`.txt`；**內容**一律視為 NDJSON，副檔名只影響
+  檔案挑選器的顯示），選完先自動跑一次 dry-run（帶 `dryRun` 呼叫同一個端點），把預計新增／
+  重複／遮罩筆數與不合法行（最多列出前 5 筆）顯示給使用者。有不合法行時面板**不提供**
+  「確認匯入」按鈕（整批不會寫入）；沒有不合法行時，使用者按下「確認匯入」才送出正式匯入
+  （同一端點、不帶 `dryRun`）。面板端不自行解析或拼接檔案、也不做部分寫入——「整批先驗證、
+  任何一行不合法就完全不寫」的語意因此在使用者按下確認前就已可見。
 - **不做**：加密、自動排程備份、串流下載、MCP 工具、chunk／向量／整庫搬遷。
 
 ## 記憶的來源欄位（2026-10-21，D4a）

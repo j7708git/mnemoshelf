@@ -25,7 +25,7 @@
  *   會先 `drain()`（等目前在途／已排隊的呼叫全部結束），worker 閒置後才 terminate；
  *   `createServer.close()` 回傳時已無 native 推論在跑，呼叫端之後 `process.exit()` 是安全的。
  *   只有 drain 超過上限（worker 卡死，預設 120 秒）才記錄並放棄：**不 terminate** 推論中的
- *   worker，此時呼叫端不得 `process.exit()`（理論邊界，見 README）。
+ *   worker，此時呼叫端不得 `process.exit()`（理論邊界，見 `docs/roots-and-privacy.md` 的「資料存放與刪除」一節）。
  * - `runtimeStatus` 由 worker 提供：初次 handshake 後快取，之後每次回應都更新；尚未 handshake
  *   前為 `undefined`（與沒有裝置概念的 embedder 相同，診斷層顯示 `null`）。
  *

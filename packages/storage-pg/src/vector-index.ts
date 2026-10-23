@@ -85,7 +85,7 @@ function vectorSchemaSql(schema: string, dim: number): string {
  *    `ORDER BY distance, seq`，模仿 sqlite-vec 的 rowid（插入序）行為。
  * 2. **帶 rootIds 的過濾**：近似索引的過濾是在 index scan 之後才套用，預設會少給結果；
  *    每個查詢前在交易內 `SET LOCAL hnsw.iterative_scan = strict_order` 才會回滿。
- *    仍受 `hnsw.max_scan_tuples`（預設 20000）上限影響，詳見 README。
+ *    仍受 `hnsw.max_scan_tuples`（預設 20000）上限影響，詳見 `docs/storage-ports.md` 的「PostgreSQL 後端」一節。
  */
 export class PgVectorIndex implements VectorIndex {
   readonly dim: number;

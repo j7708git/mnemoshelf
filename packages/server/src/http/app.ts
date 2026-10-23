@@ -194,7 +194,7 @@ export interface AddRootRequest {
   include?: string[];
   exclude?: string[];
   respectGitignore?: boolean;
-  /** 單檔大小上限；`Root` 契約沒有此欄位，因此只存在行程內，重啟後回退預設 10 MB（見 README）。 */
+  /** 單檔大小上限；`Root` 契約沒有此欄位，因此只存在行程內，重啟後回退預設 10 MB（見 docs/operations.md）。 */
   maxFileBytes?: number;
 }
 
@@ -1093,7 +1093,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
    * - 成功回 `200`＋更新後的 root。
    * - **不自動觸發重新索引**：改的是設定，掃描層下一次索引才會看到新的模態；
    *   關掉某個模態時既有的 chunk／向量也**不會立刻**釋放，要在下一次索引時由清理迴圈清掉
-   *   （與 `DELETE`／模態切換的既有語意一致，見 README）。
+   *   （與 `DELETE`／模態切換的既有語意一致，見 docs/roots-and-privacy.md 的「改變模態」一節）。
    */
   const patchRoot = async (request: IncomingMessage, id: number): Promise<{ status: number; body: unknown }> => {
     await getRootOr404(id);
