@@ -8,7 +8,7 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import { gitInfo, makeSanitizer } from "../../loop/report.mjs";
+import { formatReportValue, gitInfo, makeSanitizer } from "../../loop/report.mjs";
 
 export { makeSanitizer };
 
@@ -24,6 +24,13 @@ function labelSoft(met) {
 
 function pct(value) {
   return value === null || value === undefined ? "N/A" : `${(value * 100).toFixed(1)}%`;
+}
+
+/** 軟門檻的實際值：比率照舊印百分比；非數字（例如物件）走安全序列化，避免 NaN%／[object Object]。 */
+function pctOrValue(value) {
+  if (typeof value === "number") return pct(value);
+  if (value === null || value === undefined) return "N/A";
+  return formatReportValue(value);
 }
 
 function renderTurnTable(turns) {
@@ -65,7 +72,7 @@ export function renderMarkdown(report, sanitize) {
   lines.push("| 結果 | 條件 | 實際 |");
   lines.push("|---|---|---|");
   for (const entry of report.hardConditions) {
-    lines.push(`| ${labelHard(entry.ok)} | ${entry.label} | ${entry.actual} |`);
+    lines.push(`| ${labelHard(entry.ok)} | ${entry.label} | ${formatReportValue(entry.actual)} |`);
   }
   lines.push("");
   lines.push("## 軟門檻（僅報告，不影響退出碼）");
@@ -73,7 +80,7 @@ export function renderMarkdown(report, sanitize) {
   lines.push("| 狀態 | 指標 | 門檻 | 實際 |");
   lines.push("|---|---|---|---|");
   for (const entry of report.softThresholds) {
-    lines.push(`| ${labelSoft(entry.met)} | ${entry.label} | ${pct(entry.threshold)} | ${pct(entry.actual)} |`);
+    lines.push(`| ${labelSoft(entry.met)} | ${entry.label} | ${pct(entry.threshold)} | ${pctOrValue(entry.actual)} |`);
   }
   lines.push("");
   lines.push("> 軟門檻先當報告、尚未升為硬門檻；`INFO` 不代表通過，也不影響退出碼。");

@@ -35,6 +35,18 @@ const ENV = {
   MNEMOSHELF_TOKEN: "test-token-value",
 };
 
+/**
+ * 測試用的隔離家目錄：位於 `os.tmpdir()` 底下、刻意不建立。
+ *
+ * `runtimeCandidates()` 會從 home 推導 `~/.config/Mnemoshelf/data/runtime.json` 等候選路徑。
+ * 若讓它用真實家目錄，改成真的讀檔的測試就會看到使用者機器上的 runtime 檔
+ * （本機紅燈、別台綠燈）。注入一個不存在的路徑，所有候選都讀不到，測試就不再依賴環境。
+ */
+const ISOLATED_HOME = path.join(
+  os.tmpdir(),
+  `mnemoshelf-plugin-home-${process.pid}-${Math.random().toString(36).slice(2)}`,
+);
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -143,6 +155,9 @@ async function setup(
   const cleanup = await createMemoryRuntime(ctx, {
     env,
     platform: "linux",
+    // 永遠注入隔離的 home，避免 runtime 候選路徑落回使用者的真實家目錄。
+    // `...extraDeps` 保持在最後，測試仍可覆寫。
+    home: ISOLATED_HOME,
     fetchImpl: recordingFetch,
     log: (line) => logs.push(line),
     readFileImpl: async () => {
@@ -573,6 +588,18 @@ describe("最近回合紀錄召回", () => {
     });
   }
 
+  /** 假 server 的 `GET /memories` 回應（由新到舊），並遵守請求裡的 `limit`。 */
+  function turnListForLimit(requestUrl: string): Response {
+    const all = [
+      { id: 303, content: "第三回合：結論 C，下一步 D。", createdAt: "2026-10-22T03:00:00.000Z" },
+      { id: 302, content: "第二回合：結論 B。", createdAt: "2026-10-22T02:00:00.000Z" },
+      { id: 301, content: "第一回合：結論 A。", createdAt: "2026-10-22T01:00:00.000Z" },
+    ];
+    const requested = Number(new URL(requestUrl).searchParams.get("limit"));
+    const limit = Number.isInteger(requested) && requested > 0 ? requested : all.length;
+    return jsonResponse({ untrusted: true, memories: all.slice(0, limit) });
+  }
+
   it("專案 session：帶 scope=project&project=<name>、agent=…%2Fturn、limit=recentTurns", async () => {
     const harness = await setup({}, async (_input, init) =>
       init?.method === "GET" ? turnList() : jsonResponse(memoryHits()),
@@ -621,12 +648,54 @@ describe("最近回合紀錄召回", () => {
     expect(lists[0].url).toContain("limit=3");
   });
 
-  it("recentTurns=0 時完全不打 GET /memories", async () => {
+  it("recentTurns=0 時完全不打 GET /memories，也不注入回合紀錄", async () => {
     const harness = await setup({ recentTurns: 0 });
     const event = userEvent(FIRST_QUERY);
     await harness.handler(event);
     expect(harness.listCalls()).toHaveLength(0);
-    expect(latestText(event)).toContain("記憶向量改存");
+    const text = latestText(event);
+    expect(text).toContain("記憶向量改存");
+    // 行為面：注入區塊裡不得出現任何回合紀錄行，也不得用「回合紀錄」的開場語。
+    expect(text).not.toContain("- [turn]");
+    expect(text).not.toContain("回合紀錄與背景資料");
+  });
+
+  it("recentTurns=2：請求 limit=2，只注入 2 筆且順序舊→新", async () => {
+    const harness = await setup({ recentTurns: 2 }, async (input, init) =>
+      init?.method === "GET" ? turnListForLimit(String(input)) : jsonResponse(memoryHits()),
+    );
+    const event = userEvent(FIRST_QUERY);
+    await harness.handler(event);
+
+    const lists = harness.listCalls();
+    expect(lists).toHaveLength(1);
+    expect(new URL(lists[0].url).searchParams.get("limit")).toBe("2");
+
+    const text = latestText(event);
+    expect(text.match(/- \[turn\]/g) ?? []).toHaveLength(2);
+    // server 遵守 limit=2：最舊的一筆不會出現。
+    expect(text).not.toContain("第一回合：結論 A。");
+    const second = text.indexOf("第二回合：結論 B。");
+    const third = text.indexOf("第三回合：結論 C，下一步 D。");
+    expect(second).toBeGreaterThan(-1);
+    expect(third).toBeGreaterThan(-1);
+    expect(second).toBeLessThan(third);
+  });
+
+  it("改設定 recentTurns：注入筆數跟著變（1／2／3）", async () => {
+    const injectedTurnCounts: number[] = [];
+    for (const recentTurns of [1, 2, 3]) {
+      const harness = await setup({ recentTurns }, async (input, init) =>
+        init?.method === "GET" ? turnListForLimit(String(input)) : jsonResponse(memoryHits()),
+      );
+      const event = userEvent(FIRST_QUERY);
+      await harness.handler(event);
+
+      expect(harness.listCalls()).toHaveLength(1);
+      expect(new URL(harness.listCalls()[0].url).searchParams.get("limit")).toBe(String(recentTurns));
+      injectedTurnCounts.push((latestText(event).match(/- \[turn\]/g) ?? []).length);
+    }
+    expect(injectedTurnCounts).toEqual([1, 2, 3]);
   });
 
   it("最近查詢失敗（500／timeout）仍注入語意結果、不拋錯", async () => {

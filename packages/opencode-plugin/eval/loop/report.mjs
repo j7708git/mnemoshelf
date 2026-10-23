@@ -71,12 +71,36 @@ function statusLabel(status) {
   return "NOT RUN";
 }
 
+/**
+ * 報告欄位用的安全序列化：一般物件走 JSON，其餘維持 `String()` 的既有呈現。
+ *
+ * `renderChecks()` 與 `printCaseResult()` 過去直接 `String()`，物件會被印成
+ * `[object Object]`。這裡只改「非 null、非陣列、typeof === "object"」的呈現，
+ * 基本型別與陣列（仍是 `a,b,c`）保持不變，既有報告文字不會大改。
+ */
+export function formatReportValue(value) {
+  if (value === null || typeof value !== "object") return String(value);
+  if (Array.isArray(value)) return String(value);
+  try {
+    const text = JSON.stringify(value);
+    return typeof text === "string" ? text : String(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/** 表格儲存格：null／undefined 仍舊留空（沿用舊行為）。 */
+function formatCheckCell(value) {
+  if (value === null || value === undefined) return "";
+  return formatReportValue(value);
+}
+
 function renderChecks(checks) {
   if (!Array.isArray(checks) || checks.length === 0) return "";
   const rows = checks.map((entry) => {
     const name = String(entry.name).replace(/\|/g, "\\|");
-    const expected = String(entry.expected ?? "").replace(/\|/g, "\\|");
-    const actual = String(entry.actual ?? "").replace(/\|/g, "\\|");
+    const expected = formatCheckCell(entry.expected).replace(/\|/g, "\\|");
+    const actual = formatCheckCell(entry.actual).replace(/\|/g, "\\|");
     return `| ${entry.ok === false ? "✗" : "✓"} | ${name} | ${expected} | ${actual} |`;
   });
   return ["| 檢查 | 項目 | 預期 | 實際 |", "|---|---|---|---|", ...rows].join("\n");
@@ -210,7 +234,9 @@ export function printCaseResult(entry, sanitize) {
   if (entry.status === "fail") {
     for (const check of entry.checks ?? []) {
       if (check.ok === false) {
-        console.log(`[loop]        ✗ ${check.name}：預期 ${sanitize(check.expected)}，實際 ${sanitize(check.actual)}`);
+        const expected = sanitize(formatReportValue(check.expected));
+        const actual = sanitize(formatReportValue(check.actual));
+        console.log(`[loop]        ✗ ${check.name}：預期 ${expected}，實際 ${actual}`);
       }
     }
     if (entry.detail !== undefined) console.log(`[loop]        ${sanitize(entry.detail)}`);
