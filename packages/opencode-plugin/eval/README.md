@@ -180,7 +180,7 @@ pnpm --filter @mnemoshelf/opencode-plugin eval
 | 口徑 | 意思 | 用在哪裡 |
 |---|---|---|
 | **retrieval** | 假設每一題都會觸發召回；把 `planRecall` 的結果全部算進去。 | 看檢索器／裝箱的**上限**，用來定位「找不到」還是「裝不進去」。 |
-| **production** | 先用外掛真正的 `skipReason`（空字串／slash／少於 20 字／幾乎全程式碼）判斷；被跳過的題目算 **0 注入**（外掛根本沒查 server）。 | 生產環境的**誤注入率與 abstention** 要讀這個；負向題常是短句，會被 skip，retrieval 口徑會高估誤注入。 |
+| **production** | 先用外掛真正的 `skipReason`（空字串／slash／少於 6 字／幾乎全程式碼）判斷；被跳過的題目算 **0 注入**（外掛根本沒查 server）。 | 生產環境的**誤注入率與 abstention** 要讀這個；負向題常是短句，會被 skip，retrieval 口徑會高估誤注入。 |
 
 - production 口徑的 Recall@5 欄位仍標成「檢索」：那是模型層的實測值，被 skip 的題目不是「找不到」，
   而是「根本沒查」。注入層的召回請看 `hitItems`（expected 卡實際被注入的數量）與
@@ -326,3 +326,108 @@ keyword 命中的 `score` 是 `1/rank`，不是 cosine。
 | `F` 的 `semanticHits > 0` | 代表有 cosine 恰好 1.0 的命中（幾乎不可能），或 server 行為變了；報告的 `keywordOnlyCheck` 會顯示。 |
 | `pnpm -r build` 很慢 | 手動先建置一次，之後 eval 不會重跑。 |
 | 想保留 DB 檢查 | `--keep`，路徑會印在 console（不是報告裡）。 |
+
+---
+
+## 10. L1：規則層鎖定（`npx vitest run test/rules`）
+
+對話記憶的**常數與規則**鎖在 vitest，不啟動 server、不呼叫模型：
+
+```bash
+cd packages/opencode-plugin && npx vitest run test/rules
+```
+
+| 檔案 | 鎖住什麼 |
+|---|---|
+| `test/rules/constants.test.ts` | 召回 short 門檻（`6` 字）、`MIN_DIGEST_TURN_CHARS=40`、items 上限、timeout 上下限與預設值 |
+| `test/rules/incidents.test.ts` | 三次真實事故的回歸（每一條的失敗訊息都寫出「當時錯在哪」） |
+| `test/rules/regression-queries.test.ts` | `eval/fixtures/regression-queries.json` 的召回回歸題 |
+| `test/rules/matrix.test.ts` | 規則矩陣（觸發／跳過／預算／scope 的組合） |
+
+前提：只要 `node_modules` 與 `src/**` 存在即可。**不要**用
+`pnpm --filter … test -- test/rules` 想只跑這個目錄——vitest 會忽略該路徑過濾；
+請照上面的 `npx vitest run test/rules`。
+
+## 11. L2：對話迴圈（`eval:loop`）
+
+假宿主（假 OpenCode `ctx`）＋**真** mnemoshelf server＋**真** embedder，跑完整 digest 迴圈與
+召回注入；模型是 canned，不需要 API key。
+
+```bash
+pnpm --filter @mnemoshelf/opencode-plugin eval:loop
+# 負向對照：受影響的場景應該轉紅（退出碼 1）
+pnpm --filter @mnemoshelf/opencode-plugin eval:loop -- --fault model-missing
+```
+
+| 項目 | 內容 |
+|---|---|
+| 前提 | `packages/server` 已建置；embedder 快取存在（`MNEMOSHELF_MODEL_DIR` 可覆寫）；外掛 dist 比 src 新（過期會只重建本套件） |
+| 報告 | `.tmp/eval-loop/loop-report.{json,md}`（gitignore） |
+| 退出碼 | `0`＝全部硬門檻 PASS；`1`＝有硬門檻 FAIL／未執行，或環境層失敗 |
+
+場景↔斷言對照（完整清單見 `eval/loop/README.md`）：
+
+| 斷言 | 場景 |
+|---|---|
+| 1 回合卡內容與 payload | `a1.turn-cards-alpha`、`a1.turn-cards-chat`、`a1.snapshot-waterline` |
+| 2 最近回合注入順序／招呼語不注入 | `a2.recent-turns-order`、`a2.greeting-not-injected` |
+| 3 舊回合靠語意找回（**僅報告 INFO**） | `a3.semantic-old-turn` |
+| 4 scope 隔離 | `a4.alpha-not-beta`、`a4.global-visible-alpha`、`a4.alpha-not-chat` |
+| 5 召回去重 TTL | `a5.dedupe-ttl` |
+| 6 fail-open（503／timeout） | `a6.fail-open-503`、`a6.fail-open-timeout` |
+| 7 模型逾時（寫入前） | `a7.model-timeout-before-write` |
+| 8 冪等 | `a8.idempotent-*`（5 個） |
+| 9 `digest.log` 隱私 | `a9.log-privacy` |
+| 負向自我檢查 | `n1.other-location-skipped`、`n2.model-unavailable-skipped` |
+
+`INFO` 只輸出觀察值、不設門檻，**不是 PASS**，也不影響退出碼。
+
+## 12. L3：摘要品質（`eval:digest`）
+
+30 回合合成對話，量摘要的內容、kind、召回與延遲；預設 canned 基線完全離線。
+
+```bash
+pnpm --filter @mnemoshelf/opencode-plugin eval:digest
+pnpm --filter @mnemoshelf/opencode-plugin eval:digest -- --dry-run
+pnpm --filter @mnemoshelf/opencode-plugin eval:digest -- --model <id> --allow-paid
+```
+
+| 項目 | 內容 |
+|---|---|
+| 前提 | `packages/server` 已建置；embedder 快取存在；指定模型需在 `eval/digest/models.json` 且憑證在環境變數 |
+| 報告 | `.tmp/eval-digest/digest-report.{json,md}`（gitignore） |
+| 退出碼 | `0`＝硬條件全過＋parity 一致＋沒有 degraded 召回；`1`＝NOT RUN／硬條件 FAIL／parity 不一致／前置失敗 |
+| 硬條件 | `mustNotInclude=0`、跨專案洩漏=0、`45000ms ≥ 2×p95` |
+| 軟門檻 | mustInclude 90%、kind 80%、端到端召回 90%——只標 `INFO`，不影響退出碼 |
+
+端到端召回口徑：期望內容被 server 召回**且**實際注入 `<memory-context>`（不區分來源卡別）。
+`rejected` 是被 parser 丟棄的 item 數，parse 錯誤另計。詳見 `eval/digest/README.md`。
+
+環境變數（只有 L3 真模型會用到；名稱如下，值不寫進 repo）：
+`MNEMOSHELF_EVAL_MODEL_URL`、`MNEMOSHELF_EVAL_MODEL_KEY`（`models.json` 的範例項）。
+
+## 13. matrix：三模型同條件比較（`eval:digest:matrix`）
+
+同一份 fixture、同一條管線跑多個摘要模型，產出排行榜；預設 screening 前 10 回合。
+
+```bash
+pnpm --filter @mnemoshelf/opencode-plugin eval:digest:matrix -- --models all
+pnpm --filter @mnemoshelf/opencode-plugin eval:digest:matrix -- --models all --turns all
+pnpm --filter @mnemoshelf/opencode-plugin eval:digest:matrix -- --models all --dry-run
+```
+
+| 項目 | 內容 |
+|---|---|
+| 模型設定 | `eval/digest/matrix-models.json`（eval 專屬；只有環境變數名稱） |
+| 報告 | `.tmp/eval-digest-matrix/matrix-report.{json,md}`（gitignore） |
+| 退出碼 | `0`＝每個模型都 `RANKED` 且五條硬門檻全過；`1`＝任何模型 NOT RUN／ERROR／硬門檻 FAIL，或估算超過 `--max-calls` |
+| 成本保護 | 預設 10 回合；付費模型要 `--allow-paid`；`--dry-run` 不發請求；`--max-calls` 預設 100 |
+
+五條硬門檻：`mustNotInclude=0`、跨專案洩漏=0、JSON 成功率 ≥95%、
+p95 ≤ 該模型 `timeoutMs/2`、p95 ≤ 30000ms（絕對上限）。
+環境變數（名稱）：`MNEMOSHELF_EVAL_OPENCODE_URL`、`MNEMOSHELF_EVAL_OPENCODE_PASSWORD`、
+`MNEMOSHELF_EVAL_OPENCODE_USERNAME`、`MNEMOSHELF_EVAL_OPENROUTER_API_KEY`。
+缺少時該模型標 `NOT RUN`（非零退出），不改走其他供應商繞路。
+
+矩陣報告另有 S6 spike（OpenCode `/api/experimental/generate` 的認證、schema、錯誤碼、延遲）
+與「硬條件鑑別力」表：canned 基線下哪些 PASS 只是結構性成立。

@@ -1,0 +1,23 @@
+{
+  "version": "digest-models-v1",
+  "description": "L3 可用的模型來源。第一個 enabled 的模型是預設；canned 基線完全離線、零成本。付費模型必須同時加 --allow-paid。憑證只從環境變數讀，不寫進本檔。",
+  "models": [
+    {
+      "id": "canned/baseline-extractive-v1",
+      "kind": "canned",
+      "paid": false,
+      "enabled": true,
+      "note": "抽取式基線（助理回覆前兩句＋關鍵詞分類）。只用來驗證管線與量測規則，數字不代表真實模型品質。"
+    },
+    {
+      "id": "openai-compatible/example",
+      "kind": "openai-compatible",
+      "paid": true,
+      "enabled": false,
+      "baseUrlEnv": "MNEMOSHELF_EVAL_MODEL_URL",
+      "apiKeyEnv": "MNEMOSHELF_EVAL_MODEL_KEY",
+      "model": "example-model",
+      "note": "範例：任何 OpenAI 相容的 /chat/completions 端點。停用中；要用時改 enabled 或傳 --model，並加 --allow-paid。"
+    }
+  ]
+}

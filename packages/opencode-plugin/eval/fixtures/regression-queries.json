@@ -1,0 +1,127 @@
+{
+  "schemaVersion": 1,
+  "description": "對話記憶 L1 的合成查詢題庫。全部是合成等價句，不是真人原句；用來鎖住 skipReason／decideTrigger 的長度、形狀與明示線索規則。",
+  "recallSemantics": "expectedSkipReason 是 skipReason(query) 的預期（null 代表不跳過）；expectedRecall 是在 firstTurn=false、trigger='first-turn+explicit' 下 decideTrigger().decide 的預期。chars 是以 code point 計算的長度。",
+  "queries": [
+    {
+      "id": "rq-001",
+      "query": "早安",
+      "chars": 2,
+      "expectedSkipReason": "short",
+      "expectedRecall": false,
+      "note": "2 字招呼：低於 6 字門檻，必須跳過。注意「早安」是 2 字，不是 5 字。"
+    },
+    {
+      "id": "rq-002",
+      "query": "請繼續往下",
+      "chars": 5,
+      "expectedSkipReason": "short",
+      "expectedRecall": false,
+      "note": "5 字：仍在 <6 的門檻內，視為過短。"
+    },
+    {
+      "id": "rq-003",
+      "query": "這樣可以嗎？",
+      "chars": 6,
+      "expectedSkipReason": null,
+      "expectedRecall": false,
+      "note": "6 字：剛好達門檻，不再算 short；沒有明示線索且非首輪，所以 trigger 不召回。"
+    },
+    {
+      "id": "rq-004",
+      "query": "請幫我確認這個設定值",
+      "chars": 10,
+      "expectedSkipReason": null,
+      "expectedRecall": false,
+      "note": "10 字、無明示線索：不因 short 被殺，但非首輪也不召回。"
+    },
+    {
+      "id": "rq-005",
+      "query": "你還記得剛剛討論的佇列設定嗎？",
+      "chars": 15,
+      "expectedSkipReason": null,
+      "expectedRecall": true,
+      "note": "事故三的合成等價句：15 字、含明示線索「剛剛」，必須召回而不是被 short 殺掉。"
+    },
+    {
+      "id": "rq-006",
+      "query": "請幫我把這個函式的參數命名整理成一份清單好嗎？",
+      "chars": 23,
+      "expectedSkipReason": null,
+      "expectedRecall": false,
+      "note": "23 字（≥21）：長句且無明示線索，非首輪不召回，但不可被 short 或 code 誤判。"
+    },
+    {
+      "id": "rq-007",
+      "query": "剛才那個排序的決定是什麼？",
+      "chars": 13,
+      "expectedSkipReason": null,
+      "expectedRecall": true,
+      "note": "13 字、含明示線索「剛才」：非首輪仍要召回。"
+    },
+    {
+      "id": "rq-008",
+      "query": "之前提到的重試次數上限是多少？",
+      "chars": 15,
+      "expectedSkipReason": null,
+      "expectedRecall": true,
+      "note": "15 字、含明示線索「之前」：另一種線索詞也要召回。"
+    },
+    {
+      "id": "rq-009",
+      "query": "/memory",
+      "chars": 7,
+      "expectedSkipReason": "slash",
+      "expectedRecall": false,
+      "note": "slash 指令：長度雖達門檻，仍必須跳過召回。"
+    },
+    {
+      "id": "rq-010",
+      "query": "/memory 剛剛討論的內容",
+      "chars": 15,
+      "expectedSkipReason": "slash",
+      "expectedRecall": false,
+      "note": "含 /memory 指令且帶明示線索：slash 優先於線索，仍要跳過。"
+    },
+    {
+      "id": "rq-011",
+      "query": "```ts\nconst queueSize = 42;\n```",
+      "chars": 31,
+      "expectedSkipReason": "code",
+      "expectedRecall": false,
+      "note": "幾乎全是 fenced code（≥60%）：視為 code-heavy，跳過召回。"
+    },
+    {
+      "id": "rq-012",
+      "query": "let a = 1;\nlet b = 2;\nlet c = 3;\nlet d = 4;\nlet e = 5;\nlet f = 6;\nlet g = 7;\nlet h = 8;\nlet i = 9;\nlet j = 10;",
+      "chars": 110,
+      "expectedSkipReason": "code",
+      "expectedRecall": false,
+      "note": "10 行且平均行長 <20：沒有 fence 的 code-heavy 變體也要跳過。"
+    },
+    {
+      "id": "rq-013",
+      "query": "記得嗎？",
+      "chars": 4,
+      "expectedSkipReason": "short",
+      "expectedRecall": false,
+      "note": "4 字且含線索「記得」：short 先於線索判定，仍要跳過。"
+    },
+    {
+      "id": "rq-014",
+      "query": "請幫我比較剛剛兩版設定的差異，並整理成三點結論給我。",
+      "chars": 26,
+      "expectedSkipReason": null,
+      "expectedRecall": true,
+      "note": "26 字（≥21）且含「剛剛」：長句不影響明示線索召回。"
+    },
+    {
+      "id": "rq-015",
+      "query": "我記得上次調整過逾時上限，現在的值是多少？",
+      "chars": 21,
+      "expectedSkipReason": null,
+      "expectedRecall": true,
+      "note": "21 字、含「記得」與「上次」：剛好 ≥21 的召回案例。"
+    }
+  ]
+}

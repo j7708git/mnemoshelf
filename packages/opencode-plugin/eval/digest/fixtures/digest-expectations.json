@@ -1,0 +1,400 @@
+{
+  "version": "digest-expectations-v1",
+  "description": "30 回合 fixture 的期望值。比對規則寫死在 runner（正規化後子字串比對、最短 4 字）；本檔只放資料。",
+  "rules": {
+    "normalize": "NFKC（全形轉半形）→ 轉小寫 → 移除所有空白",
+    "match": "mustInclude／mustNotInclude／expectedItems.contains／recallMarker 都是正規化後的子字串比對",
+    "minNeedleChars": 4
+  },
+  "turns": {
+    "t01": {
+      "expectEmpty": true,
+      "mustInclude": [],
+      "mustNotInclude": [],
+      "expectedItems": [],
+      "expectSkip": "no-user"
+    },
+    "t02": {
+      "expectEmpty": true,
+      "mustInclude": [],
+      "mustNotInclude": [],
+      "expectedItems": [],
+      "expectSkip": "short"
+    },
+    "t03": {
+      "expectEmpty": true,
+      "mustInclude": [],
+      "mustNotInclude": [],
+      "expectedItems": [],
+      "expectSkip": "short"
+    },
+    "t04": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "指數退避"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "decision",
+          "contains": "指數退避"
+        }
+      ],
+      "recallQuery": "重試間隔要怎麼避免失敗任務塞滿佇列？",
+      "recallMarker": "指數退避"
+    },
+    "t05": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "逐列寫入"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [],
+      "recallQuery": "匯出器要怎麼避免一次把全部資料放進記憶體？",
+      "recallMarker": "逐列寫入"
+    },
+    "t06": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "沒有上限"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "pitfall",
+          "contains": "快取沒有上限"
+        }
+      ],
+      "recallQuery": "服務重啟前快取一直長大是什麼原因？",
+      "recallMarker": "沒有上限"
+    },
+    "t07": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "設定載入"
+      ],
+      "mustNotInclude": [
+        "貝塔專案"
+      ],
+      "expectedItems": [],
+      "recallQuery": "設定載入要集中到哪裡？"
+    },
+    "t08": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "單一寫入佇列"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "decision",
+          "contains": "單一寫入佇列"
+        }
+      ],
+      "recallQuery": "多個 worker 同時寫入互相卡住要怎麼解？",
+      "recallMarker": "單一寫入佇列"
+    },
+    "t09": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "以秒為單位"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [],
+      "recallQuery": "排程的時間單位是什麼？"
+    },
+    "t10": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "隨機抖動"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "pitfall",
+          "contains": "沒有加抖動"
+        }
+      ],
+      "recallQuery": "重試高峰還是會同時重試，還缺什麼？",
+      "recallMarker": "沒有加抖動"
+    },
+    "t11": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "snake_case"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "preference",
+          "contains": "snake_case"
+        }
+      ],
+      "recallQuery": "日誌欄位命名的慣例是什麼？"
+    },
+    "t12": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "每批最多五十封"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [],
+      "recallQuery": "通知批次寄送的上限怎麼定？",
+      "recallMarker": "批次寄送"
+    },
+    "t13": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "串流輸出"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "decision",
+          "contains": "串流輸出"
+        }
+      ],
+      "recallQuery": "匯出大檔要怎麼避免使用者等到逾時？",
+      "recallMarker": "串流輸出"
+    },
+    "t14": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "採用p95"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [],
+      "recallQuery": "延遲的驗收標準用平均還是百分位？"
+    },
+    "t15": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "以utc計算"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "pitfall",
+          "contains": "時區處理"
+        }
+      ],
+      "recallQuery": "排程跨日少跑一次是什麼問題？",
+      "recallMarker": "時區處理"
+    },
+    "t16": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "保留三十天"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [],
+      "recallQuery": "過期資料保留多久、怎麼清理？"
+    },
+    "t17": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "集中成單一檔案"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "decision",
+          "contains": "集中成單一檔案"
+        }
+      ],
+      "recallQuery": "設定散在三個地方要怎麼收斂？",
+      "recallMarker": "集中成單一檔案"
+    },
+    "t18": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "上限是一千筆"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "fact",
+          "contains": "上限是一千筆"
+        }
+      ],
+      "recallQuery": "佇列最多可以積多少任務？"
+    },
+    "t19": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "同一個交易"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "pitfall",
+          "contains": "交易保護"
+        }
+      ],
+      "recallQuery": "批次寫入一半成功一半失敗要怎麼保證一致？",
+      "recallMarker": "交易保護"
+    },
+    "t20": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "should開頭"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "preference",
+          "contains": "should開頭"
+        }
+      ],
+      "recallQuery": "測試名稱的風格慣例是什麼？"
+    },
+    "t21": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "需要人為介入"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "fact",
+          "contains": "需要人為介入"
+        }
+      ],
+      "recallQuery": "告警太多要怎麼收斂到需要人處理的情況？",
+      "recallMarker": "需要人為介入"
+    },
+    "t22": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "sqlite"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "decision",
+          "contains": "sqlite"
+        }
+      ],
+      "recallQuery": "儲存層自己寫的檔案格式維護成本高，要換成什麼？",
+      "recallMarker": "sqlite"
+    },
+    "t23": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "gzip壓縮"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [],
+      "recallQuery": "匯出檔傳輸時間很長要怎麼處理？"
+    },
+    "t24": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "重疊執行"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "pitfall",
+          "contains": "重疊執行"
+        }
+      ],
+      "recallQuery": "同一個排程同時跑兩份造成重複通知怎麼辦？",
+      "recallMarker": "重疊執行"
+    },
+    "t25": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "唯讀權限"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "fact",
+          "contains": "唯讀權限"
+        }
+      ],
+      "recallQuery": "外掛的權限模型要怎麼限制？"
+    },
+    "t26": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "拒絕跨專案查詢"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "decision",
+          "contains": "拒絕跨專案查詢"
+        }
+      ],
+      "recallQuery": "查詢可以跨專案嗎？"
+    },
+    "t27": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "保留七天"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [],
+      "recallQuery": "暫存檔要留多久？"
+    },
+    "t28": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "多位元組"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "pitfall",
+          "contains": "多位元組"
+        }
+      ],
+      "recallQuery": "中文內容被截在半個字是什麼原因？",
+      "recallMarker": "多位元組"
+    },
+    "t29": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "目前待辦"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [],
+      "recallQuery": "這一輪還剩哪些待辦？",
+      "recallMarker": "壓縮流程的驗收"
+    },
+    "t30": {
+      "expectEmpty": false,
+      "mustInclude": [
+        "先做量測"
+      ],
+      "mustNotInclude": [],
+      "expectedItems": [
+        {
+          "kind": "decision",
+          "contains": "先做量測"
+        }
+      ],
+      "recallQuery": "下一版要先做功能還是先做量測？",
+      "recallMarker": "先做量測"
+    }
+  },
+  "crossProject": {
+    "foreignProject": "beta",
+    "foreignMarker": "貝塔專案",
+    "queries": [
+      "排程器的重試與寫入佇列怎麼設計？",
+      "設定載入與匯出流程"
+    ],
+    "forbiddenInForeignScope": [
+      "指數退避",
+      "單一寫入佇列",
+      "拒絕跨專案查詢"
+    ]
+  },
+  "l2Only": {
+    "note": "L2 的迴圈 harness 已有自己的場景與 fixture（eval/loop/scenarios.mjs）；本卡 30 回合不需要為 L2 額外複製回合。",
+    "turns": []
+  }
+}

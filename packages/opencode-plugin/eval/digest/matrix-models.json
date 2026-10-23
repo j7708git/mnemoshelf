@@ -1,0 +1,50 @@
+{
+  "version": "digest-matrix-v1",
+  "description": "多模型矩陣的模型來源（eval 專屬，不是產品設定格式）。transport 只決定「eval 怎麼把 prompt 送到模型」，不改變產品的 digestModel 形狀。憑證一律只從環境變數讀，不寫進本檔。",
+  "models": [
+    {
+      "id": "deepseek-v4.1-flash",
+      "label": "DeepSeek V4.1 Flash",
+      "transport": "opencode",
+      "digestModel": "opencode-go/deepseek-v4.1-flash",
+      "providerID": "opencode-go",
+      "modelID": "deepseek-v4.1-flash",
+      "serverUrlEnv": "MNEMOSHELF_EVAL_OPENCODE_URL",
+      "usernameEnv": "MNEMOSHELF_EVAL_OPENCODE_USERNAME",
+      "username": "opencode",
+      "passwordEnv": "MNEMOSHELF_EVAL_OPENCODE_PASSWORD",
+      "timeoutMs": 45000,
+      "paid": false,
+      "enabled": true,
+      "note": "走本機 OpenCode HTTP server 的 /api/experimental/generate；模型憑證由 server 端持有，eval 只帶 server 自己的 Basic 認證。"
+    },
+    {
+      "id": "qwen3.7-flash",
+      "label": "Qwen 3.7 Flash",
+      "transport": "openai",
+      "digestModel": "openrouter/qwen/qwen3.7-flash",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "apiKeyEnv": "MNEMOSHELF_EVAL_OPENROUTER_API_KEY",
+      "model": "qwen/qwen3.7-flash",
+      "maxTokens": 1024,
+      "timeoutMs": 45000,
+      "paid": true,
+      "enabled": true,
+      "note": "OpenAI 相容的 POST {baseUrl}/chat/completions（temperature 0、有 max_tokens）。"
+    },
+    {
+      "id": "scaledown-summarize",
+      "label": "Scaledown Summarize",
+      "transport": "openai",
+      "digestModel": "openrouter/scaledown/summarize",
+      "baseUrl": "https://openrouter.ai/api/v1",
+      "apiKeyEnv": "MNEMOSHELF_EVAL_OPENROUTER_API_KEY",
+      "model": "scaledown/summarize",
+      "maxTokens": 1024,
+      "timeoutMs": 45000,
+      "paid": true,
+      "enabled": true,
+      "note": "同上；是否吃標準 chat/completions、回不回合法 JSON 由本輪實測決定，不為它放寬 parser。"
+    }
+  ]
+}
