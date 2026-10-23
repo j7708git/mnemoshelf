@@ -1,6 +1,6 @@
 # Mnemoshelf
 
-> 狀態：v0.4.0（開發中，功能仍可能變動）。本版重點＝**OpenChamber／OpenCode 自動召回**（外掛在模型請求前召回相關記憶，只召回、不自動寫入）；桌面版安裝檔與版本請見 GitHub Releases。
+> 狀態：v0.4.0（開發中，功能仍可能變動）。本版重點＝**OpenChamber／OpenCode 自動召回**（外掛在模型請求前召回相關記憶，預設只召回、不自動寫入；可另外開啟每回合摘要寫入）；桌面版安裝檔與版本請見 GitHub Releases。
 
 Mnemoshelf 是一個本機桌面應用程式，目標有兩個：
 
@@ -64,6 +64,16 @@ preference）、`scope`（global／project／agent）、`project`、`agent`（�
   查詢；`scope=agent` 的記憶不會被自動召回。連線沿用 `runtime.json` 或 `MNEMOSHELF_URL`／
   `MNEMOSHELF_TOKEN`；v1 需由使用者**手動**把外掛加進 OpenCode 設定（不自動改設定）。安裝、
   參數與疑難排解見 [docs/opencode-plugin.md](docs/opencode-plugin.md)。
+- **每回合摘要寫入（可選，預設關閉）**：設定 `digestEnabled: true` 並指定 `digestModel` 之後，
+  外掛會在每個回合結束時，把「這一回合的使用者訊息＋助理最終回覆」交給你指定的模型，
+  整理成 1 張回合紀錄與 0–2 則原子記憶寫回本機。**摘要內容會送到你指定的模型**（雲端模型的
+  內容會離開本機）；沒開 `digestEnabled` 就完全不會呼叫模型、也不會寫入任何東西。
+  2026-10-23 以 30 回合合成對話做的三模型同場實測：`openrouter/scaledown/summarize`
+  該記的記到 92.6%、分類正確 55.6%、延遲 p95 1.9 秒（**推薦**）；
+  `opencode-go/deepseek-v4.1-flash` 召回最穩（93.8%）但慢約 7 倍；
+  `openrouter/qwen/qwen3.7-flash` 記到率 59.3%、延遲逼近 30 秒上限（不建議）。
+  數字會隨模型輸出的非確定性而浮動，詳見
+  [docs/opencode-plugin.md](docs/opencode-plugin.md) 的「怎麼選摘要模型」。
 - **專案範圍**：MCP 的 `remember`／`search_memories` 預設以「目前專案」為範圍；`recall` 是
   **跨專案列表**（可用 `project`／`scope` 篩選，不套用預設專案解析）。專案名稱解析順序
   （適用 `remember`／`search_memories`）為工具參數 `project` → 環境變數 `MNEMOSHELF_PROJECT` →
