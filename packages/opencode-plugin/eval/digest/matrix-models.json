@@ -1,6 +1,7 @@
 {
   "version": "digest-matrix-v1",
   "description": "多模型矩陣的模型來源（eval 專屬，不是產品設定格式）。transport 只決定「eval 怎麼把 prompt 送到模型」，不改變產品的 digestModel 形狀。憑證一律只從環境變數讀，不寫進本檔。",
+  "tokenBudgetNote": "openai transport 的 maxTokens 要留足夠預算給「會先思考」的模型（reasoning）：端點把思考 token 也算進 max_tokens，若預算太小，模型會把額度全用在思考、finish_reason=length 且 content 為空，介面只能記成 empty-text。實測 qwen/qwen3.7-flash 在 1024 時 27/27 全空（completion=1024 全是 reasoning），4096 時 finish=stop 並回得出合法 JSON（completion≈2332，其中 reasoning≈2203）。因此思考型模型的 maxTokens 至少 4096；不會思考的模型維持原值即可，調高只是放寬上限、不影響輸出。",
   "models": [
     {
       "id": "deepseek-v4.1-flash",
@@ -26,11 +27,11 @@
       "baseUrl": "https://openrouter.ai/api/v1",
       "apiKeyEnv": "MNEMOSHELF_EVAL_OPENROUTER_API_KEY",
       "model": "qwen/qwen3.7-flash",
-      "maxTokens": 1024,
+      "maxTokens": 4096,
       "timeoutMs": 45000,
       "paid": true,
       "enabled": true,
-      "note": "OpenAI 相容的 POST {baseUrl}/chat/completions（temperature 0、有 max_tokens）。"
+      "note": "OpenAI 相容的 POST {baseUrl}/chat/completions（temperature 0、有 max_tokens）。此模型會先思考：max_tokens=1024 時思考吃光預算、content 空（finish_reason=length），故留 4096（實測 reasoning 約 2200、內容約 220 字）。"
     },
     {
       "id": "scaledown-summarize",

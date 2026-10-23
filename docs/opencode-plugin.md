@@ -798,6 +798,7 @@ L3 預設用 canned 基線；矩陣一定要真模型，缺環境變數就標 `N
 - 選定後把 `digestModel` 寫成 `<provider>/<model-id>`（只以第一個 `/` 切分，後面的 `/`
   屬於 model id），例如 `openrouter/qwen/qwen3.7-flash`。
 - 換模型或模型改版後重跑一次矩陣；排行榜只代表「該模型 × 該 fixture 版本 × 該回合範圍」。
+- **會先思考（reasoning）的模型需要足夠的 token 預算**（例如 `max_tokens` 至少 4096），否則思考會吃光額度、`finish_reason` 停在 `length` 而回傳空內容，看起來就像模型完全不支援摘要。
 
 ## 14. 成本與隱私（摘要）
 
