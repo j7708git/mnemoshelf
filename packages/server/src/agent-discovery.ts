@@ -62,8 +62,17 @@ const defaultLog: Log = (message) => {
   console.error(message);
 };
 
-/** 格式錯誤或不可信時回傳 null（呼叫端不應拿去使用）。 */
-function parseRuntimeFile(text: string): AgentRuntimeFile | null {
+/**
+ * 格式錯誤或不可信時回傳 null（呼叫端不應拿去使用）。
+ *
+ * 這個解析器是 `runtime.json` 格式的**唯一權威**：寫出（`writeRuntimeFile`）與讀取
+ * （`readRuntimeFile`）共用它，外部讀取者（例如 MCP 入口的連線解析）也用同一份規則，
+ * 避免兩邊對「什麼算合法」有不同解讀。
+ *
+ * 驗證刻意偏嚴：網址與 token 不得為空、pid 必須是正整數。少一份就整份不可用——
+ * 「用半份資料連線」比「連不上」更危險。
+ */
+export function parseRuntimeFile(text: string): AgentRuntimeFile | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
@@ -73,8 +82,9 @@ function parseRuntimeFile(text: string): AgentRuntimeFile | null {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
   const record = parsed as Record<string, unknown>;
   if (record.schemaVersion !== AGENT_RUNTIME_SCHEMA_VERSION) return null;
-  if (typeof record.url !== "string" || typeof record.token !== "string") return null;
-  if (typeof record.pid !== "number" || !Number.isInteger(record.pid)) return null;
+  if (typeof record.url !== "string" || record.url.trim() === "") return null;
+  if (typeof record.token !== "string" || record.token.trim() === "") return null;
+  if (typeof record.pid !== "number" || !Number.isInteger(record.pid) || record.pid <= 0) return null;
   if (typeof record.startedAt !== "string" || typeof record.appVersion !== "string") return null;
   return {
     schemaVersion: AGENT_RUNTIME_SCHEMA_VERSION,
@@ -86,11 +96,18 @@ function parseRuntimeFile(text: string): AgentRuntimeFile | null {
   };
 }
 
-/** 讀出連線資訊檔；不存在、格式錯誤或權限不足都回 `null`。 */
-export async function readRuntimeFile(file: string): Promise<AgentRuntimeFile | null> {
+/**
+ * 讀出連線資訊檔；不存在、格式錯誤或權限不足都回 `null`。
+ *
+ * `readFileImpl` 可注入（測試用）；預設走 `fs.readFile`。
+ */
+export async function readRuntimeFile(
+  file: string,
+  readFileImpl: (file: string) => Promise<string> = (target) => fs.readFile(target, "utf8"),
+): Promise<AgentRuntimeFile | null> {
   let text: string;
   try {
-    text = await fs.readFile(file, "utf8");
+    text = await readFileImpl(file);
   } catch {
     return null;
   }

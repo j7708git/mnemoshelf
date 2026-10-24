@@ -69,12 +69,12 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
 | 名稱 | 誰會用到 | 預設 | 一句話語意 |
 |---|---|---|---|
 | `MNEMOSHELF_PORT` | 服務端、桌面版 | `0`（OS 指派隨機埠） | 監聽埠；永遠只綁 `127.0.0.1`。 |
-| `MNEMOSHELF_TOKEN` | 服務端、桌面版、MCP 入口、外掛 | 無（CLI 未設即啟動失敗；桌面版自動產生並保存） | REST 的 Bearer token，持有即本機全權。 |
-| `MNEMOSHELF_DATA_DIR` | 服務端、桌面版、外掛（算 `runtime.json` 位置） | OS 使用者資料目錄下的 `mnemoshelf`（桌面版為 `<userData>/data`） | SQLite 資料目錄。 |
+| `MNEMOSHELF_TOKEN` | 服務端、桌面版、MCP 入口、外掛 | 無（CLI 未設即啟動失敗；桌面版自動產生並保存） | REST 的 Bearer token，持有即本機全權。MCP 入口缺這個變數時會改讀 `runtime.json`。 |
+| `MNEMOSHELF_DATA_DIR` | 服務端、桌面版、外掛（算 `runtime.json` 位置）、MCP 入口（算 `runtime.json` 位置） | OS 使用者資料目錄下的 `mnemoshelf`（桌面版為 `<userData>/data`） | SQLite 資料目錄。 |
 | `MNEMOSHELF_MODEL_DIR` | 服務端、桌面版、embedder | OS 使用者資料目錄下的 `mnemoshelf/models`（桌面版為 `<userData>/models`） | 模型快取目錄。 |
 | `MNEMOSHELF_WEB_DIR` | 服務端、桌面版 | 本 repo 的 `packages/web/dist`（桌面版為 `resources/web`） | Web UI 靜態檔目錄；不存在時 API 仍正常。 |
-| `MNEMOSHELF_URL` | MCP 入口、外掛 | 無（MCP 未設即啟動失敗） | REST 基底網址（例如 `http://127.0.0.1:8787`）。 |
-| `MNEMOSHELF_RUNTIME_FILE` | 服務端（寫出）、外掛（讀取） | `<dataDir>/runtime.json` | 覆寫連線資訊檔位置。 |
+| `MNEMOSHELF_URL` | MCP 入口、外掛 | 無（MCP 未設時改讀 `runtime.json`；仍找不到就啟動失敗） | REST 基底網址（例如 `http://127.0.0.1:8787`）。 |
+| `MNEMOSHELF_RUNTIME_FILE` | 服務端（寫出）、MCP 入口與外掛（讀取） | `<dataDir>/runtime.json` | 覆寫連線資訊檔位置。 |
 | `MNEMOSHELF_AGENT_DISCOVERY` | 服務端（CLI）；桌面版由設定頁覆寫 | `off`（桌面版預設 `on`） | 是否寫出含 token 的 `runtime.json`。 |
 | `MNEMOSHELF_PROJECT` | MCP 入口、外掛 | 未設定 | 預設專案名稱（MCP 的 `remember`／`search_memories`；外掛的召回範圍）。 |
 | `MNEMOSHELF_DESKTOP_USER_DATA` | 桌面版 | Electron 預設 `userData` | 覆寫桌面版的 userData（開發／驗收用）。 |

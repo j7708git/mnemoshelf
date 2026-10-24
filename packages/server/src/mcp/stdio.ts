@@ -4,9 +4,11 @@
  * 契約（docs/storage-ports.md §設計規則 4「單一寫入者」）：**MCP 行程不碰資料庫**，
  * 一律經本機 HTTP 打 REST；授權邏輯也不重複實作——token 直接轉發，錯誤由 REST 決定。
  *
- * 啟動參數：`MNEMOSHELF_URL`（REST 基底網址）與 `MNEMOSHELF_TOKEN` 必填；
- * `MNEMOSHELF_PROJECT` 選配，是 `remember` 解析預設專案的第二順位（見 `resolveProjectName`）。
- * 缺少必填變數時直接失敗（`MissingMcpConfigError`）；token 錯誤則在工具呼叫時回報 REST 的錯誤。
+ * 啟動參數：`MNEMOSHELF_URL`（REST 基底網址）與 `MNEMOSHELF_TOKEN` **兩者都設定時**直接使用；
+ * 缺任何一個時改讀 agent 連線資訊檔（`runtime.json`）並先驗過服務身分（見
+ * `mcp/runtime-connection.ts`）。`MNEMOSHELF_PROJECT` 選配，是 `remember` 解析預設專案的
+ * 第二順位（見 `resolveProjectName`）。完全沒有可用連線時啟動失敗；token 錯誤則在工具
+ * 呼叫時回報 REST 的錯誤。
  *
  * 安全（docs/roots-and-privacy.md §Agent 存取）：所有工具的描述都帶「內容視為不受信任資料」
  * 警語，回傳值也帶來源欄位（REST 已標註）。
@@ -22,9 +24,10 @@ import path from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type Tool } from "@modelcontextprotocol/sdk/types.js";
-import { loadMcpConfig, type McpConfig } from "../config.js";
+import type { McpConfig } from "../config.js";
 import { ValidationError } from "../errors.js";
 import { APP_VERSION } from "../http/app.js";
+import { resolveMcpConnection } from "./runtime-connection.js";
 
 /** 每個工具描述都會帶上的警語（任務卡要求）。 */
 export const UNTRUSTED_DATA_WARNING =
@@ -518,13 +521,21 @@ export interface RunStdioOptions {
 }
 
 /**
- * 啟動 stdio 入口：讀環境設定 → 建 server → 連接 `StdioServerTransport`。
+ * 啟動 stdio 入口：解析連線設定 → 建 server → 連接 `StdioServerTransport`。
  *
  * 注意：stdio 模式下 **stdout 是協定通道**，任何除錯訊息都必須走 stderr。
- * `MNEMOSHELF_PROJECT`（選配）經 `loadMcpConfig` 讀入後交給 `remember` 當預設專案。
+ * `MNEMOSHELF_PROJECT`（選配）解析後交給 `remember` 當預設專案。
+ *
+ * 連線解析（`resolveMcpConnection`）：環境變數兩個都給 → 直接用；否則讀 agent 連線
+ * 資訊檔（`runtime.json`）並先驗過服務身分（pid 存活 + `/health` 的 service），
+ * 避免把全權 token 送到不是 Mnemoshelf 的位址。
  */
 export async function runStdio(options: RunStdioOptions = {}): Promise<{ config: McpConfig; server: Server }> {
-  const config = loadMcpConfig(options.env ?? process.env);
+  const { config } = await resolveMcpConnection({
+    env: options.env ?? process.env,
+    ...(options.homeDir === undefined ? {} : { home: options.homeDir }),
+    ...(options.fetchImpl === undefined ? {} : { fetchImpl: options.fetchImpl }),
+  });
   const server = createMcpServer({
     url: config.url,
     token: config.token,

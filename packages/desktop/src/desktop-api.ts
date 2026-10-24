@@ -22,6 +22,7 @@ export const DESKTOP_CHANNELS = {
   settingsSetAutostart: "mnemoshelf:settings:set-autostart",
   settingsSetAgentDiscovery: "mnemoshelf:settings:set-agent-discovery",
   settingsCopyConnectionInfo: "mnemoshelf:settings:copy-connection-info",
+  settingsCopyMcpConfig: "mnemoshelf:settings:copy-mcp-config",
 } as const;
 
 /** `contextBridge` 掛在 renderer 上的全域名稱，以及 API 版本。 */
@@ -96,5 +97,12 @@ export interface DesktopBridge {
      * token 只在 main process；回傳不含 token，renderer 只拿到「是否成功」與網址。
      */
     copyConnectionInfo(): Promise<{ copied: boolean; url: string | null }>;
+    /**
+     * 把可直接貼進 MCP client 的設定片段放進剪貼簿。
+     *
+     * 片段**不含 token**：MCP 入口會自己讀 `runtime.json` 取得網址與 token。
+     * 回傳不含 token，renderer 只拿到「是否成功」與網址。
+     */
+    copyMcpConfig(): Promise<{ copied: boolean; url: string | null }>;
   };
 }

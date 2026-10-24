@@ -96,6 +96,11 @@ export interface DesktopBridge {
     setAgentDiscovery(enabled: boolean): Promise<DesktopSettingsState>;
     /** 把 `{url, token}` 放進剪貼簿（使用者點擊才呼叫）；回傳不含 token。 */
     copyConnectionInfo(): Promise<{ copied: boolean; url: string | null }>;
+    /**
+     * 把可直接貼進 MCP client 的設定片段放進剪貼簿；片段**不含 token**。
+     * 回傳不含 token，renderer 只拿到「是否成功」與網址。
+     */
+    copyMcpConfig(): Promise<{ copied: boolean; url: string | null }>;
   };
 }
 

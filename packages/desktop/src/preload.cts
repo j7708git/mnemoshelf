@@ -21,6 +21,7 @@ const CHANNELS = {
   settingsSetAutostart: "mnemoshelf:settings:set-autostart",
   settingsSetAgentDiscovery: "mnemoshelf:settings:set-agent-discovery",
   settingsCopyConnectionInfo: "mnemoshelf:settings:copy-connection-info",
+  settingsCopyMcpConfig: "mnemoshelf:settings:copy-mcp-config",
 };
 
 const api = {
@@ -45,6 +46,7 @@ const api = {
     setAutostart: (enabled: unknown) => ipcRenderer.invoke(CHANNELS.settingsSetAutostart, enabled === true),
     setAgentDiscovery: (enabled: unknown) => ipcRenderer.invoke(CHANNELS.settingsSetAgentDiscovery, enabled === true),
     copyConnectionInfo: () => ipcRenderer.invoke(CHANNELS.settingsCopyConnectionInfo),
+    copyMcpConfig: () => ipcRenderer.invoke(CHANNELS.settingsCopyMcpConfig),
   },
 };
 

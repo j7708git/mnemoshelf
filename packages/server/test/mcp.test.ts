@@ -15,6 +15,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   api,
   makeFixtureRoot,
+  makeTempDir,
   NOTE_TOKEN,
   removeTempDir,
   startTestServer,
@@ -674,11 +675,22 @@ describe("MCP：resolveProjectName 的純函式優先序", () => {
 });
 
 describe("MCP 啟動設定", () => {
-  it("缺少 MNEMOSHELF_URL／TOKEN → 具名錯誤", async () => {
-    await expect(runStdio({ env: {} })).rejects.toMatchObject({ name: "MissingMcpConfigError" });
-    await expect(runStdio({ env: { MNEMOSHELF_URL: "http://127.0.0.1:1" } })).rejects.toMatchObject({
-      name: "MissingMcpConfigError",
-    });
+  it("沒有任何連線來源 → 具名錯誤（會先嘗試 agent 連線資訊檔）", async () => {
+    // 注入空的暫存家目錄：確保不會連到本機正在執行的 Mnemoshelf（測試必須自我隔離）。
+    const home = await makeTempDir("mnemoshelf-mcp-home-");
+    try {
+      await expect(runStdio({ env: {}, homeDir: home })).rejects.toMatchObject({
+        name: "McpConnectionError",
+        reason: "no-config",
+      });
+      // 只有網址、沒有 token：同樣落到連線資訊檔；找不到就回 no-config。
+      await expect(runStdio({ env: { MNEMOSHELF_URL: "http://127.0.0.1:1" }, homeDir: home })).rejects.toMatchObject({
+        name: "McpConnectionError",
+        reason: "no-config",
+      });
+    } finally {
+      await removeTempDir(home);
+    }
   });
 
   it("loadMcpConfig 讀選配的 MNEMOSHELF_PROJECT（trim；空白視為未設定）", () => {

@@ -79,6 +79,7 @@ export function App() {
   const [showSettings, setShowSettings] = useState(false);
   /** 「複製連線資訊」的結果提示（桌面模式）。 */
   const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
+  const [mcpConfigNotice, setMcpConfigNotice] = useState<string | null>(null);
   /** 匯出診斷資訊的狀態（與桌面設定無關，兩種模式都能用）。 */
   const [diagnosticsBusy, setDiagnosticsBusy] = useState(false);
   const [diagnosticsNotice, setDiagnosticsNotice] = useState<string | null>(null);
@@ -180,7 +181,10 @@ export function App() {
    * 還留著上一次的結果（切換開關／再次複製時也會各自清一次）。
    */
   useEffect(() => {
-    if (!showSettings) setConnectionNotice(null);
+    if (!showSettings) {
+      setConnectionNotice(null);
+      setMcpConfigNotice(null);
+    }
   }, [showSettings]);
 
   /**
@@ -314,6 +318,25 @@ export function App() {
       );
     } catch (error) {
       setConnectionNotice(error instanceof Error ? error.message : "複製連線資訊失敗");
+    }
+  }, [desktop]);
+
+  /**
+   * 複製 MCP 設定片段：片段不含 token（MCP 入口自己讀 runtime.json），
+   * 使用者只要貼進 MCP client 的設定檔就能連上。
+   */
+  const copyMcpConfig = useCallback(async (): Promise<void> => {
+    if (desktop === null) return;
+    setMcpConfigNotice(null);
+    try {
+      const result = await desktop.settings.copyMcpConfig();
+      setMcpConfigNotice(
+        result.copied
+          ? "已複製 MCP 設定片段到剪貼簿（不含 token）。貼進 MCP client 的設定檔後重新啟動它即可。"
+          : "目前無法產生 MCP 設定片段，請確認服務正在執行。",
+      );
+    } catch (error) {
+      setMcpConfigNotice(error instanceof Error ? error.message : "複製 MCP 設定片段失敗");
     }
   }, [desktop]);
 
@@ -515,6 +538,8 @@ export function App() {
               onToggleAgentDiscovery={(enabled) => void toggleAgentDiscovery(enabled)}
               onCopyConnectionInfo={() => void copyConnectionInfo()}
               connectionNotice={connectionNotice}
+              onCopyMcpConfig={() => void copyMcpConfig()}
+              mcpConfigNotice={mcpConfigNotice}
               onExportDiagnostics={() => void exportDiagnostics()}
               onClose={() => setShowSettings(false)}
             />

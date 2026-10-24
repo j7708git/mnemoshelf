@@ -394,6 +394,7 @@ export type { IndexRate, McpConfig, ServerConfig } from "./config.js";
 export {
   AGENT_RUNTIME_SCHEMA_VERSION,
   createAgentDiscovery,
+  parseRuntimeFile,
   readRuntimeFile,
   removeRuntimeFile,
   removeRuntimeFileIfOwned,
@@ -421,6 +422,7 @@ export {
   IndexInProgressError,
   InvalidHostError,
   InvalidRequestUrlError,
+  McpConnectionError,
   MethodNotAllowedError,
   MissingMcpConfigError,
   MissingTokenError,
@@ -432,6 +434,7 @@ export {
   UnsupportedFileTypeError,
   ValidationError,
 } from "./errors.js";
+export type { McpConnectionFailureReason } from "./errors.js";
 export { IndexStatusTracker } from "./index-status.js";
 export type { IndexErrorInfo, IndexState, IndexStatus } from "./index-status.js";
 export {
@@ -522,6 +525,20 @@ export type {
   UnifiedSearchResult,
 } from "./search.js";
 export { createMcpServer, MCP_TOOLS, resolveProjectName, runStdio, UNTRUSTED_DATA_WARNING } from "./mcp/stdio.js";
+export {
+  checkServiceHealth,
+  describeMcpConnectionFailure,
+  isProcessAlive,
+  MCP_HEALTH_TIMEOUT_MS,
+  resolveMcpConnection,
+  runtimeCandidates,
+} from "./mcp/runtime-connection.js";
+export type {
+  HealthCheckResult,
+  McpConnection,
+  McpConnectionSource,
+  ResolveMcpConnectionOptions,
+} from "./mcp/runtime-connection.js";
 export { containsRedacted, maskSecrets, REDACTED_PREFIX } from "./secret-masking.js";
 export type { MaskSecretsResult, SecretKind } from "./secret-masking.js";
 export type { McpServerOptions, ProjectResolution, ResolveProjectOptions } from "./mcp/stdio.js";

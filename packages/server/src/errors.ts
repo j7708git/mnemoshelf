@@ -27,6 +27,43 @@ export class MissingMcpConfigError extends Error {
   }
 }
 
+/**
+ * MCP 入口無法解析出可用連線（環境變數不完整，且連線資訊檔也不可用）。
+ *
+ * `reason` 是穩定字串（可程式比對）；訊息只說明「要怎麼解決」，**不含路徑、不含 token**。
+ * 與 `MissingMcpConfigError` 分開的原因：後者只代表「環境變數少了哪些」，
+ * 而這裡代表「連線資訊檔也救不了」，兩者的使用者動作不同（補環境變數 vs 開啟功能／重啟）。
+ */
+export type McpConnectionFailureReason =
+  /** 沒有任何連線來源（既無環境變數，也找不到連線資訊檔）。 */
+  | "no-config"
+  /** 使用者明確指定了連線資訊檔路徑，但檔案不存在或讀不出來。 */
+  | "runtime-missing"
+  /** 連線資訊檔格式不符（缺 schemaVersion／url／token／pid）。 */
+  | "runtime-invalid"
+  /** 環境變數的網址與連線資訊檔不一致，token 的歸屬不明。 */
+  | "identity-mismatch"
+  /** 連線資訊檔所指的行程已經結束（舊檔）。 */
+  | "pid-dead"
+  /** `/health` 逾時。 */
+  | "health-timeout"
+  /** `/health` 連不上。 */
+  | "health-unreachable"
+  /** `/health` 有回應但不是 mnemoshelf（服務身分不符）。 */
+  | "health-identity-mismatch";
+
+/** MCP 入口的連線解析失敗。 */
+export class McpConnectionError extends Error {
+  /** 穩定的失敗原因標籤。 */
+  readonly reason: McpConnectionFailureReason;
+
+  constructor(reason: McpConnectionFailureReason, message: string) {
+    super(message);
+    this.name = "McpConnectionError";
+    this.reason = reason;
+  }
+}
+
 /** token 缺失或不正確（HTTP 401）。訊息不回傳收到的值。 */
 export class UnauthorizedError extends Error {
   constructor(reason = "缺少或錯誤的 Authorization: Bearer token") {

@@ -48,6 +48,7 @@ import { downloadModelFiles } from "./model-download.js";
 import { MODEL_PROFILE } from "./model-profile.js";
 import { formatProbe, probeNativeModules } from "./native-probe.js";
 import { buildServerEnv, parseCliArgs, resolveDesktopPaths, type DesktopPaths } from "./paths.js";
+import { buildMcpConfigSnippet, resolveMcpEntryPath } from "./mcp-entry.js";
 import { loadOrCreateToken, toTokenInfo, type TokenInfo } from "./token-store.js";
 import { createTrayImage } from "./tray-icon.js";
 
@@ -432,6 +433,27 @@ function registerIpcHandlers(): void {
       // Electron 44 的 clipboard 是 Promise API：要等寫入完成才回報成功。
       await clipboard.writeText(JSON.stringify({ url: server.url, token: tokenValue }));
       log("已將連線資訊複製到剪貼簿（含 token；不寫進 log）");
+      return { copied: true, url: server.url };
+    },
+  );
+  ipcMain.handle(
+    DESKTOP_CHANNELS.settingsCopyMcpConfig,
+    async (event): Promise<{ copied: boolean; url: string | null }> => {
+      assertTrustedSender(event);
+      if (server === null || desktopPaths === null) return { copied: false, url: null };
+      // 片段**不含 token**：MCP 入口會自己讀 runtime.json 取得連線資訊。
+      // 這是刻意的——全權憑證不必經過剪貼簿與第三方的 MCP 設定檔。
+      const entryPath = resolveMcpEntryPath({
+        isPackaged: app.isPackaged,
+        resourcesPath: process.resourcesPath,
+        appPath: app.getAppPath(),
+      });
+      const snippet = buildMcpConfigSnippet({
+        entryPath,
+        runtimeFile: desktopPaths.runtimeFile,
+      });
+      await clipboard.writeText(snippet);
+      log("已將 MCP 設定片段複製到剪貼簿（不含 token；不寫進 log）");
       return { copied: true, url: server.url };
     },
   );

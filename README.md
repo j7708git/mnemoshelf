@@ -71,7 +71,7 @@ TypeScript／Node.js／pnpm；桌面殼是 Electron＋React，Web UI 用 Vite＋
 | [docs/building.md](docs/building.md) | 從原始碼建置、各平台產物、簽章與公證警告、LGPL 合規 |
 | [docs/operations.md](docs/operations.md) | REST 端點速查、MCP 工具、環境變數總表、索引排隊與取消 |
 | [docs/opencode-plugin.md](docs/opencode-plugin.md) | OpenCode／OpenChamber 外掛：安裝、召回行為、回合摘要 |
-| [docs/agent-integration.md](docs/agent-integration.md) | `runtime.json` 連線資訊檔與 MCP 設定範例 |
+| [docs/agent-integration.md](docs/agent-integration.md) | `runtime.json` 連線資訊檔與 MCP 設定片段（入口會自動讀檔，不必手動貼 token） |
 | [docs/roots-and-privacy.md](docs/roots-and-privacy.md) | root 規則、路徑安全、機密遮罩、信任模型、資料刪除 |
 | [docs/storage-ports.md](docs/storage-ports.md) | 搜尋模式、記憶欄位與檢索、匯出／匯入、PostgreSQL 後端 |
 | [docs/embedder-contract.md](docs/embedder-contract.md) | embedder 能力宣告、執行裝置與退回、CoreML 風險 |

@@ -34,6 +34,10 @@ export interface SettingsPanelProps {
   onCopyConnectionInfo: () => void;
   /** 複製結果的提示（含 token 警語在固定文案裡）。 */
   connectionNotice: string | null;
+  /** 「複製 MCP 設定片段」：由 main process 把可直接貼用的設定放進剪貼簿（不含 token）。 */
+  onCopyMcpConfig: () => void;
+  /** MCP 設定片段的複製結果提示。 */
+  mcpConfigNotice: string | null;
   onExportDiagnostics: () => void;
   onClose: () => void;
 }
@@ -112,6 +116,8 @@ export function SettingsPanel({
   onToggleAgentDiscovery,
   onCopyConnectionInfo,
   connectionNotice,
+  onCopyMcpConfig,
+  mcpConfigNotice,
   onExportDiagnostics,
   onClose,
 }: SettingsPanelProps) {
@@ -208,6 +214,27 @@ export function SettingsPanel({
               <p className="text-xs text-muted">
                 複製的內容是 <code>{'{"url","token"}'}</code>，<strong>包含 token</strong>：只貼給信任的程式，
                 不要放進版本控制、共用的設定檔或聊天訊息。
+              </p>
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  id="mnemoshelf-mcp-copy"
+                  type="button"
+                  onClick={onCopyMcpConfig}
+                  disabled={!agentDiscovery.present}
+                  className="rounded-md border border-line px-3 py-1.5 text-sm text-ink disabled:opacity-40"
+                >
+                  複製 MCP 設定片段
+                </button>
+                {mcpConfigNotice !== null && (
+                  <span role="status" className="text-xs text-muted">
+                    {mcpConfigNotice}
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-muted">
+                給 MCP client（Claude Code、Codex 等）用的設定片段：貼進它的 MCP 設定檔、重啟它就能連上。
+                這段<strong>不含 token</strong>——MCP 入口會自己讀上面那份連線資訊檔取得憑證，
+                全權憑證不必經過剪貼簿。
               </p>
               {agentDiscovery.error !== null && (
                 <p role="alert" className="text-sm text-red-600">
