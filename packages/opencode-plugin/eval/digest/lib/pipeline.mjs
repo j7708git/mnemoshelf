@@ -34,9 +34,6 @@ export const DIGEST_SETTINGS = {
   timeoutMs: 1000,
   digestEnabled: true,
   digestModel: DIGEST_MODEL,
-  digestMaxPerTurn: 3,
-  digestMaxPerSession: 100,
-  digestMaxPerDay: 1000,
 };
 
 /** 只做召回（digest 關閉）的 plugin options。 */
@@ -204,7 +201,7 @@ export async function runDigestPipeline(input) {
       rejected = parsed.rejected;
       rawItemCount = countRawItems(raw);
       keptItemCount = parsed.items.length;
-      cards = digest.buildDigestCards(parsed, settings.digestMaxPerTurn);
+      cards = digest.buildDigestCards(parsed);
     }
 
     // 實際 POST 內容 vs buildDigestCards 的輸出（同一回合、同一順序）。

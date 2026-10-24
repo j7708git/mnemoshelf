@@ -251,7 +251,6 @@ async function main() {
       },
       settings: {
         digestTimeoutMs: 45000,
-        digestMaxPerTurn: 3,
         recentTurns: 3,
         minScore: 0.4,
         recallTimeoutMs: 1000,

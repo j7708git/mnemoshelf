@@ -128,37 +128,23 @@ describe("readSettings", () => {
     const settings = readSettings(undefined);
     expect(settings.digestEnabled).toBe(false);
     expect(settings.digestModel).toBeNull();
-    expect(settings.digestMaxPerTurn).toBe(3);
-    expect(settings.digestMaxPerSession).toBe(20);
-    expect(settings.digestMaxPerDay).toBe(100);
     expect(settings.digestOnInterrupted).toBe(false);
   });
 
-  it("digest 設定值夾在範圍內並回報 out-of-range", () => {
+  it("digest 設定值合法時不回報 warning", () => {
     const warnings: { key: string; reason: string }[] = [];
     const settings = readSettings(
       {
         digestEnabled: true,
         digestModel: "cheap/test-model",
-        digestMaxPerTurn: 99,
-        digestMaxPerSession: 1000,
-        digestMaxPerDay: 5000,
         digestOnInterrupted: true,
       },
       (warning) => warnings.push(warning),
     );
     expect(settings.digestEnabled).toBe(true);
     expect(settings.digestModel).toBe("cheap/test-model");
-    expect(settings.digestMaxPerTurn).toBe(5);
-    expect(settings.digestMaxPerSession).toBe(100);
-    expect(settings.digestMaxPerDay).toBe(1000);
     expect(settings.digestOnInterrupted).toBe(true);
-    expect(warnings.map((warning) => warning.key).sort()).toEqual([
-      "digestMaxPerDay",
-      "digestMaxPerSession",
-      "digestMaxPerTurn",
-    ]);
-    expect(warnings.every((warning) => warning.reason === "out-of-range")).toBe(true);
+    expect(warnings).toEqual([]);
   });
 
   it("digest 非法型別回退預設並記 warning（不含值）", () => {
@@ -167,18 +153,15 @@ describe("readSettings", () => {
       {
         digestEnabled: "yes",
         digestModel: "沒有斜線的模型",
-        digestMaxPerTurn: "很多",
         digestOnInterrupted: 1,
       },
       (warning) => warnings.push(warning),
     );
     expect(settings.digestEnabled).toBe(false);
     expect(settings.digestModel).toBeNull();
-    expect(settings.digestMaxPerTurn).toBe(3);
     expect(settings.digestOnInterrupted).toBe(false);
     expect(warnings.map((warning) => warning.key).sort()).toEqual([
       "digestEnabled",
-      "digestMaxPerTurn",
       "digestModel",
       "digestOnInterrupted",
     ]);

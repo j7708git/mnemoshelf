@@ -521,24 +521,6 @@ describe("digest：回合紀錄（episodic memory）", () => {
     expect(harness.posts.map((post) => post.body.sourceMessage)).toEqual(["a1", "a2"]);
   });
 
-  it("digestMaxPerTurn=1 時只寫回合卡、不寫 items", async () => {
-    const harness = await setup({ settings: digestSettings({ digestMaxPerTurn: 1 }) });
-    harness.setTurn([user("u1", TURN1_USER), assistant("a1", text(TURN1_ASSISTANT))]);
-    harness.generate = async () => ({
-      text: turnOutput("討論主題；結論行之。", [
-        { content: "第一張", kind: "fact", quote: "預設關閉" },
-        { content: "第二張", kind: "fact", quote: "每回合抽取" },
-      ]),
-    });
-
-    await harness.settle(succeeded());
-
-    expect(harness.posts).toHaveLength(1);
-    expect(harness.posts[0].body.agent).toBe("opencode-plugin/turn");
-    expect(harness.posts[0].body.content).toBe("討論主題；結論行之。");
-    expect(harness.logs.join("\n")).toContain('"items":3');
-  });
-
   it("回合卡寫入失敗不影響 items", async () => {
     const harness = await setup({ settings: digestSettings() });
     harness.setTurn([user("u1", TURN1_USER), assistant("a1", text(TURN1_ASSISTANT))]);
@@ -860,7 +842,7 @@ describe("digest：失敗與邊界", () => {
     expect(harness.logs.join("\n")).toContain('"reason":"timeout"');
   });
 
-  it("模型失敗：reason 為 <name>: <message>、不含對話內容，且不消耗 digest 預算", async () => {
+  it("模型失敗：reason 為 <name>: <message>、不含對話內容，且今日統計只記呼叫與回合失敗", async () => {
     const harness = await setup({ settings: digestSettings() });
     harness.setTurn([user("u1", TURN1_USER), assistant("a1", text(TURN1_ASSISTANT))]);
     harness.generate = async () => {
@@ -881,14 +863,19 @@ describe("digest：失敗與邊界", () => {
     expect(log).not.toContain(TURN1_USER);
     expect(log).not.toContain(TURN1_ASSISTANT);
 
-    // 模型失敗發生在 reserve 之前：預算計數不得增加。
-    const counters = [...harness.storage.map.keys()].filter(
-      (key) => key.startsWith("digest-day:") || key.startsWith("digest-session:"),
-    );
-    expect(counters).toEqual([]);
+    // 模型失敗：沒有寫入統計，只記一次呼叫與一次回合失敗。
+    const statsKey = [...harness.storage.map.keys()].find((key) => key.startsWith("digest-stats:"));
+    expect(statsKey).toBeDefined();
+    expect(harness.storage.map.get(statsKey as string)).toMatchObject({
+      calls: 1,
+      ok: 0,
+      duplicate: 0,
+      failed: 0,
+      callFailed: 1,
+    });
 
     const status = await harness.status();
-    expect(status).toContain("今日已寫 0 筆");
+    expect(status).toContain("今日 呼叫 1｜寫入 0｜重複 0｜失敗 0（回合 1）");
     expect(status).toContain("失敗：Generate.ModelSelectionError: Model unavailable: cheap/test-model");
   });
 });
@@ -977,58 +964,136 @@ describe("digest：檔案型診斷紀錄", () => {
   });
 });
 
-describe("digest：預算與狀態", () => {
-  it("每回合上限生效", async () => {
-    const harness = await setup({ settings: digestSettings({ digestMaxPerTurn: 1 }) });
+describe("digest：寫入結果與今日統計", () => {
+  it("模型回空：不寫卡、不造假回合卡、標記去重、state ok", async () => {
+    const harness = await setup({ settings: digestSettings() });
+    harness.setTurn([user("u1", TURN1_USER), assistant("a1", text(TURN1_ASSISTANT))]);
+    harness.generate = async () => ({ text: '{"turn":"","items":[]}' });
+
+    await harness.settle(succeeded());
+
+    expect(harness.posts).toHaveLength(0);
+    expect(harness.generateCalls).toHaveLength(1);
+    // 去重鍵有寫入：同一事件重送不再花模型錢。
+    expect(harness.storage.map.has("digest:s1:a1")).toBe(true);
+    const last = JSON.parse((await harness.readLog()).at(-1) ?? "{}") as Record<string, unknown>;
+    expect(last).toMatchObject({ state: "ok", written: 0, items: 0, duplicates: 0, failed: 0, cards: [] });
+
+    await harness.settle(succeeded());
+    expect(harness.generateCalls).toHaveLength(1);
+  });
+
+  it("duplicate 不計入 written，逐卡結果寫進 digest.log", async () => {
+    const harness = await setup({ settings: digestSettings() });
+    harness.setTurn([user("u1", TURN1_USER), assistant("a1", text(TURN1_ASSISTANT))]);
+    harness.generate = async () => ({ text: itemsFor("既有卡片", "預設關閉") });
+    harness.postMemory = async () => jsonResponse({ id: 7, duplicate: true }, 200);
+
+    await harness.settle(succeeded());
+
+    expect(harness.posts).toHaveLength(1);
+    const entry = JSON.parse((await harness.readLog()).at(-1) ?? "{}") as Record<string, unknown>;
+    expect(entry).toMatchObject({ state: "ok", written: 0, duplicates: 1, failed: 0 });
+    expect(entry.cards).toEqual([{ role: "item", state: "duplicate" }]);
+
+    const status = await harness.status();
+    expect(status).toContain("成功寫入 0 筆（重複 1 筆）");
+    expect(status).toContain("今日 呼叫 1｜寫入 0｜重複 1｜失敗 0（回合 0）");
+  });
+
+  it("部分失敗：state ok、written 1／failed 1，失敗卡恰好請求 2 次", async () => {
+    const harness = await setup({ settings: digestSettings() });
     harness.setTurn([user("u1", TURN1_USER), assistant("a1", text(TURN1_ASSISTANT))]);
     harness.generate = async () => ({
-      text: JSON.stringify({
-        items: [
-          { content: "第一張", kind: "fact", quote: "預設關閉" },
-          { content: "第二張", kind: "fact", quote: "成本考量" },
-          { content: "第三張", kind: "fact", quote: "每回合抽取" },
-        ],
-      }),
+      text: turnOutput("討論主題；結論：部分失敗照樣完成。", [
+        { content: "原子記憶會失敗", kind: "decision", quote: "預設關閉" },
+      ]),
     });
+    harness.postMemory = async (body) => {
+      if (body.agent === "opencode-plugin") return jsonResponse({ error: "boom" }, 500);
+      return jsonResponse({ id: 1, duplicate: false }, 201);
+    };
+
     await harness.settle(succeeded());
-    expect(harness.posts).toHaveLength(1);
-    expect(harness.posts[0].body.content).toBe("第一張");
+
+    // 回合卡 1 次成功；item 卡重試後共 2 次。
+    expect(harness.posts).toHaveLength(3);
+    expect(harness.posts.filter((post) => post.body.agent === "opencode-plugin/turn")).toHaveLength(1);
+    expect(harness.posts.filter((post) => post.body.agent === "opencode-plugin")).toHaveLength(2);
+
+    const entry = JSON.parse((await harness.readLog()).at(-1) ?? "{}") as Record<string, unknown>;
+    expect(entry).toMatchObject({ state: "ok", written: 1, failed: 1, duplicates: 0 });
+    expect(entry.cards).toEqual([
+      { role: "turn", state: "ok" },
+      { role: "item", state: "failed", status: 500 },
+    ]);
+
+    const status = await harness.status();
+    expect(status).toContain("成功寫入 1 筆（失敗 1 筆）");
   });
 
-  it("每 session 上限生效，/memory 標示已達上限", async () => {
-    const harness = await setup({ settings: digestSettings({ digestMaxPerSession: 1 }) });
+  it("全部失敗：state failed、逐卡結果仍可見、不標記去重", async () => {
+    const harness = await setup({ settings: digestSettings() });
+    harness.setTurn([user("u1", TURN1_USER), assistant("a1", text(TURN1_ASSISTANT))]);
+    harness.generate = async () => ({ text: turnOutput("討論主題；結論：全失敗。") });
+    harness.postMemory = async () => jsonResponse({ error: "boom" }, 500);
+
+    await harness.settle(succeeded());
+
+    expect(harness.posts).toHaveLength(2);
+    const entry = JSON.parse((await harness.readLog()).at(-1) ?? "{}") as Record<string, unknown>;
+    expect(entry).toMatchObject({ state: "failed", reason: "http-500", written: 0, failed: 1 });
+    expect(entry.cards).toEqual([{ role: "turn", state: "failed", status: 500 }]);
+    expect(harness.storage.map.has("digest:s1:a1")).toBe(false);
+  });
+
+  it("/memory 顯示今日統計：三種結果各自計數", async () => {
+    const harness = await setup({ settings: digestSettings() });
     const turns = threeTurns();
-    harness.generate = async (input) => ({
-      text: itemsFor("卡片", input.prompt.includes("第二回合") ? "去重鍵長什麼樣子" : "預設關閉"),
-    });
+    harness.generate = async (input) => {
+      if (input.prompt.includes("第一回合")) return { text: itemsFor("成功卡", "預設關閉") };
+      if (input.prompt.includes("第二回合")) return { text: itemsFor("重複卡", "去重鍵") };
+      return { text: itemsFor("失敗卡", "interrupted") };
+    };
+    harness.postMemory = async (body) => {
+      if (body.content === "成功卡") return jsonResponse({ id: 1, duplicate: false }, 201);
+      if (body.content === "重複卡") return jsonResponse({ id: 2, duplicate: true }, 200);
+      return jsonResponse({ error: "boom" }, 500);
+    };
+
     harness.setTurn(turns.slice(0, 2));
     await harness.settle(succeeded());
     harness.setTurn(turns.slice(0, 4));
     await harness.settle(succeeded());
-    expect(harness.posts).toHaveLength(1);
-    expect(harness.logs.join("\n")).toContain('"reason":"session-budget"');
+    harness.setTurn(turns);
+    await harness.settle(succeeded());
+
     const status = await harness.status();
-    expect(status).toContain("本 session 已達上限");
-    expect(status).toContain("今日已寫 1 筆");
+    expect(status).toContain("今日 呼叫 3｜寫入 1｜重複 1｜失敗 1（回合 0）");
   });
 
-  it("每日上限生效，/memory 顯示今日已達上限", async () => {
-    const harness = await setup({ settings: digestSettings({ digestMaxPerDay: 1 }) });
-    const turns = threeTurns();
-    harness.generate = async (input) => ({
-      text: itemsFor("卡片", input.prompt.includes("第二回合") ? "去重鍵長什麼樣子" : "預設關閉"),
-    });
-    harness.setTurn(turns.slice(0, 2));
+  it("未連線時 /memory 說「未知（未連線）」，不拿本機數字冒充", async () => {
+    const harness = await setup({ settings: digestSettings(), env: {} });
+    harness.setTurn([user("u1", TURN1_USER), assistant("a1", text(TURN1_ASSISTANT))]);
     await harness.settle(succeeded());
-    harness.setTurn(turns.slice(0, 4));
-    await harness.settle(succeeded());
-    expect(harness.posts).toHaveLength(1);
-    expect(harness.logs.join("\n")).toContain('"reason":"daily-budget"');
+
     const status = await harness.status();
-    expect(status).toContain("今日摘要已達上限");
+    expect(status).toContain("今日：未知（未連線）");
   });
 
-  it("/memory 顯示 digest 開關、模型、今日筆數與最近結果", async () => {
+  it("統計讀不到時 /memory 說「今日：未知」", async () => {
+    const storage = memoryStorage();
+    storage.scan = async () => {
+      throw new Error("storage down");
+    };
+    const harness = await setup({ settings: digestSettings(), storage });
+
+    const status = await harness.status();
+    expect(status).toContain("今日：未知");
+    expect(status).not.toContain("今日：未知（未連線）");
+  });
+
+  it("/memory 顯示 digest 開關、模型、今日統計與最近結果（不再有 max）", async () => {
     const harness = await setup({ settings: digestSettings() });
     harness.setTurn([user("u1", TURN1_USER), assistant("a1", text(TURN1_ASSISTANT))]);
     harness.generate = async () => ({ text: itemsFor("卡片一", "預設關閉") });
@@ -1036,19 +1101,25 @@ describe("digest：預算與狀態", () => {
 
     const status = await harness.status();
     expect(status).toContain("摘要：開啟（模型 cheap/test-model");
-    expect(status).toContain("每回合 ≤3");
-    expect(status).toContain("每 session ≤20");
-    expect(status).toContain("每日 ≤100");
-    expect(status).toContain("今日已寫 1 筆");
+    expect(status).toContain("今日 呼叫 1｜寫入 1｜重複 0｜失敗 0（回合 0）");
     expect(status).toContain("成功寫入 1 筆");
+    expect(status).not.toContain("每回合 ≤");
+    expect(status).not.toContain("每 session ≤");
+    expect(status).not.toContain("每日 ≤");
     expect(status).not.toContain("test-token-value");
   });
 
-  it("啟動時 prune 超過 30 天的去重鍵與計數", async () => {
+  it("啟動時 prune 超過 30 天的去重鍵與今日統計", async () => {
     const storage = memoryStorage();
     storage.map.set("digest:s1:old-assistant", { day: "2020-01-01" });
-    storage.map.set("digest-session:old-session", { count: 5, updatedAt: "2020-01-01T00:00:00.000Z" });
-    storage.map.set("digest-day:2020-01-01", { count: 7, updatedAt: "2020-01-01T00:00:00.000Z" });
+    storage.map.set("digest-stats:2020-01-01", {
+      calls: 5,
+      ok: 7,
+      duplicate: 0,
+      failed: 0,
+      callFailed: 0,
+      updatedAt: "2020-01-01T00:00:00.000Z",
+    });
 
     const harness = await setup({
       settings: digestSettings(),
@@ -1061,9 +1132,8 @@ describe("digest：預算與狀態", () => {
     await tick();
 
     expect(storage.map.has("digest:s1:old-assistant")).toBe(false);
-    expect(storage.map.has("digest-session:old-session")).toBe(false);
-    expect(storage.map.has("digest-day:2020-01-01")).toBe(false);
-    // 當日的計數仍保留。
-    expect([...storage.map.keys()].some((key) => key.startsWith("digest-day:"))).toBe(true);
+    expect(storage.map.has("digest-stats:2020-01-01")).toBe(false);
+    // 當日的統計仍保留。
+    expect([...storage.map.keys()].some((key) => key.startsWith("digest-stats:"))).toBe(true);
   });
 });

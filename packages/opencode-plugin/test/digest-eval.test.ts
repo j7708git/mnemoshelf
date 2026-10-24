@@ -16,12 +16,11 @@ import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  MAX_DIGEST_ITEMS,
   buildDigestCards,
   countDigestCards,
   parseDigestItems,
   resolveDigestTurn,
-  type DigestItem,
-  type DigestParseResult,
 } from "../src/digest.js";
 import { createMemoryRuntime, type RuntimeCleanup } from "../src/recall.js";
 import type {
@@ -49,69 +48,54 @@ afterEach(async () => {
 });
 
 /* ------------------------------------------------------------------ *
- * 1. 純函式 parity
+ * 1. 輸出形狀（寫死，不可設定）
  * ------------------------------------------------------------------ */
 
-/** 重構前寫在 `runDigest()` 裡的組卡邏輯（逐字照抄，作為對照組）。 */
-function legacyBuildDigestCards(
-  parsed: DigestParseResult,
-  digestMaxPerTurn: number,
-): { item: DigestItem; agent: string; force: boolean }[] {
-  const cards: { item: DigestItem; agent: string; force: boolean }[] = [];
-  if (parsed.turn !== null) {
-    cards.push({
-      item: { content: parsed.turn, kind: "fact", quote: "" },
+/** 引號片段都真的出現在原文裡；`quote` 驗證會逐句比對。 */
+const SHAPE_SOURCE = "第一句：決定採用指數退避。第二句：快取上限是 32。第三句：日誌用 snake_case。";
+
+const THREE_ITEMS = [
+  { content: "指數退避可以避免重試風暴。", kind: "decision", quote: "指數退避" },
+  { content: "快取需要上限。", kind: "pitfall", quote: "快取上限" },
+  { content: "日誌欄位用 snake_case。", kind: "preference", quote: "snake_case" },
+];
+
+describe("buildDigestCards：輸出形狀固定", () => {
+  it("turn＋3 items → 3 張（回合卡在前、items 由 parser 截到 2）", () => {
+    const parsed = parseDigestItems(
+      JSON.stringify({ turn: "回合紀錄", items: THREE_ITEMS }),
+      SHAPE_SOURCE,
+      MAX_DIGEST_ITEMS,
+    );
+    expect(parsed.error).toBeUndefined();
+    expect(parsed.items).toHaveLength(2);
+    const cards = buildDigestCards(parsed);
+    expect(cards).toHaveLength(3);
+    expect(cards[0]).toEqual({
+      item: { content: "回合紀錄", kind: "fact", quote: "" },
       agent: "opencode-plugin/turn",
       force: true,
     });
-  }
-  for (const item of parsed.items) {
-    cards.push({ item, agent: "opencode-plugin", force: false });
-  }
-  if (cards.length > digestMaxPerTurn) cards.length = digestMaxPerTurn;
-  return cards;
-}
-
-function item(content: string): DigestItem {
-  return { content, kind: "fact", quote: "quote" };
-}
-
-const PARITY_INPUTS: DigestParseResult[] = [
-  { turn: null, items: [], rejected: 0 },
-  { turn: null, items: [item("原子記憶一")], rejected: 0 },
-  { turn: "回合紀錄", items: [], rejected: 0 },
-  { turn: "回合紀錄", items: [item("原子記憶一")], rejected: 0 },
-  { turn: "回合紀錄", items: [item("原子記憶一"), item("原子記憶二")], rejected: 0 },
-  { turn: "回合紀錄", items: [item("一"), item("二"), item("三")], rejected: 2 },
-  { turn: null, items: [item("一"), item("二"), item("三")], rejected: 0 },
-];
-
-describe("buildDigestCards：重構 parity", () => {
-  it("與重構前的組卡邏輯逐位元等價（digestMaxPerTurn 0–5 全矩陣）", () => {
-    for (const parsed of PARITY_INPUTS) {
-      for (let max = 0; max <= 5; max += 1) {
-        expect(buildDigestCards(parsed, max)).toEqual(legacyBuildDigestCards(parsed, max));
-      }
-    }
+    expect(cards.slice(1).map((card) => card.item.content)).toEqual([
+      "指數退避可以避免重試風暴。",
+      "快取需要上限。",
+    ]);
+    expect(cards.slice(1).every((card) => card.agent === "opencode-plugin" && card.force === false)).toBe(true);
+    expect(countDigestCards(parsed)).toBe(3);
   });
 
-  it("回合卡在前（fact／force）、原子記憶在後，且截斷前候選數不受上限影響", () => {
-    const parsed: DigestParseResult = {
-      turn: "回合紀錄",
-      items: [item("原子記憶一"), item("原子記憶二")],
-      rejected: 0,
-    };
-    expect(buildDigestCards(parsed, 5)).toEqual([
-      { item: { content: "回合紀錄", kind: "fact", quote: "" }, agent: "opencode-plugin/turn", force: true },
-      { item: item("原子記憶一"), agent: "opencode-plugin", force: false },
-      { item: item("原子記憶二"), agent: "opencode-plugin", force: false },
-    ]);
-    // 上限 2：先保留回合卡，再保留第一則原子記憶（與舊行為一致）。
-    expect(buildDigestCards(parsed, 2)).toHaveLength(2);
-    expect(buildDigestCards(parsed, 2)[1].item.content).toBe("原子記憶一");
-    expect(countDigestCards(parsed)).toBe(3);
-    expect(buildDigestCards(parsed, 0)).toEqual([]);
-    expect(countDigestCards({ turn: null, items: [], rejected: 0 })).toBe(0);
+  it("只有 items（3 則原始輸出）→ 2 張，且沒有回合卡", () => {
+    const parsed = parseDigestItems(JSON.stringify({ items: THREE_ITEMS }), SHAPE_SOURCE, MAX_DIGEST_ITEMS);
+    expect(parsed.turn).toBeNull();
+    const cards = buildDigestCards(parsed);
+    expect(cards).toHaveLength(2);
+    expect(cards.every((card) => card.agent === "opencode-plugin")).toBe(true);
+  });
+
+  it("空結果 → 0 張（不造假回合卡）", () => {
+    const parsed = parseDigestItems('{"turn":"","items":[]}', SHAPE_SOURCE, MAX_DIGEST_ITEMS);
+    expect(buildDigestCards(parsed)).toEqual([]);
+    expect(countDigestCards(parsed)).toBe(0);
   });
 });
 
@@ -212,9 +196,6 @@ async function runParityRuntime(): Promise<{ posts: Record<string, unknown>[]; c
     options: {
       digestEnabled: true,
       digestModel: MODEL,
-      digestMaxPerTurn: 2,
-      digestMaxPerSession: 10,
-      digestMaxPerDay: 10,
     },
     location: { directory: LOCATION, project: { canonical: LOCATION, directory: LOCATION } },
     session: {
@@ -267,7 +248,7 @@ async function runParityRuntime(): Promise<{ posts: Record<string, unknown>[]; c
 }
 
 describe("runtime POST 內容 ≡ buildDigestCards", () => {
-  it("真 runtime 送出的每一張卡都等於純函式的輸出（含 digestMaxPerTurn 截斷）", async () => {
+  it("真 runtime 送出的每一張卡都等於純函式的輸出（形狀固定：turn＋最多 2 則）", async () => {
     const { posts, cleanup } = await runParityRuntime();
     try {
       const resolved = resolveDigestTurn([
@@ -277,18 +258,20 @@ describe("runtime POST 內容 ≡ buildDigestCards", () => {
       expect("turn" in resolved).toBe(true);
       if (!("turn" in resolved)) return;
 
-      const parsed = parseDigestItems(RAW_RESPONSE, resolved.turn.sourceText, 2);
-      const cards = buildDigestCards(parsed, 2);
+      const parsed = parseDigestItems(RAW_RESPONSE, resolved.turn.sourceText, MAX_DIGEST_ITEMS);
+      const cards = buildDigestCards(parsed);
       const expected = cards.map((card) =>
         digestPostBody(card, { sessionID: "s1", messageID: "a-1", project: "eval-parity" }),
       );
 
-      expect(cards).toHaveLength(2); // 回合卡 + 1 則 item（上限 2）
+      expect(cards).toHaveLength(3); // 回合卡 + 2 則 item
       expect(posts).toEqual(expected);
       // 額外鎖住「回合卡先寫、force=true；原子記憶 force 不帶」。
       expect(posts[0]).toMatchObject({ agent: "opencode-plugin/turn", kind: "fact", force: true });
       expect(posts[1]).toMatchObject({ agent: "opencode-plugin", kind: "decision" });
       expect(posts[1].force).toBeUndefined();
+      expect(posts[2]).toMatchObject({ agent: "opencode-plugin", kind: "pitfall" });
+      expect(posts[2].force).toBeUndefined();
     } finally {
       await cleanup();
     }

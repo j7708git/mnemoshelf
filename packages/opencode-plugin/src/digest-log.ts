@@ -67,6 +67,14 @@ export function digestSessionHash(sessionID: string): string {
 
 export type DigestLogState = "ok" | "skipped" | "failed";
 
+/** 單張卡的寫入結果（只記角色、狀態與 HTTP 狀態碼，不含內容）。 */
+export interface DigestLogCard {
+  role: "turn" | "item";
+  state: "ok" | "duplicate" | "failed";
+  /** HTTP 狀態碼（只有 failed 且拿得到時才有）。 */
+  status?: number;
+}
+
 /** 每次 digest 嘗試寫一行；欄位固定，順序固定（方便人眼與 grep）。 */
 export interface DigestLogEntry {
   /** 嘗試完成的時間（ISO 8601）。 */
@@ -82,8 +90,14 @@ export interface DigestLogEntry {
   latencyMs: number;
   /** 模型候選的卡片數；失敗或跳過時為 0。 */
   items: number;
-  /** 實際寫入的卡片數；失敗或跳過時為 0。 */
+  /** 實際寫入的卡片數（**不含** duplicate）；失敗或跳過時為 0。 */
   written: number;
+  /** server 回 `duplicate: true` 的卡數（可選；舊格式沒有）。 */
+  duplicates?: number;
+  /** 卡片寫入失敗數（可選；舊格式沒有）。 */
+  failed?: number;
+  /** 逐卡結果，順序與送出順序一致（可選；舊格式沒有）。 */
+  cards?: readonly DigestLogCard[];
 }
 
 /** 把一筆紀錄轉成單行 JSON（不含換行；`reason` 會截短）。 */
@@ -100,6 +114,16 @@ export function formatDigestLogLine(entry: DigestLogEntry): string {
   payload.latencyMs = entry.latencyMs;
   payload.items = entry.items;
   payload.written = entry.written;
+  // 新欄位只在有值時輸出：舊讀者仍能解析既有格式。
+  if (entry.duplicates !== undefined) payload.duplicates = entry.duplicates;
+  if (entry.failed !== undefined) payload.failed = entry.failed;
+  if (entry.cards !== undefined) {
+    payload.cards = entry.cards.map((card) => ({
+      role: card.role,
+      state: card.state,
+      ...(card.status === undefined ? {} : { status: card.status }),
+    }));
+  }
   return JSON.stringify(payload);
 }
 

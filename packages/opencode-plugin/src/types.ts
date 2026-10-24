@@ -40,12 +40,6 @@ export interface Settings {
   digestEnabled: boolean;
   /** digest 用的模型（`<providerID>/<modelID>`）；未設定＝跳過，不退回目前 session 模型。 */
   digestModel: string | null;
-  /** 每回合最多寫幾張卡（0–5）。 */
-  digestMaxPerTurn: number;
-  /** 每個 session 最多寫幾張卡（0–100）。 */
-  digestMaxPerSession: number;
-  /** 每日最多寫幾張卡（0–1000）。 */
-  digestMaxPerDay: number;
   /** `interrupted`（非 shutdown）是否也補寫；預設關閉。 */
   digestOnInterrupted: boolean;
   /** digest 模型呼叫／模型清單檢查的 timeout（毫秒，3000–120000）；預設 45000。 */
@@ -256,7 +250,7 @@ export interface PluginContextLike {
   generate?: GenerateDomainLike;
   /** 宿主可用模型清單（digest 啟動期驗證 `digestModel` 是否存在）。 */
   model?: ModelDomainLike;
-  /** plugin 專屬持久 KV（digest 的去重鍵與計數）。 */
+  /** plugin 專屬持久 KV（digest 的去重鍵與今日統計）。 */
   storage?: StorageLike;
 }
 

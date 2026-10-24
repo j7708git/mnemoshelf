@@ -12,6 +12,12 @@
  * - 同一 `sessionID` 的工作**串行**（promise 鏈）；不同 session 可並行。
  * - 全程 fire-and-forget：任何失敗只記結構化 log（不含對話內容、prompt、token），
  *   不影響 session、不重試超過一次。
+ *
+ * 外掛與 server 的職責邊界（刻意設計）：
+ * - 外掛：收回合事件、抓快照、呼叫摘要模型、把卡片送進 `POST /memories`；
+ *   除了「這一回合要不要記」之外不決定產品規則，也不保存記憶內容。
+ * - server：去重、儲存、查詢；不呼叫模型、不決定摘要內容。
+ * - 因此換宿主（例如未來的其他 agent）只需重寫這個檔的取樣與送出路徑，server 不用改。
  */
 import { DEFAULT_DIGEST_TIMEOUT_MS, parseDigestModel } from "./config.js";
 import { MEMORY_CONTEXT_OPEN, STATUS_SENTINEL, SYSTEM_REMINDER_PREFIX } from "./constants.js";
@@ -434,23 +440,24 @@ function candidateDigestCards(parsed: DigestParseResult): DigestCard[] {
 }
 
 /**
- * 這一回合實際要送出的卡片：候選卡片依 `digestMaxPerTurn` 截斷（回合紀錄優先保留）。
+ * 這一回合實際要送出的卡片：候選卡片（回合紀錄優先、原子記憶在後）。
+ *
+ * 輸出形狀**寫死**：1 張回合紀錄（有內容時）＋最多 `MAX_DIGEST_ITEMS`（2）則原子記憶；
+ * 「最多 2 則」由 `parseDigestItems()` 的 limit 保證，這裡不再截斷、也沒有任何設定可調。
  *
  * 純函式：不讀設定、不碰 store、不發請求。`runDigest()` 與 L3 的 harness 共用它，
  * 「harness 量到的卡片」因此就是「runtime 會 POST 的卡片」。
  */
-export function buildDigestCards(parsed: DigestParseResult, digestMaxPerTurn: number): DigestCard[] {
-  const cards = candidateDigestCards(parsed);
-  if (cards.length <= digestMaxPerTurn) return cards;
-  return cards.slice(0, Math.max(0, digestMaxPerTurn));
+export function buildDigestCards(parsed: DigestParseResult): DigestCard[] {
+  return candidateDigestCards(parsed);
 }
 
-/** 截斷前的候選卡片數（診斷與 `/memory` 的「候選 N 筆」用）。 */
+/** 這一回合的卡片數（診斷與 `/memory` 的「候選 N 筆」用）。 */
 export function countDigestCards(parsed: DigestParseResult): number {
   return candidateDigestCards(parsed).length;
 }
 
-/** `YYYY-MM-DD`（使用者本地時區；每日上限與計數鍵都用它）。 */
+/** `YYYY-MM-DD`（使用者本地時區；今日統計鍵用它）。 */
 export function formatDay(date: Date): string {
   const year = date.getFullYear();
   const month = `${date.getMonth() + 1}`.padStart(2, "0");
@@ -459,12 +466,11 @@ export function formatDay(date: Date): string {
 }
 
 /* ------------------------------------------------------------------ *
- * 持久狀態：去重鍵與計數（`ctx.storage`，失敗時退回 process 內快取）
+ * 持久狀態：去重鍵與今日統計（`ctx.storage`，失敗時退回 process 內快取）
  * ------------------------------------------------------------------ */
 
 const SEEN_PREFIX = "digest:";
-const SESSION_PREFIX = "digest-session:";
-const DAY_PREFIX = "digest-day:";
+const STATS_PREFIX = "digest-stats:";
 const SCAN_LIMIT = 200;
 const SCAN_MAX_PAGES = 20;
 const SEEN_HARD_LIMIT = 5000;
@@ -472,41 +478,55 @@ const SEEN_HARD_LIMIT = 5000;
 /** `ctx.storage` 的子集（見 `types.ts` 的 `StorageLike`）。 */
 export type DigestStoreHost = StorageLike;
 
-export interface DigestReservation {
-  /** 這次允許寫入的卡片數（0 代表被預算擋下）。 */
-  allowed: number;
-  reason?: "session-budget" | "daily-budget";
+/**
+ * 今日統計：只作 `/memory` 顯示，**不是上限**，不擋任何寫入。
+ *
+ * 這是 read-modify-write；多個外掛實例同時寫同一天時可能偏低（lost update）。
+ * 數字只用來回答「今天做了多少事」，不參與任何產品決策。
+ */
+export interface DigestDayStats {
+  /** 實際呼叫摘要模型的次數。 */
+  calls: number;
+  /** 成功寫入的卡數（不含 duplicate）。 */
+  ok: number;
+  /** server 回 `duplicate: true` 的卡數。 */
+  duplicate: number;
+  /** 卡片寫入失敗數（重試後仍失敗）。 */
+  failed: number;
+  /** 模型呼叫失敗或解析失敗的回合數。 */
+  callFailed: number;
+  /** 最後更新時間（ISO 8601）。 */
+  updatedAt: string;
 }
+
+export type DigestStatsDelta = Partial<Omit<DigestDayStats, "updatedAt">>;
 
 export interface DigestStore {
   prune(now: Date): Promise<void>;
   hasSeen(key: string): Promise<boolean>;
   markSeen(key: string, at: Date): Promise<void>;
-  sessionCount(sessionID: string): Promise<number>;
-  dayCount(day: string): Promise<number>;
-  reserve(input: {
-    sessionID: string;
-    day: string;
-    cards: number;
-    maxSession: number;
-    maxDay: number;
-    at: Date;
-  }): Promise<DigestReservation>;
+  /** 今日統計；`null`＝讀不到（顯示端要說「未知」，不可拿 0 冒充）。 */
+  dayStats(day: string): Promise<DigestDayStats | null>;
+  bumpStats(day: string, at: Date, delta: DigestStatsDelta): Promise<void>;
 }
 
-interface CountRecord {
-  count: number;
-  updatedAt: string;
+function emptyStats(): DigestDayStats {
+  return { calls: 0, ok: 0, duplicate: 0, failed: 0, callFailed: 0, updatedAt: "" };
 }
 
-function countFromValue(value: unknown): CountRecord | null {
+/** 讀統計值；缺欄位視為 0，任何一欄不合法就整筆丟棄（不猜半份資料）。 */
+function statsFromValue(value: unknown): DigestDayStats | null {
   if (typeof value !== "object" || value === null) return null;
-  const record = value as { count?: unknown; updatedAt?: unknown };
-  if (typeof record.count !== "number" || !Number.isFinite(record.count) || record.count < 0) return null;
-  return {
-    count: Math.floor(record.count),
-    updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : "",
-  };
+  const record = value as Record<string, unknown>;
+  const stats = emptyStats();
+  for (const field of ["calls", "ok", "duplicate", "failed", "callFailed"] as const) {
+    const raw = record[field];
+    if (raw === undefined) continue;
+    if (typeof raw !== "number" || !Number.isFinite(raw) || raw < 0) return null;
+    stats[field] = Math.floor(raw);
+  }
+  stats.updatedAt = typeof record.updatedAt === "string" ? record.updatedAt : "";
+  return stats;
 }
 
 function dayFromValue(value: unknown): string | null {
@@ -533,8 +553,9 @@ async function scanAll(host: DigestStoreHost, prefix: string): Promise<{ key: st
 
 class DigestStoreImpl implements DigestStore {
   private readonly seen = new Map<string, string>();
-  private readonly sessions = new Map<string, CountRecord>();
-  private readonly days = new Map<string, CountRecord>();
+  private readonly stats = new Map<string, DigestDayStats>();
+  /** 統計掃描是否成功；失敗時顯示端要說「今日：未知」。 */
+  private statsReadable = true;
   private loading: Promise<void> | null = null;
   private loaded = false;
 
@@ -559,16 +580,17 @@ class DigestStoreImpl implements DigestStore {
         const day = dayFromValue(entry.value);
         if (day !== null) this.seen.set(entry.key, day);
       }
-      for (const entry of await scanAll(host, SESSION_PREFIX)) {
-        const record = countFromValue(entry.value);
-        if (record !== null) this.sessions.set(entry.key.slice(SESSION_PREFIX.length), record);
-      }
-      for (const entry of await scanAll(host, DAY_PREFIX)) {
-        const record = countFromValue(entry.value);
-        if (record !== null) this.days.set(entry.key.slice(DAY_PREFIX.length), record);
+    } catch {
+      // storage 讀不到：退化成本次 process 的記憶體快取（去重仍在，只是跨行程不連續）。
+    }
+    try {
+      for (const entry of await scanAll(host, STATS_PREFIX)) {
+        const stats = statsFromValue(entry.value);
+        if (stats !== null) this.stats.set(entry.key.slice(STATS_PREFIX.length), stats);
       }
     } catch {
-      // storage 讀不到：退化成本次 process 的記憶體快取（去重與計數仍在，只是跨行程不連續）。
+      // 統計讀不到只影響顯示；寫入照常、記憶體快取照常累加。
+      this.statsReadable = false;
     }
   }
 
@@ -613,42 +635,28 @@ class DigestStoreImpl implements DigestStore {
     this.persist(key, { day });
   }
 
-  async sessionCount(sessionID: string): Promise<number> {
+  async dayStats(day: string): Promise<DigestDayStats | null> {
     await this.load();
-    return this.sessions.get(sessionID)?.count ?? 0;
+    const stored = this.stats.get(day);
+    if (stored !== undefined) return stored;
+    if (!this.statsReadable) return null;
+    return emptyStats();
   }
 
-  async dayCount(day: string): Promise<number> {
+  async bumpStats(day: string, at: Date, delta: DigestStatsDelta): Promise<void> {
     await this.load();
-    return this.days.get(day)?.count ?? 0;
-  }
-
-  async reserve(input: {
-    sessionID: string;
-    day: string;
-    cards: number;
-    maxSession: number;
-    maxDay: number;
-    at: Date;
-  }): Promise<DigestReservation> {
-    await this.load();
-    const sessionCount = this.sessions.get(input.sessionID)?.count ?? 0;
-    const dayCount = this.days.get(input.day)?.count ?? 0;
-    if (sessionCount >= input.maxSession) return { allowed: 0, reason: "session-budget" };
-    if (dayCount >= input.maxDay) return { allowed: 0, reason: "daily-budget" };
-    const allowed = Math.max(
-      0,
-      Math.min(input.cards, input.maxSession - sessionCount, input.maxDay - dayCount),
-    );
-    if (allowed === 0) return { allowed: 0, reason: "session-budget" };
-    const stamp = input.at.toISOString();
-    const sessionRecord: CountRecord = { count: sessionCount + allowed, updatedAt: stamp };
-    const dayRecord: CountRecord = { count: dayCount + allowed, updatedAt: stamp };
-    this.sessions.set(input.sessionID, sessionRecord);
-    this.days.set(input.day, dayRecord);
-    this.persist(`${SESSION_PREFIX}${input.sessionID}`, sessionRecord);
-    this.persist(`${DAY_PREFIX}${input.day}`, dayRecord);
-    return { allowed };
+    const current = this.stats.get(day) ?? emptyStats();
+    const add = (value: number | undefined): number => Math.max(0, Math.floor(value ?? 0));
+    const next: DigestDayStats = {
+      calls: current.calls + add(delta.calls),
+      ok: current.ok + add(delta.ok),
+      duplicate: current.duplicate + add(delta.duplicate),
+      failed: current.failed + add(delta.failed),
+      callFailed: current.callFailed + add(delta.callFailed),
+      updatedAt: at.toISOString(),
+    };
+    this.stats.set(day, next);
+    this.persist(`${STATS_PREFIX}${day}`, next);
   }
 
   async prune(now: Date): Promise<void> {
@@ -662,15 +670,11 @@ class DigestStoreImpl implements DigestStore {
       this.seen.delete(key);
       this.drop(key);
     }
-    for (const [key, record] of [...this.sessions]) {
-      if (record.updatedAt >= cutoffStamp) continue;
-      this.sessions.delete(key);
-      this.drop(`${SESSION_PREFIX}${key}`);
-    }
-    for (const [key, record] of [...this.days]) {
-      if (record.updatedAt >= cutoffStamp) continue;
-      this.days.delete(key);
-      this.drop(`${DAY_PREFIX}${key}`);
+    for (const [key, stats] of [...this.stats]) {
+      // 沒有 updatedAt 的舊資料一律視為過期。
+      if (stats.updatedAt !== "" && stats.updatedAt >= cutoffStamp) continue;
+      this.stats.delete(key);
+      this.drop(`${STATS_PREFIX}${key}`);
     }
   }
 }
@@ -798,15 +802,39 @@ export type DigestSkipReason =
   | "status-turn"
   | "empty"
   | "short"
-  | "already"
-  | "turn-budget"
-  | "session-budget"
-  | "daily-budget";
+  | "already";
+
+/** 單張卡的寫入結果（只記角色與狀態，不含內容）。 */
+export interface DigestCardResult {
+  role: "turn" | "item";
+  state: "ok" | "duplicate" | "failed";
+  /** HTTP 狀態碼（只有 failed 且拿得到時才有）。 */
+  status?: number;
+}
 
 export type DigestOutcome =
-  | { state: "ok"; at: string; written: number; items: number }
+  | {
+      state: "ok";
+      at: string;
+      /** 成功寫入的卡數（不含 duplicate）。 */
+      written: number;
+      /** 這一回合的候選卡片數。 */
+      items: number;
+      /** server 回 duplicate 的卡數。 */
+      duplicates: number;
+      /** 卡片寫入失敗數。 */
+      failed: number;
+      cards: DigestCardResult[];
+    }
   | { state: "skipped"; at: string; reason: DigestSkipReason }
-  | { state: "failed"; at: string; reason: string };
+  | {
+      state: "failed";
+      at: string;
+      reason: string;
+      /** 全部卡片都失敗時，逐卡結果仍要留給診斷。 */
+      cards?: DigestCardResult[];
+      failed?: number;
+    };
 
 /** 跳過原因的顯示文字（`/memory` 用；不含任何內容）。 */
 export function skipReasonText(reason: string): string {
@@ -851,12 +879,6 @@ export function skipReasonText(reason: string): string {
       return "本回合對話太短";
     case "already":
       return "同一回合已處理過";
-    case "turn-budget":
-      return "每回合上限為 0";
-    case "session-budget":
-      return "本 session 已達上限";
-    case "daily-budget":
-      return "今日摘要已達上限";
     default:
       return reason;
   }
@@ -1093,6 +1115,15 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
     return prunePromise;
   };
 
+  /** 今日統計遞增；任何失敗都吞掉（只供顯示，不得影響 digest 的結果）。 */
+  const bumpStats = async (day: string, delta: DigestStatsDelta): Promise<void> => {
+    try {
+      await store.bumpStats(day, now(), delta);
+    } catch {
+      // 統計寫不進去不影響這一輪的寫入。
+    }
+  };
+
   /**
    * 記一次嘗試：`/memory` 的最近結果（同步）＋檔案診斷紀錄（fire-and-forget）。
    *
@@ -1110,6 +1141,11 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
       latencyMs: measured,
       items: outcome.state === "ok" ? outcome.items : 0,
       written: outcome.state === "ok" ? outcome.written : 0,
+      ...(outcome.state === "ok"
+        ? { duplicates: outcome.duplicates, failed: outcome.failed, cards: outcome.cards }
+        : outcome.state === "failed" && outcome.cards !== undefined
+          ? { failed: outcome.failed ?? 0, cards: outcome.cards }
+          : {}),
     };
     const task = appendDigestLog(logFile, formatDigestLogLine(entry)).catch(() => undefined);
     pendingLogs.add(task);
@@ -1126,6 +1162,8 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
     if (outcome.state === "ok") {
       payload.written = outcome.written;
       payload.items = outcome.items;
+      payload.duplicates = outcome.duplicates;
+      payload.failed = outcome.failed;
     } else {
       payload.reason = outcome.reason;
     }
@@ -1249,25 +1287,11 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
       skip(sessionID, "already", startedAt);
       return;
     }
-    if (settings.digestMaxPerTurn <= 0) {
-      skip(sessionID, "turn-budget", startedAt);
-      return;
-    }
     if (project === null && deps.scope === "project") {
       skip(sessionID, "project-unresolved", startedAt);
       return;
     }
     const day = formatDay(startedAt);
-    const sessionCount = await store.sessionCount(sessionID);
-    if (sessionCount >= settings.digestMaxPerSession) {
-      skip(sessionID, "session-budget", startedAt);
-      return;
-    }
-    const dayCount = await store.dayCount(day);
-    if (dayCount >= settings.digestMaxPerDay) {
-      skip(sessionID, "daily-budget", startedAt);
-      return;
-    }
 
     const ownership = await checkOwnership(sessionID);
     if (!ownership.ok) {
@@ -1285,10 +1309,13 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
       return;
     }
 
+    // 統計只作顯示：呼叫前先記一次，模型失敗也算一次呼叫。
+    await bumpStats(day, { calls: 1 });
     let raw: string;
     try {
       raw = await callModel(buildDigestPrompt(turn));
     } catch (error) {
+      await bumpStats(day, { callFailed: 1 });
       record(
         sessionID,
         { state: "failed", at: now().toISOString(), reason: failureReason(error) },
@@ -1299,6 +1326,7 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
 
     const parsed = parseDigestItems(raw, turn.sourceText, MAX_DIGEST_ITEMS);
     if (parsed.error !== undefined) {
+      await bumpStats(day, { callFailed: 1 });
       record(
         sessionID,
         { state: "failed", at: now().toISOString(), reason: parsed.error },
@@ -1306,38 +1334,36 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
       );
       return;
     }
-    // 寫入順序：回合紀錄先（預算不足時優先保留），再寫原子記憶。
-    const cards = buildDigestCards(parsed, settings.digestMaxPerTurn);
-    // 每回合總數上限（1 張回合紀錄＋最多 2 則 items，仍受 `digestMaxPerTurn` 限制）。
+    // 輸出形狀固定：1 張回合紀錄＋最多 2 則原子記憶（items 已由 parse 截斷）。
+    const cards = buildDigestCards(parsed);
     const candidateCount = countDigestCards(parsed);
     if (cards.length === 0) {
-      // 「這回合沒有可記的內容」也算處理完成：標記去重，避免同一事件重送時再花一次模型錢。
+      // 模型回空就回空：不造假一張空回合卡。「這回合沒有可記的內容」也算處理完成，
+      // 標記去重，避免同一事件重送時再花一次模型錢。
       await store.markSeen(seenKey, now());
       record(
         sessionID,
-        { state: "ok", at: now().toISOString(), written: 0, items: 0 },
+        {
+          state: "ok",
+          at: now().toISOString(),
+          written: 0,
+          items: 0,
+          duplicates: 0,
+          failed: 0,
+          cards: [],
+        },
         Date.now() - startedMs,
       );
       return;
     }
 
-    const reservation = await store.reserve({
-      sessionID,
-      day,
-      cards: cards.length,
-      maxSession: settings.digestMaxPerSession,
-      maxDay: settings.digestMaxPerDay,
-      at: startedAt,
-    });
-    if (reservation.allowed <= 0) {
-      skip(sessionID, reservation.reason ?? "session-budget", startedAt);
-      return;
-    }
-    const selected = cards.slice(0, reservation.allowed);
-
     let written = 0;
+    let duplicates = 0;
+    let failed = 0;
     let lastStatus: number | undefined;
-    for (const card of selected) {
+    const results: DigestCardResult[] = [];
+    for (const card of cards) {
+      const role: DigestCardResult["role"] = card.agent === DIGEST_TURN_AGENT ? "turn" : "item";
       const result = await writeDigestMemory({
         connection,
         scope: deps.scope,
@@ -1350,15 +1376,41 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
         timeoutMs: writeTimeoutMs,
         ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
       });
-      if (result.ok) written += 1;
-      else lastStatus = result.status;
+      if (result.ok) {
+        if (result.duplicate) {
+          duplicates += 1;
+          results.push({ role, state: "duplicate" });
+        } else {
+          written += 1;
+          results.push({ role, state: "ok" });
+        }
+        continue;
+      }
+      failed += 1;
+      lastStatus = result.status;
+      results.push({
+        role,
+        state: "failed",
+        ...(result.status === undefined ? {} : { status: result.status }),
+      });
     }
+    // 統計一次寫入整回合的結果（read-modify-write；只作顯示，偏低不影響行為）。
+    await bumpStats(day, { ok: written, duplicate: duplicates, failed });
 
-    if (written > 0) {
+    if (written > 0 || duplicates > 0) {
+      // 至少一張成功或全部重複都算處理完成：標記去重，不重複花模型錢。
       await store.markSeen(seenKey, now());
       record(
         sessionID,
-        { state: "ok", at: now().toISOString(), written, items: candidateCount },
+        {
+          state: "ok",
+          at: now().toISOString(),
+          written,
+          items: candidateCount,
+          duplicates,
+          failed,
+          cards: results,
+        },
         Date.now() - startedMs,
       );
       return;
@@ -1369,6 +1421,8 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
         state: "failed",
         at: now().toISOString(),
         reason: lastStatus === undefined ? "network" : `http-${lastStatus}`,
+        failed,
+        cards: results,
       },
       Date.now() - startedMs,
     );
@@ -1482,9 +1536,6 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
       formatLog({
         event: "digest",
         state: "enabled",
-        maxPerTurn: settings.digestMaxPerTurn,
-        maxPerSession: settings.digestMaxPerSession,
-        maxPerDay: settings.digestMaxPerDay,
         onInterrupted: settings.digestOnInterrupted,
       }),
     );
@@ -1504,37 +1555,52 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
     if (pendingLogs.size > 0) await Promise.allSettled([...pendingLogs]);
   };
 
+  /**
+   * 今日統計的顯示文字（只供顯示，不是上限）。
+   *
+   * - 未連線：`今日：未知（未連線）`——不拿本機舊數字冒充。
+   * - 統計讀不到：`今日：未知`。
+   */
+  const todayStatsText = async (): Promise<string> => {
+    const connection = await deps.getConnection();
+    if (connection === null) return "今日：未知（未連線）";
+    const stats = await store.dayStats(formatDay(now()));
+    if (stats === null) return "今日：未知";
+    return `今日 呼叫 ${stats.calls}｜寫入 ${stats.ok}｜重複 ${stats.duplicate}｜失敗 ${stats.failed}（回合 ${stats.callFailed}）`;
+  };
+
   const statusLines = async (): Promise<string[]> => {
     const lines: string[] = [];
-    const maxTurn = settings.digestMaxPerTurn;
-    const maxSession = settings.digestMaxPerSession;
-    const maxDay = settings.digestMaxPerDay;
-    const today = formatDay(now());
-    const written = await store.dayCount(today);
+    const today = await todayStatsText();
     if (!settings.digestEnabled) {
-      lines.push(`摘要：關閉（digestEnabled=false；今日已寫 ${written} 筆）`);
+      lines.push(`摘要：關閉（digestEnabled=false；${today}）`);
     } else if (model === null) {
       lines.push(
-        `摘要：已開啟但未指定模型（digestEnabled=true、digestModel 未設定：不會呼叫模型、不會寫入；今日已寫 ${written} 筆）`,
+        `摘要：已開啟但未指定模型（digestEnabled=true、digestModel 未設定：不會呼叫模型、不會寫入；${today}）`,
       );
     } else if (modelCheckResult?.state === "model-unavailable") {
       lines.push(
-        `摘要：已開啟但模型不可用（${settings.digestModel}：providerID 或 model id 不存在／未啟用；不會呼叫模型；今日已寫 ${written} 筆）`,
+        `摘要：已開啟但模型不可用（${settings.digestModel}：providerID 或 model id 不存在／未啟用；不會呼叫模型；${today}）`,
       );
     } else {
-      const capped = written >= maxDay ? "，今日已達上限" : "";
       // 清單取不到時誠實標示「未驗證」：行為與以前相同（照舊嘗試），但使用者看得到原因。
       const unchecked =
         modelCheckResult?.state === "unchecked" ? "；模型清單取不到，未驗證模型是否存在" : "";
-      lines.push(
-        `摘要：開啟（模型 ${settings.digestModel}；每回合 ≤${maxTurn}／每 session ≤${maxSession}／每日 ≤${maxDay}；今日已寫 ${written} 筆${capped}${unchecked}）`,
-      );
+      lines.push(`摘要：開啟（模型 ${settings.digestModel}；${today}${unchecked}）`);
     }
     if (last === undefined) {
       lines.push("最近摘要：尚無紀錄");
     } else if (last.state === "ok") {
-      const detail =
-        last.written === 0 ? "本回合沒有可記的內容" : `成功寫入 ${last.written} 筆（候選 ${last.items} 筆）`;
+      // 只有「真的寫了東西」才說成功；0 筆時要說清楚是重複、失敗還是沒有可記的內容。
+      let detail: string;
+      if (last.written === 0 && last.duplicates === 0 && last.failed === 0) {
+        detail = "本回合沒有可記的內容";
+      } else {
+        const notes: string[] = [];
+        if (last.duplicates > 0) notes.push(`重複 ${last.duplicates} 筆`);
+        if (last.failed > 0) notes.push(`失敗 ${last.failed} 筆`);
+        detail = `成功寫入 ${last.written} 筆${notes.length === 0 ? "" : `（${notes.join("、")}）`}`;
+      }
       lines.push(`最近摘要：${last.at}｜${detail}`);
     } else if (last.state === "skipped") {
       lines.push(`最近摘要：${last.at}｜跳過：${skipReasonText(last.reason)}`);

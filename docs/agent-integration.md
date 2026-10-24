@@ -148,15 +148,19 @@ Mnemoshelf 的 MCP 入口是 local stdio 程式，只把請求轉發給本機 RE
 | | MCP 入口（本文上節） | `@mnemoshelf/opencode-plugin`（自動召回） |
 |---|---|---|
 | 誰發動 | **agent 主動呼叫工具**（`remember`／`search_memories`／`recall` 等） | 外掛在**每次模型請求前**自動查一次 |
-| 能做什麼 | 查詢、寫入、釘選、遺忘（六個工具） | **只召回**：把相關記憶注入當次請求，不寫入 |
+| 能做什麼 | 查詢、寫入、釘選、遺忘（六個工具） | **召回**（注入當次請求）＋**可選**的每回合摘要寫入（`digestEnabled`＋`digestModel`，預設關閉） |
 | 連線來源 | **只讀環境變數** `MNEMOSHELF_URL`／`MNEMOSHELF_TOKEN`（手動貼上） | options → 環境變數 → **自動讀 `runtime.json`** |
 | 設定方式 | 使用者在 MCP client 設定（見上節） | 使用者手動加進 `opencode.jsonc` 的 `plugins`（v1 不自動改設定） |
 
 - **`runtime.json` 只給外掛自動發現用**：MCP 入口目前不讀這個檔，仍要自己把 `url`／`token`
   寫進 MCP client 設定（值可從 `runtime.json` 抄出，見本文前面的 Node 讀檔範例）。
-- **外掛不做自動寫入**：要留下記憶，請用 MCP 工具或 REST（見 README 的功能說明與
+- **外掛的寫入是可選的**：召回一直是開啟的；寫入只有在你設定 `digestEnabled: true` 並指定
+  `digestModel` 後才會發生——每個成功結束的回合會把 1 張回合紀錄＋最多 2 則原子記憶寫回
+  mnemoshelf（見 [opencode-plugin.md](opencode-plugin.md) §7）。沒有開啟時外掛不呼叫模型、
+  也不寫入；要主動留下記憶，請用 MCP 工具或 REST（見 README 的功能說明與
   `docs/operations.md` §REST 端點速查）。
-  v1.5 才會評估自動摘要寫入。
+- **職責邊界**：外掛負責「每回合自動摘要寫入＋需要時自動召回」，MCP 負責「agent 想查、想寫、
+  想釘選或想遺忘時自己動手」；兩者共用同一台本機服務與同一組 `url` + `token`。
 - 兩者可以同時開：外掛負責「不用問就帶進背景」，MCP 負責「agent 想查或想寫時自己動手」。
 - 詳細安裝、參數與疑難排解見 [opencode-plugin.md](opencode-plugin.md)。
 

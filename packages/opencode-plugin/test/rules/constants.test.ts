@@ -105,24 +105,6 @@ describe("召回與 digest 設定預設值鎖", () => {
     lockConstant("DEFAULT_SETTINGS.kMax", DEFAULT_SETTINGS.kMax, 8);
   });
 
-  it("digestMaxPerTurn 預設 3（範圍 0–5）", () => {
-    lockConstant("DEFAULT_SETTINGS.digestMaxPerTurn", DEFAULT_SETTINGS.digestMaxPerTurn, 3);
-    lockConstant("digestMaxPerTurn 下限", readSettings({ digestMaxPerTurn: -1 }).digestMaxPerTurn, 0);
-    lockConstant("digestMaxPerTurn 上限", readSettings({ digestMaxPerTurn: 6 }).digestMaxPerTurn, 5);
-  });
-
-  it("digestMaxPerSession 預設 20、上限 100", () => {
-    lockConstant("DEFAULT_SETTINGS.digestMaxPerSession", DEFAULT_SETTINGS.digestMaxPerSession, 20);
-    lockConstant("digestMaxPerSession 下限", readSettings({ digestMaxPerSession: -1 }).digestMaxPerSession, 0);
-    lockConstant("digestMaxPerSession 上限", readSettings({ digestMaxPerSession: 500 }).digestMaxPerSession, 100);
-  });
-
-  it("digestMaxPerDay 預設 100、上限 1000", () => {
-    lockConstant("DEFAULT_SETTINGS.digestMaxPerDay", DEFAULT_SETTINGS.digestMaxPerDay, 100);
-    lockConstant("digestMaxPerDay 下限", readSettings({ digestMaxPerDay: -1 }).digestMaxPerDay, 0);
-    lockConstant("digestMaxPerDay 上限", readSettings({ digestMaxPerDay: 5000 }).digestMaxPerDay, 1000);
-  });
-
   it("digestTimeoutMs 預設等於模型 timeout 常數", () => {
     lockConstant("DEFAULT_SETTINGS.digestTimeoutMs", DEFAULT_SETTINGS.digestTimeoutMs, DEFAULT_DIGEST_TIMEOUT_MS);
   });

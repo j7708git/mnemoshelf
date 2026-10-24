@@ -3,9 +3,10 @@
 `@mnemoshelf/opencode-plugin` 在每次模型請求前，用**最新的使用者訊息**查詢本機的
 mnemoshelf，並把相關記憶注入**當次**請求的最新 user message 末端。
 
-- **寫入預設關閉**：召回一直是開啟的；v1.5 新增的「回合結束自動摘要」（digest，見 §7）
-  **預設關閉**，開啟後才會用你指定的便宜模型把每個回合整理成 1 張**回合紀錄**＋
-  0–2 張原子記憶卡寫回 mnemoshelf。每次召回另外固定注入最近幾張回合紀錄（見 §6.5）。
+- **寫入預設關閉**：召回一直是開啟的；「回合結束自動摘要」（digest，見 §7）**預設關閉**，
+  開啟後才會用你指定的便宜模型把每個回合整理成 1 張**回合紀錄**＋最多 2 則原子記憶卡
+  寫回 mnemoshelf。這是**輸出格式**，不是配額：外掛沒有任何張數型寫入上限。
+  每次召回另外固定注入最近幾張回合紀錄（見 §6.5）。
 - **不改歷史**：注入只存在於 outgoing request；已持久化的 session 訊息不含
   `<memory-context>`。tool 續跑會重新注入同一塊（不重打 server）。
 - **fail-open**：逾時、連不上、格式不符一律不注入（digest 失敗也不影響回覆），
@@ -192,7 +193,7 @@ mnemoshelf 若在 OpenCode 之後才啟動，請執行一次 `/memory`（會重�
 ### 4.1 `/memory`
 
 顯示連線狀態、目前專案、召回開關、最近一次召回的統計，以及 digest 的開關／模型／
-今日已寫筆數與最近一次結果（見 §7.7）。**不會顯示 token。**
+今日統計與最近一次結果（見 §7.7）。**不會顯示 token。**
 
 ```text
 [[mnemoshelf-status]] [mnemoshelf] 記憶外掛狀態
@@ -200,7 +201,7 @@ mnemoshelf 若在 OpenCode 之後才啟動，請執行一次 `/memory`（會重�
 專案：mnemoshelf
 自動召回：開啟（trigger=first-turn+explicit；k=8／最多 4 筆；最近回合 ≤3）
 最近召回：2026-10-21T02:18:24.773Z｜回傳 3｜採用 3（回合 1）｜字元 317｜延遲 132ms｜跳過 —
-摘要：關閉（digestEnabled=false；今日已寫 0 筆）
+摘要：關閉（digestEnabled=false；今日 呼叫 0｜寫入 0｜重複 0｜失敗 0（回合 0））
 最近摘要：尚無紀錄
 ```
 
@@ -289,12 +290,12 @@ pid 死亡、找不到設定，以及 `/health` 有回應但**不是 mnemoshelf*
 | `dedupeTTL` | int | 8 | 8（可調高至 10）；同 session 已注入 id 的 TTL（輪） |
 | `recentTurns` | int | 3 | 0–5；每次召回固定注入最近幾筆回合紀錄（0＝關閉，見 §6.5） |
 | `digestEnabled` | bool | `false` | 回合結束自動摘要總開關（見 §7） |
-| `digestModel` | string | — | digest 用的模型 `<providerID>/<modelID>`；未設＝跳過 |
-| `digestMaxPerTurn` | int | 3 | 0–5；每回合最多寫幾張卡 |
-| `digestMaxPerSession` | int | 20 | 0–100；每 session 最多寫幾張卡 |
-| `digestMaxPerDay` | int | 100 | 0–1000；每日最多寫幾張卡 |
+| `digestModel` | string | `null` | digest 用的模型 `<providerID>/<modelID>`；未設＝跳過 |
 | `digestOnInterrupted` | bool | `false` | `interrupted`（非 shutdown）是否也補寫 |
 | `digestTimeoutMs` | int | 45000 | 3000–120000；digest 模型呼叫與模型清單檢查的 timeout（毫秒）；單次寫入固定 8 秒 |
+
+> digest **沒有**每回合／每 session／每日的張數上限，也沒有對應的設定項；
+> 每回合的輸出形狀固定是「1 張回合紀錄＋最多 2 則原子記憶」，由模型輸出格式決定。
 
 > 預設 `minScore=0.65` 來自 2026-10-21 合成評估（FP 7.6%、negative 0%、hitItems 不變）；
 > `maxItems=3` 可再省約 21% token，但缺品質 A/B，列 v1.5 候選。
@@ -431,18 +432,22 @@ system 前綴，prompt cache 成本較高，log 會標 `injected:"system"`）。
 
 ## 7. 回合結束自動摘要（digest，預設關閉）
 
-> v1.5 新增。**預設關閉**：沒有開啟就不會訂閱事件、不會呼叫任何模型、也不會寫入記憶。
+> **預設關閉**：沒有開啟就不會訂閱事件、不會呼叫任何模型、也不會寫入記憶。
 >
 > 研究筆記原本建議「不要做每輪 LLM 抽取」（成本與品質）。這裡是**刻意的產品取捨**：
 > 使用者要的是接近 Honcho／Hindsight 的即時體驗，因此改成**每回合一次**、並用
-> 「便宜模型＋前置跳過＋預算上限＋quote 驗證」換取頻率。
+> 「便宜模型＋前置跳過＋固定輸出形狀＋quote 驗證」換取頻率。
 
 每個 agent 回合**成功結束**後（宿主 durable 事件 `session.execution.succeeded`，
 一個 busy period 只發一次），外掛可以用你指定的便宜模型把這一回合整理成 **1 張回合紀錄**
-（這輪談了什麼、結論、下一步／未解問題）＋ **0–2 張原子記憶卡**，寫回 mnemoshelf 目前專案
+（這輪談了什麼、結論、下一步／未解問題）＋ **最多 2 則原子記憶卡**，寫回 mnemoshelf 目前專案
 （**OpenChamber 聊天 session 例外：寫成 `scope:"global"`**，見 §6.4／§7.2）。回合紀錄讓新對話
 一開始就看得到「上次聊到哪」，原子記憶則保留跨回合仍有用的事實／決策／偏好。這與 §6 的
 自動召回是兩件獨立的事。
+
+「1 張回合紀錄＋最多 2 則原子記憶」是**輸出格式**（決定模型被要求回什麼、以及送出順序），
+不是配額：外掛**沒有任何張數型寫入上限**，也不會因為「今天／這個 session 寫夠了」而停止。
+模型判斷這回合沒有值得保留的內容時就**什麼都不寫**（見 §7.2 第 7 步）。
 
 > 觸發由宿主發事件，不是模型決定，所以不會有「上下文太長讓模型忘記觸發」；
 > 真正會漏的只有程序結束、`failed` 與（預設跳過的）`interrupted`。
@@ -474,7 +479,7 @@ system 前綴，prompt cache 成本較高，log 會標 `injected:"system"`）。
 外掛啟動時（`digest.start()`）會先用 `ctx.model.list()` 驗證一次 `digestModel`：清單內必須有
 `providerID` 與 `id` 完全相符的模型（該清單只含已啟用的模型）。模型不存在時只記一次
 warning，之後每回合直接跳過、**不會**先呼叫模型再失敗；清單取不到時退回「不驗證」，
-行為與以前相同（見 §7.3）。這個檢查與模型呼叫用同一個 timeout（`digestTimeoutMs`，預設 15 秒）。
+行為與以前相同（見 §7.3）。這個檢查與模型呼叫用同一個 timeout（`digestTimeoutMs`，預設 45 秒）。
 
 1. 收到回合結束事件的**當下立刻**抓一次 `ctx.session.context` 快照，以「當下最後一則
    非 synthetic 的 assistant 訊息」的 id 當**水位線**。
@@ -485,7 +490,7 @@ warning，之後每回合直接跳過、**不會**先呼叫模型再失敗；清
 3. 同一 `sessionID` 的 digest **串行**（promise 鏈）；不同 session 可並行。
 4. 去掉工具呼叫／輸出、reasoning、檔案附件內容、system／synthetic 訊息與
    `<memory-context>` 注入塊；user 文字截到 1200 字元、assistant 最終文字截到 2500
-   字元（保留結尾）。輸入比 v1.5 更短，是為了降低模型延遲。
+   字元（保留結尾）。輸入刻意短，是為了降低模型延遲。
 5. 送模型，要求只回 JSON：
 
    ```json
@@ -498,7 +503,7 @@ warning，之後每回合直接跳過、**不會**先呼叫模型再失敗；清
    - `items`：最多 2 筆、每筆 `content` ≤400 字、`quote`（≤120 字）必須**真的出現在
      本回合原文**，否則丟棄該筆；`kind` 不在清單內時當 `fact`；批次內重複內容只留一筆；
      與 `turn` 重複的項目直接丟棄。
-7. 以 `POST /memories` 寫入，**回合紀錄先寫、原子記憶後寫**（預算不足時優先保留回合紀錄）：
+7. 以 `POST /memories` 寫入，**回合紀錄先寫、原子記憶後寫**：
    - 回合紀錄：`agent:"opencode-plugin/turn"`、`kind:"fact"`、內容是 `turn`，
      並帶 `sourceSession`／`sourceMessage`（= 該回合的 assistant message id）。它**不套用**
      去重（帶 `force:true`），所以連續兩回合的 `turn` 文字相同時仍會留下兩張。
@@ -506,8 +511,10 @@ warning，之後每回合直接跳過、**不會**先呼叫模型再失敗；清
    - 一般目錄是 `scope:"project"`、`project` 沿用 §6.4；**OpenChamber 聊天 session**
      （§6.4）是 `scope:"global"` 且**不帶** `project`。兩者都會出現在 web 的「只看自動寫入」
      （以 `agent` 前綴 `opencode-plugin` 判定）。
-   - 單回合最多 `digestMaxPerTurn` 張（預設 3＝1 張回合紀錄＋2 張 items）；單張寫入失敗
-     不影響其他張，回合卡失敗時 items 照常寫。
+   - 一張回合卡＋最多 2 張 items 是**輸出格式**，不是配額：外掛不會再截斷、也沒有任何
+     可調的張數上限。單張寫入失敗不影響其他張，回合卡失敗時 items 照常寫。
+   - 模型回空（`{"turn":"","items":[]}`，或 `turn` 是空白字串且 `items` 也空）時
+     **不寫任何卡**，也不會造假一張空回合卡。
    - **不會**把一般專案的記憶升成 global，也**不會**改寫既有卡片。
 
 失敗一律 fail-open：只記一行結構化 log，不影響 session 回覆，也不阻塞下一個回合。
@@ -525,9 +532,9 @@ warning，之後每回合直接跳過、**不會**先呼叫模型再失敗；清
 - 本回合沒有非 synthetic 的 user 實質文字（`/memory` 狀態回合、slash command、synthetic 訊息）。
 - user＋assistant 總字數 < 40（例如「好，照這樣做」）。
 - 同一回合已處理過：去重鍵 `digest:<sessionID>:<assistantMessageID>`，
-  **寫入成功才設定**（寫入失敗時同一事件重送仍會再試）。模型判定本回合沒有值得保留的內容
-  （沒有 `turn`、`items` 也空）也算處理完成，同樣會設定去重鍵，避免同一事件重送再花一次模型錢。
-- 本 session／今日已達上限（§7.4）。
+  **至少一張成功寫入或全部為 duplicate 才設定**（全部失敗時同一事件重送仍會再試）。
+  模型判定本回合沒有值得保留的內容（沒有 `turn`、`items` 也空）也算處理完成，
+  同樣會設定去重鍵，避免同一事件重送再花一次模型錢。
 - 專案名解析不到且**不是** OpenChamber 聊天目錄（fail closed；聊天目錄寫 global）。
 - `session.execution.failed`、subagent session、不是本 location 的 session。
 - `session.execution.interrupted`：依 `digestOnInterrupted`（預設關閉）；
@@ -536,22 +543,28 @@ warning，之後每回合直接跳過、**不會**先呼叫模型再失敗；清
 
 ### 7.4 成本護欄
 
+張數型的護欄（每回合／每個 session／每天能寫幾張）**已移除**：外掛不會因為寫入張數而停止，
+也不提供對應設定。現在的成本控制只有「前置跳過」（§7.3）、固定的輸出形狀（§7.2）
+與 timeout：
+
 | 設定 | 預設 | 範圍 | 說明 |
 |---|---|---|---|
 | `digestEnabled` | `false` | bool | 總開關 |
 | `digestModel` | `null` | `<providerID>/<modelID>` | 未設＝跳過 |
-| `digestMaxPerTurn` | `3` | 0–5 | 每回合最多寫幾張（1 張回合紀錄＋最多 2 張 items） |
-| `digestMaxPerSession` | `20` | 0–100 | 每個 session 最多寫幾張（含回合紀錄） |
-| `digestMaxPerDay` | `100` | 0–1000 | 每日最多寫幾張（含回合紀錄；本地時區換日） |
+| `digestOnInterrupted` | `false` | bool | `interrupted`（非 shutdown）是否也補寫 |
 | `digestTimeoutMs` | `45000` | 3000–120000 | 模型呼叫與模型清單檢查的 timeout |
 
 - 模型呼叫與模型清單檢查的 timeout 預設 **45 秒**，可用 `digestTimeoutMs`（3000–120000）
   調整；模型慢或雲端排隊時可調高，但要自行承擔回合結束後仍在背景等待的成本。
 - 單次寫入（`POST /memories`）的 timeout 固定 **8 秒**；寫入失敗最多再試一次
-  （HTTP 4xx 不重試），所以單張卡最多 2 次請求。
-- 預算用盡就停止，`/memory` 顯示「今日摘要已達上限」／「本 session 已達上限」。
-- 去重鍵與每日／每 session 計數存在 OpenCode 的 plugin `ctx.storage`；啟動時 prune
-  超過 **30 天**的鍵。宿主沒有 `ctx.storage` 時只存在 process 記憶體（重啟後去重重置）。
+  （HTTP 4xx 不重試），所以單張卡最多 2 次請求。`duplicate`（server 判定重複）不算失敗，
+  但**不計入**「成功寫入」。
+- 今日統計（呼叫／寫入／重複／失敗／失敗回合數）只存在 `ctx.storage` 供 `/memory` 顯示，
+  **不參與任何寫入決策**；外掛不會因為數字多少而停寫。今日統計是外掛自己的
+  read-modify-write，**多個 OpenCode 實例同時寫同一天時可能偏低**（lost update），
+  數字只作參考。
+- 去重鍵與今日統計存在 OpenCode 的 plugin `ctx.storage`；啟動時 prune
+  超過 **30 天**的鍵。宿主沒有 `ctx.storage` 時只存在 process 記憶體（重啟後去重與統計重置）。
 - 程式或服務重啟時**不補跑**未完成的 digest（不掃歷史）。
 
 ### 7.5 隱私
@@ -565,11 +578,14 @@ warning，之後每回合直接跳過、**不會**先呼叫模型再失敗；清
 - log 只含狀態、筆數、跳過原因、失敗原因（`<錯誤型別名>: <錯誤訊息>`，≤200 字元）、
   延遲與 HTTP 狀態碼；**不含**對話內容、prompt、token。
 - 另有**檔案型診斷紀錄**：`<XDG_STATE_HOME 或 ~/.local/state>/mnemoshelf-plugin/digest.log`。
-  每次 digest 嘗試一行 JSON，欄位固定為
-  `{"at","session":"<hash8>","state","reason?","model","latencyMs","items","written"}`：
+  每次 digest 嘗試一行 JSON，欄位為
+  `{"at","session":"<hash8>","state","reason?","model","latencyMs","items","written","duplicates?","failed?","cards?"}`：
   `session` 是 sessionID 的 SHA-256 前 8 碼，`reason` 只放原因碼或
   `<name>: <message>`（≤200 字元），`model` 是 `<providerID>/<modelID>`，
-  `items` 是模型這次給的候選張數（含回合紀錄），`written` 是實際寫入張數。
+  `items` 是模型這次給的候選張數（含回合紀錄），`written` 是實際寫入張數
+  （**不含 duplicate**），`duplicates` 是被 server 判定重複的張數，`failed` 是寫入失敗張數，
+  `cards` 是逐卡結果（`{role,state,status?}`，見 §7.7）。新增的 `duplicates`／`failed`／
+  `cards` 是**可選**欄位，只有本次嘗試有內容時才出現；舊格式的紀錄仍可讀。
   **不含**對話內容、卡片內容、prompt、token。
   目錄權限 `0700`、檔案 `0600`；單檔上限 1 MiB，超過就輪替成 `digest.log.1`（只留一份）。
   寫入失敗完全吞掉，不影響 digest 或 session。宿主不會轉存外掛的 console 輸出，
@@ -583,28 +599,52 @@ warning，之後每回合直接跳過、**不會**先呼叫模型再失敗；清
 把 `digestEnabled` 設回 `false`（或移除）即可：重新載入後不再訂閱事件、不再呼叫模型。
 已寫入的卡片是普通記憶，用 UI／API 刪除；外掛不會自動刪。
 
-### 7.7 `/memory` 會顯示什麼
+### 7.7 寫入結果與診斷（`/memory`、`digest.log`）
+
+`/memory` 的摘要兩行是所有寫入結果的第一站；完整逐卡結果在檔案型診斷紀錄（§7.5）。
+
+**`/memory` 的摘要行**（實際文案）：
 
 ```text
-摘要：開啟（模型 <providerID>/<modelID>；每回合 ≤3／每 session ≤20／每日 ≤100；今日已寫 4 筆）
-最近摘要：2026-10-22T10:03:11.412Z｜成功寫入 2 筆（候選 3 筆）
+摘要：開啟（模型 <providerID>/<modelID>；今日 呼叫 5｜寫入 4｜重複 1｜失敗 0（回合 1））
+最近摘要：2026-10-22T10:03:11.412Z｜成功寫入 2 筆（重複 1 筆）
 ```
 
-關閉時顯示 `摘要：關閉（digestEnabled=false；今日已寫 N 筆）`；未設模型、模型不存在、
-跳過與失敗都會顯示原因，例如：
+- 「今日」是**本機當日**的統計：`呼叫`＝呼叫過摘要模型的次數、`寫入`＝成功寫入張數
+  （**不含 duplicate**）、`重複`＝server 判定 duplicate 的張數、`失敗`＝重試後仍失敗的張數、
+  `（回合 N）`＝模型呼叫或解析失敗的回合數。變體：
+  - 未連線 mnemoshelf：`摘要：…（digestEnabled=false；今日：未知（未連線））`
+  - 統計讀不到（`ctx.storage` 不可用等）：`今日：未知`
+  - 未指定模型：`摘要：已開啟但未指定模型（digestEnabled=true、digestModel 未設定：不會呼叫模型、不會寫入；今日 …）`
+  - 模型不可用：`摘要：已開啟但模型不可用（<providerID>/<modelID>：providerID 或 model id 不存在／未啟用；不會呼叫模型；今日 …）`
+  - 模型清單取不到：在「開啟」那句尾端加「；模型清單取不到，未驗證模型是否存在」。
+- 「最近摘要」的變體：
+  - 成功（至少一張寫入，或全部為 duplicate）：`成功寫入 N 筆`，後接非零的
+    `（重複 M 筆、失敗 K 筆）`（該項為 0 就不列；兩者皆 0 時不加括號）。
+  - 三者皆 0：`最近摘要：<時間>｜本回合沒有可記的內容`（模型回空，不造假空回合卡）。
+  - 跳過：`最近摘要：<時間>｜跳過：<原因>`，例如「本回合對話太短」「同一回合已處理過」。
+  - 失敗：`最近摘要：<時間>｜失敗：<原因>`，並多一行 `紀錄：<digest.log 路徑>`。
+- 沒有張數型 max 字樣：寫入沒有張數上限，今日數字只作顯示，不會阻止寫入。
 
-- `摘要：已開啟但模型不可用（<providerID>/<modelID>：providerID 或 model id 不存在／未啟用；不會呼叫模型；今日已寫 0 筆）`
-- `跳過：本回合對話太短`
-- `失敗：模型回應不是 JSON`
-- `失敗：寫入失敗（HTTP 500）`
-- `失敗：Generate.ModelSelectionError: Model unavailable: <providerID>/<modelID>`
+**`digest.log`**：`<XDG_STATE_HOME 或 ~/.local/state>/mnemoshelf-plugin/digest.log`
+（路徑以 `node:path` 組合，不假設分隔符；`XDG_STATE_HOME` 只在是絕對路徑時採用），
+每次 digest 嘗試一行 JSON。帶逐卡結果的範例：
 
-最近一次失敗時會多一行檔案型診斷紀錄的路徑（方便把檔案交回來排查）：
-
-```text
-最近摘要：2026-10-22T10:03:11.412Z｜失敗：Generate.ModelSelectionError: Model unavailable: <providerID>/<modelID>
-紀錄：<XDG_STATE_HOME 或 ~/.local/state>/mnemoshelf-plugin/digest.log
+```json
+{"at":"2026-10-22T10:03:11.412Z","session":"<hash8>","state":"ok","model":"<providerID>/<modelID>","latencyMs":2140,"items":3,"written":1,"duplicates":1,"failed":1,"cards":[{"role":"turn","state":"ok"},{"role":"item","state":"duplicate"},{"role":"item","state":"failed","status":500}]}
 ```
+
+- `cards` 陣列順序＝送出順序（回合紀錄在前、原子記憶在後），元素是
+  `{"role":"turn"|"item","state":"ok"|"duplicate"|"failed","status?":<HTTP 狀態碼>}`；
+  `status` 只在失敗且拿得到狀態碼時出現。卡片**內容**不會寫進檔案。
+- **重試語意**：每張卡最多 **2 次請求**；4xx 不重試，5xx／429／網路錯誤才重試。
+  重試後仍失敗的卡計入 `failed`；`duplicate` 算「server 已判定重複」，不算成功寫入，
+  也不算失敗。
+- **已知限制**：`digest.log`／今日統計是外掛自己寫的，**多個 OpenCode 實例同時寫同一天
+  時今日數字可能偏低**（read-modify-write 的 lost update），只影響顯示、不影響寫入。
+  另外回合卡帶 `force`，重試或跨實例可能寫成兩張相同內容的回合紀錄（已知限制）。
+- `state` 是 `ok`／`skipped`／`failed`；失敗或跳過時 `items`、`written` 為 0，
+  失敗會帶 `reason`（例如 `http-500`、`timeout`）。
 
 失敗原因固定是 `<錯誤型別名>: <錯誤訊息>`，只取錯誤本身的文字、壓成單行並截到
 **200 字元**；不會附加 prompt 或對話內容（真正的對話內容只會出現在送給模型的那次請求裡）。
@@ -835,9 +875,9 @@ pnpm --filter @mnemoshelf/opencode-plugin eval:digest:matrix -- --models all --t
   交給 `digestModel`。雲端模型的內容會離開本機；要避免此事，就選本機執行的 OpenAI 相容端點，
   或關閉摘要（預設就是關閉）。
 - **預設不寫入。** 只有 `digestEnabled: true` 且指定 `digestModel` 才會呼叫模型與寫入記憶。
-- **成本護欄**：每回合最多 3 張卡（`digestMaxPerTurn` 上限 5）、每 session 與每日有張數上限
-  （`digestMaxPerSession`／`digestMaxPerDay`）；跳過條件（短句、招呼、只有 synthetic 訊息、
-  預算用盡）不會呼叫模型。
+- **沒有張數型上限**：每回合的輸出形狀固定是 1 張回合紀錄＋最多 2 則原子記憶
+  （輸出格式，不是配額）；外掛不會因為寫入張數停止。真正省錢的是跳過條件
+  （短句、招呼、只有 synthetic 訊息、沒有實質文字），那些回合不會呼叫模型。
 - **token 與成本**：評估報告只使用端點回傳的 usage；端點沒回就標 `N/A`，不推估。
 - **評估報告**不含 prompt、對話全文、金鑰、server URL 或本機絕對路徑；環境變數只記名稱與是否有值。
   雲端模型端的日誌與保留政策仍取決於該供應商。

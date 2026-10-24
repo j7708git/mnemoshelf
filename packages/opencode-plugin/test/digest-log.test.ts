@@ -100,6 +100,53 @@ describe("formatDigestLogLine", () => {
     });
   });
 
+  it("新欄位（duplicates／failed／cards）只在有值時輸出；卡片只有 role／state／status", () => {
+    const line = formatDigestLogLine(
+      entry({
+        state: "ok",
+        written: 1,
+        duplicates: 1,
+        failed: 1,
+        cards: [
+          { role: "turn", state: "ok" },
+          { role: "item", state: "duplicate" },
+          { role: "item", state: "failed", status: 500 },
+        ],
+      }),
+    );
+    const parsed = JSON.parse(line) as Record<string, unknown>;
+    expect(parsed).toMatchObject({
+      state: "ok",
+      written: 1,
+      duplicates: 1,
+      failed: 1,
+      cards: [
+        { role: "turn", state: "ok" },
+        { role: "item", state: "duplicate" },
+        { role: "item", state: "failed", status: 500 },
+      ],
+    });
+    // 卡片不得帶內容：只有 role／state／status 三個鍵。
+    for (const card of parsed.cards as Record<string, unknown>[]) {
+      expect(Object.keys(card).sort()).toEqual(
+        Object.keys(card).includes("status") ? ["role", "state", "status"] : ["role", "state"],
+      );
+    }
+  });
+
+  it("舊格式（沒有新欄位）仍輸出原本的固定欄位", () => {
+    const parsed = JSON.parse(formatDigestLogLine(entry())) as Record<string, unknown>;
+    expect(Object.keys(parsed)).toEqual([
+      "at",
+      "session",
+      "state",
+      "model",
+      "latencyMs",
+      "items",
+      "written",
+    ]);
+  });
+
   it("失敗的 reason 壓成單行並截到 200 字元", () => {
     const line = formatDigestLogLine(
       entry({

@@ -40,9 +40,6 @@ const DIGEST_SETTINGS = {
   minScore: 0.4,
   digestEnabled: true,
   digestModel: DIGEST_MODEL,
-  digestMaxPerTurn: 5,
-  digestMaxPerSession: 100,
-  digestMaxPerDay: 1000,
 };
 
 /** 只測召回的場景（digest 關閉，不訂閱事件）。 */
@@ -757,7 +754,19 @@ export async function runScenarios({ client, baseUrl, token, tmpRoot, logDir, fa
     const checks = createChecks();
     const files = (await fs.readdir(logDir)).filter((file) => file.startsWith("digest-") && file.endsWith(".log"));
     checks.eq("有產生 digest.log 檔案", files.length > 0, true);
-    const allowedKeys = new Set(["at", "session", "state", "reason", "model", "latencyMs", "items", "written"]);
+    const allowedKeys = new Set([
+      "at",
+      "session",
+      "state",
+      "reason",
+      "model",
+      "latencyMs",
+      "items",
+      "written",
+      "duplicates",
+      "failed",
+      "cards",
+    ]);
     const allowedStates = new Set(["ok", "skipped", "failed"]);
     const sessionIds = ["alpha-s1", "beta-s1", "chat-s1", "waterline-s1"];
     const markers = ["TURN-", "USER-", "ITEM-", "GLOBAL-SCOPE", "DEDUPE-", "FAILOPEN-", "SEMANTIC-"];
