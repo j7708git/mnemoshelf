@@ -80,8 +80,20 @@ function clampInt(value: unknown, fallback: number, min: number, max: number): n
 /** 設定值被回退／夾住的原因（只帶鍵名，不帶值——避免把使用者填錯的敏感字串寫進 log）。 */
 export interface SettingsWarning {
   key: string;
-  reason: "invalid" | "out-of-range";
+  /**
+   * - `invalid`：型別不符，回退預設。
+   * - `out-of-range`：超出範圍，夾在範圍內。
+   * - `removed`：這個鍵已從產品移除；留著不會生效（不驗證值、不記值）。
+   */
+  reason: "invalid" | "out-of-range" | "removed";
 }
+
+/** 已移除的設定鍵：只警告、不生效（不驗證值，也不帶值進 log）。 */
+const REMOVED_SETTINGS_KEYS = [
+  "digestMaxPerTurn",
+  "digestMaxPerSession",
+  "digestMaxPerDay",
+] as const;
 
 export type SettingsWarnFn = (warning: SettingsWarning) => void;
 
@@ -148,6 +160,10 @@ export function readSettings(options: unknown, warn?: SettingsWarnFn): Settings 
     } else {
       digestModel = normalized;
     }
+  }
+  // 已移除的張數上限鍵：設定檔若還留著，留一筆警告讓使用者知道它不會生效。
+  for (const key of REMOVED_SETTINGS_KEYS) {
+    if (raw[key] !== undefined) warn?.({ key, reason: "removed" });
   }
   return {
     ...(readNonEmptyString(raw.baseUrl) === undefined ? {} : { baseUrl: readNonEmptyString(raw.baseUrl) }),

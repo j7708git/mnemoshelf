@@ -297,6 +297,10 @@ pid 死亡、找不到設定，以及 `/health` 有回應但**不是 mnemoshelf*
 > digest **沒有**每回合／每 session／每日的張數上限，也沒有對應的設定項；
 > 每回合的輸出形狀固定是「1 張回合紀錄＋最多 2 則原子記憶」，由模型輸出格式決定。
 
+> `digestMaxPerTurn`／`digestMaxPerSession`／`digestMaxPerDay` 已移除（從未進入任何發行版）；設定檔若仍保留這些鍵，
+> 不會生效，外掛會在 console log 留一筆 `config` 警告（`warning: removed`，格式見下方）；這筆警告不會進
+> `digest.log`。
+
 > 預設 `minScore=0.65` 來自 2026-10-21 合成評估（FP 7.6%、negative 0%、hitItems 不變）；
 > `maxItems=3` 可再省約 21% token，但缺品質 A/B，列 v1.5 候選。
 >

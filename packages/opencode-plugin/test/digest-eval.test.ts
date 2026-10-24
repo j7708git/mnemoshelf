@@ -18,7 +18,6 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   MAX_DIGEST_ITEMS,
   buildDigestCards,
-  countDigestCards,
   parseDigestItems,
   resolveDigestTurn,
 } from "../src/digest.js";
@@ -81,7 +80,7 @@ describe("buildDigestCards：輸出形狀固定", () => {
       "快取需要上限。",
     ]);
     expect(cards.slice(1).every((card) => card.agent === "opencode-plugin" && card.force === false)).toBe(true);
-    expect(countDigestCards(parsed)).toBe(3);
+    expect(buildDigestCards(parsed).length).toBe(3);
   });
 
   it("只有 items（3 則原始輸出）→ 2 張，且沒有回合卡", () => {
@@ -95,7 +94,7 @@ describe("buildDigestCards：輸出形狀固定", () => {
   it("空結果 → 0 張（不造假回合卡）", () => {
     const parsed = parseDigestItems('{"turn":"","items":[]}', SHAPE_SOURCE, MAX_DIGEST_ITEMS);
     expect(buildDigestCards(parsed)).toEqual([]);
-    expect(countDigestCards(parsed)).toBe(0);
+    expect(buildDigestCards(parsed).length).toBe(0);
   });
 });
 

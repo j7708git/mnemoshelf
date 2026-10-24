@@ -452,11 +452,6 @@ export function buildDigestCards(parsed: DigestParseResult): DigestCard[] {
   return candidateDigestCards(parsed);
 }
 
-/** 這一回合的卡片數（診斷與 `/memory` 的「候選 N 筆」用）。 */
-export function countDigestCards(parsed: DigestParseResult): number {
-  return candidateDigestCards(parsed).length;
-}
-
 /** `YYYY-MM-DD`（使用者本地時區；今日統計鍵用它）。 */
 export function formatDay(date: Date): string {
   const year = date.getFullYear();
@@ -1259,9 +1254,11 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
     return { ok: true };
   };
 
-  const callModel = async (prompt: string): Promise<string> => {
+  const callModel = async (day: string, prompt: string): Promise<string> => {
     const generate: GenerateDomainLike | undefined = ctx.generate;
     if (generate === undefined || model === null) throw new DigestFailure("no-generate");
+    // 真的呼叫模型才計一次「今日呼叫」：no-generate 時模型從未被呼叫，不該計入。
+    await bumpStats(day, { calls: 1 });
     const output = await withTimeout(
       (signal) => generate.text({ prompt, model }, { signal }),
       modelTimeoutMs,
@@ -1309,11 +1306,9 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
       return;
     }
 
-    // 統計只作顯示：呼叫前先記一次，模型失敗也算一次呼叫。
-    await bumpStats(day, { calls: 1 });
     let raw: string;
     try {
-      raw = await callModel(buildDigestPrompt(turn));
+      raw = await callModel(day, buildDigestPrompt(turn));
     } catch (error) {
       await bumpStats(day, { callFailed: 1 });
       record(
@@ -1336,7 +1331,6 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
     }
     // 輸出形狀固定：1 張回合紀錄＋最多 2 則原子記憶（items 已由 parse 截斷）。
     const cards = buildDigestCards(parsed);
-    const candidateCount = countDigestCards(parsed);
     if (cards.length === 0) {
       // 模型回空就回空：不造假一張空回合卡。「這回合沒有可記的內容」也算處理完成，
       // 標記去重，避免同一事件重送時再花一次模型錢。
@@ -1406,7 +1400,7 @@ export function createDigestRuntime(deps: DigestRuntimeDeps): DigestRuntime {
           state: "ok",
           at: now().toISOString(),
           written,
-          items: candidateCount,
+          items: cards.length,
           duplicates,
           failed,
           cards: results,

@@ -10,6 +10,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createMemoryRuntime, type RuntimeCleanup, type RuntimeDeps } from "../src/recall.js";
+import { formatDay } from "../src/digest.js";
 import type {
   CommandEditorLike,
   CommandInvocationLike,
@@ -173,6 +174,8 @@ async function setup(input: {
    * - `null`＝宿主沒有 `ctx.model`
    */
   models?: readonly ModelInfoLike[] | null | (() => Promise<unknown>);
+  /** 宿主沒有 `ctx.generate`（模擬「不支援 generate」的宿主）。 */
+  withoutGenerate?: boolean;
 } = {}): Promise<Harness> {
   const logs: string[] = [];
   const posts: Harness["posts"] = [];
@@ -239,12 +242,16 @@ async function setup(input: {
         return { dispose: async () => undefined };
       },
     },
-    generate: {
-      text: async (payload) => {
-        generateCalls.push({ prompt: payload.prompt, model: payload.model });
-        return harness.generate(payload);
-      },
-    },
+    ...(input.withoutGenerate === true
+      ? {}
+      : {
+          generate: {
+            text: async (payload) => {
+              generateCalls.push({ prompt: payload.prompt, model: payload.model });
+              return harness.generate(payload);
+            },
+          },
+        }),
     ...(input.models === null
       ? {}
       : {
@@ -878,6 +885,30 @@ describe("digest：失敗與邊界", () => {
     expect(status).toContain("今日 呼叫 1｜寫入 0｜重複 0｜失敗 0（回合 1）");
     expect(status).toContain("失敗：Generate.ModelSelectionError: Model unavailable: cheap/test-model");
   });
+
+  it("宿主沒有 generate：不計呼叫、只記一次回合失敗", async () => {
+    const harness = await setup({ settings: digestSettings(), withoutGenerate: true });
+    harness.setTurn([user("u1", TURN1_USER), assistant("a1", text(TURN1_ASSISTANT))]);
+
+    await harness.settle(succeeded());
+
+    expect(harness.posts).toHaveLength(0);
+    expect(harness.logs.join("\n")).toContain('"reason":"no-generate"');
+
+    // 模型從未被呼叫：calls 維持 0，回合失敗仍算 1。
+    const statsKey = [...harness.storage.map.keys()].find((key) => key.startsWith("digest-stats:"));
+    expect(statsKey).toBeDefined();
+    expect(harness.storage.map.get(statsKey as string)).toMatchObject({
+      calls: 0,
+      ok: 0,
+      duplicate: 0,
+      failed: 0,
+      callFailed: 1,
+    });
+
+    const status = await harness.status();
+    expect(status).toContain("今日 呼叫 0｜寫入 0｜重複 0｜失敗 0（回合 1）");
+  });
 });
 
 describe("digest：檔案型診斷紀錄", () => {
@@ -1091,6 +1122,31 @@ describe("digest：寫入結果與今日統計", () => {
     const status = await harness.status();
     expect(status).toContain("今日：未知");
     expect(status).not.toContain("今日：未知（未連線）");
+  });
+
+  it("重啟後仍看得到今天數字：從 storage 讀回且不被 prune", async () => {
+    const now = new Date("2026-10-22T10:00:00.000Z");
+    const day = formatDay(now);
+    const storage = memoryStorage();
+    storage.map.set(`digest-stats:${day}`, {
+      calls: 5,
+      ok: 4,
+      duplicate: 1,
+      failed: 0,
+      callFailed: 1,
+      updatedAt: now.toISOString(),
+    });
+
+    // 新的 runtime（等同重啟）：今日數字必須從 storage 讀回，而不是從 0 起算。
+    const harness = await setup({
+      settings: digestSettings(),
+      storage,
+      extraDeps: { now: () => now },
+    });
+
+    const status = await harness.status();
+    expect(status).toContain("今日 呼叫 5｜寫入 4｜重複 1｜失敗 0（回合 1）");
+    expect(storage.map.has(`digest-stats:${day}`)).toBe(true);
   });
 
   it("/memory 顯示 digest 開關、模型、今日統計與最近結果（不再有 max）", async () => {

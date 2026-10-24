@@ -167,6 +167,33 @@ describe("readSettings", () => {
     ]);
     expect(warnings.every((warning) => warning.reason === "invalid")).toBe(true);
   });
+  it("已移除的張數上限鍵：留著不生效，但每個鍵各記一筆 removed 警告（不帶值）", () => {
+    const warnings: { key: string; reason: string }[] = [];
+    const settings = readSettings(
+      {
+        digestMaxPerTurn: 5,
+        digestMaxPerSession: 20,
+        digestMaxPerDay: 100,
+      },
+      (warning) => warnings.push(warning),
+    );
+    expect(warnings).toEqual([
+      { key: "digestMaxPerTurn", reason: "removed" },
+      { key: "digestMaxPerSession", reason: "removed" },
+      { key: "digestMaxPerDay", reason: "removed" },
+    ]);
+    // 警告不含使用者填的值；這些鍵也不再出現在解析結果裡。
+    expect(JSON.stringify(warnings)).not.toContain("100");
+    expect(settings).toEqual(DEFAULT_SETTINGS);
+  });
+
+  it("沒有舊鍵時不發 removed 警告", () => {
+    const warnings: { key: string; reason: string }[] = [];
+    readSettings({ digestEnabled: true, digestModel: "cheap/test-model" }, (warning) =>
+      warnings.push(warning),
+    );
+    expect(warnings.some((warning) => warning.reason === "removed")).toBe(false);
+  });
 });
 
 describe("parseDigestModel", () => {
