@@ -12,6 +12,7 @@
  * 記憶；這裡只提示既有 id，**不新增卡片**。
  */
 import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
+import { ConfirmDialog } from "./ConfirmDialog";
 import {
   addMemory,
   deleteMemory,
@@ -125,6 +126,17 @@ function RecallResults({ result }: { result: MemoryRecallResult }) {
   );
 }
 
+/**
+ * 目前開啟的確認對話框（一次只有一個）。
+ *
+ * 永久刪除刻意維持兩段：第一段按「繼續」只把狀態換成第二段，不呼叫後端；
+ * 第二段才真的送 `DELETE /memories/:id?hard=true`。
+ */
+type PendingConfirm =
+  | { kind: "remove"; memory: Memory }
+  | { kind: "purge-first"; memory: Memory }
+  | { kind: "purge-second"; memory: Memory };
+
 export function MemoriesPanel() {
   const [state, setState] = useState<LoadState>({ kind: "loading" });
   const [editingId, setEditingId] = useState<number | null>(null);
@@ -147,6 +159,9 @@ export function MemoriesPanel() {
   const [recallState, setRecallState] = useState<RecallState>({ kind: "idle" });
   /** 備份匯出／匯入進行中（期間兩個按鈕都禁用，避免重複觸發）。 */
   const [backupBusy, setBackupBusy] = useState(false);
+  /** 確認對話框（取代原生 confirm）與其送出中的狀態。 */
+  const [pendingConfirm, setPendingConfirm] = useState<PendingConfirm | null>(null);
+  const [confirmBusy, setConfirmBusy] = useState(false);
   /** dry-run 後待確認的匯入（原始文字只留在這個 state，不寫 log／storage）。 */
   const [importPreview, setImportPreview] = useState<{
     text: string;
@@ -305,41 +320,101 @@ export function MemoriesPanel() {
     }
   };
 
+  /**
+   * 確認對話框按下確定後的共用流程：對話框保持開啟並顯示「處理中…」，
+   * 成功才關閉並刷新；失敗先關閉，讓面板原本的錯誤橫幅（`actionError`）看得見。
+   */
+  const runConfirmed = async (action: () => Promise<void>, success: string): Promise<void> => {
+    setConfirmBusy(true);
+    setActionError(null);
+    setMessage(null);
+    try {
+      await action();
+      setMessage(success);
+      setPendingConfirm(null);
+      await load();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "操作失敗。");
+      setPendingConfirm(null);
+    } finally {
+      setConfirmBusy(false);
+    }
+  };
+
+  /** 軟刪除：先開確認框，使用者按「刪除」才呼叫後端。 */
   const remove = (memory: Memory): void => {
-    const confirmed = window.confirm(
-      `要刪除這筆記憶嗎？\n\n「${memory.content.slice(0, 80)}」\n\n刪除後搜尋不到，資料仍保留在資料庫（軟刪除）。`,
-    );
-    if (!confirmed) return;
-    void run(
-      memory.id,
-      async () => {
-        await deleteMemory(memory.id);
-      },
-      "已刪除記憶。",
-    );
+    setPendingConfirm({ kind: "remove", memory });
   };
 
   /**
    * 永久刪除（硬刪除；卡 C2）：內容真的從資料庫移除、無法復原。
    *
    * 刻意做兩段確認（與軟刪除分開），文案必須誠實：不做安全抹除，本機檔案／WAL 可能仍有殘留。
+   * 這裡只開第一段；第二段由對話框的「繼續」切換。
    */
   const purge = (memory: Memory): void => {
-    const first = window.confirm(
-      `要永久刪除這筆記憶嗎？\n\n「${memory.content.slice(0, 80)}」\n\n` +
-        "內容會從資料庫刪除、無法復原；本機檔案／WAL 可能仍有殘留（未做安全抹除）。",
-    );
-    if (!first) return;
-    const second = window.confirm(
-      `再次確認：永久刪除 #${memory.id} 後無法復原（沒有備份、也沒有垃圾桶）。真的要刪除嗎？`,
-    );
-    if (!second) return;
-    void run(
-      memory.id,
-      async () => {
-        await deleteMemory(memory.id, { hard: true });
-      },
-      "已永久刪除（資料列已移除；本機檔案／WAL 仍可能有殘留，未做安全抹除）。",
+    setPendingConfirm({ kind: "purge-first", memory });
+  };
+
+  const confirmRemove = (memory: Memory): void => {
+    void runConfirmed(async () => {
+      await deleteMemory(memory.id);
+    }, "已刪除記憶。");
+  };
+
+  const confirmPurge = (memory: Memory): void => {
+    void runConfirmed(async () => {
+      await deleteMemory(memory.id, { hard: true });
+    }, "已永久刪除（資料列已移除；本機檔案／WAL 仍可能有殘留，未做安全抹除）。");
+  };
+
+  /** 把目前的 `pendingConfirm` 畫成對話框（文案照原本 `window.confirm` 的內容搬過來）。 */
+  const renderConfirmDialog = (pending: PendingConfirm) => {
+    const cancel = (): void => setPendingConfirm(null);
+    if (pending.kind === "remove") {
+      return (
+        <ConfirmDialog
+          key="remove"
+          open
+          title="要刪除這筆記憶嗎？"
+          description={`「${pending.memory.content.slice(0, 80)}」\n\n刪除後搜尋不到，資料仍保留在資料庫（軟刪除）。`}
+          confirmLabel="刪除"
+          busy={confirmBusy}
+          onConfirm={() => confirmRemove(pending.memory)}
+          onCancel={cancel}
+        />
+      );
+    }
+    if (pending.kind === "purge-first") {
+      return (
+        <ConfirmDialog
+          key="purge-first"
+          open
+          title="要永久刪除這筆記憶嗎？"
+          description={
+            `「${pending.memory.content.slice(0, 80)}」\n\n` +
+            "內容會從資料庫刪除、無法復原；本機檔案／WAL 可能仍有殘留（未做安全抹除）。"
+          }
+          confirmLabel="繼續"
+          variant="danger"
+          busy={confirmBusy}
+          onConfirm={() => setPendingConfirm({ kind: "purge-second", memory: pending.memory })}
+          onCancel={cancel}
+        />
+      );
+    }
+    return (
+      <ConfirmDialog
+        key="purge-second"
+        open
+        title={`再次確認：永久刪除 #${pending.memory.id}`}
+        description="刪除後無法復原（沒有備份、也沒有垃圾桶）。真的要刪除嗎？"
+        confirmLabel="永久刪除"
+        variant="danger"
+        busy={confirmBusy}
+        onConfirm={() => confirmPurge(pending.memory)}
+        onCancel={cancel}
+      />
     );
   };
 
@@ -564,7 +639,12 @@ export function MemoriesPanel() {
             <button
               type="button"
               disabled={backupBusy}
-              onClick={() => setImportPreview(null)}
+              onClick={() => {
+                // 取消預覽時一起清掉錯誤與成功訊息：紅色錯誤只屬於這次預覽，不該殘留。
+                setImportPreview(null);
+                setActionError(null);
+                setMessage(null);
+              }}
               className="rounded-md border border-line px-3 py-1.5 text-sm text-ink disabled:opacity-40"
             >
               取消
@@ -895,6 +975,8 @@ export function MemoriesPanel() {
           })}
         </ul>
       )}
+
+      {pendingConfirm !== null && renderConfirmDialog(pendingConfirm)}
     </section>
   );
 }

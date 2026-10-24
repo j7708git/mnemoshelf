@@ -16,6 +16,7 @@ import {
 } from "./api";
 import { AddRootFlow, modalitiesForImages } from "./AddRootFlow";
 import { BootstrapScreen } from "./BootstrapScreen";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { ExplorerPanel } from "./ExplorerPanel";
 import { MemoriesPanel } from "./MemoriesPanel";
 import { RootsList } from "./RootsList";
@@ -63,6 +64,9 @@ export function App() {
   const [imagesBusyRootId, setImagesBusyRootId] = useState<number | null>(null);
   /** 側欄的設定更新錯誤訊息（不切換整個畫面）。 */
   const [rootsError, setRootsError] = useState<string | null>(null);
+  /** 等待確認的「移除資料夾」（站內確認框，取代原生 confirm）。 */
+  const [pendingRemoveRoot, setPendingRemoveRoot] = useState<Root | null>(null);
+  const [removeRootBusy, setRemoveRootBusy] = useState(false);
 
   /** 桌面殼的模型下載狀態（瀏覽器模式永遠是 null）。 */
   const [bootstrap, setBootstrap] = useState<DesktopBootstrapState | null>(null);
@@ -336,17 +340,26 @@ export function App() {
     void load();
   };
 
-  const onRemoveRoot = async (root: Root): Promise<void> => {
-    const confirmed = window.confirm(
-      `要移除資料夾「${root.path}」嗎？\n移除後索引資料會一併刪除，但磁碟上的檔案不會被更動。`,
-    );
-    if (!confirmed) return;
+  /** 按「移除」只開確認框；真的刪除（`DELETE /roots/:id?deleteData=1`）在確認後才發生。 */
+  const onRemoveRoot = (root: Root): void => {
+    setPendingRemoveRoot(root);
+  };
+
+  const confirmRemoveRoot = async (): Promise<void> => {
+    if (pendingRemoveRoot === null) return;
+    const root = pendingRemoveRoot;
+    setRemoveRootBusy(true);
     try {
       await removeRoot(root.id, true);
       if (selectedRootId === root.id) setSelectedRootId(null);
+      setPendingRemoveRoot(null);
       await load();
     } catch (error) {
+      // 失敗先關閉對話框，讓整個畫面的錯誤訊息看得見（行為與原本一致）。
+      setPendingRemoveRoot(null);
       setState({ kind: "error", message: error instanceof Error ? error.message : "移除資料夾失敗" });
+    } finally {
+      setRemoveRootBusy(false);
     }
   };
 
@@ -574,6 +587,19 @@ export function App() {
 
           {view === "memories" && <MemoriesPanel />}
         </div>
+      )}
+
+      {pendingRemoveRoot !== null && (
+        <ConfirmDialog
+          open
+          title={`要移除資料夾「${pendingRemoveRoot.path}」嗎？`}
+          description="移除後索引資料會一併刪除，但磁碟上的檔案不會被更動。"
+          confirmLabel="移除"
+          variant="danger"
+          busy={removeRootBusy}
+          onConfirm={() => void confirmRemoveRoot()}
+          onCancel={() => setPendingRemoveRoot(null)}
+        />
       )}
     </div>
   );

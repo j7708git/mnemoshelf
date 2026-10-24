@@ -2,7 +2,7 @@
 
 本機桌面應用程式：把自己挑選的資料夾變成可語意搜尋的知識庫，並讓多個 AI agent 共用同一份記憶。
 
-> **狀態**：v0.4.0 開發中（功能仍可能變動）；最新釋出為 **v0.3.0**（[GitHub Releases](https://github.com/j7708git/mnemoshelf/releases)）。本版重點＝**OpenChamber／OpenCode 自動召回**與**可選的每回合摘要寫入**。授權 [MIT](LICENSE)。
+> **狀態**：版本已 bump 到 **v0.4.0**、**尚未打 tag**；最新釋出仍是 **v0.3.0**（[GitHub Releases](https://github.com/j7708git/mnemoshelf/releases)）。本版重點＝**OpenChamber／OpenCode 自動召回**與**可選的每回合摘要寫入（預設關閉；開啟後無張數上限）**。授權 [MIT](LICENSE)。
 
 ## 這是什麼
 
