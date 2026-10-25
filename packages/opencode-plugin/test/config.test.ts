@@ -44,6 +44,35 @@ function healthResponse(body: unknown, status = 200): Response {
   });
 }
 
+/** 合法 runtime 檔內容（給注入 `readFileImpl` 的案例用）。 */
+function runtimeRecord(overrides: Record<string, unknown> = {}): string {
+  return JSON.stringify({
+    schemaVersion: 1,
+    url: "http://127.0.0.1:43117",
+    token: "runtime-token",
+    pid: 4321,
+    startedAt: "2026-10-21T00:00:00.000Z",
+    appVersion: "9.9.9",
+    ...overrides,
+  });
+}
+
+/** 記錄讀過哪些路徑的 `readFileImpl`；`content` 可依路徑給不同內容。 */
+function recordingReader(
+  content: (file: string) => string | null,
+): { reads: string[]; readFileImpl: (file: string) => Promise<string> } {
+  const reads: string[] = [];
+  return {
+    reads,
+    readFileImpl: async (file) => {
+      reads.push(file);
+      const text = content(file);
+      if (text === null) throw new Error("ENOENT");
+      return text;
+    },
+  };
+}
+
 afterEach(async () => {
   await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
 });
@@ -254,37 +283,103 @@ describe("runtimeCandidates", () => {
     expect(candidates).toContain(path.win32.join(appData, "mnemoshelf", "runtime.json"));
   });
 
-  it("明確路徑排最前且去重", () => {
+  it("明確路徑（option runtimeFile）釘住：只有那一個，不接平台預設", () => {
     const home = path.join(path.sep, "work", "userdata");
     const custom = path.join(home, "custom.json");
     const candidates = runtimeCandidates({
       platform: "linux",
-      env: { MNEMOSHELF_RUNTIME_FILE: custom },
+      env: { MNEMOSHELF_RUNTIME_FILE: path.join(home, "env.json") },
       home,
       runtimeFile: custom,
     });
-    expect(candidates[0]).toBe(custom);
-    expect(candidates.filter((item) => item === custom)).toHaveLength(1);
+    expect(candidates).toEqual([path.resolve(custom)]);
+  });
+
+  it("MNEMOSHELF_RUNTIME_FILE 釘住：只有那一個", () => {
+    const home = path.join(path.sep, "work", "userdata");
+    const custom = path.join(home, "env.json");
+    const candidates = runtimeCandidates({
+      platform: "linux",
+      env: { MNEMOSHELF_RUNTIME_FILE: custom },
+      home,
+    });
+    expect(candidates).toEqual([path.resolve(custom)]);
+  });
+
+  it("MNEMOSHELF_DATA_DIR 釘住：只有 <DATA_DIR>/runtime.json", () => {
+    const home = path.join(path.sep, "work", "userdata");
+    const dataDir = path.join(home, "data");
+    const candidates = runtimeCandidates({
+      platform: "linux",
+      env: { MNEMOSHELF_DATA_DIR: dataDir },
+      home,
+    });
+    expect(candidates).toEqual([path.resolve(path.join(dataDir, "runtime.json"))]);
+  });
+
+  it("Linux 設了 XDG_CONFIG_HOME 時桌面候選同時保留 XDG 與 ~/.config（XDG 在前）", () => {
+    const home = path.join(path.sep, "work", "userdata");
+    const configHome = path.join(path.sep, "work", "config");
+    const dataHome = path.join(path.sep, "work", "data");
+    const candidates = runtimeCandidates({
+      platform: "linux",
+      env: { XDG_CONFIG_HOME: configHome, XDG_DATA_HOME: dataHome },
+      home,
+    });
+    const xdgDesktop = path.join(configHome, "Mnemoshelf", "data", "runtime.json");
+    const homeDesktop = path.join(home, ".config", "Mnemoshelf", "data", "runtime.json");
+    expect(candidates[0]).toBe(xdgDesktop);
+    // GUI 行程不一定繼承 shell rc 的 XDG 設定 → `~/.config` 也要留著，順序在 XDG 之後。
+    expect(candidates[1]).toBe(homeDesktop);
+    // CLI 同理：XDG_DATA_HOME 與 ~/.local/share 兩處都試。
+    expect(candidates).toContain(path.join(dataHome, "mnemoshelf", "runtime.json"));
+    expect(candidates).toContain(path.join(home, ".local", "share", "mnemoshelf", "runtime.json"));
+    expect(new Set(candidates).size).toBe(candidates.length);
+  });
+
+  it("Linux 未設 XDG 時桌面候選去重後只剩一個（~/.config），CLI 也只剩一個", () => {
+    const home = path.join(path.sep, "work", "userdata");
+    const candidates = runtimeCandidates({ platform: "linux", env: {}, home });
+    expect(candidates).toEqual([
+      path.join(home, ".config", "Mnemoshelf", "data", "runtime.json"),
+      path.join(home, ".local", "share", "mnemoshelf", "runtime.json"),
+    ]);
   });
 });
 
 describe("parseRuntimeFile", () => {
+  const valid = {
+    schemaVersion: 1,
+    url: "http://127.0.0.1:1",
+    token: "t",
+    pid: 9,
+    startedAt: "2026-10-21T00:00:00.000Z",
+    appVersion: "0.4.0",
+  };
+
   it("接受合法內容並保留欄位", () => {
-    const record = parseRuntimeFile(
-      JSON.stringify({ schemaVersion: 1, url: "http://127.0.0.1:1", token: "t", pid: 9 }),
-    );
+    const record = parseRuntimeFile(JSON.stringify(valid));
     expect(record?.pid).toBe(9);
+    expect(record?.startedAt).toBe(valid.startedAt);
+    expect(record?.appVersion).toBe(valid.appVersion);
   });
 
   it("拒絕格式不符", () => {
     expect(parseRuntimeFile("not json")).toBeNull();
-    expect(parseRuntimeFile(JSON.stringify({ schemaVersion: 2, url: "u", token: "t", pid: 1 }))).toBeNull();
-    expect(
-      parseRuntimeFile(JSON.stringify({ schemaVersion: 1, url: "u", token: "", pid: 1 })),
-    ).toBeNull();
-    expect(
-      parseRuntimeFile(JSON.stringify({ schemaVersion: 1, url: "u", token: "t", pid: 1.5 })),
-    ).toBeNull();
+    expect(parseRuntimeFile(JSON.stringify({ ...valid, schemaVersion: 2 }))).toBeNull();
+    expect(parseRuntimeFile(JSON.stringify({ ...valid, url: "" }))).toBeNull();
+    expect(parseRuntimeFile(JSON.stringify({ ...valid, token: "  " }))).toBeNull();
+    expect(parseRuntimeFile(JSON.stringify({ ...valid, pid: 1.5 }))).toBeNull();
+    expect(parseRuntimeFile(JSON.stringify({ ...valid, pid: 0 }))).toBeNull();
+  });
+
+  it("缺 startedAt 或 appVersion，或型別不是字串，一律不合法", () => {
+    const { startedAt: _startedAt, ...withoutStartedAt } = valid;
+    const { appVersion: _appVersion, ...withoutAppVersion } = valid;
+    expect(parseRuntimeFile(JSON.stringify(withoutStartedAt))).toBeNull();
+    expect(parseRuntimeFile(JSON.stringify(withoutAppVersion))).toBeNull();
+    expect(parseRuntimeFile(JSON.stringify({ ...valid, startedAt: 123 }))).toBeNull();
+    expect(parseRuntimeFile(JSON.stringify({ ...valid, appVersion: null }))).toBeNull();
   });
 });
 
@@ -381,6 +476,22 @@ describe("resolveConnection", () => {
     expect(httpError.reason).toBe("health-identity-mismatch");
   });
 
+  it("health 回 JSON null／陣列／字串／數字也是確定性身分失敗（不是暫時連不上）", async () => {
+    const runtimeFile = await makeRuntimeFile();
+    for (const body of ["null", "[]", '"mnemoshelf"', "42"]) {
+      const resolution = await resolveConnection({
+        options: {},
+        env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile },
+        platform: "linux",
+        fetchImpl: async () =>
+          new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
+        killImpl: () => undefined,
+      });
+      expect(resolution.connection).toBeNull();
+      expect(resolution.reason).toBe("health-identity-mismatch");
+    }
+  });
+
   it("pid 死亡時不送 token、也不打 health", async () => {
     const runtimeFile = await makeRuntimeFile();
     let called = 0;
@@ -426,31 +537,194 @@ describe("resolveConnection", () => {
     expect(resolution.reason).toBe("identity-mismatch");
   });
 
-  it("檔案不存在且沒有任何設定時回 no-config", async () => {
+  it("檔案不存在且沒有任何設定時回 no-config，並依平台預設順序各試一次", async () => {
     const home = path.join(os.tmpdir(), "mnemoshelf-plugin-nohome");
+    const reader = recordingReader(() => null);
     const resolution = await resolveConnection({
       options: {},
       env: {},
       platform: "linux",
       home,
-      readFileImpl: async () => {
-        throw new Error("ENOENT");
-      },
+      readFileImpl: reader.readFileImpl,
     });
     expect(resolution.connection).toBeNull();
     expect(resolution.reason).toBe("no-config");
+    // 未明確指定 → 仍走平台預設候選（桌面版資料路徑、CLI 資料目錄）。
+    expect(reader.reads).toEqual(resolution.candidates);
+    expect(reader.reads).toHaveLength(2);
   });
 
-  it("明確指定的檔案讀不到時回 runtime-missing", async () => {
+  it("未指定時平台預設仍會依序嘗試：第一個讀不到就換下一個", async () => {
+    const home = path.join(os.tmpdir(), "mnemoshelf-plugin-default-home");
+    const desktop = path.resolve(path.join(home, ".config", "Mnemoshelf", "data", "runtime.json"));
+    const cli = path.resolve(path.join(home, ".local", "share", "mnemoshelf", "runtime.json"));
+    const reader = recordingReader((file) => (file === desktop ? null : runtimeRecord()));
     const resolution = await resolveConnection({
       options: {},
-      env: { MNEMOSHELF_RUNTIME_FILE: path.join(os.tmpdir(), "missing-runtime.json") },
+      env: {},
       platform: "linux",
-      readFileImpl: async () => {
-        throw new Error("ENOENT");
-      },
+      home,
+      readFileImpl: reader.readFileImpl,
+      fetchImpl: async () => healthResponse({ service: "mnemoshelf" }),
+      killImpl: () => undefined,
+    });
+    expect(reader.reads).toEqual([desktop, cli]);
+    expect(resolution.connection?.source).toBe("runtime");
+  });
+
+  it("平台預設的檔案內容不合法時回 runtime-invalid", async () => {
+    const home = path.join(os.tmpdir(), "mnemoshelf-plugin-invalid-home");
+    const reader = recordingReader(() => "not json");
+    const resolution = await resolveConnection({
+      options: {},
+      env: {},
+      platform: "linux",
+      home,
+      readFileImpl: reader.readFileImpl,
+    });
+    expect(resolution.connection).toBeNull();
+    expect(resolution.reason).toBe("runtime-invalid");
+    // 兩個平台預設候選都讀過（都無效）才下結論。
+    expect(reader.reads).toEqual(resolution.candidates);
+  });
+
+  it("option runtimeFile 釘住：只讀那一個，讀不到回 runtime-missing", async () => {
+    const pinned = path.join(os.tmpdir(), "mnemoshelf-plugin-option-pinned", "runtime.json");
+    const reader = recordingReader(() => null);
+    const resolution = await resolveConnection({
+      options: { runtimeFile: pinned },
+      env: {},
+      platform: "linux",
+      home: path.join(os.tmpdir(), "mnemoshelf-plugin-unused-home"),
+      readFileImpl: reader.readFileImpl,
+    });
+    expect(resolution.connection).toBeNull();
+    expect(resolution.reason).toBe("runtime-missing");
+    expect(reader.reads).toEqual([path.resolve(pinned)]);
+    expect(resolution.candidates).toEqual([path.resolve(pinned)]);
+  });
+
+  it("MNEMOSHELF_RUNTIME_FILE 釘住：只讀那一個，讀不到回 runtime-missing", async () => {
+    const pinned = path.join(os.tmpdir(), "mnemoshelf-plugin-env-pinned", "runtime.json");
+    const reader = recordingReader(() => null);
+    const resolution = await resolveConnection({
+      options: {},
+      env: { MNEMOSHELF_RUNTIME_FILE: pinned },
+      platform: "linux",
+      home: path.join(os.tmpdir(), "mnemoshelf-plugin-unused-home"),
+      readFileImpl: reader.readFileImpl,
     });
     expect(resolution.reason).toBe("runtime-missing");
+    expect(reader.reads).toEqual([path.resolve(pinned)]);
+    expect(resolution.candidates).toEqual([path.resolve(pinned)]);
+  });
+
+  it("MNEMOSHELF_DATA_DIR 釘住：只讀 <DATA_DIR>/runtime.json，讀不到回 runtime-missing", async () => {
+    const dataDir = path.join(os.tmpdir(), "mnemoshelf-plugin-data-dir");
+    const pinned = path.resolve(path.join(dataDir, "runtime.json"));
+    const reader = recordingReader(() => null);
+    const resolution = await resolveConnection({
+      options: {},
+      env: { MNEMOSHELF_DATA_DIR: dataDir },
+      platform: "linux",
+      home: path.join(os.tmpdir(), "mnemoshelf-plugin-unused-home"),
+      readFileImpl: reader.readFileImpl,
+    });
+    expect(resolution.reason).toBe("runtime-missing");
+    expect(reader.reads).toEqual([pinned]);
+    expect(resolution.candidates).toEqual([pinned]);
+  });
+
+  it("MNEMOSHELF_DATA_DIR 有合法 runtime 檔時真的連上（來源 runtime）", async () => {
+    const dataDir = path.join(os.tmpdir(), "mnemoshelf-plugin-data-dir-ok");
+    const pinned = path.resolve(path.join(dataDir, "runtime.json"));
+    const reader = recordingReader((file) => (file === pinned ? runtimeRecord() : null));
+    const resolution = await resolveConnection({
+      options: {},
+      env: { MNEMOSHELF_DATA_DIR: dataDir },
+      platform: "linux",
+      home: path.join(os.tmpdir(), "mnemoshelf-plugin-unused-home"),
+      readFileImpl: reader.readFileImpl,
+      fetchImpl: async () => healthResponse({ service: "mnemoshelf" }),
+      killImpl: () => undefined,
+    });
+    expect(resolution.reason).toBeNull();
+    expect(resolution.connection?.source).toBe("runtime");
+    expect(resolution.connection?.baseUrl).toBe("http://127.0.0.1:43117");
+    expect(reader.reads).toEqual([pinned]);
+  });
+
+  it("MNEMOSHELF_RUNTIME_FILE 與 MNEMOSHELF_DATA_DIR 同時設定時只讀前者", async () => {
+    const pinned = path.join(os.tmpdir(), "mnemoshelf-plugin-both-pinned", "runtime.json");
+    const dataDir = path.join(os.tmpdir(), "mnemoshelf-plugin-both-data-dir");
+    const reader = recordingReader(() => null);
+    const resolution = await resolveConnection({
+      options: {},
+      env: { MNEMOSHELF_RUNTIME_FILE: pinned, MNEMOSHELF_DATA_DIR: dataDir },
+      platform: "linux",
+      home: path.join(os.tmpdir(), "mnemoshelf-plugin-unused-home"),
+      readFileImpl: reader.readFileImpl,
+    });
+    expect(resolution.reason).toBe("runtime-missing");
+    expect(reader.reads).toEqual([path.resolve(pinned)]);
+    expect(resolution.candidates).toEqual([path.resolve(pinned)]);
+  });
+
+  it("釘住的檔案內容不合法時回 runtime-invalid，且不退回平台預設（即使預設有可用檔）", async () => {
+    const pinned = path.join(os.tmpdir(), "mnemoshelf-plugin-invalid-pinned", "runtime.json");
+    const reader = recordingReader((file) =>
+      file === path.resolve(pinned) ? JSON.stringify({ schemaVersion: 1 }) : runtimeRecord(),
+    );
+    const resolution = await resolveConnection({
+      options: {},
+      env: { MNEMOSHELF_RUNTIME_FILE: pinned },
+      platform: "linux",
+      home: path.join(os.tmpdir(), "mnemoshelf-plugin-unused-home"),
+      readFileImpl: reader.readFileImpl,
+    });
+    expect(resolution.connection).toBeNull();
+    expect(resolution.reason).toBe("runtime-invalid");
+    expect(reader.reads).toEqual([path.resolve(pinned)]);
+  });
+
+  it("Linux 平台預設在設定 XDG_CONFIG_HOME 時讀該目錄下的桌面 runtime 檔", async () => {
+    const home = path.join(os.tmpdir(), "mnemoshelf-plugin-xdg-home");
+    const configHome = path.join(os.tmpdir(), "mnemoshelf-plugin-xdg-config");
+    const expected = path.resolve(path.join(configHome, "Mnemoshelf", "data", "runtime.json"));
+    const reader = recordingReader(() => runtimeRecord());
+    const resolution = await resolveConnection({
+      options: {},
+      env: { XDG_CONFIG_HOME: configHome },
+      platform: "linux",
+      home,
+      readFileImpl: reader.readFileImpl,
+      fetchImpl: async () => healthResponse({ service: "mnemoshelf", appVersion: "0.4.0" }),
+      killImpl: () => undefined,
+    });
+    expect(reader.reads[0]).toBe(expected);
+    expect(resolution.connection?.source).toBe("runtime");
+  });
+
+  it("XDG_CONFIG_HOME 只設在 shell rc、桌面版卻寫在 ~/.config 時仍然連得上", async () => {
+    const home = path.join(os.tmpdir(), "mnemoshelf-plugin-rc-home");
+    const configHome = path.join(os.tmpdir(), "mnemoshelf-plugin-rc-config");
+    const homeDesktop = path.resolve(path.join(home, ".config", "Mnemoshelf", "data", "runtime.json"));
+    // 桌面版從圖形工作階段啟動，看不到 shell rc 的 XDG_CONFIG_HOME → 檔案寫在 ~/.config。
+    const reader = recordingReader((file) => (file === homeDesktop ? runtimeRecord() : null));
+    const resolution = await resolveConnection({
+      options: {},
+      env: { XDG_CONFIG_HOME: configHome },
+      platform: "linux",
+      home,
+      readFileImpl: reader.readFileImpl,
+      fetchImpl: async () => healthResponse({ service: "mnemoshelf" }),
+      killImpl: () => undefined,
+    });
+    expect(reader.reads[0]).toBe(
+      path.resolve(path.join(configHome, "Mnemoshelf", "data", "runtime.json")),
+    );
+    expect(reader.reads[1]).toBe(homeDesktop);
+    expect(resolution.connection?.source).toBe("runtime");
   });
 
   it("health 逾時會回 health-timeout", async () => {
@@ -495,6 +769,41 @@ describe("checkHealth", () => {
       fetchImpl: async () => new Response("<html>ok</html>", { status: 200 }),
     });
     expect(result).toEqual({ ok: false, reason: "not-json" });
+  });
+
+  it("JSON null／陣列／字串／數字回 wrong-service（不是暫時連不上）", async () => {
+    for (const body of ["null", "[]", '"mnemoshelf"', "42", "true"]) {
+      const result = await checkHealth({
+        baseUrl: "http://127.0.0.1:1",
+        fetchImpl: async () =>
+          new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
+      });
+      expect(result).toEqual({ ok: false, reason: "wrong-service" });
+    }
+  });
+
+  it("service 不是字串或不是 mnemoshelf 時回 wrong-service", async () => {
+    for (const body of [{}, { service: 123 }, { service: "other" }]) {
+      const result = await checkHealth({
+        baseUrl: "http://127.0.0.1:1",
+        fetchImpl: async () => healthResponse(body),
+      });
+      expect(result).toEqual({ ok: false, reason: "wrong-service" });
+    }
+  });
+
+  it("逾時回 timeout", async () => {
+    const result = await checkHealth({
+      baseUrl: "http://127.0.0.1:1",
+      timeoutMs: 5,
+      fetchImpl: (_input, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () =>
+            reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          );
+        }),
+    });
+    expect(result).toEqual({ ok: false, reason: "timeout" });
   });
 });
 

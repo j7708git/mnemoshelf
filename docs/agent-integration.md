@@ -80,10 +80,13 @@ MNEMOSHELF_TOKEN=<token> MNEMOSHELF_AGENT_DISCOVERY=on \
 | Windows | `%APPDATA%\Mnemoshelf\data\runtime.json` | `%APPDATA%\Mnemoshelf\agentSettings.json` | `%APPDATA%\mnemoshelf\runtime.json` |
 
 - Linux 的桌面 `userData` 尊重 `XDG_CONFIG_HOME`；CLI 的資料目錄尊重 `XDG_DATA_HOME`。
+  但 GUI 行程不一定繼承 shell rc 的設定，所以未明確指定時，**MCP 入口與 OpenCode 外掛**
+  會同時試 XDG 位置與 `~/.config`／`~/.local/share` 位置（XDG 在前、去重）。
 - 桌面版的實際位置以設定頁顯示的路徑為準（開發模式與打包版可能不同）。
 - **自訂 `MNEMOSHELF_DATA_DIR`／`XDG_DATA_HOME` 時**，外部程式不一定算得出預設路徑；
   請明確設定 `MNEMOSHELF_RUNTIME_FILE`（或外掛的 `runtimeFile` 選項），不要假設預設路徑找得到。
-  MCP 入口也會看 `MNEMOSHELF_DATA_DIR`（只試 `<MNEMOSHELF_DATA_DIR>/runtime.json`）。
+  **MCP 入口與 OpenCode 外掛**都會看 `MNEMOSHELF_DATA_DIR`（只試
+  `<MNEMOSHELF_DATA_DIR>/runtime.json`）。
 - **明確指定即不猜**：MCP 入口只要看到 `MNEMOSHELF_RUNTIME_FILE`（或只看到 `MNEMOSHELF_DATA_DIR`），
   就**只用那個位置**，不會再退回平台預設路徑。讀不到時回報失敗代碼 `runtime-missing`、讀到了但
   內容不合法回報 `runtime-invalid`，而且**不會送出任何請求**。這是刻意的：使用者指定某個檔案，

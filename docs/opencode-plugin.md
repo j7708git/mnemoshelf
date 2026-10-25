@@ -130,18 +130,40 @@ msg="loading plugin" id=.../mnemoshelf/packages/opencode-plugin
 
 ### 3.1 runtime 檔候選路徑
 
-依序嘗試（第一個能讀到且格式正確的為準）：
+**明確指定即不猜**：下列三個來源任一個有設定，就**只讀那一個位置**，不會再退回平台
+預設路徑（否則可能默默連到另一個服務實例，記憶會寫進不同的資料庫）：
+
+| 情況（依優先序，前面的先判） | 候選路徑 |
+|---|---|
+| option `runtimeFile` 有設定 | 只有該路徑（任意平台） |
+| 否則 `MNEMOSHELF_RUNTIME_FILE` 有設定 | 只有該路徑（任意平台） |
+| 否則 `MNEMOSHELF_DATA_DIR` 有設定 | 只有 `$MNEMOSHELF_DATA_DIR/runtime.json` |
+| 以上都沒設定 | 依平台預設位置（見下表），依序嘗試 |
+
+平台預設位置（**只有完全沒有明確指定時**才會用到）：
 
 | 來源 | Linux | macOS | Windows |
 |---|---|---|---|
-| option `runtimeFile` | 任意 | 任意 | 任意 |
-| `MNEMOSHELF_RUNTIME_FILE` | 任意 | 任意 | 任意 |
-| `MNEMOSHELF_DATA_DIR` 有設時 | `$MNEMOSHELF_DATA_DIR/runtime.json` | 同左 | 同左 |
-| 桌面版（Electron userData） | `~/.config/Mnemoshelf/data/runtime.json` | `~/Library/Application Support/Mnemoshelf/data/runtime.json` | `%APPDATA%\Mnemoshelf\data\runtime.json` |
-| CLI（server mode） | `$XDG_DATA_HOME/mnemoshelf/runtime.json`（預設 `~/.local/share/mnemoshelf/runtime.json`） | `~/Library/Application Support/mnemoshelf/runtime.json` | `%APPDATA%\mnemoshelf\runtime.json` |
+| 桌面版（Electron userData） | `$XDG_CONFIG_HOME/Mnemoshelf/data/runtime.json` **與** `~/.config/Mnemoshelf/data/runtime.json`（未設 `XDG_CONFIG_HOME` 時兩者相同，去重後只剩一個） | `~/Library/Application Support/Mnemoshelf/data/runtime.json` | `%APPDATA%\Mnemoshelf\data\runtime.json` |
+| CLI（server mode） | `$XDG_DATA_HOME/mnemoshelf/runtime.json` **與** `~/.local/share/mnemoshelf/runtime.json`（未設 `XDG_DATA_HOME` 時兩者相同，去重後只剩一個） | `~/Library/Application Support/mnemoshelf/runtime.json` | `%APPDATA%\mnemoshelf\runtime.json` |
 
-**桌面版多一層 `data`**，CLI 沒有；兩者刻意不同。自訂 `MNEMOSHELF_DATA_DIR`／XDG
-而外掛算不到時，請明確設定 `MNEMOSHELF_RUNTIME_FILE` 或 option `runtimeFile`。
+**桌面版多一層 `data`**，CLI 沒有；兩者刻意不同。自訂 `MNEMOSHELF_DATA_DIR` 而外掛
+算不到時，請明確設定 `MNEMOSHELF_RUNTIME_FILE` 或 option `runtimeFile`。
+
+Linux 的桌面版路徑尊重 `XDG_CONFIG_HOME`，但 Electron **只在自己的行程環境變數裡**看得到它：
+若你只在 shell rc（例如 `~/.bashrc`）設定，從圖形工作階段啟動的桌面版仍會寫在 `~/.config`，
+而從終端啟動的 OpenCode 卻看得到 `XDG_CONFIG_HOME`。因此 Linux 的桌面與 CLI 預設候選
+都**同時保留 XDG 位置與 `~` 位置**（XDG 在前、`~` 在後，去重），兩種啟動方式都找得到；
+macOS／Windows 沒有這個分歧，路徑不變。
+
+**明確指定時的失敗語意**（沿用既有原因碼，不新增）：
+
+- 指定的位置**讀不到檔案** → `runtime-missing`；
+- 讀得到但**內容不合法** → `runtime-invalid`；
+- 完全沒有來源（未指定、平台預設也沒有檔案） → `no-config`。
+
+任何情況都**不會**改試平台預設路徑：使用者明確指定的位置讀不到或內容不合法時，外掛會如實報錯
+（`runtime-missing`／`runtime-invalid`），不會改連別的服務實例。
 
 `runtime.json` 由 mnemoshelf 在 `MNEMOSHELF_AGENT_DISCOVERY=on`（桌面版：設定頁開關）
 時寫出，權限 `0600`，內容形如：
@@ -276,7 +298,7 @@ pid 死亡、找不到設定，以及 `/health` 有回應但**不是 mnemoshelf*
 |---|---|---|---|
 | `baseUrl` | string | — | mnemoshelf URL（如 `http://127.0.0.1:43117`） |
 | `token` | string | — | Bearer token；**會寫進設定檔**，建議改用 env／runtime 檔 |
-| `runtimeFile` | string | — | 明確指定 runtime 檔路徑；優先於所有預設候選 |
+| `runtimeFile` | string | — | 明確指定 runtime 檔路徑；有設定時**只讀這個路徑**（不再嘗試平台預設候選） |
 | `project` | string | — | 覆寫專案名（見 §6.4） |
 | `trigger` | `first-turn+explicit` \| `every-turn` | `first-turn+explicit` | 召回時機 |
 | `kMax` | int | 8 | 1–20；送給 server 的候選筆數 |
@@ -683,10 +705,13 @@ warning，之後每回合直接跳過、**不會**先呼叫模型再失敗；清
 
 1. mnemoshelf 是否啟動？`curl -s http://127.0.0.1:<port>/health` 應回
    `{"status":"ok","service":"mnemoshelf",...}`。
-2. runtime 檔是否存在、`0600`、內容有 `schemaVersion:1`？
+2. runtime 檔是否存在、`0600`、內容有 `schemaVersion:1`、非空的 `url`／`token`、
+   正整數 `pid`，且 `startedAt`／`appVersion` 都是字串？
    桌面版請確認設定頁的 agent discovery 已開啟；CLI 請確認
    `MNEMOSHELF_AGENT_DISCOVERY=on`。
 3. 使用自訂資料目錄？設 `MNEMOSHELF_RUNTIME_FILE` 或 option `runtimeFile`。
+   若設了 `MNEMOSHELF_DATA_DIR` 但該目錄沒有 `runtime.json`，會顯示 `runtime-missing`
+   （**不會**改連桌面版那份）。
 4. 設定好後執行一次 `/memory` 重新檢查；必要時重啟 OpenCode。
 
 ### 9.2 身分比對失敗

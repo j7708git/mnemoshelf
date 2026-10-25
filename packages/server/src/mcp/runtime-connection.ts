@@ -168,9 +168,18 @@ function resolveRuntimeCandidatePlan(input: {
     addPlatform(p.join(home, "Library", "Application Support", "mnemoshelf", "runtime.json"));
   } else {
     // 桌面版的 userData 尊重 XDG_CONFIG_HOME；CLI 的資料目錄尊重 XDG_DATA_HOME。
-    const configRoot = readNonEmptyString(env.XDG_CONFIG_HOME) ?? p.join(home, ".config");
+    //
+    // 但 Electron 只在**自己的行程環境變數裡**看得到 XDG_CONFIG_HOME：若使用者只在 shell rc
+    // （例如 `~/.bashrc`）設定，從圖形工作階段啟動的桌面版仍會寫到 `~/.config`，而從終端
+    // 啟動的 MCP 入口卻看得到 XDG——只試 XDG 位置會變成「本來連得上、現在找不到」。
+    // 因此兩個位置都留：XDG 版在前、`~` 版在後；未設 XDG 時兩者相同，去重後只剩一個。
+    const xdgConfigHome = readNonEmptyString(env.XDG_CONFIG_HOME);
+    const configRoot = xdgConfigHome ?? p.join(home, ".config");
     addPlatform(p.join(configRoot, "Mnemoshelf", "data", "runtime.json"));
+    addPlatform(p.join(home, ".config", "Mnemoshelf", "data", "runtime.json"));
+    // CLI 同理：`dataRoot` 已是 XDG 版（未設時就是 `~/.local/share`），再補一次 `~` 版。
     addPlatform(p.join(dataRoot, "mnemoshelf", "runtime.json"));
+    addPlatform(p.join(home, ".local", "share", "mnemoshelf", "runtime.json"));
   }
   return { candidates, pinned: false };
 }
@@ -179,7 +188,9 @@ function resolveRuntimeCandidatePlan(input: {
  * 依序回傳可能存在的 runtime 檔路徑（去重、保留順序）。
  *
  * 桌面版多一層 `data`：`<userData>/data/runtime.json`；CLI 是 `<OS 資料目錄>/mnemoshelf/runtime.json`。
- * 兩者刻意不同（大小寫也不同），不要合併成同一個路徑。
+ * 兩者刻意不同（大小寫也不同），不要合併成同一個路徑。Linux 的桌面與 CLI 各自**同時**保留
+ * `$XDG_CONFIG_HOME`／`$XDG_DATA_HOME` 位置與 `~/.config`／`~/.local/share` 位置
+ * （GUI 行程不一定繼承 shell rc 的 XDG 設定；順序 XDG 在前，去重）。
  *
  * **明確指定即不猜**：`MNEMOSHELF_RUNTIME_FILE` 或 `MNEMOSHELF_DATA_DIR` 有設定時，回傳的
  * 清單**只有那一個**路徑（見 `resolveRuntimeCandidatePlan`）；只有兩者都沒設定時才回傳平台預設
@@ -421,7 +432,7 @@ export const MCP_CONNECTION_FAILURE_MESSAGES: Record<McpConnectionFailureReason,
   "no-config":
     "找不到連線設定：請設定 MNEMOSHELF_URL 與 MNEMOSHELF_TOKEN，或在 Mnemoshelf 的「Agent 連線資訊」開啟連線資訊檔",
   "runtime-missing":
-    "找不到 agent 連線資訊檔（runtime.json）：請確認 Mnemoshelf 正在執行且該功能已開啟，或直接設定 MNEMOSHELF_URL 與 MNEMOSHELF_TOKEN",
+    "找不到 agent 連線資訊檔（runtime.json）：請確認 Mnemoshelf 正在執行且該功能已開啟，或設定 MNEMOSHELF_RUNTIME_FILE／MNEMOSHELF_DATA_DIR，或直接設定 MNEMOSHELF_URL 與 MNEMOSHELF_TOKEN",
   "runtime-invalid":
     "agent 連線資訊檔格式不符：需要 schemaVersion 為 1、非空的 url 與 token、正整數 pid，且 startedAt 與 appVersion 都是字串",
   "url-not-loopback":

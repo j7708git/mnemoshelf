@@ -235,22 +235,57 @@ function osUserDataDir(platform: NodeJS.Platform, env: NodeJS.ProcessEnv, home: 
   return xdg ?? p.join(home, ".local", "share");
 }
 
+/** runtime 候選路徑的解析結果（內部用；對外只提供 `runtimeCandidates`）。 */
+interface RuntimeCandidatePlan {
+  /** 依序嘗試的路徑（已去重）。 */
+  candidates: string[];
+  /**
+   * 位置是否由使用者**明確指定**（option `runtimeFile`、`MNEMOSHELF_RUNTIME_FILE` 或
+   * `MNEMOSHELF_DATA_DIR`）。
+   *
+   * 釘住時 `candidates` 只有那一個路徑，而且讀不到就是 `runtime-missing`：
+   * **不得再退回平台預設路徑**（否則會連到另一個服務實例，可能是不同的資料庫）。
+   */
+  pinned: boolean;
+}
+
 /**
- * 依序回傳可能存在的 runtime 檔路徑（去重、保留順序）。
+ * 算出 runtime 檔的候選路徑。四個來源**互斥**（與 MCP 入口同一套語意）：
  *
- * 桌面版多一層 `data`：`<userData>/data/runtime.json`；CLI 是 `<OS 資料目錄>/mnemoshelf/runtime.json`。
- * 兩者刻意不同，不要合併成同一個路徑。
+ * 1. option `runtimeFile` 有設定 → 只有那一個路徑。
+ * 2. 否則 `MNEMOSHELF_RUNTIME_FILE` 有設定 → 只有那一個路徑。
+ * 3. 否則 `MNEMOSHELF_DATA_DIR` 有設定 → 只有 `<MNEMOSHELF_DATA_DIR>/runtime.json`。
+ * 4. 否則 → 依平台的預設位置（桌面版 `data` 路徑 ＋ CLI 資料目錄，順序固定）。
+ *
+ * 明確指定就代表「我要連這個檔案對應的服務」；再往下猜會讓 agent 連上另一個實例
+ * （可能用不同的資料庫），因此第 1–3 段都**不再接平台預設候選**。
  */
-export function runtimeCandidates(input: {
+function resolveRuntimeCandidatePlan(input: {
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
   home?: string;
   runtimeFile?: string;
-}): string[] {
+}): RuntimeCandidatePlan {
   const platform = input.platform ?? process.platform;
   const env = input.env ?? process.env;
   const home = input.home ?? os.homedir();
-  // 依目標平台選路徑規則：正式流程的 platform 就是 process.platform；測試可注入。
+  // 使用者明確給的路徑是「目前這台機器」的路徑，用原生規則解析（不要套用模擬平台）。
+  const explicitOption = readNonEmptyString(input.runtimeFile);
+  if (explicitOption !== undefined) return { candidates: [path.resolve(explicitOption)], pinned: true };
+
+  const explicitFile = readNonEmptyString(env.MNEMOSHELF_RUNTIME_FILE);
+  if (explicitFile !== undefined) return { candidates: [path.resolve(explicitFile)], pinned: true };
+
+  // server 的資料目錄若被明確覆寫，runtime 檔就在同一個目錄（CLI／headless 常見）。
+  const explicitDataDir = readNonEmptyString(env.MNEMOSHELF_DATA_DIR);
+  if (explicitDataDir !== undefined) {
+    return {
+      candidates: [path.resolve(path.join(explicitDataDir, "runtime.json"))],
+      pinned: true,
+    };
+  }
+
+  // 平台預設位置：依目標平台選路徑規則（正式流程的 platform 就是 process.platform；測試可注入）。
   const p = platform === "win32" ? path.win32 : path.posix;
   const appData = readNonEmptyString(env.APPDATA) ?? p.join(home, "AppData", "Roaming");
   const dataRoot = osUserDataDir(platform, env, home);
@@ -262,19 +297,6 @@ export function runtimeCandidates(input: {
     const resolved = p.resolve(trimmed);
     if (!candidates.includes(resolved)) candidates.push(resolved);
   };
-  // 使用者明確給的路徑是「目前這台機器」的路徑，用原生規則解析（不要套用模擬平台）。
-  const addNative = (value: string | undefined): void => {
-    const trimmed = readNonEmptyString(value);
-    if (trimmed === undefined) return;
-    const resolved = path.resolve(trimmed);
-    if (!candidates.includes(resolved)) candidates.push(resolved);
-  };
-
-  addNative(input.runtimeFile);
-  addNative(env.MNEMOSHELF_RUNTIME_FILE);
-  // server 的資料目錄若被明確覆寫，runtime 檔就在同一個目錄（CLI／headless 常見）。
-  const explicitDataDir = readNonEmptyString(env.MNEMOSHELF_DATA_DIR);
-  if (explicitDataDir !== undefined) addNative(path.join(explicitDataDir, "runtime.json"));
 
   if (platform === "win32") {
     addPlatform(p.join(appData, "Mnemoshelf", "data", "runtime.json"));
@@ -283,13 +305,50 @@ export function runtimeCandidates(input: {
     addPlatform(p.join(home, "Library", "Application Support", "Mnemoshelf", "data", "runtime.json"));
     addPlatform(p.join(home, "Library", "Application Support", "mnemoshelf", "runtime.json"));
   } else {
+    // 桌面版的 userData 尊重 XDG_CONFIG_HOME；CLI 的資料目錄尊重 XDG_DATA_HOME。
+    //
+    // 但 Electron 只在**自己的行程環境變數裡**看得到 XDG_CONFIG_HOME：若使用者只在 shell rc
+    // （例如 `~/.bashrc`）設定，從圖形工作階段啟動的桌面版仍會寫到 `~/.config`，而從終端
+    // 啟動的 OpenCode 卻看得到 XDG——只試 XDG 位置會變成「本來連得上、現在找不到」。
+    // 因此兩個位置都留：XDG 版在前、`~` 版在後；未設 XDG 時兩者相同，去重後只剩一個。
+    const xdgConfigHome = readNonEmptyString(env.XDG_CONFIG_HOME);
+    const configRoot = xdgConfigHome ?? p.join(home, ".config");
+    addPlatform(p.join(configRoot, "Mnemoshelf", "data", "runtime.json"));
     addPlatform(p.join(home, ".config", "Mnemoshelf", "data", "runtime.json"));
+    // CLI 同理：`dataRoot` 已是 XDG 版（未設時就是 `~/.local/share`），再補一次 `~` 版。
     addPlatform(p.join(dataRoot, "mnemoshelf", "runtime.json"));
+    addPlatform(p.join(home, ".local", "share", "mnemoshelf", "runtime.json"));
   }
-  return candidates;
+  return { candidates, pinned: false };
 }
 
-/** 解析 runtime 檔文字；格式不符回 `null`（不猜、不用半份資料）。 */
+/**
+ * 依序回傳可能存在的 runtime 檔路徑（去重、保留順序）。
+ *
+ * 桌面版多一層 `data`：`<userData>/data/runtime.json`；CLI 是 `<OS 資料目錄>/mnemoshelf/runtime.json`。
+ * 兩者刻意不同，不要合併成同一個路徑。Linux 的桌面與 CLI 各自**同時**保留
+ * `$XDG_CONFIG_HOME`／`$XDG_DATA_HOME` 位置與 `~/.config`／`~/.local/share` 位置
+ * （GUI 行程不一定繼承 shell rc 的 XDG 設定；順序 XDG 在前，去重）。
+ *
+ * **明確指定即不猜**：option `runtimeFile`、`MNEMOSHELF_RUNTIME_FILE` 或
+ * `MNEMOSHELF_DATA_DIR` 有設定時，回傳的清單**只有那一個**路徑；只有三者都沒設定時
+ * 才回傳平台預設候選。讀不到時由呼叫端回報 `runtime-missing`，不會改試別的位置。
+ */
+export function runtimeCandidates(input: {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  home?: string;
+  runtimeFile?: string;
+}): string[] {
+  return resolveRuntimeCandidatePlan(input).candidates;
+}
+
+/**
+ * 解析 runtime 檔文字；格式不符回 `null`（不猜、不用半份資料）。
+ *
+ * 與 MCP 入口的解析器（server `agent-discovery.ts`）同一套規則：`schemaVersion` 為 1、
+ * 網址與 token 為非空字串、pid 為正整數，且 `startedAt` 與 `appVersion` 都是字串。
+ */
 export function parseRuntimeFile(text: string): RuntimeFileRecord | null {
   let parsed: unknown;
   try {
@@ -303,26 +362,45 @@ export function parseRuntimeFile(text: string): RuntimeFileRecord | null {
   if (typeof record.url !== "string" || typeof record.token !== "string") return null;
   if (record.url.trim() === "" || record.token.trim() === "") return null;
   if (typeof record.pid !== "number" || !Number.isInteger(record.pid) || record.pid <= 0) return null;
+  if (typeof record.startedAt !== "string" || typeof record.appVersion !== "string") return null;
   return {
     schemaVersion: 1,
     url: record.url,
     token: record.token,
     pid: record.pid,
-    ...(typeof record.startedAt === "string" ? { startedAt: record.startedAt } : {}),
-    ...(typeof record.appVersion === "string" ? { appVersion: record.appVersion } : {}),
+    startedAt: record.startedAt,
+    appVersion: record.appVersion,
   };
 }
 
-/** 讀 runtime 檔並解析；任何錯誤都回 `null`。 */
+/** 讀 runtime 檔的結果：要區分「讀不到」與「讀到但不合法」，失敗原因才不會混在一起。 */
+type RuntimeFileReadResult =
+  | { kind: "ok"; record: RuntimeFileRecord }
+  | { kind: "missing" }
+  | { kind: "invalid" };
+
+/** 讀檔並解析，保留「讀不到」與「內容不合法」的差異（對外只給 `readRuntimeFile`）。 */
+async function readRuntimeFileResult(
+  file: string,
+  readFileImpl: (file: string) => Promise<string>,
+): Promise<RuntimeFileReadResult> {
+  let text: string;
+  try {
+    text = await readFileImpl(file);
+  } catch {
+    return { kind: "missing" };
+  }
+  const record = parseRuntimeFile(text);
+  return record === null ? { kind: "invalid" } : { kind: "ok", record };
+}
+
+/** 讀 runtime 檔並解析；讀不到或格式不符都回 `null`。 */
 export async function readRuntimeFile(
   file: string,
   readFileImpl: (file: string) => Promise<string> = (target) => fs.readFile(target, "utf8"),
 ): Promise<RuntimeFileRecord | null> {
-  try {
-    return parseRuntimeFile(await readFileImpl(file));
-  } catch {
-    return null;
-  }
+  const result = await readRuntimeFileResult(file, readFileImpl);
+  return result.kind === "ok" ? result.record : null;
 }
 
 export type HealthCheckResult =
@@ -346,13 +424,22 @@ export async function checkHealth(input: {
     });
     // 非 2xx 是「這個位址有回應，但不是我們要的服務」→ 身分不明，不是暫時連不上。
     if (!response.ok) return { ok: false, reason: "http-error" };
-    let info: HealthInfo;
+    let payload: unknown;
     try {
-      info = (await response.json()) as HealthInfo;
+      payload = await response.json();
     } catch {
       return { ok: false, reason: "not-json" };
     }
-    if (info.service !== "mnemoshelf") return { ok: false, reason: "wrong-service" };
+    // 回應必須是物件：JSON `null`（或陣列、字串、數字、布林）一律視為身分不符。
+    // 不能讓 `null.service` 這種存取拋 TypeError 而被外層 catch 誤分類成「暫時連不上」
+    // （那會保留舊連線並每輪重試，等於把 token 繼續送往不明服務）。
+    if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+      return { ok: false, reason: "wrong-service" };
+    }
+    const info = payload as HealthInfo;
+    if (typeof info.service !== "string" || info.service !== "mnemoshelf") {
+      return { ok: false, reason: "wrong-service" };
+    }
     return { ok: true, info };
   } catch {
     return { ok: false, reason: controller.signal.aborted ? "timeout" : "unreachable" };
@@ -425,6 +512,10 @@ function failure(
 /**
  * 依優先序解析連線；runtime 檔的憑證一律先驗身分。
  *
+ * runtime 檔位置**明確指定即不猜**（option `runtimeFile`／`MNEMOSHELF_RUNTIME_FILE`／
+ * `MNEMOSHELF_DATA_DIR`）：只有那一個候選，讀不到就是 `runtime-missing`、讀得到但內容
+ * 不合法就是 `runtime-invalid`，都不退回平台預設路徑。
+ *
  * 這個函式只讀檔／打 `/health`，不寫任何東西、也不記 token。
  */
 export async function resolveConnection(input: ResolveConnectionInput): Promise<ConnectionResolution> {
@@ -446,25 +537,33 @@ export async function resolveConnection(input: ResolveConnectionInput): Promise<
   const usedEnv = envUrl !== undefined || envToken !== undefined;
 
   const needRuntime = url === undefined || token === undefined;
-  const candidates = needRuntime
-    ? runtimeCandidates({ platform, env, home, ...(readNonEmptyString(options.runtimeFile) === undefined
-        ? {}
-        : { runtimeFile: readNonEmptyString(options.runtimeFile) as string }) })
-    : [];
+  // 明確指定（option／MNEMOSHELF_RUNTIME_FILE／MNEMOSHELF_DATA_DIR）時 plan 只有一個候選，
+  // 且失敗時不得退回平台預設路徑。
+  const plan = needRuntime
+    ? resolveRuntimeCandidatePlan({
+        platform,
+        env,
+        home,
+        ...(readNonEmptyString(options.runtimeFile) === undefined
+          ? {}
+          : { runtimeFile: readNonEmptyString(options.runtimeFile) as string }),
+      })
+    : { candidates: [] as string[], pinned: false };
+  const candidates = plan.candidates;
   let record: RuntimeFileRecord | null = null;
+  let sawInvalid = false;
   if (needRuntime) {
     for (const candidate of candidates) {
-      const found = await readRuntimeFile(candidate, readFileImpl);
-      if (found !== null) {
-        record = found;
+      const result = await readRuntimeFileResult(candidate, readFileImpl);
+      if (result.kind === "ok") {
+        record = result.record;
         break;
       }
+      // 檔案在、但內容不合法：記下來；沒有其他可用候選時報 `runtime-invalid`。
+      if (result.kind === "invalid") sawInvalid = true;
     }
   }
 
-  const explicitRuntime =
-    readNonEmptyString(options.runtimeFile) !== undefined ||
-    readNonEmptyString(env.MNEMOSHELF_RUNTIME_FILE) !== undefined;
   let usedRuntime = false;
   let candidateUrlInvalid = false;
   if (url === undefined && record !== null) {
@@ -484,7 +583,14 @@ export async function resolveConnection(input: ResolveConnectionInput): Promise<
   if (url === undefined || token === undefined) {
     if (needRuntime) {
       if (record === null) {
-        return failure(explicitRuntime ? "runtime-missing" : "no-config", candidates, true);
+        // 讀到了但不合法 → runtime-invalid；位置被釘住卻讀不到 → runtime-missing；
+        // 完全沒有線索（未指定、平台預設也沒有）→ no-config。
+        const reason: ConnectionFailureReason = sawInvalid
+          ? "runtime-invalid"
+          : plan.pinned
+            ? "runtime-missing"
+            : "no-config";
+        return failure(reason, candidates, true);
       }
       if (candidateUrlInvalid) return failure("url-invalid", candidates, true);
     }
@@ -537,9 +643,9 @@ export function describeConnectionFailure(reason: ConnectionFailureReason | null
     case "no-config":
       return "找不到連線設定（可設 MNEMOSHELF_URL／MNEMOSHELF_TOKEN，或開啟 runtime.json）";
     case "runtime-missing":
-      return "runtime 檔不存在或無法讀取（請確認路徑或設定 MNEMOSHELF_RUNTIME_FILE）";
+      return "runtime 檔不存在或無法讀取（請確認路徑，或設定 MNEMOSHELF_RUNTIME_FILE／MNEMOSHELF_DATA_DIR）";
     case "runtime-invalid":
-      return "runtime 檔格式不符（schemaVersion／url／token／pid）";
+      return "runtime 檔格式不符（schemaVersion／url／token／pid／startedAt／appVersion）";
     case "url-invalid":
       return "runtime 檔的 url 不是有效的 http(s) 位址";
     case "identity-mismatch":

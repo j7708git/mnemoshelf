@@ -126,14 +126,28 @@ describe("runtimeCandidates", () => {
     expect(withoutAppData[0]).toBe("C:\\Users\\synthetic-user\\AppData\\Roaming\\Mnemoshelf\\data\\runtime.json");
   });
 
-  it("Linux 桌面版尊重 XDG_CONFIG_HOME，CLI 走 XDG_DATA_HOME", () => {
+  it("Linux 桌面版尊重 XDG_CONFIG_HOME，且同時保留 ~/.config；CLI 同理（XDG 在前）", () => {
     const candidates = runtimeCandidates({
       platform: "linux",
       env: { XDG_CONFIG_HOME: "/cfg", XDG_DATA_HOME: "/data" },
       home: HOME,
     });
-    expect(candidates).toContain("/cfg/Mnemoshelf/data/runtime.json");
-    expect(candidates).toContain("/data/mnemoshelf/runtime.json");
+    expect(candidates).toEqual([
+      "/cfg/Mnemoshelf/data/runtime.json",
+      // GUI 行程不一定繼承 shell rc 的 XDG 設定 → `~/.config` 也要留著，順序在 XDG 之後。
+      `${HOME}/.config/Mnemoshelf/data/runtime.json`,
+      "/data/mnemoshelf/runtime.json",
+      `${HOME}/.local/share/mnemoshelf/runtime.json`,
+    ]);
+    expect(new Set(candidates).size).toBe(candidates.length);
+  });
+
+  it("Linux 未設 XDG 時候選去重後只剩桌面與 CLI 各一個", () => {
+    const candidates = runtimeCandidates({ platform: "linux", env: {}, home: HOME });
+    expect(candidates).toEqual([
+      `${HOME}/.config/Mnemoshelf/data/runtime.json`,
+      `${HOME}/.local/share/mnemoshelf/runtime.json`,
+    ]);
   });
 
   it("明確指定 runtime 檔時只剩那一個路徑（不再接平台預設路徑）", () => {
@@ -488,6 +502,22 @@ describe("resolveMcpConnection", () => {
     });
     expect(connection.source).toBe("runtime");
     expect(connection.config.url).toBe("http://127.0.0.1:53459");
+  });
+
+  it("XDG_CONFIG_HOME 只設在 shell rc、桌面版卻寫在 ~/.config 時仍然連得上", async () => {
+    const homeDesktop = `${HOME}/.config/Mnemoshelf/data/runtime.json`;
+    const { readFileImpl, reads } = trackingReader({ [homeDesktop]: runtimeJson() });
+    const connection = await resolveMcpConnection({
+      env: { XDG_CONFIG_HOME: "/cfg" },
+      platform: "linux",
+      home: HOME,
+      readFileImpl,
+      fetchImpl: fakeFetch(200, HEALTHY),
+      killImpl: () => undefined,
+    });
+    expect(connection.source).toBe("runtime");
+    // 先試 XDG 位置（不存在），再試 ~/.config（找到）。
+    expect(reads).toEqual(["/cfg/Mnemoshelf/data/runtime.json", homeDesktop]);
   });
 
   it("連線資訊檔格式不符時回 runtime-invalid", async () => {
