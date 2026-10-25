@@ -137,6 +137,30 @@ pnpm --filter "@mnemoshelf/desktop..." licenses list --prod --long
   正式版本，測完可刪。
 - tag 去 `v` 後的版本號會在建置時寫入 app 版本，因此安裝檔版本與 tag 一致。
 
+## 隱私掃描（密鑰與個人本機路徑）
+
+repo 內有一支可獨立執行的掃描 `.github/scripts/scan-repo.sh`，由
+`.github/workflows/privacy-scan.yml` 在 push（`main`、`dsh/**`）、pull request 與手動觸發時執行：
+
+- **密鑰**：gitleaks（釘住 8.30.1；CI 下載官方 release 並驗 sha256），設定在 `.gitleaks.toml`。
+- **個人本機路徑**：`.github/scripts/check-personal-paths.py` 讀
+  `.github/repo-privacy-policy.json`，比對家目錄形式的絕對路徑（家目錄前綴後面接個人帳號）。
+  這份 policy JSON 與本機 commit／push 前隱私檢查使用的是同一套規則（內容相同），
+  因此本機與 CI 不會各有一套標準。
+
+掃描範圍是「會進版控的檔案」：已追蹤，以及未追蹤但未被 `.gitignore` 忽略的檔案；生成物
+（`node_modules`、`dist`、`dist-app`、`out`、`coverage`、`.tmp`）不掃，`pnpm-lock.yaml` 照樣掃。
+
+本機執行（需要 `gitleaks` 8.30.1 在 `PATH`，以及 Python 3）：
+
+```bash
+bash .github/scripts/scan-repo.sh
+```
+
+退出碼：`0` 乾淨、`1` 有發現（log 只列出 `檔案:行號` 與類型，不會印出密鑰原文或命中的路徑）、
+`2` 工具或設定錯誤（掃描沒有完成，**不代表乾淨**）。CI 失敗時請依指出的位置修正；
+不要用跳過 workflow 的方式合併。
+
 ## 已知限制
 
 - **ad-hoc 簽章、未公證**：安裝時需依上面「下載安裝檔」一節繞過系統警告；沒有 auto-update。

@@ -1,0 +1,34 @@
+{
+  "schemaVersion": "1.0",
+  "id": "agent-workspace-strict",
+  "description": "Agent 工作區政策：把『個人本機路徑』視為 high，含 /home/<user>/、/Users/<user>/、C:\\Users\\<user>\\ 的內容 commit／push 一律擋下。pattern 收緊成真實帳號字元集並加負向後顧（排除如 substack.com/home/post/ 的 URL 與程式原始碼裡的 regex 字面），並白名單常見合成／CI 佔位名稱。其餘規則沿用內建預設。",
+  "paths": {
+    "personalPathSeverity": "high",
+    "personalPathPatterns": [
+      "(?<![\\w.-])/home/[A-Za-z0-9._-]+/",
+      "(?<![\\w.-])/Users/[A-Za-z0-9._-]+/",
+      "(?<![\\w.-])[A-Za-z]:\\\\Users\\\\[^\\\\\\s\"']+\\\\"
+    ],
+    "personalPathAllow": [
+      "/home/runner/",
+      "/home/ci/",
+      "/Users/runner/",
+      "/Users/ci/",
+      "/home/user/",
+      "/Users/user/",
+      "/home/example/",
+      "/Users/example/",
+      "/home/you/",
+      "/Users/you/",
+      "/home/username/",
+      "/Users/username/",
+      "/home/synthetic-user/",
+      "/Users/synthetic-user/",
+      "/home/me/",
+      "/Users/me/",
+      "C:\\Users\\data\\",
+      "C:\\Users\\<user>\\"
+    ],
+    "maxFileBytes": 4194304
+  }
+}

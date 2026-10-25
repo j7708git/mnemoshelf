@@ -1,0 +1,45 @@
+# gitleaks 設定：只負責「密鑰」這一類。
+#
+# 個人本機絕對路徑（Unix／macOS 家目錄前綴、Windows 的 Users 目錄等）不在這裡掃：
+# gitleaks 的 regex 引擎是 Go 的 RE2，不支援負向後顧，寫不出政策檔需要的 pattern。那一類由
+# `.github/scripts/check-personal-paths.py` 讀 `.github/repo-privacy-policy.json` 檢查。
+#
+# 偵測規則全部沿用 gitleaks 內建預設（`useDefault = true`）；下面只放白名單，
+# 每一條都寫明為什麼排除，不用「放寬或關掉某條規則」的方式遷就誤報。
+[extend]
+useDefault = true
+
+# 生成物與相依套件。`scan-repo.sh` 匯出的是「會進版控的檔案」，正常情況這裡不會
+# 出現它們；保留這條是為了有人直接對工作目錄跑 `gitleaks dir` 時，不去掃
+# node_modules（本機超過 1 GB）與打包產物，也避免掃到二進位內容。
+# `pnpm-lock.yaml` **不在**排除名單內：lockfile 可能夾帶 registry token，必須掃。
+# （gitleaks 的預設設定自己有把 pnpm-lock.yaml 放進全域白名單；`scan-repo.sh` 會在
+#   暫存副本把它改名再掃，見該腳本的說明。這裡不複製整份預設規則，避免規則漂移。）
+[[allowlists]]
+description = "生成物與相依套件（不是原始碼、不進版控）；pnpm-lock.yaml 仍會掃"
+paths = [
+  '''(^|/)\.git/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)dist/''',
+  '''(^|/)dist-app/''',
+  '''(^|/)out/''',
+  '''(^|/)coverage/''',
+  '''(^|/)\.tmp/''',
+]
+
+# 文件與測試裡既有的合成佔位路徑。它們是拿來示範「什麼是個人路徑」的樣本，
+# 不是憑證；gitleaks 的預設規則目前不會把它們當密鑰，這條白名單是把「佔位不算
+# 密鑰」固定下來，日後預設規則調整時也不會讓既有內容突然變紅。
+#
+# 精準度：
+# - regexTarget = "match"：只比對「命中的那一段文字」，不是整行；同一行若真有
+#   別處的密鑰，仍會被抓到（用 line 會連同整行一起放行，太寬）。
+# - 只列政策檔白名單裡的固定佔位名稱，不用 `.*` 之類的萬用字元。
+[[allowlists]]
+description = "文件與測試中的合成佔位路徑（/home/synthetic-user/、/home/example/、C:\\Users\\<user>\\ 等），不是憑證"
+regexTarget = "match"
+regexes = [
+  '''/home/(?:synthetic-user|example|runner|ci|user|you|username|me)/''',
+  '''/Users/(?:synthetic-user|example|runner|ci|user|you|username|me)/''',
+  '''[A-Za-z]:\\Users\\(?:<user>|data)\\''',
+]
