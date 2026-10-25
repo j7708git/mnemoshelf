@@ -42,6 +42,12 @@ electron-builder 打包（`--dir` 產物供本機實跑驗收）。
   打包後是 asar 內的路徑；但 SQLite 的 C 層 `load_extension()` 直接開檔、不經過 Electron 的 fs 補丁，
   所以會得到 `ENOTDIR`。`src/asar-paths.ts` 在 `better-sqlite3` 的 `loadExtension` 上包一層，
   把 asar 路徑改指到 `app.asar.unpacked`（上游同問題：electron-builder issue #8824）。
+- **設定畫面可複製 MCP 設定片段**：Agent 連線資訊那一區有「複製 MCP 設定片段」按鈕，產出可直接
+  貼進 MCP client 的 `mcpServers` JSON（含 MCP 入口路徑與 `MNEMOSHELF_RUNTIME_FILE`）。
+  這段**不含 token**——MCP 入口會自己讀 `runtime.json` 取得憑證，全權憑證不必經過剪貼簿。
+  入口路徑由 `src/mcp-entry.ts` 解析：打包版指向 `app.asar.unpacked`（一般 `node` 讀得到），
+  開發模式指向 monorepo 裡的 `packages/server/dist/scripts/mcp.js`。細節見
+  `docs/agent-integration.md` §MCP 設定片段。
 - **啟動失敗不留白屏**：服務起不來或 UI 載入失敗時，視窗顯示可讀的錯誤頁。
 
 ## desktop shell API（renderer 端）
@@ -56,8 +62,11 @@ preload（`src/preload.cts` → `dist/preload.cjs`）用 `contextBridge` 掛上
 | `bootstrap.getState()` | 目前的模型下載狀態 |
 | `bootstrap.retry()` | 重新檢查並（必要時）重試下載 |
 | `bootstrap.onUpdate(listener)` | 訂閱狀態推播；回傳取消訂閱函式 |
-| `settings.get()` | 應用版本、token **保存狀態**（不含 token）、開機自啟狀態 |
+| `settings.get()` | 應用版本、token **保存狀態**（不含 token）、開機自啟狀態、Agent 連線資訊狀態 |
 | `settings.setAutostart(enabled)` | 切換開機自啟；回傳更新後的設定 |
+| `settings.setAgentDiscovery(enabled)` | 切換是否寫出 `runtime.json`（關閉時立即刪檔）；回傳更新後的設定 |
+| `settings.copyConnectionInfo()` | 把 `{url, token}` 放進剪貼簿；**回傳不含 token** |
+| `settings.copyMcpConfig()` | 把可直接貼進 MCP client 的設定片段放進剪貼簿；**片段不含 token**（入口自行讀 `runtime.json`）；回傳不含 token |
 
 **renderer 拿不到 token**：介面只回傳狀態，token 只留在 main process。
 

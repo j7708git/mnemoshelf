@@ -56,6 +56,13 @@ pnpm --filter @mnemoshelf/desktop run dist:win     # Windows x64：NSIS 安裝�
 > （electron-builder 對不同 target 的架構正規化不同）。上表的 Linux 名稱是實測結果；
 > macOS／Windows 的產物名稱依同一套命名規則（尚未在實機產出）。
 
+安裝檔裡也帶著 **MCP 入口**，讓 agent（Claude Code、Codex 等）連上本機服務：
+入口在 `<安裝目錄>/resources/app.asar.unpacked/node_modules/@mnemoshelf/server/dist/scripts/mcp.js`
+（**不是** `app.asar` 裡——一般 `node` 讀不到 asar 內的虛擬檔案系統）。
+桌面版設定頁的「複製 MCP 設定片段」會直接產生含正確路徑的設定。
+Linux 的 AppImage 掛載點每次啟動都會變動，那個入口路徑不固定；各平台的完整說明見
+[agent-integration.md](agent-integration.md) §MCP 設定片段。
+
 ## 下載安裝檔（ad-hoc 簽章、未公證）
 
 本專案的 macOS 安裝檔使用 **ad-hoc 簽章**（無身份證明的自我簽章，`identity: "-"`）——
