@@ -971,8 +971,14 @@ describe("serializedInference 的內部互斥（同一實例的推論不重疊�
 // ---------------------------------------------------------------------------
 
 describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）", () => {
+  // 自我測試用「實測耗時」算倍率，門檻是 1.3（見 SELF_TEST_CRITERIA.minThroughputRatio）。
+  // 這裡的 mock 延遲刻意留很大的餘裕（CPU 60ms vs CoreML 5ms，倍率約 12 倍）：
+  // 延遲是用真實計時器模擬的，CI runner 忙碌時量測會抖動，若倍率貼近門檻就會翻到
+  // 「accel-slow」分支（v0.4.1 的 CI 曾因此誤紅）。倍率遠離門檻能大幅降低因負載波動誤判的機率
+  // （用真實計時器做量測，原理上仍非零機率）。
+
   it("沒有快取：先量 CPU、再量 CoreML，通過後採用 coreml（並保留測試時建好的 session）", async () => {
-    mocks.behavior.delayMs = { cpu: 30, dml: 0, coreml: 5 };
+    mocks.behavior.delayMs = { cpu: 60, dml: 0, coreml: 5 };
     const { embedder, decisionPath } = darwinEmbedder({ appVersion: "1.2.3" });
 
     // 載入前：計畫裝置就是 coreml（尚未測試 → 沒有 selfTest）。
@@ -1060,7 +1066,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
   });
 
   it("沒有快取且向量不一致：退回 cpu、記 accel-inconsistent（餘弦 0.99875 < 0.999）", async () => {
-    mocks.behavior.delayMs = { cpu: 20, dml: 0, coreml: 5 };
+    mocks.behavior.delayMs = { cpu: 60, dml: 0, coreml: 5 };
     mocks.behavior.coremlVectorDrift = 0.05;
     const { embedder, decisionPath } = darwinEmbedder({ appVersion: "1.0.0" });
 
@@ -1240,7 +1246,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
   });
 
   it("appVersion 變更：重測一次並改寫記錄（即使是 usable 也重測）", async () => {
-    mocks.behavior.delayMs = { cpu: 15, dml: 0, coreml: 3 };
+    mocks.behavior.delayMs = { cpu: 60, dml: 0, coreml: 5 };
     const dir = tempDir();
     const decisionPath = join(dir, "device-decision.json");
     writeRecord(decisionPath, { outcome: "usable", appVersion: "0.9.0", throughputRatio: 9 });
@@ -1266,7 +1272,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
   });
 
   it("dtype 不同：快取決定不適用（重測），不會被舊量測誤導", async () => {
-    mocks.behavior.delayMs = { cpu: 15, dml: 0, coreml: 3 };
+    mocks.behavior.delayMs = { cpu: 60, dml: 0, coreml: 5 };
     const dir = tempDir();
     const decisionPath = join(dir, "device-decision.json");
     writeRecord(decisionPath, { outcome: "unusable", reason: SELF_TEST_REASONS.tooSlow, dtype: "q8" });
@@ -1287,7 +1293,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
   });
 
   it("CoreML 建得起來但推論失敗：退回 cpu、記 inference-failed，並更新快取", async () => {
-    mocks.behavior.delayMs = { cpu: 10, dml: 0, coreml: 3 };
+    mocks.behavior.delayMs = { cpu: 60, dml: 0, coreml: 5 };
     // 自我測試用掉 2 次推論（暖機＋計時），第 3 次（真正的嵌入）才失敗。
     mocks.behavior.coremlInferenceFailsAfter = 2;
     const { embedder, decisionPath } = darwinEmbedder({ appVersion: "1.0.0" });
@@ -1311,7 +1317,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
   });
 
   it("明示 coreml（darwin）：強制嘗試、不跑自我測試、不讀也不寫快取", async () => {
-    mocks.behavior.delayMs = { cpu: 30, dml: 0, coreml: 5 };
+    mocks.behavior.delayMs = { cpu: 60, dml: 0, coreml: 5 };
     const dir = tempDir();
     const decisionPath = join(dir, "device-decision.json");
     // 即使有一份「崩潰」的記錄（auto 會永久退回 CPU），明示 coreml 仍然照試。
@@ -1807,7 +1813,7 @@ describe("auto 在 macOS：載入期護欄與疑似崩潰的容忍", () => {
   });
 
   it("F2：自我測試通過後，同一實例 dispose→重載不重跑自我測試（只重載一次 coreml）", async () => {
-    mocks.behavior.delayMs = { cpu: 15, dml: 0, coreml: 3 };
+    mocks.behavior.delayMs = { cpu: 60, dml: 0, coreml: 5 };
     const { embedder } = darwinEmbedder({ appVersion: "1.0.0" });
 
     await embedder.embedDocuments(documents(2));
