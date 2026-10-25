@@ -43,8 +43,12 @@ electron-builder 打包（`--dir` 產物供本機實跑驗收）。
   所以會得到 `ENOTDIR`。`src/asar-paths.ts` 在 `better-sqlite3` 的 `loadExtension` 上包一層，
   把 asar 路徑改指到 `app.asar.unpacked`（上游同問題：electron-builder issue #8824）。
 - **設定畫面可複製 MCP 設定片段**：Agent 連線資訊那一區有「複製 MCP 設定片段」按鈕，產出可直接
-  貼進 MCP client 的 `mcpServers` JSON（含 MCP 入口路徑與 `MNEMOSHELF_RUNTIME_FILE`）。
-  這段**不含 token**——MCP 入口會自己讀 `runtime.json` 取得憑證，全權憑證不必經過剪貼簿。
+  貼進 MCP client 的 `mcpServers` JSON。片段用**應用程式自己的 Electron 執行檔**當 `command`，
+  並帶 `ELECTRON_RUN_AS_NODE=1`（Electron 以一般 Node.js 身分執行入口腳本），因此使用者
+  **不必另外安裝 Node.js**；`env` 另含 `MNEMOSHELF_RUNTIME_FILE`、`MNEMOSHELF_PROJECT`
+  （預設 `mnemoshelf`）與該變數。
+  這段**不含 token、也不含服務網址**——MCP 入口會自己讀 `runtime.json` 取得憑證與網址，
+  全權憑證不必經過剪貼簿。
   入口路徑由 `src/mcp-entry.ts` 解析：打包版指向 `app.asar.unpacked`（一般 `node` 讀得到），
   開發模式指向 monorepo 裡的 `packages/server/dist/scripts/mcp.js`。細節見
   `docs/agent-integration.md` §MCP 設定片段。

@@ -83,7 +83,12 @@ MNEMOSHELF_TOKEN=<token> MNEMOSHELF_AGENT_DISCOVERY=on \
 - 桌面版的實際位置以設定頁顯示的路徑為準（開發模式與打包版可能不同）。
 - **自訂 `MNEMOSHELF_DATA_DIR`／`XDG_DATA_HOME` 時**，外部程式不一定算得出預設路徑；
   請明確設定 `MNEMOSHELF_RUNTIME_FILE`（或外掛的 `runtimeFile` 選項），不要假設預設路徑找得到。
-  （MCP 入口也會看 `MNEMOSHELF_DATA_DIR`，但明確指定仍是最可靠的做法。）
+  MCP 入口也會看 `MNEMOSHELF_DATA_DIR`（只試 `<MNEMOSHELF_DATA_DIR>/runtime.json`）。
+- **明確指定即不猜**：MCP 入口只要看到 `MNEMOSHELF_RUNTIME_FILE`（或只看到 `MNEMOSHELF_DATA_DIR`），
+  就**只用那個位置**，不會再退回平台預設路徑。讀不到時回報失敗代碼 `runtime-missing`、讀到了但
+  內容不合法回報 `runtime-invalid`，而且**不會送出任何請求**。這是刻意的：使用者指定某個檔案，
+  就是要連那個檔案對應的服務；默默改連另一個實例可能寫進**另一個資料庫**（同一時間建議只跑一個
+  Mnemoshelf 服務，見下方安全說明）。只有兩個變數都沒設定時，才依上表的平台預設位置尋找。
 
 ## 讀取與使用
 
@@ -122,24 +127,48 @@ MCP 入口的連線來源有兩條，**先環境變數、後連線資訊檔**：
 | 順序 | 條件 | 行為 |
 |---|---|---|
 | 1 | `MNEMOSHELF_URL` **與** `MNEMOSHELF_TOKEN` 都設定 | 直接使用；這是使用者明確指定的連線，不做身分驗證。 |
-| 2 | 否則 | 讀 `runtime.json`（候選路徑見「預設路徑」；`MNEMOSHELF_RUNTIME_FILE` 最優先），**先驗身分再使用**。 |
+| 2 | 否則 | 讀 `runtime.json`（**明確指定 `MNEMOSHELF_RUNTIME_FILE` 時只試那一個位置**；只指定 `MNEMOSHELF_DATA_DIR` 時只試 `<MNEMOSHELF_DATA_DIR>/runtime.json`；兩者都沒給才依「預設路徑」尋找），**先驗身分再使用**。 |
 
-第 2 條的三道檢查（避免把全權 token 送到佔用同一個埠的無關程式）：
+第 2 條的檢查（避免把全權 token 送到佔用同一個埠的無關程式）：
 
-1. `MNEMOSHELF_URL` 若有給，必須與 `runtime.json` 的 `url` 一致；不一致就拒絕（token 歸屬不明）。
-2. `runtime.json` 的 `pid` 必須還活著（POSIX；Windows 沒有可靠的 signal 0，略過此檢查）。
-3. `GET <url>/health`（**不帶 Authorization**）必須回 `service === "mnemoshelf"`。
+1. 網址的主機必須是本機 loopback（`127.0.0.1` 或 `localhost`，大小寫不拘）；
+   不是就拒絕，且**一個請求都不送**（連免 token 的 `/health` 也不打）。
+2. `MNEMOSHELF_URL` 若有給，必須與 `runtime.json` 的 `url` 一致；不一致就拒絕（token 歸屬不明）。
+3. `runtime.json` 的 `pid` 必須還活著（POSIX；Windows 沒有可靠的 signal 0，略過此檢查）。
+4. `GET <url>/health`（**不帶 Authorization**）必須回 `service === "mnemoshelf"`。
 
 任何一項不符就啟動失敗，且**不會送出 token**。失敗原因有穩定的代碼
-（`no-config`／`runtime-missing`／`runtime-invalid`／`identity-mismatch`／`pid-dead`／
-`health-timeout`／`health-unreachable`／`health-identity-mismatch`）。
+（`no-config`／`runtime-missing`／`runtime-invalid`／`url-not-loopback`／`identity-mismatch`／
+`pid-dead`／`health-timeout`／`health-unreachable`／`health-identity-mismatch`）。
 
-`MNEMOSHELF_PROJECT` 是選配：agent 用 `remember` 寫入時的預設專案；省略時退回 MCP 行程
-cwd 的資料夾名稱。
+**連線中斷會自動重連一次**：工具呼叫若在**連線層**失敗（fetch 拋錯、連線被拒——例如服務重啟
+換了埠），入口會重新解析一次連線（重讀 `runtime.json` → 重做上面的 loopback、pid 與 `/health`
+檢查 → 取得新的網址與 token），然後把**該次呼叫重試一次**；重連成功後，後續呼叫都用新的設定。
+重試上限固定 1 次。HTTP 有回應但狀態碼是錯誤（401／404／400…）**不會**重試：那是服務端的答案，
+重試只會多打一次 API。重新驗證若失敗，工具回應會帶上對應的失敗代碼。
 
-### 入口路徑
+> 重啟 Mnemoshelf 之後，agent 端**不一定**需要跟著重啟（入口會自動接回新位址）；但仍建議重啟
+> agent 端，以確保從乾淨狀態開始、也避免舊連線殘留在 client 端。
 
-| 情境 | 路徑 |
+**啟動時會在 stderr 印一則連線來源說明**（來源是環境變數還是連線資訊檔，加上 `host:port`），
+不含 token、也不含檔案路徑。環境變數只給一半（例如只有 `MNEMOSHELF_TOKEN`）而改用檔案時，
+會額外印一則警告說明哪一個被忽略。stdout 是 MCP 協定通道，不會有任何非 JSON-RPC 輸出。
+
+`MNEMOSHELF_PROJECT` 是選配：agent 用 `remember` 寫入時的預設專案。**專案名的解析順序**是：
+工具參數 `project` → 環境變數 `MNEMOSHELF_PROJECT` → MCP 行程 cwd 的資料夾名稱（cwd 是家目錄時
+跳過）→ 解析不到。
+
+- 解析不到專案時：`remember` 會退回**全域（global）**範圍，記憶變成跨專案共用；
+  `search_memories` 在未指定 scope 且未帶 `includeAllProjects` 時會直接回
+  `ValidationError`「無法解析專案」。`recall` 依設計是**跨專案**列出，不套用預設專案解析
+  （見 `docs/operations.md`）。
+- 從 Dock 啟動的圖形介面 agent，其 MCP 行程的工作目錄不受控（可能是家目錄或根目錄），
+  所以**建議明確設定 `MNEMOSHELF_PROJECT`**，不要依賴 cwd 的資料夾名稱。
+  桌面版產生的片段會直接帶 `mnemoshelf`（見下方），使用者可自行改成別的專案名稱。
+
+### 入口路徑與執行方式
+
+| 情境 | 入口腳本路徑 |
 |---|---|
 | 桌面版（打包） | `<resourcesPath>/app.asar.unpacked/node_modules/@mnemoshelf/server/dist/scripts/mcp.js` |
 | 桌面版（開發模式） | `<repo>/packages/server/dist/scripts/mcp.js` |
@@ -148,6 +177,12 @@ cwd 的資料夾名稱。
 - 打包版的入口落在 `app.asar.unpacked`（**不是** `app.asar` 裡）：electron-builder 的
   `asarUnpack: "**/node_modules/**"` 把 production 相依解包到 asar 之外，一般 `node`
   才讀得到。macOS 上已實測可直接執行並完成 `initialize`／`tools/list`。
+- **桌面版片段用應用程式自己的 Electron 執行檔啟動入口，不需要另外安裝 Node.js**：
+  `command` 是 `<App>.app/Contents/MacOS/<名稱>`（macOS）等應用程式執行檔，並在 `env` 帶
+  `ELECTRON_RUN_AS_NODE=1`。Electron 官方行為：這個變數會讓 Electron 以一般 Node.js 的身分
+  啟動，因此能直接執行入口腳本。它需要 Electron 的 `RunAsNode` fuse 處於開啟狀態——本專案的
+  `electron-builder.yml` 沒有關閉任何 fuse，打包產物的 `RunAsNode` 實測為 `ENABLED`；
+  若未來有人關掉它，這段片段就會失效。自己用 `node` 執行入口仍然可行（見下方說明）。
 - `resourcesPath` 在各平台的位置：macOS `<App>.app/Contents/Resources`、
   Windows `<安裝目錄>/resources`、Linux AppImage 為每次啟動變動的掛載點
   （**AppImage 的入口路徑不固定**，建議改用解壓後的版本或自行包一層固定路徑的腳本）。
@@ -160,18 +195,26 @@ cwd 的資料夾名稱。
   "mcpServers": {
     "mnemoshelf": {
       "type": "stdio",
-      "command": "node",
-      "args": ["<MCP 入口路徑>"],
+      "command": "<桌面版執行檔路徑>",
+      "args": [
+        "<MCP 入口路徑>"
+      ],
       "env": {
-        "MNEMOSHELF_RUNTIME_FILE": "<runtime.json 路徑>"
+        "MNEMOSHELF_RUNTIME_FILE": "<runtime.json 路徑>",
+        "MNEMOSHELF_PROJECT": "mnemoshelf",
+        "ELECTRON_RUN_AS_NODE": "1"
       }
     }
   }
 }
 ```
 
-- **這裡沒有 token**：入口會自己讀 `runtime.json` 取得網址與 token，全權憑證不必經過
-  剪貼簿或第三方的 MCP 設定檔。
+- **這裡沒有 token、也沒有網址**：入口會自己讀 `runtime.json` 取得網址與 token，全權憑證不必
+  經過剪貼簿或第三方的 MCP 設定檔；網址也不寫死（服務每次啟動可能換埠）。
+- `<桌面版執行檔路徑>`：打包後是應用程式執行檔本身。想改用系統的 `node` 也可以，把
+  `command` 換成 `node` 並刪掉 `ELECTRON_RUN_AS_NODE`（本專案的入口只需要 Node.js 22 以上）。
+- `MNEMOSHELF_PROJECT` 是這個 agent 的預設專案名稱；片段預設 `mnemoshelf`，可自行改成
+  別的專案名稱。
 - `<runtime.json 路徑>` 省略也可以：入口會依平台預設路徑尋找（見「預設路徑」）。
   明寫較保險（自訂資料目錄時尤其重要）。
 - OpenCode V2 的設定形狀不同（`mcp.servers`、鍵名 `type: "local"`、欄位是 `environment`）：
@@ -183,10 +226,11 @@ cwd 的資料夾名稱。
     "servers": {
       "mnemoshelf": {
         "type": "local",
-        "command": ["node", "<MCP 入口路徑>"],
+        "command": ["<桌面版執行檔路徑>", "<MCP 入口路徑>"],
         "environment": {
           "MNEMOSHELF_RUNTIME_FILE": "<runtime.json 路徑>",
-          "MNEMOSHELF_PROJECT": "<project-name>"
+          "MNEMOSHELF_PROJECT": "<project-name>",
+          "ELECTRON_RUN_AS_NODE": "1"
         }
       }
     }
@@ -231,8 +275,8 @@ cwd 的資料夾名稱。
 - **同使用者程式也能改寫 `runtime.json` 的 `url`。** v1 以 `/health` 的 `service` 身分比對
   與 `pid` 檢查來緩解「把 token 送到錯的程式」與「誤刪別人的檔」，但**不防惡意篡改**。
 - **不要複製這個檔案到別台機器、備份、repo 或共用資料夾。** 需要備份 token 時請用密碼管理工具。
-- **MCP 設定片段不含 token**：貼進 MCP client 的只有入口路徑與連線資訊檔路徑，
-  憑證由入口在執行時自行讀取。取得片段不需要複製憑證出去。
+- **MCP 設定片段不含 token**：貼進 MCP client 的只有執行檔／入口路徑、連線資訊檔路徑
+  與專案名稱，憑證由入口在執行時自行讀取。取得片段不需要複製憑證出去。
 - **讀到 `runtime.json` 的程式拿到的是全權憑證。** 自動讀檔讓「不用手動貼 token」變方便，
   但也代表任何能讀該檔的同使用者程式都能取得全權——信任模型沒有改變，只是路徑變短了。
 - Windows 沒有 POSIX `0600` 的等價語意；檔案位於使用者專屬的 `%APPDATA%`，由使用者 profile

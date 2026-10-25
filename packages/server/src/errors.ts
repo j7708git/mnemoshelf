@@ -41,6 +41,8 @@ export type McpConnectionFailureReason =
   | "runtime-missing"
   /** 連線資訊檔格式不符（缺 schemaVersion／url／token／pid）。 */
   | "runtime-invalid"
+  /** 連線資訊檔的網址不是 loopback（只接受 `127.0.0.1`／`localhost`）。 */
+  | "url-not-loopback"
   /** 環境變數的網址與連線資訊檔不一致，token 的歸屬不明。 */
   | "identity-mismatch"
   /** 連線資訊檔所指的行程已經結束（舊檔）。 */

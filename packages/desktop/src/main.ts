@@ -451,6 +451,9 @@ function registerIpcHandlers(): void {
       const snippet = buildMcpConfigSnippet({
         entryPath,
         runtimeFile: desktopPaths.runtimeFile,
+        // 用桌面版自己的 Electron 執行檔當 command（不必額外安裝 Node.js）：
+        // 片段另帶 ELECTRON_RUN_AS_NODE=1，Electron 會以一般 Node.js 身分執行入口腳本。
+        executablePath: process.execPath,
       });
       await clipboard.writeText(snippet);
       log("已將 MCP 設定片段複製到剪貼簿（不含 token；不寫進 log）");

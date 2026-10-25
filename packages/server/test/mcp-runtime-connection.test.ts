@@ -16,12 +16,14 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
   checkServiceHealth,
+  describeMcpConnectionFailure,
   isProcessAlive,
   McpConnectionError,
   resolveMcpConnection,
   runStdio,
   runtimeCandidates,
   type HealthCheckResult,
+  type McpConnectionFailureReason,
 } from "../src/index.js";
 import { makeTempDir, removeTempDir, startTestServer, TEST_TOKEN } from "./helpers.js";
 
@@ -72,8 +74,38 @@ function fakeFetch(
   }) as unknown as typeof fetch;
 }
 
+/** 假的讀檔：只認得指定路徑，其餘一律當不存在；另外記錄每次嘗試的路徑。 */
+function trackingReader(files: Record<string, string>): {
+  readFileImpl: (file: string) => Promise<string>;
+  reads: string[];
+} {
+  const reads: string[] = [];
+  const readFileImpl = async (file: string): Promise<string> => {
+    reads.push(file);
+    const content = files[file];
+    if (content === undefined) {
+      const error = new Error("ENOENT") as NodeJS.ErrnoException;
+      error.code = "ENOENT";
+      throw error;
+    }
+    return content;
+  };
+  return { readFileImpl, reads };
+}
+
 /** 健康的 `/health` 回應。 */
 const HEALTHY = { status: "ok", service: "mnemoshelf", appVersion: "0.4.0" };
+
+/** 假的 fetch：一律回健康的 `/health`，並記錄呼叫次數。 */
+function countingFetch(counter: { calls: number }): typeof fetch {
+  return (async () => {
+    counter.calls += 1;
+    return new Response(JSON.stringify(HEALTHY), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+}
 
 describe("runtimeCandidates", () => {
   it("macOS 同時給桌面版與 CLI 的路徑（大小寫不同，刻意不合併）", () => {
@@ -104,25 +136,41 @@ describe("runtimeCandidates", () => {
     expect(candidates).toContain("/data/mnemoshelf/runtime.json");
   });
 
-  it("明確指定的 runtime 檔路徑排在最前面", () => {
+  it("明確指定 runtime 檔時只剩那一個路徑（不再接平台預設路徑）", () => {
     const candidates = runtimeCandidates({
       platform: "linux",
       env: { MNEMOSHELF_RUNTIME_FILE: "/explicit/runtime.json" },
       home: HOME,
     });
-    expect(candidates[0]).toBe("/explicit/runtime.json");
+    expect(candidates).toEqual(["/explicit/runtime.json"]);
   });
 
-  it("明確指定的資料目錄會推出 runtime.json", () => {
+  it("只指定資料目錄時只剩該目錄下的 runtime.json", () => {
     const candidates = runtimeCandidates({
       platform: "linux",
       env: { MNEMOSHELF_DATA_DIR: "/data-dir" },
       home: HOME,
     });
-    expect(candidates).toContain("/data-dir/runtime.json");
+    expect(candidates).toEqual(["/data-dir/runtime.json"]);
   });
 
-  it("重複的路徑只留一次", () => {
+  it("檔案位置優先於資料目錄（兩者都給時只用檔案位置）", () => {
+    const candidates = runtimeCandidates({
+      platform: "linux",
+      env: { MNEMOSHELF_RUNTIME_FILE: "/explicit/runtime.json", MNEMOSHELF_DATA_DIR: "/data-dir" },
+      home: HOME,
+    });
+    expect(candidates).toEqual(["/explicit/runtime.json"]);
+  });
+
+  it("兩者都沒設時仍走平台預設候選（不被新規則清空）", () => {
+    const candidates = runtimeCandidates({ platform: "linux", env: {}, home: HOME });
+    expect(candidates).toContain(`${HOME}/.config/Mnemoshelf/data/runtime.json`);
+    expect(candidates).toContain(`${HOME}/.local/share/mnemoshelf/runtime.json`);
+    expect(candidates.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("明確指定時仍是去重後的單一候選", () => {
     const candidates = runtimeCandidates({
       platform: "linux",
       env: { MNEMOSHELF_RUNTIME_FILE: "/explicit/runtime.json" },
@@ -281,6 +329,114 @@ describe("resolveMcpConnection", () => {
     ).rejects.toMatchObject({ name: "McpConnectionError", reason: "runtime-missing" });
   });
 
+  it("明確指定的檔案不存在時只讀那一個路徑，不退回平台預設路徑、也不送請求", async () => {
+    const explicit = "/explicit/runtime.json";
+    const desktopDefault = `${HOME}/.config/Mnemoshelf/data/runtime.json`;
+    // 平台預設位置「有」一份可用檔案：舊行為會默默改用它，新行為不得如此。
+    const { readFileImpl, reads } = trackingReader({ [desktopDefault]: runtimeJson() });
+    const counter = { calls: 0 };
+
+    await expect(
+      resolveMcpConnection({
+        env: { MNEMOSHELF_RUNTIME_FILE: explicit },
+        platform: "linux",
+        home: HOME,
+        readFileImpl,
+        fetchImpl: countingFetch(counter),
+        killImpl: () => undefined,
+      }),
+    ).rejects.toMatchObject({ name: "McpConnectionError", reason: "runtime-missing" });
+
+    expect(reads).toEqual([explicit]);
+    expect(counter.calls).toBe(0);
+  });
+
+  it("明確指定的檔案存在時直接使用它（來源 runtime）", async () => {
+    const explicit = "/explicit/runtime.json";
+    const connection = await resolveMcpConnection({
+      env: { MNEMOSHELF_RUNTIME_FILE: explicit },
+      platform: "linux",
+      home: HOME,
+      readFileImpl: readerFor({ [explicit]: runtimeJson({ url: "http://127.0.0.1:54321" }) }),
+      fetchImpl: fakeFetch(200, HEALTHY),
+      killImpl: () => undefined,
+    });
+    expect(connection.source).toBe("runtime");
+    expect(connection.config.url).toBe("http://127.0.0.1:54321");
+    expect(connection.config.token).toBe(TOKEN);
+  });
+
+  it("明確指定的檔案內容不合法時回 runtime-invalid，且不退回平台預設路徑", async () => {
+    const explicit = "/explicit/runtime.json";
+    const desktopDefault = `${HOME}/.config/Mnemoshelf/data/runtime.json`;
+    const { readFileImpl, reads } = trackingReader({
+      [explicit]: JSON.stringify({ schemaVersion: 1, url: "http://127.0.0.1:53459" }),
+      [desktopDefault]: runtimeJson(),
+    });
+    const counter = { calls: 0 };
+
+    await expect(
+      resolveMcpConnection({
+        env: { MNEMOSHELF_RUNTIME_FILE: explicit },
+        platform: "linux",
+        home: HOME,
+        readFileImpl,
+        fetchImpl: countingFetch(counter),
+        killImpl: () => undefined,
+      }),
+    ).rejects.toMatchObject({ name: "McpConnectionError", reason: "runtime-invalid" });
+
+    expect(reads).toEqual([explicit]);
+    expect(counter.calls).toBe(0);
+  });
+
+  it("只設 MNEMOSHELF_DATA_DIR 時使用該目錄下的 runtime.json", async () => {
+    const connection = await resolveMcpConnection({
+      env: { MNEMOSHELF_DATA_DIR: "/data-dir" },
+      platform: "linux",
+      home: HOME,
+      readFileImpl: readerFor({ "/data-dir/runtime.json": runtimeJson() }),
+      fetchImpl: fakeFetch(200, HEALTHY),
+      killImpl: () => undefined,
+    });
+    expect(connection.source).toBe("runtime");
+    expect(connection.config.url).toBe("http://127.0.0.1:53459");
+  });
+
+  it("只設 MNEMOSHELF_DATA_DIR 而該目錄沒有檔案時回 runtime-missing，且不試平台預設路徑", async () => {
+    const desktopDefault = `${HOME}/.config/Mnemoshelf/data/runtime.json`;
+    const { readFileImpl, reads } = trackingReader({ [desktopDefault]: runtimeJson() });
+    const counter = { calls: 0 };
+
+    await expect(
+      resolveMcpConnection({
+        env: { MNEMOSHELF_DATA_DIR: "/data-dir" },
+        platform: "linux",
+        home: HOME,
+        readFileImpl,
+        fetchImpl: countingFetch(counter),
+        killImpl: () => undefined,
+      }),
+    ).rejects.toMatchObject({ name: "McpConnectionError", reason: "runtime-missing" });
+
+    expect(reads).toEqual(["/data-dir/runtime.json"]);
+    expect(counter.calls).toBe(0);
+  });
+
+  it("完全沒有指定時仍會找到平台預設位置的檔案（既有行為不回歸）", async () => {
+    const desktopDefault = `${HOME}/.config/Mnemoshelf/data/runtime.json`;
+    const connection = await resolveMcpConnection({
+      env: {},
+      platform: "linux",
+      home: HOME,
+      readFileImpl: readerFor({ [desktopDefault]: runtimeJson() }),
+      fetchImpl: fakeFetch(200, HEALTHY),
+      killImpl: () => undefined,
+    });
+    expect(connection.source).toBe("runtime");
+    expect(connection.config.url).toBe("http://127.0.0.1:53459");
+  });
+
   it("連線資訊檔格式不符時回 runtime-invalid", async () => {
     const file = `${HOME}/.config/Mnemoshelf/data/runtime.json`;
     await expect(
@@ -377,6 +533,93 @@ describe("resolveMcpConnection", () => {
     }).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(McpConnectionError);
     expect(String((error as Error).message)).not.toContain(TOKEN);
+  });
+});
+
+describe("resolveMcpConnection：只接受 loopback 網址（B1）", () => {
+  const file = `${HOME}/.config/Mnemoshelf/data/runtime.json`;
+
+  /** 解析連線；回傳錯誤（成功時丟測試失敗）。 */
+  async function resolveWith(url: string, seen: { requests: string[] }): Promise<unknown> {
+    return resolveMcpConnection({
+      env: {},
+      platform: "linux",
+      home: HOME,
+      readFileImpl: readerFor({ [file]: runtimeJson({ url }) }),
+      fetchImpl: (async (input: string | URL | Request) => {
+        seen.requests.push(String(input));
+        return new Response(JSON.stringify(HEALTHY), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as unknown as typeof fetch,
+      killImpl: () => undefined,
+    }).catch((caught: unknown) => caught);
+  }
+
+  it("127.0.0.1 與 localhost（大小寫不拘）可通過", async () => {
+    for (const url of ["http://127.0.0.1:53459", "http://localhost:53459", "http://LOCALHOST:53459"]) {
+      const seen = { requests: [] as string[] };
+      const connection = await resolveWith(url, seen);
+      expect(connection).not.toBeInstanceOf(McpConnectionError);
+      expect((connection as { source: string }).source).toBe("runtime");
+      // 通過的網址才會打 /health。
+      expect(seen.requests).toHaveLength(1);
+      expect(seen.requests[0]).toBe(`${url}/health`);
+    }
+  });
+
+  it("非 loopback 網址回 url-not-loopback，且一個請求都不送", async () => {
+    for (const url of ["http://192.168.1.9:53459", "http://example.test:53459", "http://0.0.0.0:53459"]) {
+      const seen = { requests: [] as string[] };
+      const error = await resolveWith(url, seen);
+      expect(error).toBeInstanceOf(McpConnectionError);
+      expect((error as McpConnectionError).reason).toBe("url-not-loopback");
+      // 連不帶 token 的 /health 都不送：不能把任何請求帶離本機。
+      expect(seen.requests).toHaveLength(0);
+      // 錯誤訊息不得含 token。
+      expect(String((error as Error).message)).not.toContain(TOKEN);
+    }
+  });
+
+  it("無法解析成網址時同樣拒絕，且不送任何請求", async () => {
+    const seen = { requests: [] as string[] };
+    const error = await resolveWith("not-a-url", seen);
+    expect((error as McpConnectionError).reason).toBe("url-not-loopback");
+    expect(seen.requests).toHaveLength(0);
+  });
+});
+
+describe("describeMcpConnectionFailure", () => {
+  /** 所有失敗代碼（新增代碼時這裡也要補，測試會提醒）。 */
+  const ALL_REASONS: McpConnectionFailureReason[] = [
+    "no-config",
+    "runtime-missing",
+    "runtime-invalid",
+    "url-not-loopback",
+    "identity-mismatch",
+    "pid-dead",
+    "health-timeout",
+    "health-unreachable",
+    "health-identity-mismatch",
+  ];
+
+  it("每個失敗代碼都有專屬文案（不是通用的 fallback）", () => {
+    const messages = ALL_REASONS.map((reason) => describeMcpConnectionFailure(reason));
+    for (const message of messages) {
+      expect(message.length).toBeGreaterThan(0);
+      expect(message).not.toBe("無法解析 MCP 連線設定");
+    }
+    // 每個代碼的文案都不同：使用者／文件可以據此對照。
+    expect(new Set(messages).size).toBe(ALL_REASONS.length);
+  });
+
+  it("文案不含 token，也不含本機家目錄路徑", () => {
+    for (const reason of ALL_REASONS) {
+      const message = describeMcpConnectionFailure(reason);
+      expect(message).not.toContain(TOKEN);
+      expect(message).not.toContain(HOME);
+    }
   });
 });
 

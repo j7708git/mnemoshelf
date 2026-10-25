@@ -1,18 +1,27 @@
 /**
  * MCP 入口路徑與設定片段的測試。
  *
- * 兩件關鍵事：
+ * 三件關鍵事：
  * 1. 打包版的入口必須落在 `app.asar.unpacked`（一般 `node` 讀不到 asar 內的檔案）。
- * 2. 設定片段**不得包含 token**——全權憑證不必經過剪貼簿與第三方的 MCP 設定檔。
+ * 2. 設定片段**不得包含 token**——全權憑證不必經過剪貼簿與第三方的 MCP 設定檔；
+ *    也不含服務網址（服務每次啟動可能換埠，入口自己讀 `runtime.json`）。
+ * 3. 片段用**桌面版自己的 Electron 執行檔**當 `command`，並帶 `ELECTRON_RUN_AS_NODE=1`：
+ *    使用者不必另外安裝 Node.js。
  */
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { buildMcpConfigSnippet, resolveMcpEntryPath } from "../src/mcp-entry.js";
+import {
+  buildMcpConfigSnippet,
+  DEFAULT_MCP_PROJECT,
+  resolveMcpEntryPath,
+} from "../src/mcp-entry.js";
 
 /** 合成路徑，不含任何使用者真實路徑。 */
 const RESOURCES = path.join("synthetic", "app", "resources");
 const APP_PATH = path.join("synthetic", "repo", "packages", "desktop");
 const RUNTIME_FILE = path.join("synthetic", "userdata", "data", "runtime.json");
+/** 合成執行檔路徑（macOS 打包後的形狀；不是真實使用者路徑）。 */
+const EXECUTABLE = path.join("synthetic", "app", "Mnemoshelf.app", "Contents", "MacOS", "Mnemoshelf");
 
 describe("resolveMcpEntryPath", () => {
   it("打包版指向 app.asar.unpacked（一般 node 可直接執行）", () => {
@@ -55,21 +64,61 @@ describe("resolveMcpEntryPath", () => {
 });
 
 describe("buildMcpConfigSnippet", () => {
-  it("產生可被 MCP client 直接使用的 mcpServers 結構", () => {
+  /** 產生片段並解析成可斷言的結構。 */
+  function parseSnippet(overrides: { executablePath?: string; project?: string } = {}): {
+    type: string;
+    command: string;
+    args: string[];
+    env: Record<string, string>;
+  } {
     const entry = resolveMcpEntryPath({ isPackaged: true, resourcesPath: RESOURCES, appPath: APP_PATH });
-    const parsed = JSON.parse(buildMcpConfigSnippet({ entryPath: entry, runtimeFile: RUNTIME_FILE })) as {
-      mcpServers: Record<string, { type: string; command: string; args: string[]; env: Record<string, string> }>;
-    };
-    const server = parsed.mcpServers.mnemoshelf;
+    const parsed = JSON.parse(
+      buildMcpConfigSnippet({
+        entryPath: entry,
+        runtimeFile: RUNTIME_FILE,
+        executablePath: overrides.executablePath ?? EXECUTABLE,
+        ...(overrides.project === undefined ? {} : { project: overrides.project }),
+      }),
+    ) as { mcpServers: Record<string, { type: string; command: string; args: string[]; env: Record<string, string> }> };
+    return parsed.mcpServers.mnemoshelf!;
+  }
+
+  it("產生可被 MCP client 直接使用的 mcpServers 結構，command 是傳入的執行檔", () => {
+    const entry = resolveMcpEntryPath({ isPackaged: true, resourcesPath: RESOURCES, appPath: APP_PATH });
+    const server = parseSnippet();
     expect(server.type).toBe("stdio");
-    expect(server.command).toBe("node");
+    expect(server.command).toBe(EXECUTABLE);
     expect(server.args).toEqual([entry]);
     expect(server.env.MNEMOSHELF_RUNTIME_FILE).toBe(RUNTIME_FILE);
   });
 
+  it("以 ELECTRON_RUN_AS_NODE=1 讓 Electron 執行檔當 Node.js 用（不必安裝 Node.js）", () => {
+    const server = parseSnippet();
+    expect(server.env.ELECTRON_RUN_AS_NODE).toBe("1");
+    // command 不是寫死的 "node"：那會要求使用者機器上裝了 Node.js。
+    expect(server.command).not.toBe("node");
+  });
+
+  it("帶預設專案名稱 MNEMOSHELF_PROJECT（預設 mnemoshelf）", () => {
+    expect(DEFAULT_MCP_PROJECT).toBe("mnemoshelf");
+    const server = parseSnippet();
+    expect(server.env.MNEMOSHELF_PROJECT).toBe("mnemoshelf");
+    expect(server.env.MNEMOSHELF_PROJECT).not.toBe("");
+    expect(server.env.MNEMOSHELF_PROJECT).toBe(DEFAULT_MCP_PROJECT);
+  });
+
+  it("可覆寫專案名稱；空白視為未指定（退回預設值）", () => {
+    expect(parseSnippet({ project: "my-shelf" }).env.MNEMOSHELF_PROJECT).toBe("my-shelf");
+    expect(parseSnippet({ project: "   " }).env.MNEMOSHELF_PROJECT).toBe(DEFAULT_MCP_PROJECT);
+  });
+
   it("不含 token，也不含服務網址（交給入口自己讀連線資訊檔）", () => {
     const entry = resolveMcpEntryPath({ isPackaged: true, resourcesPath: RESOURCES, appPath: APP_PATH });
-    const snippet = buildMcpConfigSnippet({ entryPath: entry, runtimeFile: RUNTIME_FILE });
+    const snippet = buildMcpConfigSnippet({
+      entryPath: entry,
+      runtimeFile: RUNTIME_FILE,
+      executablePath: EXECUTABLE,
+    });
     expect(snippet).not.toContain("token");
     expect(snippet).not.toContain("127.0.0.1");
     expect(snippet).not.toContain("http://");
@@ -79,6 +128,7 @@ describe("buildMcpConfigSnippet", () => {
     const snippet = buildMcpConfigSnippet({
       entryPath: path.join("synthetic", "mcp.js"),
       runtimeFile: RUNTIME_FILE,
+      executablePath: EXECUTABLE,
       serverName: "my-shelf",
     });
     const parsed = JSON.parse(snippet) as { mcpServers: Record<string, unknown> };
@@ -89,6 +139,7 @@ describe("buildMcpConfigSnippet", () => {
     const snippet = buildMcpConfigSnippet({
       entryPath: path.join("synthetic", "mcp.js"),
       runtimeFile: RUNTIME_FILE,
+      executablePath: EXECUTABLE,
     });
     expect(() => JSON.parse(snippet)).not.toThrow();
   });

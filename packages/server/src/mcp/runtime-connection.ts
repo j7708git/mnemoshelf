@@ -11,11 +11,16 @@
  * 1. `MNEMOSHELF_URL` **與** `MNEMOSHELF_TOKEN` 都設定 → 直接用（來源 `env`）。
  *    這是使用者明確指定的連線，不做身分驗證。
  * 2. 否則讀 `runtime.json`（來源 `runtime`）。讀到的憑證**一律先驗身分**再使用：
+ *    - 網址必須是本機 loopback（`127.0.0.1`／`localhost`；不是就拒絕，且不送任何請求）；
  *    - 網址必須與 `runtime.json` 記的一致（環境變數給了別的網址 → 拒絕：token 歸屬不明）；
  *    - `runtime.json` 記的 pid 必須還活著（POSIX；Windows 沒有可靠的 signal 0，略過）；
  *    - `GET <url>/health`（**不帶 Authorization**）必須回 `service === "mnemoshelf"`。
  *
- * 第 2 步的三道檢查是為了避免「過期的檔 ＋ 被重用的埠」把全權 token 送到無關的本機程式。
+ * 第 2 步找檔案時**明確指定即不猜**：`MNEMOSHELF_RUNTIME_FILE` 或 `MNEMOSHELF_DATA_DIR` 有設定時
+ * 只試那個位置，讀不到就是 `runtime-missing`，不退回平台預設路徑（否則可能連到另一個服務實例，
+ * 資料庫還可能不同）。只有兩個都沒設定時才依平台預設位置尋找。
+ *
+ * 第 2 步的檢查是為了避免「過期的檔 ＋ 被重用的埠」把全權 token 送到無關的本機程式。
  * 驗證失敗一律視同未連線：**不送 token、不重試猜測**。
  *
  * 安全邊界（docs/roots-and-privacy.md §信任模型）：`runtime.json` 的 `0600` 只擋其他使用者，
@@ -43,6 +48,26 @@ function normalizeBaseUrl(value: string | undefined): string | undefined {
   return trimmed.replace(/\/+$/, "");
 }
 
+/**
+ * 網址是否指向本機的 loopback 主機（只接受 `127.0.0.1` 與 `localhost`，大小寫不拘）。
+ *
+ * 為什麼要在送出任何請求之前檢查：`runtime.json` 是同使用者的程式可改寫的檔案
+ * （見 `docs/roots-and-privacy.md` §信任模型）。若 `url` 被改成外部位址，
+ * `GET /health` 這一步反而會把請求（與後續的 token）帶到本機之外；因此網址不是
+ * loopback 就直接拒絕，**一個請求都不送**。`localhost` 的解析結果由系統決定，
+ * 這裡只做字面比對，與 `docs/agent-integration.md` 的契約一致。
+ */
+function isLoopbackBaseUrl(value: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  return hostname === "127.0.0.1" || hostname === "localhost";
+}
+
 /** `GET /health` 的回應（只取需要的欄位）。 */
 interface HealthInfo {
   service?: unknown;
@@ -60,19 +85,34 @@ export type HealthCheckResult =
 /** `/health` 的逾時（毫秒）。逾時算「暫時連不上」，與「確定不是 mnemoshelf」分開。 */
 export const MCP_HEALTH_TIMEOUT_MS = 5_000;
 
+/** runtime 候選路徑的解析結果（內部用；對外只提供 `runtimeCandidates`）。 */
+interface RuntimeCandidatePlan {
+  /** 依序嘗試的路徑（已去重）。 */
+  candidates: string[];
+  /**
+   * 位置是否由使用者**明確指定**（`MNEMOSHELF_RUNTIME_FILE` 或 `MNEMOSHELF_DATA_DIR`）。
+   *
+   * 釘住時 `candidates` 只有那一個路徑，而且讀不到就是 `runtime-missing`：
+   * **不得再退回平台預設路徑**（否則會連到另一個服務實例，可能是不同的資料庫）。
+   */
+  pinned: boolean;
+}
+
 /**
- * 依序回傳可能存在的 runtime 檔路徑（去重、保留順序）。
+ * 算出 runtime 檔的候選路徑。三段**互斥**：
  *
- * 桌面版多一層 `data`：`<userData>/data/runtime.json`；CLI 是 `<OS 資料目錄>/mnemoshelf/runtime.json`。
- * 兩者刻意不同（大小寫也不同），不要合併成同一個路徑。
+ * 1. `MNEMOSHELF_RUNTIME_FILE` 有設定 → 只有那一個路徑。
+ * 2. 否則 `MNEMOSHELF_DATA_DIR` 有設定 → 只有 `<MNEMOSHELF_DATA_DIR>/runtime.json`。
+ * 3. 否則 → 依平台的預設位置（桌面版 `data` 路徑 ＋ CLI 資料目錄，順序固定）。
  *
- * 順序：明確指定的路徑 → 明確指定的資料目錄 → 依平台的預設位置。
+ * 明確指定就代表「我要連這個檔案對應的服務」；再往下猜會讓 agent 連上另一個實例
+ * （可能用不同的資料庫），因此第 1、2 段都**不再接平台預設候選**。
  */
-export function runtimeCandidates(input: {
+function resolveRuntimeCandidatePlan(input: {
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
   home?: string;
-}): string[] {
+}): RuntimeCandidatePlan {
   const platform = input.platform ?? process.platform;
   const env = input.env ?? process.env;
   const home = input.home ?? homedir();
@@ -81,25 +121,28 @@ export function runtimeCandidates(input: {
   const appData = readNonEmptyString(env.APPDATA) ?? p.join(home, "AppData", "Roaming");
   const dataRoot = osUserDataDir(platform, env, home);
 
+  // 1) 明確指定的檔案位置：只用這一個。使用者給的路徑是「目前這台機器」的路徑，
+  //    用原生規則解析（不要套用模擬平台）。
+  const explicitFile = readNonEmptyString(env.MNEMOSHELF_RUNTIME_FILE);
+  if (explicitFile !== undefined) return { candidates: [path.resolve(explicitFile)], pinned: true };
+
+  // 2) 明確指定的資料目錄：runtime 檔就在同一個目錄（CLI／headless 常見）。
+  const explicitDataDir = readNonEmptyString(env.MNEMOSHELF_DATA_DIR);
+  if (explicitDataDir !== undefined) {
+    return {
+      candidates: [path.resolve(path.join(explicitDataDir, "runtime.json"))],
+      pinned: true,
+    };
+  }
+
+  // 3) 平台預設位置（桌面版與 CLI 的路徑刻意不同，不要合併）。
   const candidates: string[] = [];
-  const addNative = (value: string | undefined): void => {
-    const trimmed = readNonEmptyString(value);
-    if (trimmed === undefined) return;
-    const resolved = path.resolve(trimmed);
-    if (!candidates.includes(resolved)) candidates.push(resolved);
-  };
   const addPlatform = (value: string | undefined): void => {
     const trimmed = readNonEmptyString(value);
     if (trimmed === undefined) return;
     const resolved = p.resolve(trimmed);
     if (!candidates.includes(resolved)) candidates.push(resolved);
   };
-
-  // 使用者明確給的路徑是「目前這台機器」的路徑，用原生規則解析（不要套用模擬平台）。
-  addNative(env.MNEMOSHELF_RUNTIME_FILE);
-  // server 的資料目錄若被明確覆寫，runtime 檔就在同一個目錄（CLI／headless 常見）。
-  const explicitDataDir = readNonEmptyString(env.MNEMOSHELF_DATA_DIR);
-  if (explicitDataDir !== undefined) addNative(path.join(explicitDataDir, "runtime.json"));
 
   if (platform === "win32") {
     addPlatform(p.join(appData, "Mnemoshelf", "data", "runtime.json"));
@@ -113,8 +156,27 @@ export function runtimeCandidates(input: {
     addPlatform(p.join(configRoot, "Mnemoshelf", "data", "runtime.json"));
     addPlatform(p.join(dataRoot, "mnemoshelf", "runtime.json"));
   }
-  return candidates;
+  return { candidates, pinned: false };
 }
+
+/**
+ * 依序回傳可能存在的 runtime 檔路徑（去重、保留順序）。
+ *
+ * 桌面版多一層 `data`：`<userData>/data/runtime.json`；CLI 是 `<OS 資料目錄>/mnemoshelf/runtime.json`。
+ * 兩者刻意不同（大小寫也不同），不要合併成同一個路徑。
+ *
+ * **明確指定即不猜**：`MNEMOSHELF_RUNTIME_FILE` 或 `MNEMOSHELF_DATA_DIR` 有設定時，回傳的
+ * 清單**只有那一個**路徑（見 `resolveRuntimeCandidatePlan`）；只有兩者都沒設定時才回傳平台預設
+ * 候選。讀不到時由呼叫端回報 `runtime-missing`，不會改試別的位置。
+ */
+export function runtimeCandidates(input: {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  home?: string;
+}): string[] {
+  return resolveRuntimeCandidatePlan(input).candidates;
+}
+
 
 /**
  * OS 使用者資料目錄（跨平台，不硬寫分隔符；與 server 的 `config.ts` 同一套規則）。
@@ -228,7 +290,9 @@ export async function resolveMcpConnection(options: ResolveMcpConnectionOptions 
     if (!(error instanceof MissingMcpConfigError)) throw error;
     // 2) 否則改用連線資訊檔；缺哪個環境變數要寫進錯誤訊息。
     const missingEnv = error.missing;
-    const candidates = runtimeCandidates({ platform, env, home });
+    // 明確指定（檔案或資料目錄）時候選只有那一個，且不再退回平台預設路徑。
+    const plan = resolveRuntimeCandidatePlan({ platform, env, home });
+    const candidates = plan.candidates;
 
     let record: AgentRuntimeFile | null = null;
     let sawInvalid = false;
@@ -237,7 +301,7 @@ export async function resolveMcpConnection(options: ResolveMcpConnectionOptions 
       try {
         text = await readFileImpl(candidate);
       } catch {
-        // 檔案不存在或讀不到 → 換下一個候選位置。
+        // 檔案不存在或讀不到 → 換下一個候選位置（只有「未明確指定」時才可能有多個）。
         continue;
       }
       const parsed = parseRuntimeFile(text);
@@ -251,10 +315,11 @@ export async function resolveMcpConnection(options: ResolveMcpConnectionOptions 
     }
 
     if (record === null) {
-      const explicitRuntime = readNonEmptyString(env.MNEMOSHELF_RUNTIME_FILE) !== undefined;
+      // 位置被釘住（明確指定）卻讀不到 → runtime-missing；讀到了但不合法 → runtime-invalid；
+      // 完全沒有線索（未指定、平台預設也沒有）→ no-config。
       const reason: McpConnectionFailureReason = sawInvalid
         ? "runtime-invalid"
-        : explicitRuntime
+        : plan.pinned
           ? "runtime-missing"
           : "no-config";
       throw new McpConnectionError(
@@ -268,6 +333,14 @@ export async function resolveMcpConnection(options: ResolveMcpConnectionOptions 
       throw new McpConnectionError(
         "runtime-invalid",
         describeMcpConnectionFailure("runtime-invalid"),
+      );
+    }
+
+    // 網址必須是本機 loopback：不是就拒絕，且**不送任何請求**（含不帶 token 的 `/health`）。
+    if (!isLoopbackBaseUrl(url)) {
+      throw new McpConnectionError(
+        "url-not-loopback",
+        describeMcpConnectionFailure("url-not-loopback"),
       );
     }
 
@@ -321,6 +394,8 @@ export function describeMcpConnectionFailure(reason: McpConnectionFailureReason)
       return "找不到 agent 連線資訊檔（runtime.json）：請確認 Mnemoshelf 正在執行且該功能已開啟，或直接設定 MNEMOSHELF_URL 與 MNEMOSHELF_TOKEN";
     case "runtime-invalid":
       return "agent 連線資訊檔格式不符（需要 schemaVersion、url、token、pid）";
+    case "url-not-loopback":
+      return "agent 連線資訊檔的網址不是本機 loopback（只接受 127.0.0.1 或 localhost）；已拒絕使用，且沒有送出任何請求或 token";
     case "identity-mismatch":
       return "環境變數 MNEMOSHELF_URL 與連線資訊檔的網址不一致，無法確定 token 屬於哪個服務，已拒絕使用";
     case "pid-dead":

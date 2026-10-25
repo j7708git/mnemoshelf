@@ -59,7 +59,10 @@ pnpm --filter @mnemoshelf/desktop run dist:win     # Windows x64：NSIS 安裝�
 安裝檔裡也帶著 **MCP 入口**，讓 agent（Claude Code、Codex 等）連上本機服務：
 入口在 `<安裝目錄>/resources/app.asar.unpacked/node_modules/@mnemoshelf/server/dist/scripts/mcp.js`
 （**不是** `app.asar` 裡——一般 `node` 讀不到 asar 內的虛擬檔案系統）。
-桌面版設定頁的「複製 MCP 設定片段」會直接產生含正確路徑的設定。
+桌面版設定頁的「複製 MCP 設定片段」會直接產生含正確路徑的設定：片段的 `command` 是
+**應用程式自己的 Electron 執行檔**，並帶 `ELECTRON_RUN_AS_NODE=1` 讓它以一般 Node.js 身分
+執行入口腳本，因此使用者的機器**不需要另外安裝 Node.js**（需要 `RunAsNode` fuse 未被關閉；
+本專案沒有關閉任何 fuse）。片段不含 token、也不含服務網址，憑證由入口執行時讀 `runtime.json`。
 Linux 的 AppImage 掛載點每次啟動都會變動，那個入口路徑不固定；各平台的完整說明見
 [agent-integration.md](agent-integration.md) §MCP 設定片段。
 

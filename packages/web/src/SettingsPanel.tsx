@@ -233,7 +233,8 @@ export function SettingsPanel({
               </div>
               <p className="text-xs text-muted">
                 給 MCP client（Claude Code、Codex 等）用的設定片段：貼進它的 MCP 設定檔、重啟它就能連上。
-                這段<strong>不含 token</strong>——MCP 入口會自己讀上面那份連線資訊檔取得憑證，
+                片段以應用程式自己的執行檔啟動入口（不必另外安裝 Node.js），並預設專案名稱為
+                <code>mnemoshelf</code>。這段<strong>不含 token</strong>——MCP 入口會自己讀上面那份連線資訊檔取得憑證，
                 全權憑證不必經過剪貼簿。
               </p>
               {agentDiscovery.error !== null && (

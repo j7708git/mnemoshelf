@@ -162,16 +162,30 @@ pnpm --filter @mnemoshelf/server run mcp
 ```
 
 **連線解析**：環境變數 `MNEMOSHELF_URL` 與 `MNEMOSHELF_TOKEN` **都設定時直接使用**；缺任何一個
-就改讀 agent 連線資訊檔（`runtime.json`，候選路徑依平台；`MNEMOSHELF_RUNTIME_FILE` 最優先），
-並且**在送出 token 之前先驗服務身分**：
+就改讀 agent 連線資訊檔（`runtime.json`）。位置是「**明確指定即不猜**」：`MNEMOSHELF_RUNTIME_FILE`
+有設定就只用該檔；否則 `MNEMOSHELF_DATA_DIR` 有設定就只用該目錄下的 `runtime.json`；兩者都沒設才依
+平台預設路徑尋找。明確指定的位置讀不到就報錯，**不會**改用別的路徑（避免連到另一個服務實例、
+寫進另一個資料庫）。並且**在送出 token 之前先驗服務身分**：
 
-1. `MNEMOSHELF_URL` 若有給，必須與檔案裡的網址一致（否則 token 歸屬不明 → 拒絕）；
-2. 檔案裡的 `pid` 必須還活著（POSIX；Windows 略過此檢查）；
-3. `GET <url>/health`（**不帶 Authorization**）必須回 `service === "mnemoshelf"`。
+1. 檔案的 `url` 必須是本機 loopback（`127.0.0.1`／`localhost`，大小寫不拘）；不是就拒絕，
+   且**不送任何請求**（連免 token 的 `/health` 都不打）；
+2. `MNEMOSHELF_URL` 若有給，必須與檔案裡的網址一致（否則 token 歸屬不明 → 拒絕）；
+3. 檔案裡的 `pid` 必須還活著（POSIX；Windows 略過此檢查）；
+4. `GET <url>/health`（**不帶 Authorization**）必須回 `service === "mnemoshelf"`。
 
 任一項不符就啟動失敗且**不送出 token**；失敗原因有穩定代碼（`no-config`／`runtime-missing`／
-`runtime-invalid`／`identity-mismatch`／`pid-dead`／`health-timeout`／`health-unreachable`／
-`health-identity-mismatch`）。細節見 `docs/agent-integration.md` §MCP 設定片段。
+`runtime-invalid`／`url-not-loopback`／`identity-mismatch`／`pid-dead`／`health-timeout`／
+`health-unreachable`／`health-identity-mismatch`）。細節見 `docs/agent-integration.md`
+§MCP 設定片段。
+
+**連線中斷只重試一次**：工具呼叫在**連線層**失敗（fetch 拋錯／連線被拒，例如服務重啟換埠）時，
+入口會重新解析一次連線（重讀 `runtime.json`、重做 loopback／pid／`/health` 檢查），成功後把該次
+呼叫重試一次，並改用它回傳的新網址與 token。HTTP 有回應的錯誤（401／404／400…）**不重試**。
+服務重啟後 agent 端**不一定**需要跟著重啟（入口會自動接回新位址），但仍建議重啟 agent 端，
+以確保從乾淨狀態開始。
+
+啟動時會在 **stderr** 印一則連線來源說明（來源 + `host:port`，不含 token 與路徑）；環境變數
+只給一半而改用檔案時，另印一則警告說明哪一個被忽略。stdout 是協定通道，不會有非 JSON-RPC 輸出。
 
 工具：`search`、`remember`、`recall`、`search_memories`、`forget`、`list_roots`。
 `remember` 的寫入者標識取自 MCP 客戶端的 `initialize` 名稱。所有工具描述都帶警語：
