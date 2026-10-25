@@ -14,8 +14,8 @@
  * | `MNEMOSHELF_RUNTIME_FILE` | 連線資訊檔路徑（覆寫 `<dataDir>/runtime.json`） | `<dataDir>/runtime.json` |
  *
  * MCP stdio 入口（`loadMcpConfig`）另有自己的三個變數：`MNEMOSHELF_URL`、`MNEMOSHELF_TOKEN`
- * （皆必填）與 `MNEMOSHELF_PROJECT`（選配的預設專案名稱；供 `remember` 在工具參數沒帶
- * `project` 時使用）。
+ * （**兩個都設定**才會直接使用；缺任何一個就改讀 `runtime.json`）與 `MNEMOSHELF_PROJECT`
+ * （選配的預設專案名稱；供 `remember` 與 `search_memories` 在工具參數沒帶 `project` 時使用）。
  *
  * 另有三個**由 embedder 直接讀取**（不經此處解析，本表僅登錄以免漏查；見
  * `@mnemoshelf/embedder-transformers` 的 `device.ts`）：
@@ -216,10 +216,11 @@ export interface McpConfig {
 }
 
 /**
- * 讀出 MCP 入口設定；`MNEMOSHELF_URL`／`MNEMOSHELF_TOKEN` 必填，缺少者列入錯誤的 `missing`。
+ * 讀出 MCP 入口設定；`MNEMOSHELF_URL`／`MNEMOSHELF_TOKEN` 缺少者列入錯誤的 `missing`
+ * （呼叫端據此改讀 `runtime.json`；只有兩個都在時才會直接使用環境變數）。
  *
  * `MNEMOSHELF_PROJECT` 是選配的預設專案名稱（trim 後非空才採用；純空白視為未設定），
- * 供 `remember` 在工具參數沒帶 `project` 時使用。
+ * 供 `remember` 與 `search_memories` 在工具參數沒帶 `project` 時使用。
  */
 export function loadMcpConfig(env: NodeJS.ProcessEnv = process.env): McpConfig {
   const missing: string[] = [];

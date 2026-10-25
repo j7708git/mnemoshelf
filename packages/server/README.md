@@ -34,7 +34,7 @@ MNEMOSHELF_TOKEN=<你的-token> pnpm --filter @mnemoshelf/server run serve
 | `MNEMOSHELF_URL` | **MCP 入口用**：REST 基底網址（未設時改讀 `runtime.json`） | — |
 | `MNEMOSHELF_TOKEN` | **MCP 入口用**：與 REST 相同（未設時改讀 `runtime.json`） | — |
 | `MNEMOSHELF_RUNTIME_FILE` | **MCP 入口用**：連線資訊檔位置（`runtime.json`） | `<dataDir>/runtime.json` |
-| `MNEMOSHELF_PROJECT` | **MCP 入口用**：`remember` 的預設專案名稱 | 未設定（退回 MCP 行程 cwd 的資料夾名稱） |
+| `MNEMOSHELF_PROJECT` | **MCP 入口用**：`remember` 的預設專案名稱；`search_memories` 未帶 `project` 時也用同一個值 | 未設定（退回 MCP 行程 cwd 的資料夾名稱） |
 
 ## Web UI（靜態檔與 SPA fallback）
 
@@ -167,22 +167,34 @@ pnpm --filter @mnemoshelf/server run mcp
 平台預設路徑尋找。明確指定的位置讀不到就報錯，**不會**改用別的路徑（避免連到另一個服務實例、
 寫進另一個資料庫）。並且**在送出 token 之前先驗服務身分**：
 
-1. 檔案的 `url` 必須是本機 loopback（`127.0.0.1`／`localhost`，大小寫不拘）；不是就拒絕，
-   且**不送任何請求**（連免 token 的 `/health` 都不打）；
+1. 檔案的 `url` 必須是單純的本機 loopback 基底網址（`http`／`https`、主機 `127.0.0.1`／`localhost`，
+   不含帳密、查詢字串或片段）；不是就拒絕，且**不送任何請求**（連免 token 的 `/health` 都不打）；
 2. `MNEMOSHELF_URL` 若有給，必須與檔案裡的網址一致（否則 token 歸屬不明 → 拒絕）；
 3. 檔案裡的 `pid` 必須還活著（POSIX；Windows 略過此檢查）；
-4. `GET <url>/health`（**不帶 Authorization**）必須回 `service === "mnemoshelf"`。
+4. `GET <url>/health`（**不帶 Authorization**）必須回 `service === "mnemoshelf"` 的 JSON 物件
+   （`redirect: "error"`，不讓 `/health` 被導到別處）。
 
 任一項不符就啟動失敗且**不送出 token**；失敗原因有穩定代碼（`no-config`／`runtime-missing`／
 `runtime-invalid`／`url-not-loopback`／`identity-mismatch`／`pid-dead`／`health-timeout`／
-`health-unreachable`／`health-identity-mismatch`）。細節見 `docs/agent-integration.md`
-§MCP 設定片段。
+`health-unreachable`／`health-identity-mismatch`）。`runtime-invalid` 的訊息會列出完整必要欄位：
+`schemaVersion` 1、非空 `url`／`token`、正整數 `pid`、字串 `startedAt`／`appVersion`。
+細節見 `docs/agent-integration.md` §MCP 設定片段。
 
-**連線中斷只重試一次**：工具呼叫在**連線層**失敗（fetch 拋錯／連線被拒，例如服務重啟換埠）時，
-入口會重新解析一次連線（重讀 `runtime.json`、重做 loopback／pid／`/health` 檢查），成功後把該次
-呼叫重試一次，並改用它回傳的新網址與 token。HTTP 有回應的錯誤（401／404／400…）**不重試**。
-服務重啟後 agent 端**不一定**需要跟著重啟（入口會自動接回新位址），但仍建議重啟 agent 端，
-以確保從乾淨狀態開始。
+> 這些檢查降低的是「**無關程式不小心佔用同一個埠**」的風險：`/health` 免 token，**任何程式都能
+> 偽造**；Windows 沒有 pid 檢查，POSIX 也只確認 pid 活著。它們**不防刻意偽造**，也不是身分保證。
+> 共用機器的多人情境請不要開啟連線資訊檔功能。
+
+**連線中斷的自動重連只適用於 `runtime.json` 來源，且只重試可安全重試的呼叫**：工具呼叫在
+**連線層**失敗（fetch 拋錯／連線被拒，例如服務重啟換埠）時，入口會重新解析一次連線
+（重讀 `runtime.json`、重做 loopback／pid／`/health` 檢查），成功後把該次呼叫重試一次，
+並改用它回傳的新網址與 token。`search`／`recall`／`search_memories`／`list_roots` 與**沒有**
+`force: true` 的 `remember` 會重試；`remember` 帶 `force: true` 與 `forget` **不重試**
+（重試可能多寫一筆或拿 404 冒充刪除失敗），改回報穩定代碼 `connection-lost` 並請使用者先查詢。
+HTTP 有回應的錯誤（401／404／400…）**不重試**。
+
+**用環境變數連線的人**（`MNEMOSHELF_URL` ＋ `MNEMOSHELF_TOKEN` 都設定）重解析時仍是同一組環境
+變數，**不會**改讀 `runtime.json`；服務換埠後**仍須更新環境變數或重啟 agent**。使用
+`runtime.json` 的使用者服務換埠後可能自動接回，但仍建議重啟 agent 端，以確保從乾淨狀態開始。
 
 啟動時會在 **stderr** 印一則連線來源說明（來源 + `host:port`，不含 token 與路徑）；環境變數
 只給一半而改用檔案時，另印一則警告說明哪一個被忽略。stdout 是協定通道，不會有非 JSON-RPC 輸出。

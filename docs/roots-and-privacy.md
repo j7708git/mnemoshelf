@@ -107,6 +107,15 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
 - **`scope=agent` 不是安全邊界**：它只是約定上的個人範圍（本版尚未強制），不可用來隔離不同 agent。
 - **沒有 per-agent token／授權、沒有 audit trail**；需要真正隔離時，必須先擴充身分模型（列後續）。
 - 因此：**不要把 token 分享給不受信任的程式**；多 agent 共用同一份服務時，視為同一個信任圈。
+- **`/health` 的服務身分檢查不是身分保證。** MCP 入口在使用 `runtime.json` 前會確認 `/health` 的
+  `service` 是 `mnemoshelf`、檢查檔案裡的 `pid` 是否還活著（POSIX），但這只降低「**無關程式
+  不小心佔用同一個埠**」的風險：`/health` 是免 token 的固定 JSON，**任何程式都能偽造**，
+  因此**不防刻意偽造 `/health` 的程式**；
+  **Windows 上沒有 pid 檢查**（沒有可靠的 signal 0），POSIX 也只確認 pid 活著、不確認它是
+  Mnemoshelf。這些檢查**不能**保證 token 不會被送到錯的程式。
+- **共用機器的多人情境請不要開啟連線資訊檔功能**（或改用獨立帳號／獨立資料目錄）：同一個
+  作業系統帳號的程式都能讀取檔案內的 token，也能改寫 `url`。要真正隔離需要 challenge-HMAC
+  或 owner／ACL 等機制（列後續）。
 
 ## 機密遮罩（實作語意）
 

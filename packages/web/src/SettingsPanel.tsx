@@ -232,10 +232,16 @@ export function SettingsPanel({
                 )}
               </div>
               <p className="text-xs text-muted">
-                給 MCP client（Claude Code、Codex 等）用的設定片段：貼進它的 MCP 設定檔、重啟它就能連上。
+                給採用 <code>mcpServers</code> JSON 設定的 MCP client（Claude Code、Cursor、Cline 等）用的片段：
+                貼進它的 MCP 設定檔、重啟它就能連上。其他 client 的設定形狀可能不同，見
+                <code>docs/agent-integration.md</code>。
                 片段以應用程式自己的執行檔啟動入口（不必另外安裝 Node.js），並預設專案名稱為
                 <code>mnemoshelf</code>。這段<strong>不含 token</strong>——MCP 入口會自己讀上面那份連線資訊檔取得憑證，
                 全權憑證不必經過剪貼簿。
+              </p>
+              <p className="text-xs text-muted">
+                Linux AppImage 每次啟動的掛載點不同，因此不提供這個片段；請改用環境變數
+                <code>MNEMOSHELF_URL</code> 與 <code>MNEMOSHELF_TOKEN</code> 連線（或使用解壓後的版本）。
               </p>
               {agentDiscovery.error !== null && (
                 <p role="alert" className="text-sm text-red-600">

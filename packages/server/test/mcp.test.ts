@@ -854,7 +854,7 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
     expect(logText).not.toContain(file);
   });
 
-  it("重試仍連線層失敗 → 只重試一次（共兩次 REST 呼叫），工具回報錯誤", async () => {
+  it("重試仍連線層失敗 → 只重試一次（共兩次 REST 呼叫），工具回報穩定代碼", async () => {
     const home = await makeTempDir("mnemoshelf-mcp-retry-fail-");
     dirs.push(home);
     const file = path.join(home, "runtime.json");
@@ -879,7 +879,10 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
     try {
       const result = await harness.client.callTool({ name: "list_roots", arguments: {} });
       expect(result.isError).toBe(true);
-      expect(textOf(result)).toContain("fetch failed");
+      // 使用者只看得到穩定代碼與解法，不是 fetch 的實作細節。
+      expect(textOf(result)).toContain("connection-lost");
+      expect(textOf(result)).not.toContain("fetch failed");
+      expect(textOf(result)).toContain("請確認 Mnemoshelf 正在執行");
     } finally {
       await harness.close();
     }
@@ -887,6 +890,210 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
     // 兩次嘗試，沒有第三次。
     expect(requests.filter((url) => url === `${OLD_URL}/roots`)).toHaveLength(1);
     expect(requests.filter((url) => url === `${NEW_URL}/roots`)).toHaveLength(1);
+    expect(reads()).toBe(2);
+  });
+
+  it("環境變數來源換埠：重解析不讀 runtime.json，第二次仍打同一個網址（失敗）", async () => {
+    // 使用者明確用環境變數指定連線：入口不得自行改讀連線資訊檔，也不得更換網址。
+    const requests: string[] = [];
+    const reads = { count: 0 };
+    const readFileImpl = async (): Promise<string> => {
+      reads.count += 1;
+      const error = new Error("ENOENT") as NodeJS.ErrnoException;
+      error.code = "ENOENT";
+      throw error;
+    };
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      requests.push(url);
+      throw new TypeError("fetch failed");
+    }) as unknown as typeof fetch;
+
+    const harness = await startInjected({
+      env: { MNEMOSHELF_URL: OLD_URL, MNEMOSHELF_TOKEN: OLD_TOKEN },
+      fetchImpl,
+      readFileImpl,
+    });
+    try {
+      const result = await harness.client.callTool({ name: "list_roots", arguments: {} });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain("connection-lost");
+    } finally {
+      await harness.close();
+    }
+
+    // 完全沒有讀檔：環境變數是使用者明確指定的連線。
+    expect(reads.count).toBe(0);
+    // 重試仍打舊網址（連線失敗），沒有 /health 身分檢查、沒有新埠。
+    expect(requests).toEqual([`${OLD_URL}/roots`, `${OLD_URL}/roots`]);
+  });
+
+  it("remember 帶 force: true 連線失敗 → 不重試，回穩定代碼並請使用者先查詢", async () => {
+    const home = await makeTempDir("mnemoshelf-mcp-force-no-retry-");
+    dirs.push(home);
+    const file = path.join(home, "runtime.json");
+    const { readFileImpl, reads } = runtimeReader(file, [runtimeJson(OLD_URL, OLD_TOKEN)]);
+
+    const requests: string[] = [];
+    const logs: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.endsWith("/health")) return jsonResponse(HEALTHY);
+      throw new TypeError("fetch failed");
+    }) as unknown as typeof fetch;
+
+    const harness = await startInjected({
+      env: { MNEMOSHELF_RUNTIME_FILE: file },
+      fetchImpl,
+      readFileImpl,
+      log: logs,
+    });
+    try {
+      const result = await harness.client.callTool({
+        name: "remember",
+        arguments: { content: "force 寫入不重試", scope: "global", force: true },
+      });
+      expect(result.isError).toBe(true);
+      const text = textOf(result);
+      expect(text).toContain("connection-lost");
+      expect(text).toContain("請先查詢確認");
+      expect(text).toContain("寫入");
+      expect(text).not.toContain("fetch failed");
+      expect(text).not.toContain(OLD_TOKEN);
+      expect(text).not.toContain(home);
+    } finally {
+      await harness.close();
+    }
+
+    // 只有第一次 REST 呼叫；沒有重讀 runtime 檔（重試才會），也沒有第二次請求。
+    expect(requests.filter((url) => url === `${OLD_URL}/memories`)).toHaveLength(1);
+    expect(reads()).toBe(1);
+    // 原始錯誤只寫進 stderr 診斷輸出，且不含 token／路徑。
+    const logText = logs.join("\n");
+    expect(logText).toContain("不自動重試");
+    expect(logText).toContain("fetch failed");
+    expect(logText).not.toContain(OLD_TOKEN);
+    expect(logText).not.toContain(home);
+  });
+
+  it("forget 連線失敗 → 不重試（避免 404 被誤當成刪除失敗）", async () => {
+    const home = await makeTempDir("mnemoshelf-mcp-forget-no-retry-");
+    dirs.push(home);
+    const file = path.join(home, "runtime.json");
+    const { readFileImpl, reads } = runtimeReader(file, [runtimeJson(OLD_URL, OLD_TOKEN)]);
+
+    const requests: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.endsWith("/health")) return jsonResponse(HEALTHY);
+      throw new TypeError("fetch failed");
+    }) as unknown as typeof fetch;
+
+    const harness = await startInjected({
+      env: { MNEMOSHELF_RUNTIME_FILE: file },
+      fetchImpl,
+      readFileImpl,
+    });
+    try {
+      const result = await harness.client.callTool({ name: "forget", arguments: { id: 7 } });
+      expect(result.isError).toBe(true);
+      const text = textOf(result);
+      expect(text).toContain("connection-lost");
+      expect(text).toContain("刪除");
+      expect(text).toContain("請先查詢確認");
+      expect(text).not.toContain("fetch failed");
+    } finally {
+      await harness.close();
+    }
+
+    expect(requests.filter((url) => url === `${OLD_URL}/memories/7`)).toHaveLength(1);
+    expect(reads()).toBe(1);
+  });
+
+  it("remember（沒有 force）連線失敗 → 重新解析後重試一次並成功", async () => {
+    const home = await makeTempDir("mnemoshelf-mcp-remember-retry-");
+    dirs.push(home);
+    const file = path.join(home, "runtime.json");
+    const { readFileImpl, reads } = runtimeReader(file, [
+      runtimeJson(OLD_URL, OLD_TOKEN),
+      runtimeJson(NEW_URL, NEW_TOKEN),
+    ]);
+
+    const requests: { url: string; authorization?: string }[] = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input);
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      requests.push({
+        url,
+        ...(headers.authorization === undefined ? {} : { authorization: headers.authorization }),
+      });
+      if (url.endsWith("/health")) return jsonResponse(HEALTHY);
+      if (url.startsWith(OLD_URL)) throw new TypeError("fetch failed");
+      return jsonResponse({ id: 11, content: "重試後寫入", scope: "global", duplicate: false }, 201);
+    }) as unknown as typeof fetch;
+
+    const harness = await startInjected({
+      env: { MNEMOSHELF_RUNTIME_FILE: file },
+      fetchImpl,
+      readFileImpl,
+    });
+    try {
+      const result = await harness.client.callTool({
+        name: "remember",
+        arguments: { content: "重試後寫入", scope: "global" },
+      });
+      expect(result.isError).toBeFalsy();
+      expect(jsonOf<{ id: number }>(result).id).toBe(11);
+    } finally {
+      await harness.close();
+    }
+
+    const oldCalls = requests.filter((request) => request.url === `${OLD_URL}/memories`);
+    const newCalls = requests.filter((request) => request.url === `${NEW_URL}/memories`);
+    expect(oldCalls).toHaveLength(1);
+    expect(newCalls).toHaveLength(1);
+    // 重試用的是重連後的新 token。
+    expect(newCalls[0]?.authorization).toBe(`Bearer ${NEW_TOKEN}`);
+    expect(reads()).toBe(2);
+  });
+
+  it("重連成功後，下一次呼叫直接用新網址、不再重連", async () => {
+    const home = await makeTempDir("mnemoshelf-mcp-persist-");
+    dirs.push(home);
+    const file = path.join(home, "runtime.json");
+    const { readFileImpl, reads } = runtimeReader(file, [
+      runtimeJson(OLD_URL, OLD_TOKEN),
+      runtimeJson(NEW_URL, NEW_TOKEN),
+    ]);
+
+    const requests: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request) => {
+      const url = String(input);
+      requests.push(url);
+      if (url.endsWith("/health")) return jsonResponse(HEALTHY);
+      if (url.startsWith(OLD_URL)) throw new TypeError("fetch failed");
+      return jsonResponse({ roots: [] });
+    }) as unknown as typeof fetch;
+
+    const harness = await startInjected({
+      env: { MNEMOSHELF_RUNTIME_FILE: file },
+      fetchImpl,
+      readFileImpl,
+    });
+    try {
+      expect((await harness.client.callTool({ name: "list_roots", arguments: {} })).isError).toBeFalsy();
+      // 第二次呼叫：state 已是新網址，直接打，不應再失敗或重連。
+      expect((await harness.client.callTool({ name: "list_roots", arguments: {} })).isError).toBeFalsy();
+    } finally {
+      await harness.close();
+    }
+
+    expect(requests.filter((url) => url === `${NEW_URL}/roots`)).toHaveLength(2);
+    expect(requests.filter((url) => url === `${OLD_URL}/roots`)).toHaveLength(1);
+    // 只有第一次重連會重做身分檢查與重讀檔案。
+    expect(requests.filter((url) => url.endsWith("/health"))).toHaveLength(2);
     expect(reads()).toBe(2);
   });
 

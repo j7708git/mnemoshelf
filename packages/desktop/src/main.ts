@@ -48,7 +48,7 @@ import { downloadModelFiles } from "./model-download.js";
 import { MODEL_PROFILE } from "./model-profile.js";
 import { formatProbe, probeNativeModules } from "./native-probe.js";
 import { buildServerEnv, parseCliArgs, resolveDesktopPaths, type DesktopPaths } from "./paths.js";
-import { buildMcpConfigSnippet, resolveMcpEntryPath } from "./mcp-entry.js";
+import { buildMcpConfigSnippet, canCopyMcpConfig, resolveMcpEntryPath } from "./mcp-entry.js";
 import { loadOrCreateToken, toTokenInfo, type TokenInfo } from "./token-store.js";
 import { createTrayImage } from "./tray-icon.js";
 
@@ -370,6 +370,15 @@ function assertTrustedSender(event: IpcMainInvokeEvent): void {
   throw new Error("拒絕來自非主視窗的請求");
 }
 
+/** 檔案是否存在且是一般檔案（片段只指向真的存在的檔案）。 */
+async function fileExists(file: string): Promise<boolean> {
+  try {
+    return (await fs.stat(file)).isFile();
+  } catch {
+    return false;
+  }
+}
+
 function sendToRenderer(channel: string, payload: unknown): void {
   const window = mainWindow;
   if (window === null || window.isDestroyed()) return;
@@ -448,6 +457,18 @@ function registerIpcHandlers(): void {
         resourcesPath: process.resourcesPath,
         appPath: app.getAppPath(),
       });
+      // 貼上前先確認兩個路徑真的存在：片段指向不存在的檔案，client 只會啟動失敗。
+      // AppImage 的掛載點每次啟動都不同，直接不給片段（改用環境變數連線）。
+      const decision = canCopyMcpConfig({
+        appImage: process.env.APPIMAGE,
+        runtimeFileExists: await runtimeFileExists(desktopPaths.runtimeFile),
+        entryPathExists: await fileExists(entryPath),
+      });
+      if (!decision.allowed) {
+        // 診斷輸出走 stderr；只記原因說明，不含 token、不含路徑。
+        console.error(`[mnemoshelf-desktop] 未複製 MCP 設定片段：${decision.message ?? "原因不明"}`);
+        return { copied: false, url: null };
+      }
       const snippet = buildMcpConfigSnippet({
         entryPath,
         runtimeFile: desktopPaths.runtimeFile,

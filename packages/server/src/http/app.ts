@@ -3,8 +3,9 @@
  *
  * 契約（任務卡 §REST API）：
  * - `GET  /health`（免 token）→ `{status:"ok", service:"mnemoshelf", appVersion:"<版本>"}`
- *   （`service`／`appVersion` 是 additive 欄位；agent 外掛用它確認連到的是 Mnemoshelf，
- *   避免把 token 送到佔用同一埠的無關程式）
+ *   （`service`／`appVersion` 是 additive 欄位；agent 用它確認連到的是 Mnemoshelf，
+ *   降低「無關程式剛好佔用同一個埠」的風險——但它是免 token 的自我宣告，可被偽造，
+ *   不防刻意偽造；見 `docs/roots-and-privacy.md` §信任模型）
  * - `POST /roots`、`GET /roots`、`GET /roots/:id`、`PATCH /roots/:id`（改 `modalities`）、
  *   `DELETE /roots/:id?deleteData=1`
  * - `POST /roots/:id/preview`、`POST /roots/:id/index`、`POST /roots/:id/index/cancel`
@@ -656,7 +657,9 @@ export const APP_VERSION = readPackageVersion();
 /**
  * 服務身分（`GET /health` 的 `service`）。
  *
- * agent 外掛在使用 runtime 檔之前會比對這個欄位，避免把 token 送到佔用同一埠的無關程式。
+ * 呼叫端在送出 token 前會比對這個欄位。它能降低「連到不相干的服務」的風險，但這是**免 token 的
+ * 自我宣告**：任何本機程式都能偽造，因此**不防**刻意偽造；Windows 上也沒有 pid 檢查可供交叉確認，
+ * 共用機器請勿開啟連線資訊檔功能（見 `docs/roots-and-privacy.md` §信任模型）。
  */
 export const SERVICE_NAME = "mnemoshelf";
 

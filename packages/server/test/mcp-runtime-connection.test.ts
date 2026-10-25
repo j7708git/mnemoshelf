@@ -22,9 +22,9 @@ import {
   resolveMcpConnection,
   runStdio,
   runtimeCandidates,
-  type HealthCheckResult,
   type McpConnectionFailureReason,
 } from "../src/index.js";
+import { MCP_CONNECTION_FAILURE_MESSAGES } from "../src/mcp/runtime-connection.js";
 import { makeTempDir, removeTempDir, startTestServer, TEST_TOKEN } from "./helpers.js";
 
 const HOME = "/home/synthetic-user";
@@ -230,6 +230,59 @@ describe("checkServiceHealth", () => {
       fetchImpl: fakeFetch(200, HEALTHY, seen),
     });
     expect(seen.authorization).toBeUndefined();
+  });
+
+  it("JSON null 視為身分不符（不是拋 TypeError 被誤判成連不上）", async () => {
+    const result = await checkServiceHealth({
+      baseUrl: "http://127.0.0.1:1234",
+      fetchImpl: fakeFetch(200, "null"),
+    });
+    expect(result).toEqual({ ok: false, reason: "wrong-service" });
+  });
+
+  it("回應是陣列或字串時也視為身分不符", async () => {
+    for (const body of ["[]", '"mnemoshelf"', "42"]) {
+      const result = await checkServiceHealth({
+        baseUrl: "http://127.0.0.1:1234",
+        fetchImpl: fakeFetch(200, body),
+      });
+      expect(result).toEqual({ ok: false, reason: "wrong-service" });
+    }
+  });
+
+  it("超過期限沒有回應時回 timeout", async () => {
+    const result = await checkServiceHealth({
+      baseUrl: "http://127.0.0.1:1234",
+      timeoutMs: 5,
+      fetchImpl: ((_input: string | URL | Request, init?: RequestInit) => {
+        // 模擬「有發出請求但一直不回應」：等到 signal abort 才拒絕。
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("Aborted", "AbortError"));
+          });
+        });
+      }) as unknown as typeof fetch,
+    });
+    expect(result).toEqual({ ok: false, reason: "timeout" });
+  });
+
+  it("健康檢查的請求帶 redirect: \"error\"（不讓 /health 被導到別處）", async () => {
+    const seen: { redirect?: string; url?: string } = {};
+    await checkServiceHealth({
+      baseUrl: "http://127.0.0.1:1234",
+      fetchImpl: ((input: string | URL | Request, init?: RequestInit) => {
+        seen.url = String(input);
+        seen.redirect = init?.redirect;
+        return Promise.resolve(
+          new Response(JSON.stringify(HEALTHY), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+        );
+      }) as unknown as typeof fetch,
+    });
+    expect(seen.url).toBe("http://127.0.0.1:1234/health");
+    expect(seen.redirect).toBe("error");
   });
 });
 
@@ -451,6 +504,27 @@ describe("resolveMcpConnection", () => {
     ).rejects.toMatchObject({ name: "McpConnectionError", reason: "runtime-invalid" });
   });
 
+  it("缺 appVersion 也是 runtime-invalid，訊息列舉全部必要欄位", async () => {
+    const file = `${HOME}/.config/Mnemoshelf/data/runtime.json`;
+    const { appVersion: _omitted, ...withoutVersion } = JSON.parse(runtimeJson()) as Record<string, unknown>;
+    const error = await resolveMcpConnection({
+      env: {},
+      platform: "linux",
+      home: HOME,
+      readFileImpl: readerFor({ [file]: JSON.stringify(withoutVersion) }),
+      fetchImpl: fakeFetch(200, HEALTHY),
+      killImpl: () => undefined,
+    }).catch((caught: unknown) => caught);
+
+    expect(error).toBeInstanceOf(McpConnectionError);
+    expect((error as McpConnectionError).reason).toBe("runtime-invalid");
+    const message = String((error as Error).message);
+    for (const field of ["schemaVersion", "url", "token", "pid", "startedAt", "appVersion"]) {
+      expect(message).toContain(field);
+    }
+    expect(message).not.toContain(TOKEN);
+  });
+
   it("環境變數的網址與連線資訊檔不一致時拒絕使用（token 歸屬不明）", async () => {
     const file = `${HOME}/.config/Mnemoshelf/data/runtime.json`;
     await expect(
@@ -569,6 +643,24 @@ describe("resolveMcpConnection：只接受 loopback 網址（B1）", () => {
     }
   });
 
+  it("尾端斜線會先正規化，仍可通過", async () => {
+    const seen = { requests: [] as string[] };
+    const connection = await resolveWith("http://127.0.0.1:53459///", seen);
+    expect(connection).not.toBeInstanceOf(McpConnectionError);
+    expect((connection as { config: { url: string } }).config.url).toBe("http://127.0.0.1:53459");
+    expect(seen.requests).toEqual(["http://127.0.0.1:53459/health"]);
+  });
+
+  it("數字形式的 IPv4 被 URL 正規化成 127.0.0.1 後可通過", async () => {
+    for (const host of ["2130706433", "0x7f000001", "0177.0.0.1", "127.1"]) {
+      const seen = { requests: [] as string[] };
+      const connection = await resolveWith(`http://${host}:53459`, seen);
+      expect(connection).not.toBeInstanceOf(McpConnectionError);
+      expect((connection as { config: { url: string } }).config.url).toBe(`http://${host}:53459`);
+      expect(seen.requests).toHaveLength(1);
+    }
+  });
+
   it("非 loopback 網址回 url-not-loopback，且一個請求都不送", async () => {
     for (const url of ["http://192.168.1.9:53459", "http://example.test:53459", "http://0.0.0.0:53459"]) {
       const seen = { requests: [] as string[] };
@@ -582,6 +674,37 @@ describe("resolveMcpConnection：只接受 loopback 網址（B1）", () => {
     }
   });
 
+  it("看起來像 loopback 但不在契約內的主機一律拒絕", async () => {
+    // `[::1]`：服務只綁 127.0.0.1；`localhost.` 是 FQDN 形式，與字面契約不同；
+    // `127.0.0.1.evil.test` 是另一個主機（不能被前綴比對騙過）。
+    for (const url of ["http://[::1]:53459", "http://localhost.:53459", "http://127.0.0.1.evil.test:53459"]) {
+      const seen = { requests: [] as string[] };
+      const error = await resolveWith(url, seen);
+      expect((error as McpConnectionError).reason).toBe("url-not-loopback");
+      expect(seen.requests).toHaveLength(0);
+    }
+  });
+
+  it("含帳密、查詢字串或片段的網址不是單純的基底網址，一律拒絕", async () => {
+    for (const url of [
+      "http://user@127.0.0.1:53459",
+      "http://127.0.0.1:53459/?a=1",
+      "http://127.0.0.1:53459/#frag",
+    ]) {
+      const seen = { requests: [] as string[] };
+      const error = await resolveWith(url, seen);
+      expect((error as McpConnectionError).reason).toBe("url-not-loopback");
+      expect(seen.requests).toHaveLength(0);
+    }
+  });
+
+  it("file:// 即使主機是 127.0.0.1 也不是 http(s) loopback，拒絕且不送請求", async () => {
+    const seen = { requests: [] as string[] };
+    const error = await resolveWith("file://127.0.0.1/tmp/runtime.json", seen);
+    expect((error as McpConnectionError).reason).toBe("url-not-loopback");
+    expect(seen.requests).toHaveLength(0);
+  });
+
   it("無法解析成網址時同樣拒絕，且不送任何請求", async () => {
     const seen = { requests: [] as string[] };
     const error = await resolveWith("not-a-url", seen);
@@ -591,18 +714,27 @@ describe("resolveMcpConnection：只接受 loopback 網址（B1）", () => {
 });
 
 describe("describeMcpConnectionFailure", () => {
-  /** 所有失敗代碼（新增代碼時這裡也要補，測試會提醒）。 */
-  const ALL_REASONS: McpConnectionFailureReason[] = [
-    "no-config",
-    "runtime-missing",
-    "runtime-invalid",
-    "url-not-loopback",
-    "identity-mismatch",
-    "pid-dead",
-    "health-timeout",
-    "health-unreachable",
-    "health-identity-mismatch",
-  ];
+  /**
+   * 所有失敗代碼直接取自 `MCP_CONNECTION_FAILURE_MESSAGES` 的 key。
+   *
+   * 原始碼用 `Record<McpConnectionFailureReason, string>` 宣告文案表：新增失敗代碼時
+   * 少寫一句文案就編譯不過；這裡再遍歷同一份表，避免測試清單與程式碼各自漂移。
+   */
+  const ALL_REASONS = Object.keys(MCP_CONNECTION_FAILURE_MESSAGES) as McpConnectionFailureReason[];
+
+  // 編譯期窮盡檢查：union 若有代碼不在文案表的 key 裡，`MissingReason` 就不是 `never`，
+  // 這一行會編譯失敗（比執行期的字串比對更早擋下）。
+  type MissingReason = Exclude<McpConnectionFailureReason, keyof typeof MCP_CONNECTION_FAILURE_MESSAGES>;
+  const assertEveryReasonHasMessage: MissingReason extends never ? true : never = true;
+  void assertEveryReasonHasMessage;
+
+  it("文案表包含目前所有失敗代碼（新增代碼會由 typecheck 擋下）", () => {
+    // 若 union 新增代碼而文案表沒補，`Record<...>` 會先讓 typecheck 失敗；
+    // 這裡再確認測試真的拿到每個代碼。
+    expect(ALL_REASONS).toContain("no-config");
+    expect(ALL_REASONS).toContain("health-identity-mismatch");
+    expect(new Set(ALL_REASONS).size).toBe(ALL_REASONS.length);
+  });
 
   it("每個失敗代碼都有專屬文案（不是通用的 fallback）", () => {
     const messages = ALL_REASONS.map((reason) => describeMcpConnectionFailure(reason));
@@ -623,10 +755,30 @@ describe("describeMcpConnectionFailure", () => {
   });
 });
 
-describe("HealthCheckResult", () => {
-  it("型別可用於分支判斷（編譯期檢查）", () => {
-    const result: HealthCheckResult = { ok: true, appVersion: null };
-    expect(result.ok).toBe(true);
+describe("checkServiceHealth：分類（真的呼叫函式，不靠型別宣告）", () => {
+  it("JSON null、非 JSON 與逾時各自分類，且都不會被當成 ok", async () => {
+    const nullResult = await checkServiceHealth({
+      baseUrl: "http://127.0.0.1:1234",
+      fetchImpl: fakeFetch(200, "null"),
+    });
+    expect(nullResult).toEqual({ ok: false, reason: "wrong-service" });
+
+    const notJson = await checkServiceHealth({
+      baseUrl: "http://127.0.0.1:1234",
+      fetchImpl: fakeFetch(200, "<html>not json</html>"),
+    });
+    expect(notJson).toEqual({ ok: false, reason: "not-json" });
+
+    const timeout = await checkServiceHealth({
+      baseUrl: "http://127.0.0.1:1234",
+      timeoutMs: 5,
+      fetchImpl: ((_input: string | URL | Request, init?: RequestInit) => {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+        });
+      }) as unknown as typeof fetch,
+    });
+    expect(timeout).toEqual({ ok: false, reason: "timeout" });
   });
 });
 

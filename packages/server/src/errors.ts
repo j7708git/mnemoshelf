@@ -39,7 +39,7 @@ export type McpConnectionFailureReason =
   | "no-config"
   /** 使用者明確指定了連線資訊檔路徑，但檔案不存在或讀不出來。 */
   | "runtime-missing"
-  /** 連線資訊檔格式不符（缺 schemaVersion／url／token／pid）。 */
+  /** 連線資訊檔格式不符（需要 schemaVersion 1、非空 url／token、正整數 pid、字串 startedAt／appVersion）。 */
   | "runtime-invalid"
   /** 連線資訊檔的網址不是 loopback（只接受 `127.0.0.1`／`localhost`）。 */
   | "url-not-loopback"
@@ -64,6 +64,47 @@ export class McpConnectionError extends Error {
     this.name = "McpConnectionError";
     this.reason = reason;
   }
+}
+
+/** 工具呼叫在連線層失敗時的穩定代碼（使用者看得懂，不含實作細節）。 */
+export const MCP_CONNECTION_LOST_CODE = "connection-lost" as const;
+
+/**
+ * 工具呼叫在連線層失敗，且**沒有**安全地重試（或重試後仍失敗）。
+ *
+ * 有三種情境，訊息都要讓使用者知道「現在該做什麼」：
+ * - 寫入帶 `force: true`：重試可能多寫一筆，結果未知；
+ * - 刪除：重試可能拿到 404 而被誤當成「刪除失敗」；
+ * - 唯讀工具重試一次後仍失敗。
+ *
+ * 訊息只帶穩定代碼與解法，**不含 token、不含路徑、也不含 `fetch failed` 這類實作細節**；
+ * 原始錯誤只由呼叫端寫進 stderr 的診斷輸出。
+ */
+export class McpConnectionLostError extends Error {
+  /** 穩定代碼；使用者與文件可以據此對照。 */
+  readonly code: typeof MCP_CONNECTION_LOST_CODE = MCP_CONNECTION_LOST_CODE;
+  /** 這次失敗的動作類型（只用來選訊息，不會出現在訊息裡）。 */
+  readonly effect: "write" | "delete" | "read";
+
+  constructor(effect: "write" | "delete" | "read") {
+    super(connectionLostMessage(effect));
+    this.name = "McpConnectionLostError";
+    this.effect = effect;
+  }
+}
+
+function connectionLostMessage(effect: "write" | "delete" | "read"): string {
+  if (effect === "read") {
+    return (
+      `工具呼叫失敗（${MCP_CONNECTION_LOST_CODE}）：連線中斷，已自動重試一次仍失敗。` +
+      `請確認 Mnemoshelf 正在執行，稍後再試。`
+    );
+  }
+  const action = effect === "write" ? "寫入" : "刪除";
+  return (
+    `工具呼叫失敗（${MCP_CONNECTION_LOST_CODE}）：連線中斷，這次${action}的結果未知，` +
+    `因此沒有自動重試（重試可能造成重複或刪錯）。請先查詢確認目前狀態，再決定是否重試。`
+  );
 }
 
 /** token 缺失或不正確（HTTP 401）。訊息不回傳收到的值。 */

@@ -93,8 +93,9 @@ MNEMOSHELF_TOKEN=<token> MNEMOSHELF_AGENT_DISCOVERY=on \
 ## 讀取與使用
 
 1. 讀 `runtime.json`，取出 `url` 與 `token`。
-2. 先打免 token 的 `GET /health`，確認回應的 `service` 是 `"mnemoshelf"`、`appVersion` 符合
-   預期——避免把 token 送到佔用同一個埠的無關程式。
+2. 先打免 token 的 `GET /health`，確認回應的 `service` 是 `"mnemoshelf"`——降低把 token 送到
+   佔用同一個埠的無關程式的風險（這不是保證，界線見下面「MCP 設定片段」）。**入口只比對
+   `service`**；`appVersion` 供人工核對（下面的手動 script 會印出來），版本不同不會讓入口拒絕連線。
 3. 之後的請求帶 `Authorization: Bearer <token>`。
 
 以下用 Node 22（本專案的執行環境）讀檔，不依賴 `jq`：
@@ -129,32 +130,64 @@ MCP 入口的連線來源有兩條，**先環境變數、後連線資訊檔**：
 | 1 | `MNEMOSHELF_URL` **與** `MNEMOSHELF_TOKEN` 都設定 | 直接使用；這是使用者明確指定的連線，不做身分驗證。 |
 | 2 | 否則 | 讀 `runtime.json`（**明確指定 `MNEMOSHELF_RUNTIME_FILE` 時只試那一個位置**；只指定 `MNEMOSHELF_DATA_DIR` 時只試 `<MNEMOSHELF_DATA_DIR>/runtime.json`；兩者都沒給才依「預設路徑」尋找），**先驗身分再使用**。 |
 
-第 2 條的檢查（避免把全權 token 送到佔用同一個埠的無關程式）：
+第 2 條的檢查（降低「無關程式不小心佔用同一個埠」的風險）：
 
-1. 網址的主機必須是本機 loopback（`127.0.0.1` 或 `localhost`，大小寫不拘）；
-   不是就拒絕，且**一個請求都不送**（連免 token 的 `/health` 也不打）。
+1. 網址必須是單純的本機 loopback 基底網址（`http`／`https`、主機 `127.0.0.1` 或 `localhost`，
+   大小寫不拘，且不含帳密、查詢字串或片段）；不是就拒絕，且**一個請求都不送**
+   （連免 token 的 `/health` 也不打）。
 2. `MNEMOSHELF_URL` 若有給，必須與 `runtime.json` 的 `url` 一致；不一致就拒絕（token 歸屬不明）。
 3. `runtime.json` 的 `pid` 必須還活著（POSIX；Windows 沒有可靠的 signal 0，略過此檢查）。
-4. `GET <url>/health`（**不帶 Authorization**）必須回 `service === "mnemoshelf"`。
+4. `GET <url>/health`（**不帶 Authorization**）必須回 `service === "mnemoshelf"`，而且回應是 JSON 物件
+   （`null`、陣列或字串都不算）。健康檢查使用 `redirect: "error"`，不讓 `/health` 被導到別的位址。
 
 任何一項不符就啟動失敗，且**不會送出 token**。失敗原因有穩定的代碼
 （`no-config`／`runtime-missing`／`runtime-invalid`／`url-not-loopback`／`identity-mismatch`／
 `pid-dead`／`health-timeout`／`health-unreachable`／`health-identity-mismatch`）。
 
-**連線中斷會自動重連一次**：工具呼叫若在**連線層**失敗（fetch 拋錯、連線被拒——例如服務重啟
-換了埠），入口會重新解析一次連線（重讀 `runtime.json` → 重做上面的 loopback、pid 與 `/health`
-檢查 → 取得新的網址與 token），然後把**該次呼叫重試一次**；重連成功後，後續呼叫都用新的設定。
-重試上限固定 1 次。HTTP 有回應但狀態碼是錯誤（401／404／400…）**不會**重試：那是服務端的答案，
-重試只會多打一次 API。重新驗證若失敗，工具回應會帶上對應的失敗代碼。
+**這些檢查不是身分保證——請誠實看待它的界線**：
 
-> 重啟 Mnemoshelf 之後，agent 端**不一定**需要跟著重啟（入口會自動接回新位址）；但仍建議重啟
-> agent 端，以確保從乾淨狀態開始、也避免舊連線殘留在 client 端。
+- 它降低的是「**無關程式不小心佔用同一個埠**」的風險（例如上次的服務結束後，另一個本機程式
+  剛好拿到同一個埠）。
+- 它**不防刻意偽造 `/health` 的程式**：`/health` 只是免 token 的 `{service:"mnemoshelf"}`，
+  任何程式都能回一樣的內容，再收下後面帶 token 的請求。
+- **Windows 上沒有 pid 檢查**（沒有可靠的 signal 0）；**POSIX 也只確認 pid 還活著**，
+  不確認那個 pid 是不是 Mnemoshelf。
+- **共用機器的多人情境請不要開啟連線資訊檔功能**，或改用獨立帳號／獨立資料目錄。
+- 因此**不能**說「已解決、不會把 token 送到錯的程式」；真正的身分保證（例如 challenge-HMAC
+  或 owner／ACL 檢查）是後續工作。
+
+**服務換埠後會自動接回新位址——但只有以 `runtime.json` 為連線來源時才成立**：工具呼叫若在
+**連線層**失敗（fetch 拋錯、連線被拒——例如服務重啟換了埠），入口會重新解析一次連線
+（重讀 `runtime.json` → 重做上面的 loopback、pid 與 `/health` 檢查 → 取得新的網址與 token），
+然後把**該次呼叫重試一次**；重連成功後，後續呼叫都用新的設定。重試上限固定 1 次。
+
+只有**重試了也不會改變結果**的呼叫會自動重試：
+
+| 工具 | 連線層失敗時 | 理由 |
+|---|---|---|
+| `search`／`recall`／`search_memories`／`list_roots` | 重試一次 | 唯讀。 |
+| `remember`（沒有 `force: true`） | 重試一次 | REST 對相同內容去重，重試不會產生第二筆。 |
+| `remember`（`force: true`） | **不重試** | 去重被跳過，重試可能多寫一筆。 |
+| `forget` | **不重試** | 重試會拿 404 冒充「刪除失敗」，誤導使用者。 |
+
+不重試（或重試一次後仍失敗）時，工具回應帶穩定代碼 `connection-lost`，並說明這次寫入／刪除的
+結果未知、請先查詢確認目前狀態再決定是否重試；**不會**把 `fetch failed` 這類實作細節放進
+使用者看得懂的訊息。原始錯誤只寫進 stderr 的診斷輸出（不含 token、不含路徑）。
+HTTP 有回應但狀態碼是錯誤（401／404／400…）**不會**重試：那是服務端的答案，重試只會多打一次 API。
+重新驗證若失敗，工具回應會帶上對應的失敗代碼。
+
+**只用環境變數連線的人**（`MNEMOSHELF_URL` 與 `MNEMOSHELF_TOKEN` 都設定）：重解析時仍是同一組
+環境變數，**不會**改讀 `runtime.json`，所以服務換埠後**仍須更新環境變數或重啟 agent**
+（環境變數是使用者明確指定的連線，入口不會自行改讀其他來源）。使用 `runtime.json` 的使用者
+服務換埠後才可能自動接回；但仍建議重啟 agent 端，以確保從乾淨狀態開始、也避免舊連線殘留在
+client 端。
 
 **啟動時會在 stderr 印一則連線來源說明**（來源是環境變數還是連線資訊檔，加上 `host:port`），
 不含 token、也不含檔案路徑。環境變數只給一半（例如只有 `MNEMOSHELF_TOKEN`）而改用檔案時，
 會額外印一則警告說明哪一個被忽略。stdout 是 MCP 協定通道，不會有任何非 JSON-RPC 輸出。
 
-`MNEMOSHELF_PROJECT` 是選配：agent 用 `remember` 寫入時的預設專案。**專案名的解析順序**是：
+`MNEMOSHELF_PROJECT` 是選配：agent 用 `remember` 寫入時的預設專案（`search_memories` 未帶
+`project` 時也用同一個值）。**專案名的解析順序**是：
 工具參數 `project` → 環境變數 `MNEMOSHELF_PROJECT` → MCP 行程 cwd 的資料夾名稱（cwd 是家目錄時
 跳過）→ 解析不到。
 
@@ -186,7 +219,20 @@ MCP 入口的連線來源有兩條，**先環境變數、後連線資訊檔**：
 - `resourcesPath` 在各平台的位置：macOS `<App>.app/Contents/Resources`、
   Windows `<安裝目錄>/resources`、Linux AppImage 為每次啟動變動的掛載點
   （**AppImage 的入口路徑不固定**，建議改用解壓後的版本或自行包一層固定路徑的腳本）。
-- 桌面版的設定頁「複製 MCP 設定片段」會直接產生含正確路徑的片段，不必自己拼。
+- 桌面版的設定頁「複製 MCP 設定片段」會直接產生含正確路徑的片段，不必自己拼
+  （AppImage 環境除外，見下方取捨說明；複製前也會確認連線資訊檔與入口腳本存在）。
+
+> **Electron-as-node 的取捨（使用前請知情）**：片段用應用程式執行檔 ＋ `ELECTRON_RUN_AS_NODE=1`
+> 啟動，前提是 `RunAsNode` fuse 保持開啟。這本身就是一個取捨——同一台機器上的任何程式都能用這個
+> **已簽章**的應用程式執行檔執行任意 Node 腳本，等於多了一個可執行的 Node 入口。要關掉這個 fuse
+> 就得改用系統的 `node` 執行入口（見下方說明）。
+>
+> - **更新或移除應用程式前先停掉 MCP client**：client 會在啟動時記住舊的執行檔與入口路徑；
+>   應用程式更新後路徑可能失效，先停掉 client 再更新，之後重新貼一次片段。
+> - **AppImage 不建議用這個片段**：掛載點每次啟動都不同、關閉後就消失。桌面版的設定頁在
+>   AppImage 環境**不會**產生片段，請改用環境變數連線（或解壓後的版本）。
+> - `RunAsNode` 被關掉、或應用程式未簽章／被系統隔離時，client 可能啟動失敗；此時改用系統的
+>   `node`（入口只需 Node.js 22 以上）。
 
 ### 設定片段（通用 `mcpServers` 形狀）
 
@@ -272,8 +318,9 @@ MCP 入口的連線來源有兩條，**先環境變數、後連線資訊檔**：
   可以讀寫全部記憶、瀏覽已加入的 root。`agent` 只是來源標記，不是身分驗證。
 - **`0600` 只擋其他使用者，不擋同使用者身分的程式。** 同一個作業系統帳號跑的任何程式
   （含惡意程式）都可以讀取這個檔案。
-- **同使用者程式也能改寫 `runtime.json` 的 `url`。** v1 以 `/health` 的 `service` 身分比對
-  與 `pid` 檢查來緩解「把 token 送到錯的程式」與「誤刪別人的檔」，但**不防惡意篡改**。
+- **同使用者程式也能改寫 `runtime.json` 的 `url`。** v1 的 `/health` 的 `service` 比對與 `pid`
+  檢查只降低「無關程式不小心佔用同一個埠」的風險，**不防刻意偽造**，也不是身分保證
+  （Windows 沒有 pid 檢查；POSIX 只確認 pid 活著）。詳細界線見上節「這些檢查不是身分保證」。
 - **不要複製這個檔案到別台機器、備份、repo 或共用資料夾。** 需要備份 token 時請用密碼管理工具。
 - **MCP 設定片段不含 token**：貼進 MCP client 的只有執行檔／入口路徑、連線資訊檔路徑
   與專案名稱，憑證由入口在執行時自行讀取。取得片段不需要複製憑證出去。

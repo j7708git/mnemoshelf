@@ -34,7 +34,9 @@ export const PACKAGED_MCP_ENTRY_SEGMENTS = [
 /**
  * 設定片段預設的專案名稱（`MNEMOSHELF_PROJECT`）。
  *
- * 集中成常數：文件、設定頁文案與測試都引用同一個值，避免三處各寫一份而漂移。
+ * 這是最容易與文件漂移的值：`docs/agent-integration.md` 的範例與設定頁文案是**人工同步**的，
+ * 不會在測試裡自動對照（文件不是程式）。改這裡時請一併檢查那兩處；片段本身與測試則直接引用
+ * 這個常數。
  * 使用者可在自己的 MCP 設定檔改成別的專案名稱。
  */
 export const DEFAULT_MCP_PROJECT = "mnemoshelf";
@@ -115,4 +117,64 @@ export function buildMcpConfigSnippet(input: {
     null,
     2,
   );
+}
+
+/** 不複製 MCP 設定片段的原因（穩定字串；IPC 只回 `copied: false`，原因寫 stderr）。 */
+export type McpConfigCopyBlockedReason = "appimage" | "runtime-missing" | "entry-missing";
+
+/** `canCopyMcpConfig` 的判斷結果。 */
+export interface McpConfigCopyDecision {
+  /** 是否可以複製片段。 */
+  allowed: boolean;
+  /** 不能複製時的原因；可以時為 `null`。 */
+  reason: McpConfigCopyBlockedReason | null;
+  /** 給 stderr／使用者看的說明（不含路徑、不含 token）；可以時為 `null`。 */
+  message: string | null;
+}
+
+/**
+ * 複製片段前的存在性與環境檢查（純函式；檔案系統的檢查由呼叫端做完再傳進來）。
+ *
+ * 三種情況不給片段：
+ * - **Linux AppImage**（`process.env.APPIMAGE` 有值）：執行檔路徑每次啟動都不同，
+ *   app 結束後掛載點就消失，貼進去的片段下一次必然失效；建議改用環境變數連線。
+ * - **連線資訊檔不存在**：入口啟動時會找不到憑證（`runtime-missing`）。
+ * - **入口腳本不存在**：建置不完整時片段只會讓 client 啟動失敗。
+ *
+ * 為什麼要抽成純函式：`main.ts` 的 IPC handler 難以在單元測試裡直接呼叫；這裡只做決策，
+ * 測試傳入布林值即可，不需要真的開檔。
+ */
+export function canCopyMcpConfig(input: {
+  /** `process.env.APPIMAGE`；AppImage 執行時有值。 */
+  appImage: string | undefined;
+  /** 連線資訊檔是否已存在且是一般檔案。 */
+  runtimeFileExists: boolean;
+  /** MCP 入口腳本是否存在且是一般檔案。 */
+  entryPathExists: boolean;
+}): McpConfigCopyDecision {
+  if (input.appImage !== undefined && input.appImage.trim() !== "") {
+    return {
+      allowed: false,
+      reason: "appimage",
+      message:
+        "AppImage 的執行檔路徑每次啟動都不同、結束後掛載點就消失，因此不提供可直接貼用的片段；" +
+        "請改用環境變數 MNEMOSHELF_URL 與 MNEMOSHELF_TOKEN 連線（或使用解壓後的版本）。",
+    };
+  }
+  if (!input.runtimeFileExists) {
+    return {
+      allowed: false,
+      reason: "runtime-missing",
+      message: "連線資訊檔尚未寫出；請在設定頁開啟「Agent 連線資訊」並重新啟動應用程式。",
+    };
+  }
+  if (!input.entryPathExists) {
+    return {
+      allowed: false,
+      reason: "entry-missing",
+      message:
+        "找不到 MCP 入口腳本（這個建置可能不完整）；請改用環境變數 MNEMOSHELF_URL 與 MNEMOSHELF_TOKEN 連線。",
+    };
+  }
+  return { allowed: true, reason: null, message: null };
 }

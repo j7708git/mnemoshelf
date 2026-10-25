@@ -43,12 +43,16 @@ electron-builder 打包（`--dir` 產物供本機實跑驗收）。
   所以會得到 `ENOTDIR`。`src/asar-paths.ts` 在 `better-sqlite3` 的 `loadExtension` 上包一層，
   把 asar 路徑改指到 `app.asar.unpacked`（上游同問題：electron-builder issue #8824）。
 - **設定畫面可複製 MCP 設定片段**：Agent 連線資訊那一區有「複製 MCP 設定片段」按鈕，產出可直接
-  貼進 MCP client 的 `mcpServers` JSON。片段用**應用程式自己的 Electron 執行檔**當 `command`，
-  並帶 `ELECTRON_RUN_AS_NODE=1`（Electron 以一般 Node.js 身分執行入口腳本），因此使用者
-  **不必另外安裝 Node.js**；`env` 另含 `MNEMOSHELF_RUNTIME_FILE`、`MNEMOSHELF_PROJECT`
-  （預設 `mnemoshelf`）與該變數。
+  貼進 MCP client（採用 `mcpServers` JSON 形狀者）的設定。片段用**應用程式自己的 Electron
+  執行檔**當 `command`，並帶 `ELECTRON_RUN_AS_NODE=1`（Electron 以一般 Node.js 身分執行入口
+  腳本），因此使用者**不必另外安裝 Node.js**；`env` 另含 `MNEMOSHELF_RUNTIME_FILE`、
+  `MNEMOSHELF_PROJECT`（預設 `mnemoshelf`）與該變數。
   這段**不含 token、也不含服務網址**——MCP 入口會自己讀 `runtime.json` 取得憑證與網址，
   全權憑證不必經過剪貼簿。
+  **複製前會先確認**連線資訊檔與入口腳本都存在；任一不存在就回 `{copied:false}` 並在 stderr
+  說明原因（不含 token、不含路徑）。**Linux AppImage 一律不提供片段**（`APPIMAGE` 有值時）：
+  掛載點每次啟動都不同、結束後消失，貼進去的片段下次必然失效——請改用環境變數
+  `MNEMOSHELF_URL`／`MNEMOSHELF_TOKEN` 連線，或使用解壓後的版本。
   入口路徑由 `src/mcp-entry.ts` 解析：打包版指向 `app.asar.unpacked`（一般 `node` 讀得到），
   開發模式指向 monorepo 裡的 `packages/server/dist/scripts/mcp.js`。細節見
   `docs/agent-integration.md` §MCP 設定片段。
@@ -70,7 +74,7 @@ preload（`src/preload.cts` → `dist/preload.cjs`）用 `contextBridge` 掛上
 | `settings.setAutostart(enabled)` | 切換開機自啟；回傳更新後的設定 |
 | `settings.setAgentDiscovery(enabled)` | 切換是否寫出 `runtime.json`（關閉時立即刪檔）；回傳更新後的設定 |
 | `settings.copyConnectionInfo()` | 把 `{url, token}` 放進剪貼簿；**回傳不含 token** |
-| `settings.copyMcpConfig()` | 把可直接貼進 MCP client 的設定片段放進剪貼簿；**片段不含 token**（入口自行讀 `runtime.json`）；回傳不含 token |
+| `settings.copyMcpConfig()` | 把可直接貼進 MCP client 的設定片段放進剪貼簿；**片段不含 token**（入口自行讀 `runtime.json`）；回傳不含 token；連線資訊檔／入口腳本不存在或 AppImage 環境時回 `copied:false` |
 
 **renderer 拿不到 token**：介面只回傳狀態，token 只留在 main process。
 

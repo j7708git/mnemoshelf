@@ -25,7 +25,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { McpConfig } from "../config.js";
-import { McpConnectionError, ValidationError } from "../errors.js";
+import { McpConnectionError, McpConnectionLostError, ValidationError } from "../errors.js";
 import { APP_VERSION } from "../http/app.js";
 import { resolveMcpConnection, type McpConnection, type McpConnectionSource } from "./runtime-connection.js";
 
@@ -232,6 +232,27 @@ export class RestCallError extends Error {
   }
 }
 
+/**
+ * 每個工具呼叫宣告的「連線層失敗時怎麼處置」。
+ *
+ * 只有「重試一次也不會改變結果」的呼叫才可以重試：
+ * - `retry`：唯讀查詢，以及**沒有** `force: true` 的 `remember`（REST 對相同內容去重，
+ *   重試不會產生第二筆）。
+ * - `no-retry-write`：`remember` 帶 `force: true`——去重被跳過，重試可能多寫一筆。
+ * - `no-retry-delete`：`forget`——重試可能拿到 404，被誤當成「刪除失敗」。
+ *
+ * 不重試的呼叫失敗時回 `McpConnectionLostError`（穩定代碼 `connection-lost`），
+ * 訊息會請使用者先查詢確認狀態。
+ */
+export type RestRetryPolicy = "retry" | "no-retry-write" | "no-retry-delete";
+
+/** 政策對應的動作類型（只用來選 `McpConnectionLostError` 的訊息）。 */
+const POLICY_EFFECT: Record<RestRetryPolicy, "write" | "delete" | "read"> = {
+  retry: "read",
+  "no-retry-write": "write",
+  "no-retry-delete": "delete",
+};
+
 export interface McpServerOptions {
   /** REST 基底網址（例如 `http://127.0.0.1:8787`）。 */
   url: string;
@@ -250,9 +271,10 @@ export interface McpServerOptions {
   /**
    * 連線層失敗（fetch 拋錯／連線被拒）時重新解析連線；成功時回傳新設定。
    *
-   * 未提供時維持單次呼叫（不重試）。HTTP 有回應但狀態碼是錯誤（401／404／400…）**不會**呼叫
-   * 這個函式：那是服務端的答案，重試只會得到同一個結果。`runStdio` 會傳入
-   * `resolveMcpConnection`，讓重試前重讀 `runtime.json` 並重做 pid 與 `/health` 身分檢查。
+   * 只有宣告 `retry` 的工具會呼叫它（見 `RestRetryPolicy`）；未提供時維持單次呼叫（不重試）。
+   * HTTP 有回應但狀態碼是錯誤（401／404／400…）**不會**呼叫這個函式：那是服務端的答案，
+   * 重試只會得到同一個結果。`runStdio` 會傳入 `resolveMcpConnection`，讓重試前重讀
+   * `runtime.json` 並重做 pid 與 `/health` 身分檢查。
    */
   reconnect?: () => Promise<McpConnection>;
   /** 診斷訊息輸出（stderr）；預設 `console.error`。不得帶 token 或檔案路徑。 */
@@ -344,6 +366,10 @@ function toolError(error: unknown): { content: { type: "text"; text: string }[];
       isError: true,
     };
   }
+  if (error instanceof McpConnectionLostError) {
+    // 連線層失敗且沒有安全地重試（或重試後仍失敗）：只帶穩定代碼與解法，不含實作細節。
+    return { content: [{ type: "text", text: error.message }], isError: true };
+  }
   const name = error instanceof Error ? error.name : "Error";
   const message = error instanceof Error ? error.message : String(error);
   return { content: [{ type: "text", text: `工具呼叫失敗：${name}: ${message}` }], isError: true };
@@ -361,24 +387,49 @@ export function createMcpServer(options: McpServerOptions): Server {
   const state = { url: options.url, token: options.token, project: options.project };
 
   /**
-   * 打一次 REST；**連線層**失敗時重新解析連線並重試一次（上限 1 次）。
+   * 打一次 REST；依 `policy` 決定連線層失敗時要不要重新解析連線並重試。
    *
    * 重試前一定重新解析（不是沿用舊結果）：`runtime.json` 可能已換成新服務的網址與 token，
    * pid 與 `/health` 身分檢查也會重做（B3）。重驗失敗就讓 `McpConnectionError` 往外丟，
    * 由 `toolError` 帶出失敗代碼。
+   *
+   * 不重試（或重試後仍失敗）時轉成 `McpConnectionLostError`：工具回應只帶穩定代碼與解法，
+   * 原始錯誤寫進 stderr 診斷輸出（不含 token、不含路徑）。
    */
-  const callRestWithReconnect = async (method: string, path: string, body?: unknown): Promise<unknown> => {
+  const callRestWithReconnect = async (
+    method: string,
+    path: string,
+    policy: RestRetryPolicy,
+    body?: unknown,
+  ): Promise<unknown> => {
+    // 診斷輸出：只在本檔的 stderr 通道（stdout 是協定通道）。不印 URL、不印 token。
+    const logFailure = (error: unknown, note: string): void => {
+      const detail = error instanceof Error ? `${error.name}: ${error.message}` : "未知錯誤";
+      // 防禦性遮罩：即使注入的 fetch 把 token 放進錯誤訊息，也不會原樣寫進 stderr。
+      log(`[mnemoshelf-mcp] ${note}（${detail.split(state.token).join("[REDACTED]")}）`);
+    };
+
     try {
       return await callRest({ ...options, url: state.url, token: state.token }, method, path, body);
     } catch (error) {
-      if (!isConnectionLayerFailure(error) || options.reconnect === undefined) throw error;
+      if (!isConnectionLayerFailure(error)) throw error;
+      if (policy !== "retry" || options.reconnect === undefined) {
+        logFailure(error, `連線層失敗（${policy === "retry" ? "沒有可用的重連" : "這個工具不自動重試"}）`);
+        throw new McpConnectionLostError(POLICY_EFFECT[policy]);
+      }
       const connection = await options.reconnect();
       state.url = connection.config.url;
       state.token = connection.config.token;
       if (connection.config.project !== undefined) state.project = connection.config.project;
       // 只記來源與動作，不含 token、不含路徑。
       log(`[mnemoshelf-mcp] 連線中斷，已重新解析連線（來源：${connection.source}）並重試一次`);
-      return await callRest({ ...options, url: state.url, token: state.token }, method, path, body);
+      try {
+        return await callRest({ ...options, url: state.url, token: state.token }, method, path, body);
+      } catch (retryError) {
+        if (!isConnectionLayerFailure(retryError)) throw retryError;
+        logFailure(retryError, "重試一次後仍連線失敗");
+        throw new McpConnectionLostError("read");
+      }
     }
   };
 
@@ -403,7 +454,7 @@ export function createMcpServer(options: McpServerOptions): Server {
         case "search":
           return toolText(
             JSON.stringify(
-              await callRestWithReconnect("POST", "/search", {
+              await callRestWithReconnect("POST", "/search", "retry", {
                 query: args.query,
                 ...(args.mode === undefined ? {} : { mode: args.mode }),
                 ...(args.rootIds === undefined ? {} : { rootIds: args.rootIds }),
@@ -419,6 +470,8 @@ export function createMcpServer(options: McpServerOptions): Server {
           const agent = server.getClientVersion()?.name ?? "mcp";
           const scopeArgument = args.scope;
           const requestedScope = typeof scopeArgument === "string" ? scopeArgument : undefined;
+          // `force: true` 會跳過 REST 的去重，因此這個呼叫**不可**自動重試（可能多寫一筆）。
+          const forced = args.force === true;
           const resolution = resolveProjectName({
             argument: args.project,
             configProject: state.project,
@@ -457,15 +510,20 @@ export function createMcpServer(options: McpServerOptions): Server {
 
           return toolText(
             JSON.stringify(
-              await callRestWithReconnect("POST", "/memories", {
-                content: args.content,
-                ...(args.kind === undefined ? {} : { kind: args.kind }),
-                scope,
-                project,
-                agent,
-                // `force` 原樣轉發（非 boolean 由 REST 回 400），不在 MCP 層自行解讀。
-                ...(args.force === undefined ? {} : { force: args.force }),
-              }),
+              await callRestWithReconnect(
+                "POST",
+                "/memories",
+                forced ? "no-retry-write" : "retry",
+                {
+                  content: args.content,
+                  ...(args.kind === undefined ? {} : { kind: args.kind }),
+                  scope,
+                  project,
+                  agent,
+                  // `force` 原樣轉發（非 boolean 由 REST 回 400），不在 MCP 層自行解讀。
+                  ...(args.force === undefined ? {} : { force: args.force }),
+                },
+              ),
               null,
               2,
             ),
@@ -484,6 +542,7 @@ export function createMcpServer(options: McpServerOptions): Server {
                   agent: args.agent,
                   limit: args.limit,
                 })}`,
+                "retry",
               ),
               null,
               2,
@@ -522,7 +581,7 @@ export function createMcpServer(options: McpServerOptions): Server {
 
           return toolText(
             JSON.stringify(
-              await callRestWithReconnect("POST", "/memories/search", {
+              await callRestWithReconnect("POST", "/memories/search", "retry", {
                 query: args.query,
                 ...(project === undefined ? {} : { project }),
                 ...(args.includeAllProjects === undefined ? {} : { includeAllProjects: args.includeAllProjects }),
@@ -541,11 +600,14 @@ export function createMcpServer(options: McpServerOptions): Server {
         case "forget": {
           const id = Number(args.id);
           if (!Number.isInteger(id) || id <= 0) throw new ValidationError("id", "必須是正整數");
-          return toolText(JSON.stringify(await callRestWithReconnect("DELETE", `/memories/${id}`), null, 2));
+          // 刪除重試可能拿到 404 而被誤當成「刪除失敗」：不自動重試。
+          return toolText(
+            JSON.stringify(await callRestWithReconnect("DELETE", `/memories/${id}`, "no-retry-delete"), null, 2),
+          );
         }
 
         case "list_roots":
-          return toolText(JSON.stringify(await callRestWithReconnect("GET", "/roots"), null, 2));
+          return toolText(JSON.stringify(await callRestWithReconnect("GET", "/roots", "retry"), null, 2));
 
         default:
           throw new ValidationError("name", `未知的工具 ${request.params.name}`);
@@ -629,12 +691,16 @@ function warnIgnoredEnv(
  *
  * 連線解析（`resolveMcpConnection`）：環境變數兩個都給 → 直接用；否則讀 agent 連線
  * 資訊檔（`runtime.json`）並先驗過服務身分（loopback 網址 + pid 存活 + `/health` 的 service），
- * 避免把全權 token 送到不是 Mnemoshelf 的位址。啟動後在 stderr 印一則連線來源說明
+ * 降低把全權 token 送到不相干位址的風險（`/health` 可被偽造，不防刻意偽造；
+ * 見 `docs/roots-and-privacy.md` §信任模型）。啟動後在 stderr 印一則連線來源說明
  * （來源 + `host:port`，不含 token、不含路徑）。
  *
- * 工具呼叫若在**連線層**失敗（服務重啟換埠、暫時連不上），會重新解析一次連線
- * （重讀 `runtime.json`、重做 pid 與 `/health` 檢查）並重試該次呼叫一次；HTTP 有回應的
- * 錯誤（401／404／400…）不重試。重試上限固定 1 次。
+ * 工具呼叫若在**連線層**失敗（服務重啟換埠、暫時連不上），只有**可以安全重試**的工具會
+ * 重新解析一次連線（重讀 `runtime.json`、重做 pid 與 `/health` 檢查）並重試該次呼叫一次；
+ * 寫入帶 `force: true` 與 `forget` **不重試**（重試可能多寫一筆或刪錯），改回報穩定代碼
+ * `connection-lost` 請使用者先查詢確認。HTTP 有回應的錯誤（401／404／400…）不重試。
+ * 重試上限固定 1 次。環境變數來源（`MNEMOSHELF_URL` ＋ `MNEMOSHELF_TOKEN`）重解析時仍是
+ * 同一組環境變數，不會改讀 `runtime.json`——服務換埠後請更新環境變數或重啟 agent。
  */
 export async function runStdio(options: RunStdioOptions = {}): Promise<{ config: McpConfig; server: Server }> {
   const env = options.env ?? process.env;

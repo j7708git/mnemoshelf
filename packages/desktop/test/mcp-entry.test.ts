@@ -12,7 +12,9 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   buildMcpConfigSnippet,
+  canCopyMcpConfig,
   DEFAULT_MCP_PROJECT,
+  ELECTRON_RUN_AS_NODE,
   resolveMcpEntryPath,
 } from "../src/mcp-entry.js";
 
@@ -113,15 +115,18 @@ describe("buildMcpConfigSnippet", () => {
   });
 
   it("不含 token，也不含服務網址（交給入口自己讀連線資訊檔）", () => {
-    const entry = resolveMcpEntryPath({ isPackaged: true, resourcesPath: RESOURCES, appPath: APP_PATH });
-    const snippet = buildMcpConfigSnippet({
-      entryPath: entry,
-      runtimeFile: RUNTIME_FILE,
-      executablePath: EXECUTABLE,
-    });
-    expect(snippet).not.toContain("token");
-    expect(snippet).not.toContain("127.0.0.1");
-    expect(snippet).not.toContain("http://");
+    const server = parseSnippet();
+    // 不用大小寫敏感的字串比對：直接斷言 env 的 key **恰好**是三個既定鍵。
+    expect(Object.keys(server.env).sort()).toEqual(
+      [ELECTRON_RUN_AS_NODE, "MNEMOSHELF_PROJECT", "MNEMOSHELF_RUNTIME_FILE"].sort(),
+    );
+    expect(server.env.MNEMOSHELF_TOKEN).toBeUndefined();
+    expect(server.env.MNEMOSHELF_URL).toBeUndefined();
+    // 也不含任何 http(s) 網址（網址由入口在執行時讀取；服務每次啟動可能換埠）。
+    for (const value of Object.values(server.env)) {
+      expect(value).not.toContain("http://");
+      expect(value).not.toContain("https://");
+    }
   });
 
   it("可自訂 server 名稱", () => {
@@ -142,5 +147,47 @@ describe("buildMcpConfigSnippet", () => {
       executablePath: EXECUTABLE,
     });
     expect(() => JSON.parse(snippet)).not.toThrow();
+  });
+});
+
+describe("canCopyMcpConfig", () => {
+  const OK = { appImage: undefined, runtimeFileExists: true, entryPathExists: true } as const;
+
+  it("兩個檔案都在、不是 AppImage → 可以複製", () => {
+    expect(canCopyMcpConfig(OK)).toEqual({ allowed: true, reason: null, message: null });
+  });
+
+  it("連線資訊檔不存在 → 不複製（runtime-missing）", () => {
+    const decision = canCopyMcpConfig({ ...OK, runtimeFileExists: false });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe("runtime-missing");
+    expect(decision.message).toContain("連線資訊檔");
+    // 說明不含絕對路徑、不含 token。
+    expect(decision.message).not.toContain(RUNTIME_FILE);
+    expect(decision.message).not.toContain("token:");
+  });
+
+  it("入口腳本不存在 → 不複製（entry-missing）", () => {
+    const decision = canCopyMcpConfig({ ...OK, entryPathExists: false });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe("entry-missing");
+    expect(decision.message).toContain("入口腳本");
+    expect(decision.message).toContain("MNEMOSHELF_URL");
+  });
+
+  it("AppImage 環境 → 不複製（即使兩個檔案都在），並指向環境變數連線", () => {
+    const decision = canCopyMcpConfig({
+      ...OK,
+      appImage: path.join("synthetic", "Mnemoshelf.AppImage"),
+    });
+    expect(decision.allowed).toBe(false);
+    expect(decision.reason).toBe("appimage");
+    expect(decision.message).toContain("AppImage");
+    expect(decision.message).toContain("MNEMOSHELF_URL");
+    expect(decision.message).not.toContain("synthetic");
+  });
+
+  it("APPIMAGE 是空字串視為不在 AppImage 環境", () => {
+    expect(canCopyMcpConfig({ ...OK, appImage: "   " }).allowed).toBe(true);
   });
 });

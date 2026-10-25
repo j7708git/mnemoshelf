@@ -20,7 +20,13 @@
  * 只試那個位置，讀不到就是 `runtime-missing`，不退回平台預設路徑（否則可能連到另一個服務實例，
  * 資料庫還可能不同）。只有兩個都沒設定時才依平台預設位置尋找。
  *
- * 第 2 步的檢查是為了避免「過期的檔 ＋ 被重用的埠」把全權 token 送到無關的本機程式。
+ * 第 2 步的檢查**降低的是「無關程式不小心佔用同一個埠」的風險**（例如上次的服務結束後，
+ * 另一個本機程式剛好拿到同一個埠）。它**不防刻意偽造 `/health` 的程式**：`/health` 只是免 token 的
+ * `{service:"mnemoshelf"}`，任何程式都能回一樣的內容。Windows 上沒有 pid 檢查（沒有可靠的 signal 0）；
+ * POSIX 的 pid 檢查也只確認「這個 pid 還活著」，不確認它是不是 Mnemoshelf。因此這些檢查
+ * **不能**保證 token 不會被送到錯的程式；共用機器的多人情境請不要開啟連線資訊檔功能，
+ * 或改用獨立帳號／獨立資料目錄。
+ *
  * 驗證失敗一律視同未連線：**不送 token、不重試猜測**。
  *
  * 安全邊界（docs/roots-and-privacy.md §信任模型）：`runtime.json` 的 `0600` 只擋其他使用者，
@@ -49,12 +55,19 @@ function normalizeBaseUrl(value: string | undefined): string | undefined {
 }
 
 /**
- * 網址是否指向本機的 loopback 主機（只接受 `127.0.0.1` 與 `localhost`，大小寫不拘）。
+ * 網址是否為單純的本機 loopback 基底網址。
+ *
+ * 條件（全部成立才算）：
+ * - 協定只接受 `http:`／`https:`（`file://127.0.0.1/...` 這種本機檔案 URL 一律拒絕）；
+ * - 主機是 `127.0.0.1` 或 `localhost`（大小寫不拘；主機字串由 `URL` 正規化，
+ *   因此 `2130706433`、`0x7f000001`、`0177.0.0.1`、`127.1` 都會被視為 `127.0.0.1`）；
+ * - 不含帳密、查詢字串或片段（`runtime.json` 的 `url` 是基底網址；帶這些東西會被拼成
+ *   錯誤的 `/health` 或讓 fetch 直接拒絕帶帳密的網址）。
  *
  * 為什麼要在送出任何請求之前檢查：`runtime.json` 是同使用者的程式可改寫的檔案
  * （見 `docs/roots-and-privacy.md` §信任模型）。若 `url` 被改成外部位址，
  * `GET /health` 這一步反而會把請求（與後續的 token）帶到本機之外；因此網址不是
- * loopback 就直接拒絕，**一個請求都不送**。`localhost` 的解析結果由系統決定，
+ * 單純的 loopback 基底就直接拒絕，**一個請求都不送**。`localhost` 的解析結果由系統決定，
  * 這裡只做字面比對，與 `docs/agent-integration.md` 的契約一致。
  */
 function isLoopbackBaseUrl(value: string): boolean {
@@ -64,6 +77,9 @@ function isLoopbackBaseUrl(value: string): boolean {
   } catch {
     return false;
   }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+  if (parsed.username !== "" || parsed.password !== "") return false;
+  if (parsed.search !== "" || parsed.hash !== "") return false;
   const hostname = parsed.hostname.toLowerCase();
   return hostname === "127.0.0.1" || hostname === "localhost";
 }
@@ -223,18 +239,28 @@ export async function checkServiceHealth(input: {
     const response = await fetchImpl(`${input.baseUrl}/health`, {
       method: "GET",
       headers: { accept: "application/json" },
+      // `/health` 不該被導到別的位址：導向會把請求（與後續的 token 判斷）帶離原本的服務。
+      redirect: "error",
       signal: controller.signal,
     });
     // 非 2xx 是「這個位址有回應，但不是我們要的服務」→ 身分不明，不是暫時連不上。
     if (!response.ok) return { ok: false, reason: "http-error" };
-    let info: HealthInfo;
+    let info: unknown;
     try {
-      info = (await response.json()) as HealthInfo;
+      info = (await response.json()) as unknown;
     } catch {
       return { ok: false, reason: "not-json" };
     }
-    if (info.service !== SERVICE_NAME) return { ok: false, reason: "wrong-service" };
-    return { ok: true, appVersion: typeof info.appVersion === "string" ? info.appVersion : null };
+    // 回應必須是物件：JSON `null`（或陣列、字串、數字）一律視為身分不符，
+    // 不能讓 `null.service` 這種存取拋 TypeError 而被誤分類成「連不上」。
+    if (typeof info !== "object" || info === null || Array.isArray(info)) {
+      return { ok: false, reason: "wrong-service" };
+    }
+    const record = info as HealthInfo;
+    if (typeof record.service !== "string" || record.service !== SERVICE_NAME) {
+      return { ok: false, reason: "wrong-service" };
+    }
+    return { ok: true, appVersion: typeof record.appVersion === "string" ? record.appVersion : null };
   } catch {
     return { ok: false, reason: controller.signal.aborted ? "timeout" : "unreachable" };
   } finally {
@@ -385,28 +411,32 @@ export async function resolveMcpConnection(options: ResolveMcpConnectionOptions 
   }
 }
 
+/**
+ * 每個失敗代碼對應一句使用者看得懂的話（不含路徑、不含 token）。
+ *
+ * 刻意用 `Record<McpConnectionFailureReason, string>`：新增失敗代碼時這裡必須補齊，
+ * 否則 TypeScript 編譯不過。不要改回 `switch` ＋ `default`——`default` 會把漏掉的代碼吞掉。
+ */
+export const MCP_CONNECTION_FAILURE_MESSAGES: Record<McpConnectionFailureReason, string> = {
+  "no-config":
+    "找不到連線設定：請設定 MNEMOSHELF_URL 與 MNEMOSHELF_TOKEN，或在 Mnemoshelf 的「Agent 連線資訊」開啟連線資訊檔",
+  "runtime-missing":
+    "找不到 agent 連線資訊檔（runtime.json）：請確認 Mnemoshelf 正在執行且該功能已開啟，或直接設定 MNEMOSHELF_URL 與 MNEMOSHELF_TOKEN",
+  "runtime-invalid":
+    "agent 連線資訊檔格式不符：需要 schemaVersion 為 1、非空的 url 與 token、正整數 pid，且 startedAt 與 appVersion 都是字串",
+  "url-not-loopback":
+    "agent 連線資訊檔的網址不是單純的本機 loopback 基底網址（只接受 http／https、主機 127.0.0.1 或 localhost，且不含帳密、查詢字串或片段）；已拒絕使用，且沒有送出任何請求或 token",
+  "identity-mismatch":
+    "環境變數 MNEMOSHELF_URL 與連線資訊檔的網址不一致，無法確定 token 屬於哪個服務，已拒絕使用",
+  "pid-dead":
+    "連線資訊檔所指的服務行程已經結束（可能是上次執行留下的舊檔）；請重新啟動 Mnemoshelf",
+  "health-timeout": "連線資訊檔所指的服務沒有在期限內回應；請確認 Mnemoshelf 正在執行",
+  "health-unreachable": "連線資訊檔所指的服務連不上；請確認 Mnemoshelf 正在執行",
+  "health-identity-mismatch":
+    "連線資訊檔所指的位址上不是 Mnemoshelf 服務（可能是埠被其他程式占用）；已拒絕送出 token",
+};
+
 /** 失敗原因轉成一句使用者看得懂的話（不含路徑、不含 token）。 */
 export function describeMcpConnectionFailure(reason: McpConnectionFailureReason): string {
-  switch (reason) {
-    case "no-config":
-      return "找不到連線設定：請設定 MNEMOSHELF_URL 與 MNEMOSHELF_TOKEN，或在 Mnemoshelf 的「Agent 連線資訊」開啟連線資訊檔";
-    case "runtime-missing":
-      return "找不到 agent 連線資訊檔（runtime.json）：請確認 Mnemoshelf 正在執行且該功能已開啟，或直接設定 MNEMOSHELF_URL 與 MNEMOSHELF_TOKEN";
-    case "runtime-invalid":
-      return "agent 連線資訊檔格式不符（需要 schemaVersion、url、token、pid）";
-    case "url-not-loopback":
-      return "agent 連線資訊檔的網址不是本機 loopback（只接受 127.0.0.1 或 localhost）；已拒絕使用，且沒有送出任何請求或 token";
-    case "identity-mismatch":
-      return "環境變數 MNEMOSHELF_URL 與連線資訊檔的網址不一致，無法確定 token 屬於哪個服務，已拒絕使用";
-    case "pid-dead":
-      return "連線資訊檔所指的服務行程已經結束（可能是上次執行留下的舊檔）；請重新啟動 Mnemoshelf";
-    case "health-timeout":
-      return "連線資訊檔所指的服務沒有在期限內回應；請確認 Mnemoshelf 正在執行";
-    case "health-unreachable":
-      return "連線資訊檔所指的服務連不上；請確認 Mnemoshelf 正在執行";
-    case "health-identity-mismatch":
-      return "連線資訊檔所指的位址上不是 Mnemoshelf 服務（可能是埠被其他程式占用）；已拒絕送出 token";
-    default:
-      return "無法解析 MCP 連線設定";
-  }
+  return MCP_CONNECTION_FAILURE_MESSAGES[reason];
 }
