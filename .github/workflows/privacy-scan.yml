@@ -4,30 +4,51 @@
 # - GitHub 免費層的 secret scanning 只擋「已知廠商、格式明確」的憑證，沒有通用密鑰偵測
 #   與有效性驗證（那是 GitHub Advanced Security 的付費功能，個人 repo 開不了）。
 # - 本機 commit／push 前的隱私 hook 只保護一台機器；別台機器推上來的內容不會經過它。
-#   把同一套檢查放進 CI，任何推上來的 commit／PR 都會被掃。
-# - 只讀取原始碼、不需要任何 secrets；失敗代表「有發現」或「掃描沒有完成」，
-#   請看 log 指出的檔案與行號處理，不要用跳過檢查的方式合併。
+#   這個 workflow 在 push／PR 之後補一次密鑰與個人本機路徑偵測（**事後偵測**，不是阻擋）。
 #
-# 觸發：push（main、dsh/**）、pull_request、workflow_dispatch。
-# 規則來源：`.github/repo-privacy-policy.json`（個人路徑）與 `.gitleaks.toml`（密鑰）；
-# 與本機 hook 同源，不在 workflow 裡另外寫一份規則。
+# 它**不涵蓋**（不要把 CI 當成完整保證）：
+# - 更早的歷史 commit：只掃這次事件帶來的範圍（`before..after`、PR 的合併基底..head）
+#   加上目前工作樹；沒被這次範圍碰到的舊 commit 不會重掃。
+# - force push：被覆寫掉、已不在 `before..after` 範圍內的中間 commit 可能掃不到。
+# - commit message、PR 標題／描述、issue、Release 說明。
+# - GitHub 以外的備份、fork、其他平台上的副本。
+# - 推送當下的即時阻擋：CI 是事後偵測，發現時內容已經推上去了。事前阻擋靠本機 hook 與
+#   GitHub 免費的 push protection（只擋已知廠商憑證格式）。
+#
+# 觸發：所有分支的 push、`v*` 版本 tag、pull_request、workflow_dispatch。
+# **不使用 `pull_request_target`**：那會在帶有 repo secrets 的環境執行 PR 程式碼。
+#
+# 規則來源：**這個 repo 以 `.github/repo-privacy-policy.json`（個人路徑）與
+# `.gitleaks.toml`（密鑰）為準**。工作區層級另有一份 `.openchamber/repo-privacy-policy.json`
+# 給其他專案的本機 hook 使用；兩份內容目前相同，但各自獨立、沒有同步機制——改規則時
+# 兩邊都要改。CI 一律以 `personalPathSeverity = high` 擋下（政策值只影響輸出顯示）。
 
 name: privacy-scan
 
 on:
   push:
+    # 所有分支：舊版只掃 main 與 dsh/**，其他分支推上來的內容不會被檢查。
     branches:
-      - main
-      - "dsh/**"
+      - "**"
+    # 版本 tag 也要掃：發版時 tag 指向的內容同樣會公開。
+    tags:
+      - "v*"
   pull_request:
   workflow_dispatch:
+
+# 同一個 ref 只保留最新一次掃描：新的 push／PR 更新會取代舊的，避免重複跑。
+concurrency:
+  group: privacy-scan-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  scan:
-    name: 隱私掃描
+  # scanner 自己也要被驗證：如果它退化成 no-op（什麼都說 0 處），這個 job 會紅。
+  # 與正式掃描分開跑，避免自我測試的暫存樣本混進正式掃描的結果。
+  self-test:
+    name: scanner 自我測試
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -37,9 +58,40 @@ jobs:
       # gitleaks 釘住 8.30.1：內建規則會隨版本變動，版本不同可能出現「本機乾淨、
       # CI 變紅」或相反的結果。checksum 取自同一次 release 的 checksums.txt
       # （gitleaks_8.30.1_checksums.txt），下載後先驗 sha256 再安裝。
-      #
-      # 下載與解壓都在 `$RUNNER_TEMP`（repo 外）：掃描腳本會把「未追蹤但未被忽略」
-      # 的檔案也納入掃描，若把 tarball／執行檔留在工作目錄，就會被當成待掃檔案。
+      - name: 安裝 gitleaks（釘版本並驗 checksum）
+        shell: bash
+        env:
+          GITLEAKS_VERSION: "8.30.1"
+          GITLEAKS_LINUX_X64_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          set -euo pipefail
+          cd "${RUNNER_TEMP}"
+          ARCHIVE="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          URL="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${ARCHIVE}"
+          curl -sSfL -o "${ARCHIVE}" "${URL}"
+          echo "${GITLEAKS_LINUX_X64_SHA256}  ${ARCHIVE}" | sha256sum -c -
+          tar -xzf "${ARCHIVE}" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      # 在暫存目錄建合成樣本（假 token、假個人路徑、UTF-16、含 NUL、>4MB、tracked out/、
+      # .gitleaksignore、行內 gitleaks:allow、五種 lockfile），驗證負向樣本一定被抓到、
+      # 乾淨與白名單樣本一定不報。樣本不留在 repo 內。
+      - name: 驗證 scanner 不是 no-op
+        run: bash .github/scripts/scan-repo.sh --self-test
+
+  scan:
+    name: 隱私掃描
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # 範圍掃描要能走 commit 歷史與 tag，所以取完整歷史（fetch-depth: 0）。
+      # pull request 事件取的是合併 commit；`origin/<base>` 也在，可用來算合併基底。
+      - name: 取出原始碼（完整歷史）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: 安裝 gitleaks（釘版本並驗 checksum）
         shell: bash
         env:
@@ -57,6 +109,13 @@ jobs:
           gitleaks version
 
       # 腳本會再確認 gitleaks 版本是 8.30.1，並以退出碼區分
-      # 0（乾淨）／1（有發現）／2（工具或設定錯誤，掃描沒有完成）。
+      # 0（乾淨）／1（有發現）／2（掃描沒有完成，不等於乾淨；含「有檔案被跳過」）。
+      # 事件資訊用 SCAN_* 傳入（`GITHUB_` 前綴是 runner 保留的，使用者不能設）。
       - name: 掃描密鑰與個人本機路徑
+        env:
+          SCAN_EVENT_NAME: ${{ github.event_name }}
+          SCAN_EVENT_BEFORE: ${{ github.event.before }}
+          SCAN_EVENT_AFTER: ${{ github.event.after }}
+          SCAN_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          SCAN_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: bash .github/scripts/scan-repo.sh

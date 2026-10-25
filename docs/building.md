@@ -140,26 +140,50 @@ pnpm --filter "@mnemoshelf/desktop..." licenses list --prod --long
 ## 隱私掃描（密鑰與個人本機路徑）
 
 repo 內有一支可獨立執行的掃描 `.github/scripts/scan-repo.sh`，由
-`.github/workflows/privacy-scan.yml` 在 push（`main`、`dsh/**`）、pull request 與手動觸發時執行：
+`.github/workflows/privacy-scan.yml` 在**所有分支的 push**、`v*` 版本 tag、pull request 與
+手動觸發時執行。它是**事後偵測**：內容推上來之後才檢查，不是推送當下的阻擋。
 
 - **密鑰**：gitleaks（釘住 8.30.1；CI 下載官方 release 並驗 sha256），設定在 `.gitleaks.toml`。
+  掃描一律帶 `--ignore-gitleaks-allow`，且不把 `.gitleaksignore` 放進掃描目標，repo 內的
+  忽略檔或行內 `# gitleaks:allow` 不能讓發現消失。
 - **個人本機路徑**：`.github/scripts/check-personal-paths.py` 讀
   `.github/repo-privacy-policy.json`，比對家目錄形式的絕對路徑（家目錄前綴後面接個人帳號）。
-  這份 policy JSON 與本機 commit／push 前隱私檢查使用的是同一套規則（內容相同），
-  因此本機與 CI 不會各有一套標準。
+  檔案不會因為是 UTF-16、含 NUL、非 UTF-8 或超過 `maxFileBytes` 而被跳過（最後者改成逐行
+  串流）；真的讀不到的檔案會列出來並以退出碼 `2` 結束。
 
-掃描範圍是「會進版控的檔案」：已追蹤，以及未追蹤但未被 `.gitignore` 忽略的檔案；生成物
-（`node_modules`、`dist`、`dist-app`、`out`、`coverage`、`.tmp`）不掃，`pnpm-lock.yaml` 照樣掃。
+**規則來源**：這個 repo 的規則以 `.github/repo-privacy-policy.json`（個人路徑）與
+`.gitleaks.toml`（密鑰）為準。工作區層級另有 `.openchamber/repo-privacy-policy.json` 給
+**其他專案**的本機 hook 使用；兩份目前內容相同，但**各自獨立、沒有同步機制**——改規則時
+兩邊都要改。CI 一律以 `personalPathSeverity = high` 擋下：政策值只影響輸出顯示，即使政策檔
+把等級調低，CI 仍會失敗（比本機 hook 更嚴，避免兩邊分叉）。
 
-本機執行（需要 `gitleaks` 8.30.1 在 `PATH`，以及 Python 3）：
+**掃描哪些內容**：輸出會標明這次是「樹掃描」「範圍掃描」或「兩者都做」。
+
+- **樹掃描**：目前工作樹「會進版控的檔案」（已追蹤，以及未追蹤但未被 `.gitignore` 忽略的
+  檔案）。判準是**會不會進版控**，不是目錄名稱——用 `git add -f` 加進來的 `out/`、`dist/`
+  檔案照樣會掃；被忽略的生成物本來就不在清單裡。五種常見 lockfile（`pnpm-lock.yaml`、
+  `package-lock.json`、`yarn.lock`、`deno.lock`、`npm-shrinkwrap.json`）也會掃。
+- **範圍掃描**：這次事件帶來的 commit 內容。push 用 `before..after`；`before` 全為 0
+  （新建分支／tag）時退回「上一個 `v*` tag..head」。pull request 用「合併基底..PR head」。
+  另外會掃該範圍的差異文字（個人路徑），抓得到「同一批 push 裡先加後刪」的內容。
+  取不到 PR 基底時退回只有樹掃描，並在輸出說明——那代表覆蓋範圍較小，不是「乾淨」的證明。
+
+**CI 不涵蓋**：更早的歷史 commit（除非落在這次範圍內）、force push 覆蓋掉的中間 commit、
+commit message 與 PR 描述、GitHub 以外的備份，以及推送當下的即時阻擋（事前阻擋靠本機
+hook 與 GitHub 免費的 push protection，後者只擋已知廠商憑證格式）。
+
+**支援範圍**：本機執行需要 **Linux 或 macOS**；Windows 請用 **Git Bash 或 WSL**（原生
+PowerShell 不支援）。需要 `gitleaks` 8.30.1 在 `PATH`，以及 Python 3（預設用 `python3`，
+可用環境變數 `PYTHON` 指定解譯器）。
 
 ```bash
-bash .github/scripts/scan-repo.sh
+bash .github/scripts/scan-repo.sh                # 掃描本 repo（本機沒有事件範圍時只做樹掃描）
+bash .github/scripts/scan-repo.sh --self-test    # 在暫存目錄建合成樣本，驗證 scanner 不是 no-op
 ```
 
 退出碼：`0` 乾淨、`1` 有發現（log 只列出 `檔案:行號` 與類型，不會印出密鑰原文或命中的路徑）、
-`2` 工具或設定錯誤（掃描沒有完成，**不代表乾淨**）。CI 失敗時請依指出的位置修正；
-不要用跳過 workflow 的方式合併。
+`2` 掃描沒有完成——包含工具／設定錯誤、範圍掃描失敗，以及**有檔案被跳過**（例如讀取失敗）；
+這種情況**不代表乾淨**。CI 失敗時請依指出的位置修正；不要用跳過 workflow 的方式合併。
 
 ## 已知限制
 

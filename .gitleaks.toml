@@ -6,25 +6,30 @@
 #
 # 偵測規則全部沿用 gitleaks 內建預設（`useDefault = true`）；下面只放白名單，
 # 每一條都寫明為什麼排除，不用「放寬或關掉某條規則」的方式遷就誤報。
+#
+# `minVersion` 釘住本 repo 使用的版本：設定用到的欄位（`[[allowlists]]`、`regexTarget`、
+# `[extend] useDefault`）在更舊的版本語意可能不同，先講清楚而不是靜默忽略。
+minVersion = "v8.30.1"
+
 [extend]
 useDefault = true
 
-# 生成物與相依套件。`scan-repo.sh` 匯出的是「會進版控的檔案」，正常情況這裡不會
-# 出現它們；保留這條是為了有人直接對工作目錄跑 `gitleaks dir` 時，不去掃
-# node_modules（本機超過 1 GB）與打包產物，也避免掃到二進位內容。
-# `pnpm-lock.yaml` **不在**排除名單內：lockfile 可能夾帶 registry token，必須掃。
-# （gitleaks 的預設設定自己有把 pnpm-lock.yaml 放進全域白名單；`scan-repo.sh` 會在
-#   暫存副本把它改名再掃，見該腳本的說明。這裡不複製整份預設規則，避免規則漂移。）
+# 這裡刻意**不**用目錄名稱（dist/、out/、dist-app/、coverage/ …）當白名單：
+# `scan-repo.sh` 匯出的是「會進版控的檔案」，判準是 git 追不追蹤，不是目錄名稱。
+# `git add -f out/config.js` 這種已被追蹤的檔案照樣要掃；被忽略的生成物本來就不在
+# 匯出清單裡，不需要再加一層目錄排除。
+#
+# 只留 `.git/`（git 自己永遠不會被追蹤）與 `node_modules/`（gitleaks 上游預設也以檔名
+# 排除它；保留是為了有人直接對工作目錄跑 `gitleaks dir` 時不要掃進 1 GB 的相依套件）。
+# lockfile（`pnpm-lock.yaml`、`package-lock.json`、`yarn.lock`、`deno.lock`、
+# `npm-shrinkwrap.json`）**不在**排除名單內：它們可能夾帶 registry token，必須掃。
+# gitleaks 上游預設依檔名白名單跳過這五種 lockfile，`scan-repo.sh` 會在暫存副本改名再掃，
+# 並把報告映射回原名（這裡不複製整份預設規則，避免規則漂移）。
 [[allowlists]]
-description = "生成物與相依套件（不是原始碼、不進版控）；pnpm-lock.yaml 仍會掃"
+description = "只排除 git 內部目錄與 node_modules；tracked 的 out/、dist/ 等檔案仍會掃"
 paths = [
   '''(^|/)\.git/''',
   '''(^|/)node_modules/''',
-  '''(^|/)dist/''',
-  '''(^|/)dist-app/''',
-  '''(^|/)out/''',
-  '''(^|/)coverage/''',
-  '''(^|/)\.tmp/''',
 ]
 
 # 文件與測試裡既有的合成佔位路徑。它們是拿來示範「什麼是個人路徑」的樣本，
@@ -34,12 +39,14 @@ paths = [
 # 精準度：
 # - regexTarget = "match"：只比對「命中的那一段文字」，不是整行；同一行若真有
 #   別處的密鑰，仍會被抓到（用 line 會連同整行一起放行，太寬）。
+# - 每條 regex 都以 `^` 錨定：只有「命中的內容從這個佔位路徑開頭」才放行，避免
+#   「finding 只要包含這個字串」就整個被丟掉。
 # - 只列政策檔白名單裡的固定佔位名稱，不用 `.*` 之類的萬用字元。
 [[allowlists]]
 description = "文件與測試中的合成佔位路徑（/home/synthetic-user/、/home/example/、C:\\Users\\<user>\\ 等），不是憑證"
 regexTarget = "match"
 regexes = [
-  '''/home/(?:synthetic-user|example|runner|ci|user|you|username|me)/''',
-  '''/Users/(?:synthetic-user|example|runner|ci|user|you|username|me)/''',
-  '''[A-Za-z]:\\Users\\(?:<user>|data)\\''',
+  '''^/home/(?:synthetic-user|example|runner|ci|user|you|username|me)/''',
+  '''^/Users/(?:synthetic-user|example|runner|ci|user|you|username|me)/''',
+  '''^[A-Za-z]:\\Users\\(?:<user>|data)\\''',
 ]

@@ -40,6 +40,10 @@
   成功與失敗要如實回報（程式碼 repo 與 notes repo 分別回報）。
 - **分支**：本機開發一律在專用分支（例如 `dsh/mac-dev`）上 commit，不直接在 `main` 提交；
   分支何時合併回 `main` 由使用者決定。
-- CI 也會跑同一套隱私掃描（`.github/workflows/privacy-scan.yml`）：**本機 hook 不是唯一防線**，
-  規則同源於 `.github/repo-privacy-policy.json` 與 `.gitleaks.toml`。
+- CI 也會跑隱私掃描（`.github/workflows/privacy-scan.yml`）：**本機 hook 不是唯一防線**，但
+  CI 是**事後偵測**（推上來才檢查），不涵蓋更早的歷史 commit、force push 覆蓋掉的中間 commit、
+  commit message／PR 描述、GitHub 以外的備份，也不是推送當下的阻擋。這個 repo 的規則以
+  `.github/repo-privacy-policy.json` 與 `.gitleaks.toml` 為準；工作區層級的
+  `.openchamber/repo-privacy-policy.json` 是給**其他專案**用的，兩份各自獨立、沒有同步機制，
+  **改規則時兩邊都要改**。
 - 臨時產物、下載的模型、log 放 `.tmp/`（已被忽略），不要散在專案目錄。
