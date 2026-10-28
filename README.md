@@ -78,6 +78,7 @@ TypeScript／Node.js／pnpm；桌面殼是 Electron＋React，Web UI 用 Vite＋
 | [docs/storage-ports.md](docs/storage-ports.md) | 搜尋模式、記憶欄位與檢索、匯出／匯入、PostgreSQL 後端 |
 | [docs/embedder-contract.md](docs/embedder-contract.md) | embedder 能力宣告、執行裝置與退回、CoreML 風險 |
 | [docs/architecture.html](docs/architecture.html) | 架構圖（以瀏覽器開啟） |
+| [docs/harness-memory.html](docs/harness-memory.html) | agent 怎麼接上、記憶怎麼存與找回的白話圖解（以瀏覽器開啟） |
 
 `docs/architecture.spec.json` 是架構圖的規格來源；第三方授權全文與 LGPL 合規說明在 `docs/licenses/`。
 
