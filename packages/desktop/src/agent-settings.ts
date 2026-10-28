@@ -25,6 +25,13 @@ export interface AgentSettings {
   schemaVersion: number;
   /** 是否寫出 `runtime.json`（預設 true）。 */
   agentDiscovery: boolean;
+  /**
+   * 使用者按「稍後」的更新版本（正規化、不含 `v`）。
+   *
+   * 舊版設定檔沒有這個欄位；讀不到時視為「沒有略過」。只在有值時寫入，
+   * 讓既有測試與舊檔格式維持相容。
+   */
+  skippedUpdateVersion?: string;
 }
 
 /** 預設值：連線發現**開啟**（桌面版是單人本機應用，方便 agent 直接連上）。 */
@@ -45,7 +52,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 /**
  * 讀出設定；不存在或格式不合法時回預設值（不拋錯）。
  *
- * 只認 `agentDiscovery` 是 boolean 的合法值；其他欄位目前沒有，未來新增時要保持向後相容。
+ * 只認 `agentDiscovery` 是 boolean 的合法值；`skippedUpdateVersion` 是選填（舊檔沒有它），
+ * 其他欄位未來新增時要保持向後相容。
  */
 export async function readAgentSettings(file: string, log: Log = defaultLog): Promise<AgentSettings> {
   let text: string;
@@ -69,7 +77,14 @@ export async function readAgentSettings(file: string, log: Log = defaultLog): Pr
     log("agentSettings.json 缺少 agentDiscovery，使用預設值（agentDiscovery=on）");
     return defaultAgentSettings();
   }
-  return { schemaVersion: AGENT_SETTINGS_SCHEMA_VERSION, agentDiscovery: parsed.agentDiscovery };
+  const settings: AgentSettings = {
+    schemaVersion: AGENT_SETTINGS_SCHEMA_VERSION,
+    agentDiscovery: parsed.agentDiscovery,
+  };
+  if (typeof parsed.skippedUpdateVersion === "string" && parsed.skippedUpdateVersion.trim() !== "") {
+    settings.skippedUpdateVersion = parsed.skippedUpdateVersion;
+  }
+  return settings;
 }
 
 /**
@@ -82,11 +97,14 @@ export async function writeAgentSettings(file: string, settings: AgentSettings):
   const temp = `${target}.tmp`;
   try {
     await fs.mkdir(path.dirname(target), { recursive: true });
-    const body = `${JSON.stringify(
-      { schemaVersion: AGENT_SETTINGS_SCHEMA_VERSION, agentDiscovery: settings.agentDiscovery },
-      null,
-      2,
-    )}\n`;
+    const payload: Record<string, unknown> = {
+      schemaVersion: AGENT_SETTINGS_SCHEMA_VERSION,
+      agentDiscovery: settings.agentDiscovery,
+    };
+    if (typeof settings.skippedUpdateVersion === "string" && settings.skippedUpdateVersion.trim() !== "") {
+      payload.skippedUpdateVersion = settings.skippedUpdateVersion;
+    }
+    const body = `${JSON.stringify(payload, null, 2)}\n`;
     await fs.writeFile(temp, body, { mode: 0o600 });
     // umask 會影響 writeFile 的 mode；POSIX 上再明確 chmod。Windows 沒有 POSIX mode，
     // 檔案位於使用者專屬的 userData（由 profile ACL 保護），沿用既有 best-effort 慣例。
@@ -143,6 +161,8 @@ export interface SetAgentDiscoveryOptions {
   settingsFile: string;
   runtimeFile: string;
   enabled: boolean;
+  /** 先前的「稍後」版本；變更 agentDiscovery 時要保留，不能把使用者的選擇清掉。 */
+  skippedUpdateVersion?: string | null;
   log?: Log;
 }
 
@@ -166,6 +186,9 @@ export async function setAgentDiscovery(options: SetAgentDiscoveryOptions): Prom
     schemaVersion: AGENT_SETTINGS_SCHEMA_VERSION,
     agentDiscovery: options.enabled,
   };
+  if (typeof options.skippedUpdateVersion === "string" && options.skippedUpdateVersion.trim() !== "") {
+    settings.skippedUpdateVersion = options.skippedUpdateVersion;
+  }
   await writeAgentSettings(options.settingsFile, settings);
 
   if (options.enabled) return { settings, runtimeFileRemoved: false, error: null };
@@ -179,4 +202,24 @@ export async function setAgentDiscovery(options: SetAgentDiscoveryOptions): Prom
     log(`無法刪除連線資訊檔（agent discovery 已關閉）：${error instanceof Error ? error.message : String(error)}`);
     return { settings, runtimeFileRemoved: false, error: "連線資訊檔未清除" };
   }
+}
+
+/**
+ * 記錄／清除使用者按「稍後」的更新版本（與 `agentDiscovery` 存在同一個 `0600` 檔）。
+ *
+ * 這不是第二個設定檔：更新器的略過狀態很小，放進既有設定檔比另開檔案好稽核。
+ * 傳 `null` 會移除欄位（舊檔格式仍可讀）。
+ */
+export async function setSkippedUpdateVersion(
+  settingsFile: string,
+  current: AgentSettings,
+  version: string | null,
+): Promise<AgentSettings> {
+  const next: AgentSettings = {
+    schemaVersion: AGENT_SETTINGS_SCHEMA_VERSION,
+    agentDiscovery: current.agentDiscovery,
+  };
+  if (version !== null && version.trim() !== "") next.skippedUpdateVersion = version.trim();
+  await writeAgentSettings(settingsFile, next);
+  return next;
 }

@@ -11,7 +11,7 @@
 
 | 端點 | 說明 |
 |---|---|
-| `GET /health` | 免 token；服務身分與版本 |
+| `GET /health` | 免 token；服務身分、版本與 build（建置 commit） |
 | `GET /diagnostics` | 診斷資訊（版本、平台、embedder 裝置與退回原因、每 root 統計、記憶向量狀態） |
 | `GET /roots` / `POST /roots` | 列出／加入 root（`POST` 可帶 `maxFileBytes` 指定**單檔大小上限**，預設 10 MB） |
 | `GET /roots/:id` | 單一 root |
@@ -33,6 +33,12 @@
 
 備份的範圍與匯入規則（只含記憶、遮罩後視圖、整批先驗證）見
 `docs/storage-ports.md` §記憶的匯出／匯入。
+
+`GET /health` 回 `{status, service, appVersion, build}`。`build` 是 build 時的 commit：
+`packages/server/scripts/build-info.mjs` 在 build 時以 `git rev-parse HEAD` 寫入
+`dist/build-info.json`（git 不可用時退回 build 環境的 `MNEMOSHELF_BUILD_COMMIT`，再退回
+`unknown`）。服務在**啟動時讀一次**；讀不到檔案時用執行環境的 `MNEMOSHELF_BUILD_COMMIT`
+或 `unknown`。這些都是 additive 欄位，呼叫端只比對 `service`（見 `docs/agent-integration.md`）。
 
 ## MCP 工具
 
@@ -83,6 +89,7 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
 | `MNEMOSHELF_EMBED_ORT_LOG` | embedder | 未設定（不覆寫 ORT 預設） | ONNX Runtime log 等級 `0`–`4`（`0`＝verbose），僅診斷用。 |
 | `MNEMOSHELF_MEMORY_BACKFILL` | 服務端 | `on` | 啟動時是否回填既有記憶向量；只接受 `on`／`off`（大小寫不拘），非法值直接拒絕啟動。`off` 只停啟動回填，**新寫入的記憶仍會嵌入**。 |
 | `MNEMOSHELF_INDEX_RATE` | 服務端 | `off` | 索引限速：`normal` 每檔之間休眠 50ms、`low` 250ms，`off` 不休眠。**只作用於檔案與檔案之間**，同一個大檔的嵌入批次仍一次跑完；非法值直接拒絕啟動。 |
+| `MNEMOSHELF_BUILD_COMMIT` | 建置腳本（server）；服務端僅在讀不到 build-info 時後備 | `unknown` | **build 時 fallback**：`git rev-parse HEAD` 不可用時（例如從 tarball build）寫入的 commit；不用於執行期設定。 |
 
 ## 索引期間的排隊與取消
 

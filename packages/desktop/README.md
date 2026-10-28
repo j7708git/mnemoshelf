@@ -75,8 +75,41 @@ preload（`src/preload.cts` → `dist/preload.cjs`）用 `contextBridge` 掛上
 | `settings.setAgentDiscovery(enabled)` | 切換是否寫出 `runtime.json`（關閉時立即刪檔）；回傳更新後的設定 |
 | `settings.copyConnectionInfo()` | 把 `{url, token}` 放進剪貼簿；**回傳不含 token** |
 | `settings.copyMcpConfig()` | 把可直接貼進 MCP client 的設定片段放進剪貼簿；**片段不含 token**（入口自行讀 `runtime.json`）；回傳不含 token；連線資訊檔／入口腳本不存在或 AppImage 環境時回 `copied:false` |
+| `updater.getState()` | 目前的更新狀態（階段、目前／可用版本、進度、錯誤代碼、Release 頁面） |
+| `updater.check()` | 手動檢查更新（不受 30 秒／6 小時計時器限制；會略過「此次稍後」的抑制） |
+| `updater.download()` | 下載已找到的更新（Linux／Windows） |
+| `updater.install(force?)` | 安裝已下載的更新；`force:true` 表示使用者已確認「備份失敗仍要安裝」 |
+| `updater.later()` | 本次不更新；下次啟動會再詢問（不會關 App 就安裝） |
+| `updater.openReleasePage()` | 以系統瀏覽器開啟 Release 下載頁（macOS B 案會用到） |
+| `updater.onState(listener)` | 訂閱更新狀態推播；回傳取消訂閱函式 |
 
 **renderer 拿不到 token**：介面只回傳狀態，token 只留在 main process。
+
+## 更新（U2）
+
+- **Linux／Windows**：`electron-updater@6.8.11`（**dynamic import**，只在這兩個平台載入）。
+  明確設定 `autoDownload=false` 與 `autoInstallOnAppQuit=false`：檢查後由使用者按「下載」，
+  下載完成後也**不會**在關閉 App 時靜默安裝。啟動後延遲 30 秒檢查一次，之後每 6 小時；
+  使用者手動檢查則立即執行。
+- **macOS**：**不載入** electron-updater（沒有 Developer ID 簽章，Squirrel.Mac 不可用）。
+  改用 GitHub API `releases/latest` 比版本，只回版本與 `html_url`；由 UI 呼叫
+  `shell.openExternal` 開下載頁（B 案）。
+- **安裝流程**：`quitting = true` → `closeServerOnly()`（只關 server，**不** `app.exit`）→
+  更新前備份 hook（實作在 U4；目前 no-op）→ `quitAndInstall()`。備份失敗預設中止安裝，
+  使用者明確確認後可帶 `force` 略過。
+- **跳過**：`app.isPackaged === false`、`--headless` 或未支援的平台不初始化；IPC 會回
+  `mode: "disabled"` 的狀態。
+- **AppImage 改名**：更新後檔名含新版本；main 監聽 `appimage-filename-updated`，同步改寫
+  自己的 XDG autostart `Exec=` 指向新檔（只改指向，不刪使用者的 `.desktop`）。改寫失敗時
+  狀態會帶「更新後請重新開啟開機自啟」提示。
+- **開發用 feed**：`dev-app-update.yml`（與 `electron-builder.yml` 的 publish 一致；
+  `files` 白名單不含它，不會進 Release）。
+- **錯誤代碼**：`offline`、`not-found`、`rate-limit`、`checksum`、`read-only`、
+  `unsupported-appimage`、`unsupported-tarball`、`invalid-signature`、`invalid-version`、
+  `check-failed`、`download-failed`、`install-failed`、`backup-failed` 等；狀態只帶代碼與
+  固定訊息，不含路徑、token 或 URL 查詢參數。
+- **真實安裝未驗**：單元測試只涵蓋狀態機與流程（fake updater）；AppImage／NSIS 的實際
+  替換與重啟留 U5 在打包產物上驗。
 
 ## 怎麼跑
 

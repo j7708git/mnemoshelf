@@ -15,7 +15,7 @@
  * 目錄一律取 `XDG_CONFIG_HOME`，讓驗收可以在暫存目錄裡測，不會動到使用者真正的
  * `~/.config/autostart`。本檔不碰 electron，平台 API 由呼叫端注入，方便單元測試。
  */
-import { promises as fs } from "node:fs";
+import { mkdirSync, promises as fs, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 /** `app` 上與登入項目有關的兩個方法（注入以便測試）。 */
@@ -197,4 +197,47 @@ export async function setAutostart(options: AutostartOptions, enabled: boolean):
     await fs.rm(file, { force: true });
   }
   return readAutostartState(options);
+}
+
+/** AppImage 改名後更新自啟項的結果。 */
+export type AutostartRewriteResult =
+  | { updated: true; file: string }
+  | { updated: false; reason: "unsupported-platform" | "not-configured" | "failed" };
+
+/**
+ * AppImage 更新會改名（`artifactName` 含版本），自啟項的 `Exec=` 會指向不存在的舊檔。
+ *
+ * electron-updater 的 `appimage-filename-updated` 事件在**安裝過程中同步發出**，
+ * 之後就 `app.quit()`；因此這裡刻意用同步 fs：非同步寫檔可能來不及在行程結束前完成。
+ *
+ * 只更新既有自啟項的 `Exec=` 行（保留使用者可能加的其他鍵）；自啟項不存在時
+ * 回 `not-configured`，**不**趁機替使用者開啟自啟。檔案寫不進去時回 `failed`，
+ * 由呼叫端顯示「更新後請重新開啟自啟」，不靜默。
+ */
+export function rewriteAutostartExecPath(options: AutostartOptions, execPath: string): AutostartRewriteResult {
+  if (options.platform !== "linux") return { updated: false, reason: "unsupported-platform" };
+
+  const file = autostartFilePath(options);
+  let existing: string;
+  try {
+    existing = readFileSync(file, "utf8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return { updated: false, reason: "not-configured" };
+    return { updated: false, reason: "failed" };
+  }
+
+  const exec = [execPath, ...autostartArgs(options)].map(quoteExecArgument).join(" ");
+  const execLine = `Exec=${exec}`;
+  const content = /^Exec=.*$/m.test(existing)
+    ? existing.replace(/^Exec=.*$/m, execLine)
+    : desktopEntryContent({ ...options, execPath });
+
+  try {
+    mkdirSync(path.dirname(file), { recursive: true });
+    writeFileSync(file, content, { mode: 0o644 });
+    return { updated: true, file };
+  } catch {
+    return { updated: false, reason: "failed" };
+  }
 }

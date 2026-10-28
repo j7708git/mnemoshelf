@@ -1,0 +1,8 @@
+# mnemoshelf-dsh-plugin 的 bundle patch。
+#
+# 這個檔案是 `dsh.bundle.patch` 指向的那一層：profile 的
+# `dsh.profile.bundles` 收錄本套件後，開機時會把下面這 row 插進 plugin 樹。
+# 不需要在 profile 自己的 `cordis.patch.yml` 再寫一次（會重複掛載）。
+- insert:
+    - id: mnemoshelf-dsh-plugin
+      name: '@mnemoshelf/dsh-plugin'

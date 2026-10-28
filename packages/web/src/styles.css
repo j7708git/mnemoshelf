@@ -17,3 +17,38 @@ body,
 body {
   margin: 0;
 }
+
+/*
+ * 更新區塊（UpdaterPanel）。
+ *
+ * 狀態訊息與進度列各佔固定高度：下載 0%→100% 時只改進度條寬度，區塊高度不變
+ * （驗收會量 getBoundingClientRect）。
+ */
+.updater-status {
+  min-height: 6rem;
+}
+
+.updater-status-message {
+  min-height: 2.5rem;
+}
+
+.updater-progress-area {
+  height: 2.5rem;
+  margin-top: 0.25rem;
+}
+
+/* Release notes 只以純文字顯示；長文可捲動、保留換行，不撐破版面。 */
+.updater-notes {
+  max-height: 12rem;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* 鍵盤焦點必須看得見（狀態區由程式移動焦點、按鈕與連結由 Tab 抵達）。 */
+.updater-action:focus-visible,
+.updater-link:focus-visible,
+.updater-focusable:focus-visible {
+  outline: 2px solid var(--color-ink);
+  outline-offset: 2px;
+}

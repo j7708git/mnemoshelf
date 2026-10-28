@@ -18,7 +18,7 @@
  * onnxruntime-node／sharp）都是 N-API／Node-API，不需 `@electron/rebuild`；真正要處理的是
  * asar 解包（見 `electron-builder.yml` 的 `asarUnpack`）與 sharp 在 Linux 的 glib 風險。
  */
-import { BrowserWindow, Menu, Tray, app, clipboard, ipcMain, safeStorage, session, type IpcMainInvokeEvent } from "electron";
+import { BrowserWindow, Menu, Tray, app, clipboard, ipcMain, net, safeStorage, session, shell, type IpcMainInvokeEvent } from "electron";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { promises as fs } from "node:fs";
@@ -33,9 +33,10 @@ import {
   resolveStartupDiscovery,
   runtimeFileExists,
   setAgentDiscovery,
+  setSkippedUpdateVersion,
   type AgentSettings,
 } from "./agent-settings.js";
-import { autostartFilePath, openedAtLogin, readAutostartState, setAutostart, type AutostartOptions, type AutostartState } from "./autostart.js";
+import { autostartFilePath, openedAtLogin, readAutostartState, rewriteAutostartExecPath, setAutostart, type AutostartOptions, type AutostartState } from "./autostart.js";
 import {
   DESKTOP_API_VERSION,
   DESKTOP_BRIDGE_NAME,
@@ -51,6 +52,10 @@ import { buildServerEnv, parseCliArgs, resolveDesktopPaths, type DesktopPaths } 
 import { buildMcpConfigSnippet, canCopyMcpConfig, resolveMcpEntryPath } from "./mcp-entry.js";
 import { loadOrCreateToken, toTokenInfo, type TokenInfo } from "./token-store.js";
 import { createTrayImage } from "./tray-icon.js";
+import { createFileBackup } from "./updater/backup.js";
+import { createUpdater, shouldEnableUpdater, type UpdaterController } from "./updater/index.js";
+import { createServerLifecycle } from "./updater/lifecycle.js";
+import { createInitialUpdaterState, updaterTrayTooltip, type UpdaterState } from "./updater/state.js";
 
 /** 統一的啟動 log 前綴（`scripts/smoke.mjs` 會擷取）。 */
 function log(message: string): void {
@@ -78,6 +83,8 @@ let agentDiscoveryWriteError: string | null = null;
 let agentDiscoveryDeleteError: string | null = null;
 let quitting = false;
 let allowWindowClose = false;
+/** 更新控制器（開發模式／headless 為 null；IPC 一律回 disabled 狀態）。 */
+let updater: UpdaterController | null = null;
 /** `--hidden`（登入時自啟）時不要主動顯示視窗；macOS 另由 `wasOpenedAtLogin` 推導（見 main()）。 */
 let startHidden = cli.hidden;
 
@@ -268,18 +275,35 @@ export function exitFromTray(): void {
   app.quit();
 }
 
+/**
+ * 只關 server、不結束行程（更新安裝流程用）。
+ *
+ * 不得呼叫 `app.exit`、不得設定 `quitting`、不得刪 `runtime.json`（server 的 close
+ * 自己處理）；可重入，重複呼叫只會關一次。關閉失敗時會 reject（共用同一個失敗），
+ * 讓安裝流程取消備份與 `quitAndInstall`；一般的 `shutdown()` 會 catch 後照樣結束。
+ */
+const serverLifecycle = createServerLifecycle({
+  closeServer: async () => {
+    const closing = server;
+    server = null;
+    allowWindowClose = true;
+    if (closing !== null) await closing.close();
+  },
+  exit: (code) => app.exit(code),
+  beforeExit: () => {
+    log(`授權統計：注入 Authorization 的請求 ${authCounters.injected}／${authCounters.requests}，401 回應 ${authCounters.unauthorized}`);
+  },
+  log,
+});
+
+/** 只收服務；不結束行程（更新安裝會先呼叫這個，再備份、安裝）。 */
+async function closeServerOnly(): Promise<void> {
+  await serverLifecycle.closeServerOnly();
+}
+
 /** 收掉服務後結束行程（資料庫是單一寫入者，先收乾淨再離開）。 */
 async function shutdown(code: number): Promise<void> {
-  const closing = server;
-  server = null;
-  allowWindowClose = true;
-  if (closing !== null) {
-    await closing
-      .close()
-      .catch((error: unknown) => log(`關閉服務時發生錯誤：${error instanceof Error ? error.message : String(error)}`));
-  }
-  log(`授權統計：注入 Authorization 的請求 ${authCounters.injected}／${authCounters.requests}，401 回應 ${authCounters.unauthorized}`);
-  app.exit(code);
+  await serverLifecycle.shutdown(code);
 }
 
 /** 顯示錯誤頁並等視窗就緒（用於啟動失敗）。 */
@@ -385,6 +409,20 @@ function sendToRenderer(channel: string, payload: unknown): void {
   window.webContents.send(channel, payload);
 }
 
+/** 目前更新狀態（未初始化時回 disabled；不含路徑或 token）。 */
+function currentUpdaterState(): UpdaterState {
+  return (
+    updater?.getState() ??
+    createInitialUpdaterState({ currentVersion: app.getVersion(), mode: "disabled" })
+  );
+}
+
+/** 系統匣的提示文字跟著更新狀態走（選單維持既有兩項，不影響自動驗收）。 */
+function updateTrayForUpdater(state: UpdaterState): void {
+  if (tray === null || tray.isDestroyed()) return;
+  tray.setToolTip(updaterTrayTooltip(state));
+}
+
 function registerIpcHandlers(): void {
   ipcMain.handle(DESKTOP_CHANNELS.bootstrapGet, (event): BootstrapState | null => {
     assertTrustedSender(event);
@@ -416,6 +454,7 @@ function registerIpcHandlers(): void {
         settingsFile: paths.settingsFile,
         runtimeFile: paths.runtimeFile,
         enabled: value,
+        skippedUpdateVersion: agentSettings.skippedUpdateVersion ?? null,
         log,
       });
       agentSettings = result.settings;
@@ -481,7 +520,105 @@ function registerIpcHandlers(): void {
       return { copied: true, url: server.url };
     },
   );
+  ipcMain.handle(DESKTOP_CHANNELS.updaterGetState, (event): UpdaterState => {
+    assertTrustedSender(event);
+    return currentUpdaterState();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.updaterCheck, async (event): Promise<UpdaterState> => {
+    assertTrustedSender(event);
+    if (updater === null) return currentUpdaterState();
+    return updater.check({ manual: true });
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.updaterDownload, async (event): Promise<UpdaterState> => {
+    assertTrustedSender(event);
+    if (updater === null) return currentUpdaterState();
+    return updater.download();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.updaterInstall, async (event, force: unknown): Promise<UpdaterState> => {
+    assertTrustedSender(event);
+    if (updater === null) return currentUpdaterState();
+    // `force` 只在使用者已確認「備份失敗仍要安裝」時由 UI 傳 true。
+    return updater.install({ force: force === true });
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.updaterLater, async (event): Promise<UpdaterState> => {
+    assertTrustedSender(event);
+    if (updater === null) return currentUpdaterState();
+    return updater.later();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.updaterOpenReleasePage, async (event): Promise<{ opened: boolean }> => {
+    assertTrustedSender(event);
+    if (updater === null) return { opened: false };
+    return updater.openReleasePage();
+  });
   log(`已註冊 desktop shell API v${DESKTOP_API_VERSION}（bridge：window.${DESKTOP_BRIDGE_NAME}）`);
+}
+
+/**
+ * 初始化更新器（在 server 起來之後、開視窗前）。
+ *
+ * - `--headless`／`!app.isPackaged`／其他平台：`shouldEnableUpdater()` 直接跳過。
+ * - Linux／Windows：`createUpdater()` 會 lazy 載入 electron-updater 並設定
+ *   `autoDownload=false`、`autoInstallOnAppQuit=false`。
+ * - macOS：只建立 GitHub API 檢查器，不載入 electron-updater。
+ * - 延遲 30 秒做第一次檢查，之後每 6 小時；手動 IPC 不受計時器限制。
+ */
+async function initializeUpdater(paths: DesktopPaths): Promise<void> {
+  if (!shouldEnableUpdater({ platform: process.platform, isPackaged: app.isPackaged, headless: cli.headless })) {
+    log("更新功能未啟用（開發模式、headless 或未支援的平台）");
+    return;
+  }
+
+  updater = createUpdater({
+    platform: process.platform,
+    currentVersion: app.getVersion(),
+    isPackaged: app.isPackaged,
+    headless: cli.headless,
+    github: { owner: "j7708git", repo: "mnemoshelf" },
+    closeServerOnly,
+    // 更新前備份：server 關閉後把 SQLite 檔複製到 <userData>/backups；
+    // 備份失敗預設取消安裝（見 updater/index.ts）。
+    backup: createFileBackup({ dataDir: paths.dataDir, backupsRoot: path.join(paths.userData, "backups") }),
+    onQuitting: () => {
+      quitting = true;
+    },
+    onQuitAborted: () => {
+      quitting = false;
+    },
+    onStateChange: (state) => {
+      sendToRenderer(DESKTOP_CHANNELS.updaterState, state);
+      updateTrayForUpdater(state);
+    },
+    onAppImageRenamed: (newPath) => {
+      const result = rewriteAutostartExecPath(autostartOptions(), newPath);
+      if (result.updated) {
+        log("AppImage 檔名已更新；開機自啟項目已改指新檔名");
+        return "已更新開機自啟指向新檔名";
+      }
+      if (result.reason === "not-configured") return null;
+      log(`AppImage 檔名已更新，但無法改寫開機自啟項目（${result.reason}）`);
+      return "更新後請重新開啟開機自啟";
+    },
+    skippedVersionStore: {
+      load: async () => agentSettings.skippedUpdateVersion ?? null,
+      save: async (version) => {
+        agentSettings = await setSkippedUpdateVersion(paths.settingsFile, agentSettings, version);
+      },
+    },
+    // macOS 的 GitHub API 走 Electron net（沿用系統 proxy／憑證設定）。
+    fetchImpl: (url) =>
+      net.fetch(url, {
+        headers: {
+          Accept: "application/vnd.github+json",
+          "User-Agent": "Mnemoshelf-Desktop",
+        },
+      }),
+    openExternal: (url) => shell.openExternal(url),
+    installWatchdogMs: 30_000,
+    log,
+  });
+
+  await updater.start();
+  log(`更新功能已初始化（模式：${updater.mode}；目前版本 ${app.getVersion()}）`);
 }
 
 /** 啟動流程。 */
@@ -591,6 +728,14 @@ async function main(): Promise<void> {
     return;
   }
 
+  // 更新器在 server 起來、IPC 註冊之後初始化（不阻擋啟動；第一次檢查延遲 30 秒）。
+  // 更新功能的任何失敗都不應讓應用起不來：狀態會停在 error，UI 仍可正常使用。
+  try {
+    await initializeUpdater(paths);
+  } catch {
+    log("更新功能初始化失敗（不影響應用啟動）");
+  }
+
   const window = createWindow();
   mainWindow = window;
   try {
@@ -605,6 +750,8 @@ async function main(): Promise<void> {
   if (!startHidden) window.show();
 
   tray = createTray();
+  // 更新器可能在 tray 建立前就先還原「稍後」的版本或進入錯誤狀態；補上目前 tooltip。
+  updateTrayForUpdater(currentUpdaterState());
 
   bootstrap = new ModelBootstrap({
     profile: MODEL_PROFILE,

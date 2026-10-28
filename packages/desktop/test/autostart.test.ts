@@ -10,6 +10,7 @@ import {
   openedAtLogin,
   quoteExecArgument,
   readAutostartState,
+  rewriteAutostartExecPath,
   setAutostart,
   type AutostartOptions,
   type LoginItemApi,
@@ -171,5 +172,35 @@ describe("其他平台", () => {
     expect(state.supported).toBe(false);
     expect(state.enabled).toBe(false);
     await expect(setAutostart(options({ platform: "freebsd" }), true)).rejects.toThrow();
+  });
+});
+
+describe("AppImage 改名後更新自啟項（appimage-filename-updated）", () => {
+  const appImage = (version: string): string => path.join(os.tmpdir(), `Mnemoshelf-${version}-linux-x86_64.AppImage`);
+
+  it("只改 Exec 指向新檔案，保留 --hidden 與其他鍵", async () => {
+    const original = appImage("0.4.1");
+    const updated = appImage("0.5.1");
+    await setAutostart(options({ execPath: original }), true);
+    const file = path.join(dir, "autostart", "mnemoshelf.desktop");
+
+    const result = rewriteAutostartExecPath(options({ execPath: original }), updated);
+    expect(result).toEqual({ updated: true, file });
+
+    const content = await fs.readFile(file, "utf8");
+    expect(content).toContain(`Exec="${updated}" "--hidden"`);
+    expect(content).not.toContain(original);
+    expect(content).toContain("X-GNOME-Autostart-enabled=true");
+  });
+
+  it("沒有自啟項時不建立（not-configured）", async () => {
+    const result = rewriteAutostartExecPath(options(), appImage("0.5.1"));
+    expect(result).toEqual({ updated: false, reason: "not-configured" });
+    await expect(fs.stat(path.join(dir, "autostart", "mnemoshelf.desktop"))).rejects.toThrow();
+  });
+
+  it("非 Linux 平台不處理", () => {
+    const result = rewriteAutostartExecPath(options({ platform: "darwin" }), path.join(os.tmpdir(), "Mnemoshelf.app"));
+    expect(result).toEqual({ updated: false, reason: "unsupported-platform" });
   });
 });

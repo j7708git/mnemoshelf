@@ -121,6 +121,8 @@ jobs:
             artifacts: |
               packages/desktop/dist-app/*.AppImage
               packages/desktop/dist-app/*.tar.gz
+              packages/desktop/dist-app/latest*.yml
+              packages/desktop/dist-app/*.blockmap
           - platform: linux-arm64
             os: ubuntu-24.04-arm
             script: dist:linux
@@ -128,18 +130,24 @@ jobs:
             artifacts: |
               packages/desktop/dist-app/*.AppImage
               packages/desktop/dist-app/*.tar.gz
+              packages/desktop/dist-app/latest*.yml
+              packages/desktop/dist-app/*.blockmap
           - platform: macos-arm64
             os: macos-latest
             script: dist:mac
             smoke: false
             artifacts: |
               packages/desktop/dist-app/*.dmg
+              packages/desktop/dist-app/latest*.yml
+              packages/desktop/dist-app/*.blockmap
           - platform: windows-x64
             os: windows-latest
             script: dist:win
             smoke: false
             artifacts: |
               packages/desktop/dist-app/*.exe
+              packages/desktop/dist-app/latest*.yml
+              packages/desktop/dist-app/*.blockmap
     steps:
       - name: 取出原始碼
         uses: actions/checkout@v4
@@ -296,6 +304,17 @@ jobs:
           pattern: "{linux-*,macos-*,windows-*}"
           merge-multiple: true
 
+      - name: 驗證更新 metadata
+        shell: bash
+        run: |
+          # 缺少 latest*.yml、或 yml 的 path／sha512 與實際附件對不上，使用者端的
+          # electron-updater 會更新失敗；這裡直接讓 job 紅，不把壞掉的 Release 發出去。
+          # Windows 的 blockmap 是獨立檔案（latest.yml 不引用它）；AppImage 的 blockmap
+          # 直接嵌在 AppImage 內（latest-linux.yml 只有 blockMapSize，沒有獨立 .blockmap）。
+          node packages/desktop/scripts/verify-update-metadata.mjs \
+            --dir dist \
+            --require latest.yml latest-linux.yml latest-linux-arm64.yml
+
       - name: 下載測試基準
         continue-on-error: true
         uses: actions/download-artifact@v4
@@ -341,6 +360,13 @@ jobs:
             echo "- 本 App 隨附 @img/sharp-libvips-*（LGPL-3.0-or-later）平台套件，即 sharp 使用的預編 libvips。"
             echo "- 授權全文見附件 LGPL-3.0.txt 與 GPL-3.0.txt（LGPL-3.0 以 GPL-3.0 為基礎）。"
             echo "- 對應原始碼取得方式與 shared library 替換說明見附件 THIRD-PARTY-NOTICES.md。"
+            echo
+            echo "## 更新方式（0.5.0 起）"
+            echo "- **0.5.0 之前（含 0.4.1）的版本沒有 App 內更新**：請手動下載並安裝 0.5.0；這是唯一一次需要手動升級。"
+            echo '- 0.5.0 的 Release 附件包含 electron-updater 需要的 `latest*.yml` 與 blockmap，從 0.5.0 起才能在 App 內檢查／下載更新。'
+            echo "- Linux：只有 AppImage 支援 App 內更新；tar.gz 版本請手動下載替換（AppImage 的 blockmap 直接嵌在檔案內，沒有獨立 .blockmap）。"
+            echo "- macOS（Apple Silicon）：採「檢查版本＋開啟下載頁」方式，不自動下載／安裝（本專案未做 Developer ID 簽章與公證）。"
+            echo "- Windows：安裝檔未簽章，App 內更新也沿用未簽章安裝檔（electron-updater 6.8.11 在沒有 publisherName 時不驗 Authenticode）。"
             echo
             echo "## 安裝（macOS 為 ad-hoc 簽章、未公證；Windows 未簽章）"
             echo "- macOS 安裝檔使用 ad-hoc 簽章（無開發者憑證、未公證），Windows 安裝檔未簽章；首次開啟會有系統警告："

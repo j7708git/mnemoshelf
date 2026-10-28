@@ -1,0 +1,12 @@
+# 開發模式（未打包）的更新 feed 設定。
+#
+# electron-updater 在 `app.isPackaged === false` 時預設讀取 app 目錄下的
+# `dev-app-update.yml`（只有明確設定 `forceDevUpdateConfig` 才會啟用）。
+# 本專案在開發模式**不初始化更新器**（見 main.ts 的 shouldEnableUpdater），
+# 這個檔案是給手動測試 feed／metadata 時使用的；不會被打包進 Release
+# （electron-builder.yml 的 files 只收 dist/** 與 package.json）。
+#
+# 內容必須與 electron-builder.yml 的 publish 設定一致；不得放任何 token。
+provider: github
+owner: j7708git
+repo: mnemoshelf

@@ -26,6 +26,12 @@
  * | `MNEMOSHELF_EMBED_DML_DEVICE_ID` | DirectML adapter 索引（非負整數，多顯卡時指定獨顯） | `0`（預設顯示卡） |
  * | `MNEMOSHELF_EMBED_ORT_LOG` | ONNX Runtime log 等級 `0`–`4`（`0`＝verbose；診斷用） | 未設定（不覆寫 ORT 預設） |
  *
+ * 另有**只在 build 時使用**的變數（不由本檔解析，本表僅登錄）：
+ *
+ * | 變數 | 用途 | 預設 |
+ * |---|---|---|
+ * | `MNEMOSHELF_BUILD_COMMIT` | build 時 `git rev-parse HEAD` 不可用的 fallback commit（`scripts/build-info.mjs`）；服務讀不到 `dist/build-info.json` 時，也用它作為 `GET /health` 的 `build` 後備 | `unknown` |
+ *
  * token 刻意不自動產生：自動生成會讓使用者誤以為已經有保護，實際上 token 沒人知道、
  * 也沒人能通過驗證。未設時直接失敗並提示產生方式（`MissingTokenError`）。
  */

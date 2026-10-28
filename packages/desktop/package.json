@@ -1,6 +1,6 @@
 {
   "name": "@mnemoshelf/desktop",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "description": "Mnemoshelf 桌面殼（Electron）：main process 內啟動 Core 服務、載入 Web UI，並以 electron-builder 打包",
@@ -19,7 +19,8 @@
   "dependencies": {
     "@huggingface/transformers": "4.3.1",
     "@mnemoshelf/embedder-transformers": "workspace:*",
-    "@mnemoshelf/server": "workspace:*"
+    "@mnemoshelf/server": "workspace:*",
+    "electron-updater": "6.8.11"
   },
   "devDependencies": {
     "@types/node": "^22.18.0",

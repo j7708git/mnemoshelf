@@ -1,5 +1,5 @@
 /**
- * Preload：把桌面殼的窄介面掛到 renderer 的 `window.mnemoshelfDesktop`（desktop shell API v1）。
+ * Preload：把桌面殼的窄介面掛到 renderer 的 `window.mnemoshelfDesktop`（desktop shell API v2）。
  *
  * 為什麼是 CJS（`.cts` → `dist/preload.cjs`）：Electron 的 sandbox preload 只支援 CommonJS；
  * 本檔同時負責「**只暴露狀態、不暴露 token**」這條界線——renderer 拿不到 token，
@@ -11,7 +11,7 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 const BRIDGE_NAME = "mnemoshelfDesktop";
-const API_VERSION = 1;
+const API_VERSION = 2;
 
 const CHANNELS = {
   bootstrapGet: "mnemoshelf:bootstrap:get",
@@ -22,6 +22,13 @@ const CHANNELS = {
   settingsSetAgentDiscovery: "mnemoshelf:settings:set-agent-discovery",
   settingsCopyConnectionInfo: "mnemoshelf:settings:copy-connection-info",
   settingsCopyMcpConfig: "mnemoshelf:settings:copy-mcp-config",
+  updaterGetState: "mnemoshelf:updater:get-state",
+  updaterCheck: "mnemoshelf:updater:check",
+  updaterDownload: "mnemoshelf:updater:download",
+  updaterInstall: "mnemoshelf:updater:install",
+  updaterLater: "mnemoshelf:updater:later",
+  updaterOpenReleasePage: "mnemoshelf:updater:open-release-page",
+  updaterState: "mnemoshelf:updater:state",
 };
 
 const api = {
@@ -47,6 +54,23 @@ const api = {
     setAgentDiscovery: (enabled: unknown) => ipcRenderer.invoke(CHANNELS.settingsSetAgentDiscovery, enabled === true),
     copyConnectionInfo: () => ipcRenderer.invoke(CHANNELS.settingsCopyConnectionInfo),
     copyMcpConfig: () => ipcRenderer.invoke(CHANNELS.settingsCopyMcpConfig),
+  },
+  updater: {
+    getState: () => ipcRenderer.invoke(CHANNELS.updaterGetState),
+    check: () => ipcRenderer.invoke(CHANNELS.updaterCheck),
+    download: () => ipcRenderer.invoke(CHANNELS.updaterDownload),
+    install: (force: unknown) => ipcRenderer.invoke(CHANNELS.updaterInstall, force === true),
+    later: () => ipcRenderer.invoke(CHANNELS.updaterLater),
+    openReleasePage: () => ipcRenderer.invoke(CHANNELS.updaterOpenReleasePage),
+    onState: (listener: (state: unknown) => void) => {
+      const handler = (_event: unknown, state: unknown): void => {
+        listener(state);
+      };
+      ipcRenderer.on(CHANNELS.updaterState, handler);
+      return () => {
+        ipcRenderer.removeListener(CHANNELS.updaterState, handler);
+      };
+    },
   },
 };
 

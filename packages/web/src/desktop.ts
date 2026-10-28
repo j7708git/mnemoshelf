@@ -79,6 +79,103 @@ export interface DesktopSettingsState {
   };
 }
 
+/**
+ * 更新狀態機的階段（與 `packages/desktop/src/updater/state.ts` 一致）。
+ *
+ * web 沒辦法 import desktop 的型別；這裡是契約的鏡像，兩邊要一起改。
+ */
+export type UpdaterPhase =
+  | "idle"
+  | "checking"
+  | "available"
+  | "downloading"
+  | "downloaded"
+  | "installing"
+  | "error";
+
+/** 更新模式：`auto`＝App 內下載安裝；`manual`＝只檢查並開下載頁；`disabled`＝這次不啟用。 */
+export type UpdaterMode = "auto" | "manual" | "disabled";
+
+/** 下載進度（只含顯示需要的數字，不含路徑）。 */
+export interface UpdaterProgress {
+  /** 0–100。 */
+  percent: number;
+  transferred: number;
+  /** 總位元組；未知時為 0。 */
+  total: number;
+  bytesPerSecond: number;
+}
+
+/** 穩定的錯誤代碼（與 desktop 的 `UpdaterErrorCode` 一致；顯示時保留代碼供回報）。 */
+export type UpdaterErrorCode =
+  | "offline"
+  | "not-found"
+  | "rate-limit"
+  | "checksum"
+  | "read-only"
+  | "unsupported-appimage"
+  | "unsupported-tarball"
+  | "invalid-signature"
+  | "invalid-version"
+  | "check-failed"
+  | "download-failed"
+  | "install-failed"
+  | "backup-failed"
+  | "busy"
+  | "unexpected";
+
+/** `error` 欄位的形狀。 */
+export interface UpdaterErrorInfo {
+  code: UpdaterErrorCode;
+  message: string;
+}
+
+/** renderer 看到的更新狀態（IPC 契約；不含路徑或 token）。 */
+export interface UpdaterState {
+  state: UpdaterPhase;
+  mode: UpdaterMode;
+  currentVersion: string;
+  /** 可更新版本（正規化、不含 `v`）；沒有時為 null。 */
+  availableVersion: string | null;
+  /** Release notes（純文字；UI 只以文字顯示，不解析 HTML）。 */
+  releaseNotes: string | null;
+  /** 公開的 Release 頁面（macOS 手動下載用）。 */
+  releaseUrl: string | null;
+  progress: UpdaterProgress | null;
+  error: UpdaterErrorInfo | null;
+  /** 使用者按過「稍後」的版本（本次執行；下次啟動會再詢問）。 */
+  skippedVersion: string | null;
+  /** 上次檢查完成時間（ISO 字串）。 */
+  checkedAt: string | null;
+  /** 給使用者看的非錯誤提示。 */
+  notice: string | null;
+}
+
+/**
+ * 更新相關的窄介面（desktop shell API v2 新增）。
+ *
+ * `mode === "disabled"` 時所有操作都是 no-op；狀態只帶版本、進度、錯誤代碼與公開的
+ * Release 頁面，不含路徑或 token。
+ */
+export interface DesktopUpdaterBridge {
+  getState(): Promise<UpdaterState>;
+  /** 手動檢查（略過「本次已按稍後」的抑制）。 */
+  check(): Promise<UpdaterState>;
+  download(): Promise<UpdaterState>;
+  /**
+   * 安裝已下載的更新（Linux／Windows）。
+   *
+   * `force: true` 表示使用者已確認「備份失敗仍要安裝」。
+   */
+  install(force?: boolean): Promise<UpdaterState>;
+  /** 本次不安裝；下次啟動會再詢問。 */
+  later(): Promise<UpdaterState>;
+  /** 以系統瀏覽器開啟 Release 下載頁（macOS 的主要動作）。 */
+  openReleasePage(): Promise<{ opened: boolean }>;
+  /** 訂閱狀態變化；回傳取消訂閱函式。 */
+  onState(listener: (state: UpdaterState) => void): () => void;
+}
+
 /** preload 暴露的窄介面。 */
 export interface DesktopBridge {
   kind: "mnemoshelf-desktop";
@@ -102,6 +199,13 @@ export interface DesktopBridge {
      */
     copyMcpConfig(): Promise<{ copied: boolean; url: string | null }>;
   };
+  /**
+   * 更新（v2 新增；Linux／Windows 為 App 內下載安裝，macOS 只檢查並開下載頁）。
+   *
+   * **選擇性**：v1 的 preload 沒有這個成員，舊殼搭配新 UI 時要當成「不支援」，
+   * 不可直接呼叫（`getDesktopUpdater()` 會處理）。
+   */
+  updater?: DesktopUpdaterBridge;
 }
 
 declare global {
@@ -131,4 +235,27 @@ export function useDesktopBridge(): DesktopBridge | null {
     if (bridge === null) setBridge(getDesktopBridge());
   }, [bridge]);
   return bridge;
+}
+
+/**
+ * 取得 updater 介面；不在桌面殼、或殼是 v1（沒有 updater）時回 null。
+ *
+ * v1→v2 相容：不能假設 `bridge.updater` 一定存在（舊的 preload 可能搭配新的 web build）。
+ */
+export function getDesktopUpdater(bridge: DesktopBridge | null = getDesktopBridge()): DesktopUpdaterBridge | null {
+  if (bridge === null) return null;
+  const updater = bridge.updater;
+  if (updater === undefined || updater === null) return null;
+  if (
+    typeof updater.getState !== "function" ||
+    typeof updater.check !== "function" ||
+    typeof updater.download !== "function" ||
+    typeof updater.install !== "function" ||
+    typeof updater.later !== "function" ||
+    typeof updater.openReleasePage !== "function" ||
+    typeof updater.onState !== "function"
+  ) {
+    return null;
+  }
+  return updater;
 }

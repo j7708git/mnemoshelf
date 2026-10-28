@@ -2,8 +2,8 @@
  * REST 路由（`node:http` 手寫，JSON in／JSON out；不引框架）。
  *
  * 契約（任務卡 §REST API）：
- * - `GET  /health`（免 token）→ `{status:"ok", service:"mnemoshelf", appVersion:"<版本>"}`
- *   （`service`／`appVersion` 是 additive 欄位；agent 用它確認連到的是 Mnemoshelf，
+ * - `GET  /health`（免 token）→ `{status:"ok", service:"mnemoshelf", appVersion:"<版本>", build:"<commit>"}`
+ *   （`service`／`appVersion`／`build` 是 additive 欄位；agent 用它確認連到的是 Mnemoshelf，
  *   降低「無關程式剛好佔用同一個埠」的風險——但它是免 token 的自我宣告，可被偽造，
  *   不防刻意偽造；見 `docs/roots-and-privacy.md` §信任模型）
  * - `POST /roots`、`GET /roots`、`GET /roots/:id`、`PATCH /roots/:id`（改 `modalities`）、
@@ -653,6 +653,31 @@ function readPackageVersion(): string {
 
 /** 服務版本（行程啟動時讀一次）。 */
 export const APP_VERSION = readPackageVersion();
+
+/**
+ * 建置 commit：讀 `dist/build-info.json` 的 `commit`（由 `scripts/build-info.mjs` 在 build
+ * 時寫入），讀不到或格式不符時退回 `MNEMOSHELF_BUILD_COMMIT`，再退回 `"unknown"`。
+ *
+ * 為什麼啟動時只讀一次：build marker 在行程生命週期內不會變，逐請求讀檔只是多餘 I/O。
+ * 路徑相對 `import.meta.url`，src（測試）與 dist（正式）佈局一致：dist 下是
+ * `packages/server/dist/build-info.json`；src 下不存在，自然走 fallback。
+ *
+ * `moduleUrl`／`env` 參數只供測試注入；正式呼叫一律用預設值。
+ */
+export function readBuildCommit(moduleUrl: string = import.meta.url, env: NodeJS.ProcessEnv = process.env): string {
+  try {
+    const url = new URL("../build-info.json", moduleUrl);
+    const parsed = JSON.parse(readFileSync(url, "utf8")) as { commit?: unknown };
+    if (typeof parsed.commit === "string" && parsed.commit.trim() !== "") return parsed.commit.trim();
+  } catch {
+    // 讀不到／不是合法 JSON：走 fallback。
+  }
+  const fallback = env.MNEMOSHELF_BUILD_COMMIT;
+  return fallback !== undefined && fallback.trim() !== "" ? fallback.trim() : "unknown";
+}
+
+/** 建置 commit（行程啟動時讀一次；`/health` 的 `build`）。 */
+export const BUILD_COMMIT = readBuildCommit();
 
 /**
  * 服務身分（`GET /health` 的 `service`）。
@@ -1936,8 +1961,13 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const method = (request.method ?? "GET").toUpperCase();
 
     if (method === "GET" && segments.length === 1 && segments[0] === "health") {
-      // 免 token；只放服務身分與版本，沒有任何機密。
-      sendJson(response, 200, { status: "ok", service: SERVICE_NAME, appVersion: APP_VERSION });
+      // 免 token；只放服務身分、版本與 build marker，沒有任何機密。
+      sendJson(response, 200, {
+        status: "ok",
+        service: SERVICE_NAME,
+        appVersion: APP_VERSION,
+        build: BUILD_COMMIT,
+      });
       return;
     }
 

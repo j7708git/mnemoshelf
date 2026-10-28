@@ -1,5 +1,5 @@
 /**
- * main process 與 renderer 之間的窄介面（desktop shell API v1）。
+ * main process 與 renderer 之間的窄介面（desktop shell API v2）。
  *
  * 這裡只放「契約」：通道名稱與狀態型別。實作有兩份，必須一致：
  * - main 端：`src/main.ts` 的 `ipcMain.handle`；
@@ -12,6 +12,7 @@
 import type { BootstrapState } from "./model-bootstrap.js";
 import type { TokenInfo } from "./token-store.js";
 import type { AutostartState } from "./autostart.js";
+import type { UpdaterState } from "./updater/state.js";
 
 /** IPC 通道名稱。 */
 export const DESKTOP_CHANNELS = {
@@ -23,11 +24,19 @@ export const DESKTOP_CHANNELS = {
   settingsSetAgentDiscovery: "mnemoshelf:settings:set-agent-discovery",
   settingsCopyConnectionInfo: "mnemoshelf:settings:copy-connection-info",
   settingsCopyMcpConfig: "mnemoshelf:settings:copy-mcp-config",
+  updaterGetState: "mnemoshelf:updater:get-state",
+  updaterCheck: "mnemoshelf:updater:check",
+  updaterDownload: "mnemoshelf:updater:download",
+  updaterInstall: "mnemoshelf:updater:install",
+  updaterLater: "mnemoshelf:updater:later",
+  updaterOpenReleasePage: "mnemoshelf:updater:open-release-page",
+  updaterState: "mnemoshelf:updater:state",
 } as const;
 
 /** `contextBridge` 掛在 renderer 上的全域名稱，以及 API 版本。 */
 export const DESKTOP_BRIDGE_NAME = "mnemoshelfDesktop";
-export const DESKTOP_API_VERSION = 1;
+/** v2：新增 updater 的狀態與操作（U2）。 */
+export const DESKTOP_API_VERSION = 2;
 
 /** 應用與環境資訊（顯示用）。 */
 export interface DesktopAppInfo {
@@ -104,5 +113,30 @@ export interface DesktopBridge {
      * 回傳不含 token，renderer 只拿到「是否成功」與網址。
      */
     copyMcpConfig(): Promise<{ copied: boolean; url: string | null }>;
+  };
+  /**
+   * 更新（Linux／Windows 為 App 內下載安裝；macOS 只檢查並開啟下載頁）。
+   *
+   * `mode === "disabled"` 時所有操作都是 no-op（開發模式／headless）。
+   * 狀態只帶版本、進度、錯誤代碼與公開的 Release 頁面，不含路徑或 token。
+   */
+  updater: {
+    getState(): Promise<UpdaterState>;
+    /** 手動檢查（略過「本次已按稍後」的抑制）。 */
+    check(): Promise<UpdaterState>;
+    download(): Promise<UpdaterState>;
+    /**
+     * 安裝已下載的更新（Linux／Windows）。
+     *
+     * `force: true` 表示使用者已確認「備份失敗仍要安裝」；main 會依此略過備份失敗的中止。
+     * macOS 沒有 App 內安裝，請用 `openReleasePage()`。
+     */
+    install(force?: boolean): Promise<UpdaterState>;
+    /** 本次不安裝；下次啟動會再詢問。 */
+    later(): Promise<UpdaterState>;
+    /** 以系統瀏覽器開啟 Release 下載頁（macOS B 案的主要動作）。 */
+    openReleasePage(): Promise<{ opened: boolean }>;
+    /** 訂閱狀態變化；回傳取消訂閱函式。 */
+    onState(listener: (state: UpdaterState) => void): () => void;
   };
 }

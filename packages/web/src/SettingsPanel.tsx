@@ -9,6 +9,7 @@
  */
 import type { DiagnosticsEmbedderRuntime, DiagnosticsEmbedderSelfTest } from "./api";
 import type { DesktopSettingsState } from "./desktop";
+import { UpdaterPanel } from "./UpdaterPanel";
 
 export interface SettingsPanelProps {
   settings: DesktopSettingsState | null;
@@ -279,6 +280,8 @@ export function SettingsPanel({
           </p>
         </div>
       )}
+
+      <UpdaterPanel currentVersion={settings?.app.version ?? null} />
 
       <div className="space-y-2">
         <h3 className="text-sm font-medium text-ink">匯出診斷資訊</h3>

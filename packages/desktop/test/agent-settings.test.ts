@@ -13,6 +13,7 @@ import {
   resolveStartupDiscovery,
   runtimeFileExists,
   setAgentDiscovery,
+  setSkippedUpdateVersion,
   writeAgentSettings,
 } from "../src/agent-settings.js";
 
@@ -64,6 +65,56 @@ describe("agentSettings.json", () => {
 
       await fs.writeFile(file, '{"schemaVersion":1}', "utf8");
       expect(await readAgentSettings(file, silent)).toEqual(defaultAgentSettings());
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("skippedUpdateVersion（稍後的更新版本）", () => {
+  it("與 agentDiscovery 存在同一個檔，讀寫可往返（舊檔沒有這個欄位也相容）", async () => {
+    const dir = await makeDir();
+    const file = path.join(dir, "agentSettings.json");
+    try {
+      // 舊格式（沒有 skippedUpdateVersion）→ 讀得到原本的兩個欄位。
+      await fs.writeFile(file, '{"schemaVersion":1,"agentDiscovery":false}\n', "utf8");
+      expect(await readAgentSettings(file, silent)).toEqual({ schemaVersion: 1, agentDiscovery: false });
+
+      const next = await setSkippedUpdateVersion(file, { schemaVersion: 1, agentDiscovery: false }, "0.5.1");
+      expect(next).toEqual({ schemaVersion: 1, agentDiscovery: false, skippedUpdateVersion: "0.5.1" });
+      expect(await readAgentSettings(file, silent)).toEqual({
+        schemaVersion: 1,
+        agentDiscovery: false,
+        skippedUpdateVersion: "0.5.1",
+      });
+
+      // 清除時把欄位移除，不留下舊值。
+      const cleared = await setSkippedUpdateVersion(file, next, null);
+      expect(cleared).toEqual({ schemaVersion: 1, agentDiscovery: false });
+      expect(await readAgentSettings(file, silent)).toEqual({ schemaVersion: 1, agentDiscovery: false });
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("切換 agentDiscovery 不會清掉已記錄的 skipped 版本", async () => {
+    const dir = await makeDir();
+    const settingsFile = path.join(dir, "agentSettings.json");
+    const runtimeFile = path.join(dir, "runtime.json");
+    try {
+      await setSkippedUpdateVersion(settingsFile, { schemaVersion: 1, agentDiscovery: true }, "0.5.1");
+      await setAgentDiscovery({
+        settingsFile,
+        runtimeFile,
+        enabled: false,
+        skippedUpdateVersion: "0.5.1",
+        log: silent,
+      });
+      expect(await readAgentSettings(settingsFile, silent)).toEqual({
+        schemaVersion: 1,
+        agentDiscovery: false,
+        skippedUpdateVersion: "0.5.1",
+      });
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }

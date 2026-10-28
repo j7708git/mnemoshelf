@@ -22,9 +22,31 @@ executableName: mnemoshelf
 # （electron-builder 會依 target 正規化，例如 x64 的 AppImage 是 `x86_64`）。
 artifactName: ${productName}-${version}-${os}-${arch}.${ext}
 
+# --- 更新來源（electron-updater）---
+#
+# 這裡只描述「更新 feed 在哪裡」，不含任何 token：CI 發佈 Release 仍由
+# `.github/workflows/desktop-release.yml` 的 `gh release` 負責（electron-builder 只建置、
+# 不經手 GitHub API）。
+#
+# owner／repo 明寫的原因：electron-builder 26.17.0 不會讀 CI 的 `GITHUB_REPOSITORY`，
+# 只會從 package.json 的 `repository` 欄位或 git remote（`.git/config`）推斷；本 repo
+# 的 package.json 沒有 `repository`，若依賴 git remote，產出的 `app-update.yml` 會隨
+# checkout 方式而異。owner/repo 已在公開 README 的 Releases 連結出現，不是新資訊。
+#
+# `publish` 同時決定兩件事：
+# - `--publish never` 下仍會產生 `latest*.yml`（electron-builder 的 update info 產生
+#   不受 isPublish 影響；見 app-builder-lib PublishManager）。
+# - 打包時寫進 resources 的 `app-update.yml`（electron-updater 執行期讀取的 feed 設定）。
+publish:
+  provider: github
+  owner: j7708git
+  repo: mnemoshelf
+
 # --- 三平台安裝檔 target ---
 #
 # Linux 的 arch 不寫死：CI 用兩個 runner（x64／arm64）各建各的，預設就是「目前機器」的架構。
+# AppImage 是本專案 Linux 產物中唯一支援 electron-updater 自動更新的格式；tar.gz 僅供手動安裝
+# （沒有 APPIMAGE 環境變數時 updater 會自行停用，見 U0 研究筆記）。
 linux:
   target:
     - AppImage
@@ -32,6 +54,9 @@ linux:
   category: Utility
 
 # macOS 只支援 Apple Silicon（arm64）。
+# **不要加 zip**：本專案的自動更新走 B 案（只檢查版本＋開啟下載頁），不用 Squirrel.Mac；
+# electron-updater 的 MacUpdater 需要 zip 才能下載／安裝，而我們不呼叫它。
+# 只有 dmg target 時 electron-builder 不會產生 `latest-mac.yml`，這是預期行為。
 mac:
   target:
     - target: dmg
@@ -44,6 +69,10 @@ mac:
   identity: "-"
 
 win:
+  # Windows 未簽章（沒有程式碼簽章憑證），也不設 `publisherName`：electron-updater
+  # 6.8.11 的 NsisUpdater 只有在 app-update.yml 有 publisherName 時才驗 Authenticode，
+  # 沒有就跳過。**不要**為了讓更新過關而設 `verifyUpdateCodeSignature: false`
+  # （見 project-notes 的 U0 研究筆記；v27 前重新評估簽章）。
   target:
     - target: nsis
       arch:
