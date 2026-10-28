@@ -1,6 +1,15 @@
 packages:
   - packages/*
 
+# 安全性修補：把 transitive 依賴釘到修補版，只在 workspace root 生效。
+# 父層宣告範圍都接受這些版本（`@electron/get` 的 undici ^7.24.4、node-gyp ^6.25.0、
+# `@effect/platform-node`／testcontainers 的 undici ^8.11.2、express 的 body-parser ^2.3.0）。
+overrides:
+  "undici@^6.0.0": "6.29.1"
+  "undici@^7.0.0": "7.30.1"
+  "undici@^8.0.0": "8.12.3"
+  "body-parser@^2.3.0": "2.4.0"
+
 # 注意：不要把 better-sqlite3 加進 onlyBuiltDependencies。
 #
 # better-sqlite3 13.x 以 N-API（NAPI_VERSION=10）發布，tarball 內含各平台預編譯

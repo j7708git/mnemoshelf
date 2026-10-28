@@ -21,7 +21,7 @@ mnemoshelf，並把相關記憶注入**當次**請求的最新 user message 末�
 | 項目 | 需求 |
 |---|---|
 | OpenCode | **2.1.1**（外掛型別 `@opencode/plugin@2.1.1`）；宿主 **2.2.0** 已實測（2026-10-28），其他版本請先對齊 |
-| mnemoshelf | **0.4.0 以上**可用 `runtime.json`（桌面版預設開啟、CLI 需設 `MNEMOSHELF_AGENT_DISCOVERY=on`）；0.3.0 以上若只用 `MNEMOSHELF_URL`／`MNEMOSHELF_TOKEN` 也可以。**0.4.1 起**外掛與 MCP 入口的路徑規則一致：明確指定位置就只用那一個（找不到會如實報錯，不會改連其他服務實例）。**0.5.0 起**外掛與服務同版釋出，召回契約未變；同版 repo 另含 dsh 外掛（見 [agent-integration.md](agent-integration.md)）。**0.5.1** 是 App 內更新證明版，功能與 0.5.0 相同（除版本號），外掛契約與行為未變 |
+| mnemoshelf | **0.4.0 以上**可用 `runtime.json`（桌面版預設開啟、CLI 需設 `MNEMOSHELF_AGENT_DISCOVERY=on`）；0.3.0 以上若只用 `MNEMOSHELF_URL`／`MNEMOSHELF_TOKEN` 也可以。**0.4.1 起**外掛與 MCP 入口的路徑規則一致：明確指定位置就只用那一個（找不到會如實報錯，不會改連其他服務實例）。**0.5.0 起**外掛與服務同版釋出，召回契約未變；同版 repo 另含 dsh 外掛（見 [agent-integration.md](agent-integration.md)）。**0.5.1** 是 App 內更新證明版，功能與 0.5.0 相同（除版本號），外掛契約與行為未變。**0.5.2** 為依賴安全修補，外掛契約與行為未變 |
 | Node／pnpm | Node 22 以上、pnpm 10（建置外掛用） |
 
 外掛本身**不需要**額外的 runtime 依賴：HTTP 用 Node 內建 `fetch`，`@opencode/plugin`

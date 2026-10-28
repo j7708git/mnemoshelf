@@ -1,6 +1,6 @@
 {
   "name": "@mnemoshelf/opencode-plugin",
-  "version": "0.5.1",
+  "version": "0.5.2",
   "private": true,
   "type": "module",
   "description": "Mnemoshelf 的 OpenCode v2 外掛：每次模型請求前自動召回相關記憶；可選的回合結束自動摘要（預設關閉）",
