@@ -2,7 +2,7 @@
 
 本機桌面應用程式：把自己挑選的資料夾變成可語意搜尋的知識庫，並讓多個 AI agent 共用同一份記憶。
 
-> **狀態**：最新釋出 **v0.5.0**（[GitHub Releases](https://github.com/j7708git/mnemoshelf/releases)）。本版重點＝**harness 記憶整合**（OpenCode 外掛與新的 dsh 外掛都能自動召回／寫入同一份本機記憶；契約與已知差異見 [docs/agent-integration.md](docs/agent-integration.md)）與**桌面版 App 內更新**（Linux AppImage／Windows NSIS 可在 App 內下載安裝，macOS 只檢查版本後開下載頁；見 [docs/updates.md](docs/updates.md)）。授權 [MIT](LICENSE)。
+> **狀態**：最新釋出 **v0.5.1**（[GitHub Releases](https://github.com/j7708git/mnemoshelf/releases)）。本版是**App 內更新證明**：功能與 v0.5.0 相同（除版本號），用途是驗證 0.5.0 能在 App 內檢查→下載→重啟安裝（≤ 0.4.1 仍須先手動安裝 0.5.0；行為與平台限制見 [docs/updates.md](docs/updates.md)）。v0.5.0 的重點仍是 **harness 記憶整合**（OpenCode 外掛與新的 dsh 外掛都能自動召回／寫入同一份本機記憶；契約與已知差異見 [docs/agent-integration.md](docs/agent-integration.md)）。授權 [MIT](LICENSE)。
 
 ## 這是什麼
 
