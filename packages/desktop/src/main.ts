@@ -550,6 +550,12 @@ function registerIpcHandlers(): void {
     if (updater === null) return { opened: false };
     return updater.openReleasePage();
   });
+  ipcMain.handle(DESKTOP_CHANNELS.updaterRestartApp, (event): void => {
+    assertTrustedSender(event);
+    // 更新流程失敗時 Core 服務已經關閉；重新啟動是目前唯一能恢復服務的動作。
+    app.relaunch();
+    app.exit(0);
+  });
   log(`已註冊 desktop shell API v${DESKTOP_API_VERSION}（bridge：window.${DESKTOP_BRIDGE_NAME}）`);
 }
 

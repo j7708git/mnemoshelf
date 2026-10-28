@@ -121,7 +121,6 @@ export type UpdaterErrorCode =
   | "download-failed"
   | "install-failed"
   | "backup-failed"
-  | "busy"
   | "unexpected";
 
 /** `error` 欄位的形狀。 */
@@ -172,6 +171,8 @@ export interface DesktopUpdaterBridge {
   later(): Promise<UpdaterState>;
   /** 以系統瀏覽器開啟 Release 下載頁（macOS 的主要動作）。 */
   openReleasePage(): Promise<{ opened: boolean }>;
+  /** 更新失敗後重新啟動 App 以恢復 Core 服務。 */
+  restartApp(): Promise<void>;
   /** 訂閱狀態變化；回傳取消訂閱函式。 */
   onState(listener: (state: UpdaterState) => void): () => void;
 }
@@ -253,6 +254,7 @@ export function getDesktopUpdater(bridge: DesktopBridge | null = getDesktopBridg
     typeof updater.install !== "function" ||
     typeof updater.later !== "function" ||
     typeof updater.openReleasePage !== "function" ||
+    typeof updater.restartApp !== "function" ||
     typeof updater.onState !== "function"
   ) {
     return null;

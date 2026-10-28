@@ -102,6 +102,7 @@ interface MockCalls {
   install: number;
   later: number;
   openReleasePage: number;
+  restartApp: number;
 }
 
 /** 呼叫次數的快照（給 dev 面板顯示，證明某個動作有沒有被呼叫）。 */
@@ -207,7 +208,7 @@ export function createDevUpdaterMock(
   const scenario = requestedScenario as UpdaterMockScenario;
   const listeners = new Set<(state: UpdaterState) => void>();
   const timers = new Set<number>();
-  const calls: MockCalls = { check: 0, download: 0, install: 0, later: 0, openReleasePage: 0 };
+  const calls: MockCalls = { check: 0, download: 0, install: 0, later: 0, openReleasePage: 0, restartApp: 0 };
   let state = initialState(scenario);
   let progressTimer: number | null = null;
 
@@ -369,6 +370,9 @@ export function createDevUpdaterMock(
     openReleasePage: async () => {
       bump("openReleasePage");
       return { opened: state.releaseUrl !== null };
+    },
+    restartApp: async () => {
+      bump("restartApp");
     },
     onState: (listener) => {
       listeners.add(listener);

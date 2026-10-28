@@ -222,6 +222,7 @@ export function UpdaterPanel({ currentVersion = null }: UpdaterPanelProps) {
   const updater = mock ?? desktopUpdater;
   const { state, loadError, applyState } = useUpdaterState(updater);
   const [pendingAction, setPendingAction] = useState<"check" | "download" | "install" | "later" | "open" | null>(null);
+  const [restarting, setRestarting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [openNotice, setOpenNotice] = useState<string | null>(null);
   /**
@@ -291,6 +292,20 @@ export function UpdaterPanel({ currentVersion = null }: UpdaterPanelProps) {
     [updater, applyState, state, rememberDeferred],
   );
 
+  /** 更新流程失敗後重新啟動 App；main process 會 relaunch 並結束目前行程。 */
+  const restartApp = useCallback(async (): Promise<void> => {
+    if (updater === null) return;
+    if (!window.confirm("更新未完成，重新啟動 Mnemoshelf 以恢復服務？")) return;
+    setActionError(null);
+    setRestarting(true);
+    try {
+      await updater.restartApp();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "重新啟動失敗，請手動重新開啟 Mnemoshelf。");
+      setRestarting(false);
+    }
+  }, [updater]);
+
   if (updater === null) {
     return (
       <div className="space-y-1" data-testid="updater-panel">
@@ -304,7 +319,7 @@ export function UpdaterPanel({ currentVersion = null }: UpdaterPanelProps) {
     );
   }
 
-  const busy = pendingAction !== null;
+  const busy = pendingAction !== null || restarting;
   const phase = state?.state ?? "idle";
   const mode = state?.mode ?? null;
   const isChecking = phase === "checking";
@@ -369,7 +384,7 @@ export function UpdaterPanel({ currentVersion = null }: UpdaterPanelProps) {
           onClick={() => void run("download")}
           className={PRIMARY_CLASS}
         >
-          {pendingAction === "download" ? "開始下載…" : "下載並安裝"}
+          {pendingAction === "download" ? "開始下載…" : "下載更新"}
         </button>,
       );
     }
@@ -407,17 +422,37 @@ export function UpdaterPanel({ currentVersion = null }: UpdaterPanelProps) {
       </button>,
     );
   } else if (phase === "error") {
-    actions.push(
-      <button
-        key="retry"
-        type="button"
-        disabled={busy}
-        onClick={() => void run("check")}
-        className={PRIMARY_CLASS}
-      >
-        {pendingAction === "check" ? "重試中…" : "重試"}
-      </button>,
-    );
+    // 備份失敗／安裝失敗時 Core 服務已關閉，重試不會恢復服務；提供「重新啟動應用程式」，
+    // 讓使用者不必手動找行程重新開啟。
+    const needsRestart =
+      state?.error?.code === "backup-failed" || state?.error?.code === "install-failed";
+    if (needsRestart) {
+      if (updater !== null) {
+        actions.push(
+          <button
+            key="restart"
+            type="button"
+            disabled={restarting}
+            onClick={() => void restartApp()}
+            className={PRIMARY_CLASS}
+          >
+            {restarting ? "正在重新啟動…" : "重新啟動應用程式"}
+          </button>,
+        );
+      }
+    } else {
+      actions.push(
+        <button
+          key="retry"
+          type="button"
+          disabled={busy}
+          onClick={() => void run("check")}
+          className={PRIMARY_CLASS}
+        >
+          {pendingAction === "check" ? "重試中…" : "重試"}
+        </button>,
+      );
+    }
   }
 
   const progress = state?.progress ?? null;
@@ -567,7 +602,8 @@ export function UpdaterPanel({ currentVersion = null }: UpdaterPanelProps) {
       {import.meta.env.DEV && mock !== null && (
         <p className="text-xs text-muted" data-testid="updater-mock-trace">
           開發模擬（{mock.scenario}）：check {mockCalls?.check ?? 0}｜download {mockCalls?.download ?? 0}｜install{" "}
-          {mockCalls?.install ?? 0}｜later {mockCalls?.later ?? 0}｜open {mockCalls?.openReleasePage ?? 0}
+          {mockCalls?.install ?? 0}｜later {mockCalls?.later ?? 0}｜open {mockCalls?.openReleasePage ?? 0}｜restart{" "}
+          {mockCalls?.restartApp ?? 0}
         </p>
       )}
     </div>

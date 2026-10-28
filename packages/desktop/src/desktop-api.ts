@@ -30,6 +30,7 @@ export const DESKTOP_CHANNELS = {
   updaterInstall: "mnemoshelf:updater:install",
   updaterLater: "mnemoshelf:updater:later",
   updaterOpenReleasePage: "mnemoshelf:updater:open-release-page",
+  updaterRestartApp: "mnemoshelf:updater:restart-app",
   updaterState: "mnemoshelf:updater:state",
 } as const;
 
@@ -136,6 +137,8 @@ export interface DesktopBridge {
     later(): Promise<UpdaterState>;
     /** 以系統瀏覽器開啟 Release 下載頁（macOS B 案的主要動作）。 */
     openReleasePage(): Promise<{ opened: boolean }>;
+    /** 更新失敗後重新啟動 App 以恢復 Core 服務（main process 直接 relaunch）。 */
+    restartApp(): Promise<void>;
     /** 訂閱狀態變化；回傳取消訂閱函式。 */
     onState(listener: (state: UpdaterState) => void): () => void;
   };

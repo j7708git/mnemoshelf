@@ -76,11 +76,12 @@ preload（`src/preload.cts` → `dist/preload.cjs`）用 `contextBridge` 掛上
 | `settings.copyConnectionInfo()` | 把 `{url, token}` 放進剪貼簿；**回傳不含 token** |
 | `settings.copyMcpConfig()` | 把可直接貼進 MCP client 的設定片段放進剪貼簿；**片段不含 token**（入口自行讀 `runtime.json`）；回傳不含 token；連線資訊檔／入口腳本不存在或 AppImage 環境時回 `copied:false` |
 | `updater.getState()` | 目前的更新狀態（階段、目前／可用版本、進度、錯誤代碼、Release 頁面） |
-| `updater.check()` | 手動檢查更新（不受 30 秒／6 小時計時器限制；會略過「此次稍後」的抑制） |
+| `updater.check()` | 手動檢查更新（不受 30 秒／6 小時計時器限制）。「本次稍後」的抑制只在 `skippedVersion` 有值時生效；目前 UI 只在 `downloaded` 階段呼叫 `later()`，該階段是 no-op，所以從 UI 不會寫入 `skippedVersion` |
 | `updater.download()` | 下載已找到的更新（Linux／Windows） |
 | `updater.install(force?)` | 安裝已下載的更新；`force:true` 表示使用者已確認「備份失敗仍要安裝」 |
 | `updater.later()` | 本次不更新；下次啟動會再詢問（不會關 App 就安裝） |
 | `updater.openReleasePage()` | 以系統瀏覽器開啟 Release 下載頁（macOS B 案會用到） |
+| `updater.restartApp()` | 更新失敗後重新啟動 App 以恢復 Core 服務（main process 直接 relaunch 並結束目前行程） |
 | `updater.onState(listener)` | 訂閱更新狀態推播；回傳取消訂閱函式 |
 
 **renderer 拿不到 token**：介面只回傳狀態，token 只留在 main process。

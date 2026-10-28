@@ -23,7 +23,6 @@ export type UpdaterErrorCode =
   | "download-failed"
   | "install-failed"
   | "backup-failed"
-  | "busy"
   | "unexpected";
 
 /** `error` 欄位的形狀。 */
@@ -47,7 +46,6 @@ const MESSAGES: Record<UpdaterErrorCode, string> = {
   "download-failed": "下載更新失敗，請稍後再試。",
   "install-failed": "安裝更新失敗，請重新啟動應用程式後再試。",
   "backup-failed": "更新前備份失敗，已取消安裝。",
-  busy: "更新正在進行中，請稍候。",
   unexpected: "更新時發生未預期的錯誤。",
 };
 

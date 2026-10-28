@@ -28,6 +28,7 @@ const CHANNELS = {
   updaterInstall: "mnemoshelf:updater:install",
   updaterLater: "mnemoshelf:updater:later",
   updaterOpenReleasePage: "mnemoshelf:updater:open-release-page",
+  updaterRestartApp: "mnemoshelf:updater:restart-app",
   updaterState: "mnemoshelf:updater:state",
 };
 
@@ -62,6 +63,7 @@ const api = {
     install: (force: unknown) => ipcRenderer.invoke(CHANNELS.updaterInstall, force === true),
     later: () => ipcRenderer.invoke(CHANNELS.updaterLater),
     openReleasePage: () => ipcRenderer.invoke(CHANNELS.updaterOpenReleasePage),
+    restartApp: () => ipcRenderer.invoke(CHANNELS.updaterRestartApp),
     onState: (listener: (state: unknown) => void) => {
       const handler = (_event: unknown, state: unknown): void => {
         listener(state);

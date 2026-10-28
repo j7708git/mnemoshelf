@@ -111,8 +111,8 @@ const ERROR_TEXT: Record<UpdaterErrorCode, string> = {
   "check-failed": "檢查更新失敗，請稍後再試。",
   "download-failed": "下載更新失敗，請稍後再試。",
   "install-failed": "安裝更新失敗，請重新啟動應用程式後再試。",
-  "backup-failed": "更新前備份失敗，已取消安裝。你可以重試，或改用手動下載更新。",
-  busy: "更新正在進行中，請稍候。",
+  "backup-failed":
+    "更新前備份失敗，已取消安裝。請重新啟動應用程式以恢復服務，或改用手動下載更新。",
   unexpected: "更新時發生未預期的錯誤，請稍後再試。",
 };
 

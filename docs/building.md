@@ -94,7 +94,9 @@ Windows 安裝檔則**未簽章**。因此第一次開啟時，
 - **Linux AppImage**：下載後 `chmod +x <檔名>` 再執行（需要 FUSE；沒有 FUSE 時可用
   `--appimage-extract` 解開後執行）。
 
-因為沒有開發者簽章與公證，本專案也**沒有 auto-update**：要更新請重新下載新版本安裝檔。
+0.5.0 起，Linux AppImage 與 Windows NSIS 安裝檔支援 **App 內更新**（檢查、下載、重啟並
+安裝）；macOS 因沒有 Developer ID 簽章與公證，只提供 App 內檢查與開啟下載頁。支援矩陣與
+限制見 [`updates.md`](updates.md)。
 
 ## 授權清單與 LGPL 合規
 
@@ -187,7 +189,9 @@ bash .github/scripts/scan-repo.sh --self-test    # 在暫存目錄建合成樣�
 
 ## 已知限制
 
-- **ad-hoc 簽章、未公證**：安裝時需依上面「下載安裝檔」一節繞過系統警告；沒有 auto-update。
+- **ad-hoc 簽章、未公證**：安裝時需依上面「下載安裝檔」一節繞過系統警告；macOS 只走
+  「App 內檢查＋開啟下載頁」（B 案），不支援 App 內自動安裝。0.5.0 起 Linux AppImage／
+  Windows NSIS 支援 App 內更新，支援矩陣與限制見 [`updates.md`](updates.md)。
 - **macOS 只支援 Apple Silicon（arm64）**。
 - **macOS 的自啟可能不生效**：自啟走 SMAppService（由系統管理登入項目），**ad-hoc 簽章
   （未公證）的版本可能被系統擋下而靜默無效**；而且 macOS 的登入啟動**不會**收到 `--hidden` 之類的自啟參數
