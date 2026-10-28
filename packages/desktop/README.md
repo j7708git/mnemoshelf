@@ -109,8 +109,9 @@ preload（`src/preload.cts` → `dist/preload.cjs`）用 `contextBridge` 掛上
   `unsupported-appimage`、`unsupported-tarball`、`invalid-signature`、`invalid-version`、
   `check-failed`、`download-failed`、`install-failed`、`backup-failed` 等；狀態只帶代碼與
   固定訊息，不含路徑、token 或 URL 查詢參數。
-- **真實安裝未驗**：單元測試只涵蓋狀態機與流程（fake updater）；AppImage／NSIS 的實際
-  替換與重啟留 U5 在打包產物上驗。
+- **真實安裝已驗（Linux AppImage）**：U5 用 0.5.0 AppImage 實證 0.5.0 → 0.5.1：
+  AppImage 完成替換並在常駐 X server 下自動重啟；DB、roots、token、模型快取與 MCP 入口都保留。
+  **Windows NSIS／macOS 未實機**；自動重啟的時序仍列 backlog 觀察。
 
 ## 怎麼跑
 

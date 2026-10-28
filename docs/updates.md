@@ -21,8 +21,27 @@ Mnemoshelf 桌面版會從本專案的 GitHub Release 檢查新版本。**Linux 
 - 目前版本或 Release 是 prerelease 時，穩定版檢查不會把它當成更新。
 - 自動更新的檢查在啟動後約 30 秒第一次執行，之後每 6 小時一次；使用者也可以手動按「檢查更新」。
 
-> **驗證範圍**：Linux AppImage 是本專案的主要支援與驗收路徑；Windows NSIS 與 macOS 的
-> 更新流程尚未在本專案實機驗證，行為依 electron-updater 6.8.11 的原始碼與目前設定推導。
+> **驗證範圍**：Linux AppImage 是本專案的主要支援與驗收路徑。**0.5.0 → 0.5.1 已在 Linux
+> AppImage 完成真實的 App 內更新**（檢查、下載、備份與替換安裝檔都成功，更新後的自動重啟
+> 也已確認）。
+> Windows NSIS 與 macOS 的更新流程尚未在本專案實機驗證，行為依 electron-updater 6.8.11 的
+> 原始碼與目前設定推導。
+
+### 已實證：0.5.0 → 0.5.1（Linux AppImage）
+
+2026-10-28 以 0.5.0 的 Linux x64 AppImage 對真實的 GitHub Release feed 跑過完整流程：
+
+- 檢查→下載→「重啟並安裝」；更新後版本 `0.5.0 → 0.5.1`，`GET /health` 的 `appVersion` 與
+  `build` 都換成新版本的值。
+- 安裝檔換成 `Mnemoshelf-0.5.1-linux-x86_64.AppImage`，舊檔已移除；新檔 SHA-512 與
+  `latest-linux.yml` 相符。
+- 更新前備份 `pre-update-0.5.0-to-0.5.1/` 建立成功（目錄 `0700`、DB `0600`、只含資料庫）。
+- 資料保全：`memories`／`chunks`／`roots` 筆數不變、資料庫檔位元組相同；roots、token
+  （帶 token `200`／不帶 `401` 的對照）與模型快取都沿用。
+- 用更新後 AppImage 內附的 MCP 入口可完成 `initialize`／`tools/list`／`recall`。
+- App 自動重新啟動，新實例的 `/health` 回 `0.5.1`。
+
+這是一次 Linux x64 的實證，不代表 Windows／macOS 已驗證；其他安裝形式仍請手動替換。
 
 ## 檢查、下載與安裝
 
@@ -200,6 +219,9 @@ macOS 版使用 **ad-hoc 簽章、未公證**，不具備 Squirrel.Mac 自動更
 - **按了下載卻沒反應**：確認目前狀態是「有新版本」；`downloading`／`downloaded` 期間不會重複下載。
 - **更新後舊捷徑失效**：AppImage 檔名已變，請依「AppImage 的檔名與捷徑」一節修正。
 - **想回到舊版**：沒有自動回滾，請依「回滾（手動）」操作。
+- **經過代理伺服器時顯示 `check-failed`**：若網路需經 proxy 而 proxy 連不上，錯誤可能落在
+  `check-failed` 而不是 `offline`（分類器目前只認常見的網路錯誤碼）。兩者都只影響這次檢查，
+  目前版本不變；確認 proxy 設定後再試即可。
 - **備份佔空間**：只保留 3 份；較舊的會在下次備份時自動刪除。也可以手動刪除不需要的
   `pre-update-*` 目錄（App 不會刪除其他名稱的目錄）。
 - **Windows 備份失敗**：資料庫檔案可能被防毒、同步或備份工具暫時鎖住；關閉該程式或

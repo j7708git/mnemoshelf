@@ -1,4 +1,4 @@
-# Agent 整合：連線資訊檔（`runtime.json`）
+# Agent 整合：連線資訊、MCP 與 harness 接入契約
 
 Mnemoshelf 的服務只綁 `127.0.0.1`，而且所有 REST 端點都需要 Bearer token。
 同一台機器上的 agent（OpenCode／OpenChamber 外掛、MCP client、自己的腳本）原本得由使用者
@@ -6,6 +6,22 @@ Mnemoshelf 的服務只綁 `127.0.0.1`，而且所有 REST 端點都需要 Beare
 讓程式自己找到服務。
 
 > 這份檔案是公開文件；內容以程式碼與 `docs/roots-and-privacy.md` 的契約為準。
+
+## 版本與相容性（0.5.x）
+
+| 版本 | harness 整合狀態 |
+|---|---|
+| **0.5.0** | 本文的三層接入契約與三個入口同日釋出：MCP 入口、OpenCode／OpenChamber 外掛、`@mnemoshelf/dsh-plugin`（dsh bundle）。MCP／REST 契約與 0.4.x 相同；dsh 外掛新增回合前召回與回合卡寫入（含 spool）。 |
+| **0.5.1** | App 內更新證明版：功能與 0.5.0 相同（除版本號）。MCP／REST／外掛契約與行為未變。 |
+
+- `runtime.json` 的 `schemaVersion` 仍是 `1`；MCP 工具仍是六個（`search`、`remember`、`recall`、
+  `forget`、`list_roots`、`search_memories`）。
+- harness 版本需求：OpenCode 見 [opencode-plugin.md](opencode-plugin.md) §1、dsh 見
+  `packages/dsh-plugin/README.md`、codex-cli 的實測版本見下文「MCP-only 快速上手」。
+- **實測範圍（2026-10-28，Linux x64）**：OpenCode 2.2.0（外掛型別 `@opencode/plugin@2.1.1`）、
+  dsh `0.2.1-rc.2`、codex-cli `0.147.0`。Windows／macOS 未實機。
+- 既有差異照實保留：OpenCode 外掛在 `degraded: true` 時仍注入關鍵字補位結果；dsh 依契約
+  不注入（見下文「與 OpenCode 外掛現況的差異」）。
 
 ## 這個檔案是什麼
 
@@ -320,8 +336,8 @@ client 端。
 > 契約的權威仍是程式碼；程式碼與本節不符時以程式碼為準，各小節附上對應檔案。
 >
 > **dsh 的範圍**：本節提到的 dsh 行為（`agent/pre-step`、`user/message`、`form:'recall'`、
-> `turn/end`、900 字上限）是 v1 契約與 T2 spike 的結論；`packages/dsh-plugin` 由 T3 實作，
-> **目前尚無程式碼**。T3 落地後由 T7 收斂文件與實作的差異。
+> `turn/end`、900 字上限）是 v1 契約的結論，**已實作於 `packages/dsh-plugin`**
+> 並隨 0.5.0 釋出；實作與本節如有出入，以 `packages/dsh-plugin/README.md` 與程式碼為準。
 
 ## 三層接入模型
 
@@ -331,7 +347,7 @@ harness 內用 REST 實作自動召回／寫入的整合層。三層的差別在
 | 層 | 誰發動 | 責任 | 召回 | 寫入 |
 |---|---|---|---|---|
 | MCP 工具 | 模型或 agent 主動呼叫工具 | 六個工具（`search`／`remember`／`recall`／`forget`／`list_roots`／`search_memories`）；stdio 入口只轉發 REST，不直接開資料庫 | 只有明確呼叫 `recall`／`search_memories` 才查 | 只有明確呼叫 `remember` 才寫 |
-| 外掛（自動） | 宿主生命週期事件（請求前／回合結束） | 在 harness 內自動召回；可選的自動寫入 | 每次符合條件的模型請求前 | 只在啟用時（OpenCode：`digestEnabled`＋`digestModel`，預設關閉） |
+| 外掛（自動） | 宿主生命週期事件（請求前／回合結束） | 在 harness 內自動召回；可選或固定的自動寫入 | 每次符合條件的模型請求前 | OpenCode 只在啟用時（`digestEnabled`＋`digestModel`，預設關閉）；dsh 每個成功完成的回合寫一張回合卡 |
 | REST 直接呼叫 | harness 自己的程式碼 | 自行決定時機、內容、錯誤與重試 | `POST /memories/search` | `POST /memories` |
 
 - **三者共用同一台服務與同一組 `url` + `token`**（來源都是 `runtime.json`，見上文）。同一時間建議
@@ -426,8 +442,7 @@ harness 內用 REST 實作自動召回／寫入的整合層。三層的差別在
 
 - 每個**成功結束**的回合最多一張回合卡：`kind: "fact"`、`agent: "<harness>/turn"`。
 - dsh v1 契約在 `turn/end` 取最後一則 user 與最後一則 assistant 文字後產生；使用者文字剝除後
-  < 40 字元或空白 → **不寫**、不報錯（T3 將實作於 `packages/dsh-plugin`；目前尚無程式碼，
-  細節以 T2 spike 與 T3 卡為準）。
+  < 40 字元或空白 → **不寫**、不報錯（已實作於 `packages/dsh-plugin`，細節見該套件 README）。
 - 內容是抽取式的（見下節），不是模型摘要。OpenCode 的 digest 回合卡是**模型摘要**、
   且帶 `force: true`（[opencode-plugin.md](opencode-plugin.md) §7.2），屬於既有實作；
   本契約不要求它變更，但其他 harness 不要把它當成確定性卡片的範本。
@@ -508,7 +523,8 @@ harness 內用 REST 實作自動召回／寫入的整合層。三層的差別在
   這是刻意的例外，不是本契約的通用要求。
 - **空召回 → 不注入**（`hits` 為空，或過濾後沒有可注入項目）。
 - 逾時、連線失敗、HTTP 錯誤、格式不符 → fail-open：不注入、不影響回覆、不重試。
-- **timeout 800ms**：用 `AbortController` 包住請求。dsh v1 契約固定 800ms（T3 實作）；
+- **timeout 800ms**：用 `AbortController` 包住請求。dsh v1 契約固定 800ms（已實作於
+  `packages/dsh-plugin`）；
   OpenCode 外掛的 `timeoutMs` 程式預設 150（範圍 100–2000，見
   `packages/opencode-plugin/src/config.ts`），本機現況設定為 800；本契約維持 800，不要求改動。
 - 召回失敗的 log 只放狀態與原因代碼，**不放** query 原文、記憶內容、token。
@@ -516,7 +532,7 @@ harness 內用 REST 實作自動召回／寫入的整合層。三層的差別在
 ### 注入預算
 
 - 單次注入最多 **4 筆**；超過就從尾端（最低 rank）丟。
-- dsh v1 契約的注入區塊（含標記）總長 ≤ **900 字元**（T3 實作）；超預算從最後一筆開始丟，
+- dsh v1 契約的注入區塊（含標記）總長 ≤ **900 字元**（`packages/dsh-plugin`）；超預算從最後一筆開始丟，
   不留半截圍籬。
 - OpenCode 外掛的既有預算是 soft 900／hard 1200 字元（[opencode-plugin.md](opencode-plugin.md) §6.3）。
 - 要不要另外注入「最近回合卡」由 harness 決定；本契約只要求 `POST /memories/search` 這條路徑。
@@ -527,10 +543,9 @@ harness 內用 REST 實作自動召回／寫入的整合層。三層的差別在
 - **`k`**：本契約要求新 harness 送 `k: 4`；OpenCode 外掛現行送 `kMax: 8` 取候選、最多注入
   4 筆（`maxItems: 4`）。這是外掛自己的預算策略，不要求改動。
 - **`degraded`**：dsh v1 契約要求不注入；OpenCode 外掛現行會記錄 `degraded`，但仍注入關鍵字補位
-  結果（`packages/opencode-plugin/src/recall.ts`）。**這是 v1 保留的既有行為，不是契約要求**；
-  T6 的 DoD 5 以 dsh 的行為判定。
+  結果（`packages/opencode-plugin/src/recall.ts`）。**這是 v1 保留的既有行為，不是契約要求**。
 - **timeout**：OpenCode 的 `timeoutMs` 是可設定值：程式預設 150、本機現況 800（已拍板值）；
-  dsh v1 契約固定 800（T3 實作）。
+  dsh v1 契約固定 800（`packages/dsh-plugin`）。
 
 ## 注入標記與剝除
 
@@ -545,15 +560,14 @@ harness 內用 REST 實作自動召回／寫入的整合層。三層的差別在
 ```
 
 - `source="mnemoshelf"` 與 `trust="untrusted"` **必有**；`form="recall"` 用於 dsh v1 契約的召回
-  注入（T3 實作）；`project`／`retrieved` 是選配的脈絡（`retrieved` 是日期，只屬於注入，不進卡片內容）。
+  注入（`packages/dsh-plugin`）；`project`／`retrieved` 是選配的脈絡（`retrieved` 是日期，只屬於注入，不進卡片內容）。
 - 區塊內的記憶一律視為**不受信任資料**；固定說明句不可省略。記憶內容若含
   `</memory-context>`，要轉義成 `<\/memory-context>`，避免提前關閉區塊。
 - v1 不新增逐筆 id 或逐筆來源；格式與 OpenCode 現行一致（[opencode-plugin.md](opencode-plugin.md) §6.5）。
 
 ### dsh 的注入方式
 
-以下為 dsh v1 契約（T3 將實作於 `packages/dsh-plugin`；目前尚無程式碼，細節以 T2 spike 與
-T3 卡為準）：
+以下為 dsh v1 契約（已實作於 `packages/dsh-plugin`，細節見該套件 README）：
 
 - 在 `agent/pre-step` 追加一則 `user/message`，帶 `form: 'recall'`；**不要改寫使用者原始訊息**。
 - 注入會留在 session 歷史（已接受的取捨）；因此：
@@ -599,7 +613,7 @@ const stripMemoryContext = (text) => text.replace(MEMORY_CONTEXT, "").trim();
 | token、金鑰、密碼、私人憑證 | 伺服器會遮罩，但不要依賴它；根本不要送 |
 
 剝除後如果沒有實質 user 文字，或總長度低於 harness 的門檻（dsh v1 契約是 user 文字 < 40 字元，
-由 T3 實作），就**不寫卡**、不報錯。這比寫一張空殼卡好。
+由 `packages/dsh-plugin` 實作），就**不寫卡**、不報錯。這比寫一張空殼卡好。
 
 ## 可執行範例
 

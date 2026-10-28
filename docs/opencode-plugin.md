@@ -20,7 +20,7 @@ mnemoshelf，並把相關記憶注入**當次**請求的最新 user message 末�
 
 | 項目 | 需求 |
 |---|---|
-| OpenCode | **2.1.1**（外掛型別 `@opencode/plugin@2.1.1`；其他版本請先對齊） |
+| OpenCode | **2.1.1**（外掛型別 `@opencode/plugin@2.1.1`）；宿主 **2.2.0** 已實測（2026-10-28），其他版本請先對齊 |
 | mnemoshelf | **0.4.0 以上**可用 `runtime.json`（桌面版預設開啟、CLI 需設 `MNEMOSHELF_AGENT_DISCOVERY=on`）；0.3.0 以上若只用 `MNEMOSHELF_URL`／`MNEMOSHELF_TOKEN` 也可以。**0.4.1 起**外掛與 MCP 入口的路徑規則一致：明確指定位置就只用那一個（找不到會如實報錯，不會改連其他服務實例）。**0.5.0 起**外掛與服務同版釋出，召回契約未變；同版 repo 另含 dsh 外掛（見 [agent-integration.md](agent-integration.md)）。**0.5.1** 是 App 內更新證明版，功能與 0.5.0 相同（除版本號），外掛契約與行為未變 |
 | Node／pnpm | Node 22 以上、pnpm 10（建置外掛用） |
 
@@ -89,7 +89,7 @@ Windows 在 `%APPDATA%\opencode\` 底下）。OpenChamber 用的是同一份設�
 ### 2.3 確認外掛有載入
 
 ```bash
-opencode --version           # 應為 2.1.1
+opencode --version           # 本版實測 2.2.0；外掛型別仍是 2.1.1
 opencode run --standalone --print-logs "hello"
 ```
 
@@ -97,7 +97,7 @@ opencode run --standalone --print-logs "hello"
 
 ```text
 msg="loading plugin" id=.../mnemoshelf/packages/opencode-plugin
-[mnemoshelf] {"event":"setup","appVersion":"2.1.1","trigger":"first-turn+explicit","project":"...","setupMs":1}
+[mnemoshelf] {"event":"setup","appVersion":"2.2.0","trigger":"first-turn+explicit","project":"...","setupMs":1}
 ```
 
 `setupMs` 是 setup 到 hook／指令註冊完成的毫秒數（不含背景連線檢查，正常 0–5ms）。
@@ -323,6 +323,9 @@ pid 死亡、找不到設定，以及 `/health` 有回應但**不是 mnemoshelf*
 > 不會生效，外掛會在 console log 留一筆 `config` 警告（`warning: removed`，格式見下方）；這筆警告不會進
 > `digest.log`。
 
+> `timeoutMs` 的**程式預設是 150**；本專案的驗收與日常設定使用 **800**（那是設定值，不是程式預設）。
+> 800ms 也是 `docs/agent-integration.md` 召回契約固定給 dsh 的值。
+
 > 預設 `minScore=0.65` 來自 2026-10-21 合成評估（FP 7.6%、negative 0%、hitItems 不變）；
 > `maxItems=3` 可再省約 21% token，但缺品質 A/B，列 v1.5 候選。
 >
@@ -376,6 +379,9 @@ topic-change 偵測不在 v1。
 - **語意命中**：只留 `score ≥ minScore`（預設 0.65），顯示成 `0.xx`。
 - **關鍵字補位命中**：`score` 是 `1/rank`（排序代理，不是 cosine），**不套用
   local `minScore`**；信任 server 回傳順序，超預算從尾端（最低 rank）丟，顯示成 `kw`。
+- **`degraded: true` 仍注入**：伺服器因沒有就緒向量或查詢嵌入失敗而降級時，回應仍可能帶
+  關鍵字補位的 `hits`；外掛會照常注入這些結果（這是既有行為，與 dsh v1 契約「degraded
+  不注入」不同，見 `docs/agent-integration.md` §與 OpenCode 外掛現況的差異）。
 - 每筆 `fact` 180 字、其他 kind 220 字；項目行合計 ≤900 字元（軟）、整塊 ≤1200
   字元（硬）。
 - **回合紀錄**（`recentTurns`，預設 3）與上列命中**共用**同一個 `softChars`／`hardChars`
@@ -773,7 +779,7 @@ OpenCode 的 plugin `console` 輸出不一定會進 `opencode.log`。用
 
 外掛依賴宿主的 plugin loader 與 `@opencode/plugin` 型別；升級後請重新做一次：
 
-1. `opencode --version`，確認與 `@opencode/plugin` 版本對齊（本版 2.1.1）。
+1. `opencode --version`：宿主 2.2.0 已實測；外掛型別仍是 `@opencode/plugin@2.1.1`，宿主大版本升級後請重跑本清單。
 2. 重新 `pnpm --filter @mnemoshelf/opencode-plugin build`。
 3. 用 `--print-logs` 啟動，確認：
    - `msg="loading plugin"` 指向本套件目錄；

@@ -39,6 +39,8 @@
 `dist/build-info.json`（git 不可用時退回 build 環境的 `MNEMOSHELF_BUILD_COMMIT`，再退回
 `unknown`）。服務在**啟動時讀一次**；讀不到檔案時用執行環境的 `MNEMOSHELF_BUILD_COMMIT`
 或 `unknown`。這些都是 additive 欄位，呼叫端只比對 `service`（見 `docs/agent-integration.md`）。
+App 內更新後可用這個欄位確認實際執行的是新版本的建置（桌面版更新後應同時看到新的
+`appVersion` 與 `build`）。
 
 ## MCP 工具
 
@@ -69,20 +71,22 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
 
 「誰會用到」指出讀取點所在：**服務端**（CLI／自行啟動的服務；桌面版也是用它）、**桌面版**
 （Electron 殼額外讀取或覆寫）、**MCP 入口**（`packages/server` 的 stdio 程式）、**外掛**
-（`@mnemoshelf/opencode-plugin`）、**embedder**（`@mnemoshelf/embedder-transformers`）。
+（`@mnemoshelf/opencode-plugin`）、**dsh 外掛**（`@mnemoshelf/dsh-plugin`）、**embedder**
+（`@mnemoshelf/embedder-transformers`）。
 桌面版會覆寫其中幾個變數，請以桌面版欄位為準。
 
 | 名稱 | 誰會用到 | 預設 | 一句話語意 |
 |---|---|---|---|
 | `MNEMOSHELF_PORT` | 服務端、桌面版 | `0`（OS 指派隨機埠） | 監聽埠；永遠只綁 `127.0.0.1`。 |
-| `MNEMOSHELF_TOKEN` | 服務端、桌面版、MCP 入口、外掛 | 無（CLI 未設即啟動失敗；桌面版自動產生並保存） | REST 的 Bearer token，持有即本機全權。MCP 入口缺這個變數時會改讀 `runtime.json`。 |
-| `MNEMOSHELF_DATA_DIR` | 服務端、桌面版、外掛（算 `runtime.json` 位置）、MCP 入口（算 `runtime.json` 位置） | OS 使用者資料目錄下的 `mnemoshelf`（桌面版為 `<userData>/data`） | SQLite 資料目錄。 |
+| `MNEMOSHELF_TOKEN` | 服務端、桌面版、MCP 入口、外掛、dsh 外掛 | 無（CLI 未設即啟動失敗；桌面版自動產生並保存） | REST 的 Bearer token，持有即本機全權。MCP 入口缺這個變數時會改讀 `runtime.json`。 |
+| `MNEMOSHELF_DATA_DIR` | 服務端、桌面版、外掛與 dsh 外掛（算 `runtime.json` 位置）、MCP 入口（算 `runtime.json` 位置） | OS 使用者資料目錄下的 `mnemoshelf`（桌面版為 `<userData>/data`） | SQLite 資料目錄。 |
 | `MNEMOSHELF_MODEL_DIR` | 服務端、桌面版、embedder | OS 使用者資料目錄下的 `mnemoshelf/models`（桌面版為 `<userData>/models`） | 模型快取目錄。 |
 | `MNEMOSHELF_WEB_DIR` | 服務端、桌面版 | 本 repo 的 `packages/web/dist`（桌面版為 `resources/web`） | Web UI 靜態檔目錄；不存在時 API 仍正常。 |
-| `MNEMOSHELF_URL` | MCP 入口、外掛 | 無（MCP 未設時改讀 `runtime.json`；仍找不到就啟動失敗） | REST 基底網址（例如 `http://127.0.0.1:8787`）。 |
-| `MNEMOSHELF_RUNTIME_FILE` | 服務端（寫出）、MCP 入口與外掛（讀取） | `<dataDir>/runtime.json` | 覆寫連線資訊檔位置。 |
+| `MNEMOSHELF_URL` | MCP 入口、外掛、dsh 外掛 | 無（MCP 未設時改讀 `runtime.json`；仍找不到就啟動失敗） | REST 基底網址（例如 `http://127.0.0.1:8787`）。 |
+| `MNEMOSHELF_RUNTIME_FILE` | 服務端（寫出）、MCP 入口、外掛與 dsh 外掛（讀取） | `<dataDir>/runtime.json` | 覆寫連線資訊檔位置。 |
 | `MNEMOSHELF_AGENT_DISCOVERY` | 服務端（CLI）；桌面版由設定頁覆寫 | `off`（桌面版預設 `on`） | 是否寫出含 token 的 `runtime.json`。 |
-| `MNEMOSHELF_PROJECT` | MCP 入口、外掛 | 未設定 | 預設專案名稱（MCP 的 `remember`／`search_memories`；外掛的召回範圍）。 |
+| `MNEMOSHELF_PROJECT` | MCP 入口、外掛、dsh 外掛 | 未設定 | 預設專案名稱（MCP 的 `remember`／`search_memories`；外掛的召回範圍）。 |
+| `DSH_HOME` | dsh 外掛 | `~/.dsh` | dsh 的家目錄；外掛的待補送 spool 在 `<DSH_HOME>/mnemoshelf-spool`（選項 `spoolDir` 可覆寫）。 |
 | `MNEMOSHELF_DESKTOP_USER_DATA` | 桌面版 | Electron 預設 `userData` | 覆寫桌面版的 userData（開發／驗收用）。 |
 | `MNEMOSHELF_EMBED_DEVICE` | embedder（服務端／桌面版） | `auto` | 執行裝置 `auto`／`cpu`／`dml`／`coreml`；`auto` 依平台挑加速器（Windows → `dml`、macOS → `coreml`），其中 macOS 的 `auto` 會**先跑自我測試、通過才採用**並把決定快取起來；載入或推論失敗自動退回 CPU（語意見 `docs/embedder-contract.md` 的「加速器自我測試」一節）。 |
 | `MNEMOSHELF_EMBED_DML_DEVICE_ID` | embedder（Windows 的 DirectML） | `0`（預設顯示卡） | DirectML adapter 索引；多顯卡時指定獨顯。只接受十進位非負整數字串，非法值直接拒絕啟動（不靜默回預設）。 |
@@ -90,6 +94,10 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
 | `MNEMOSHELF_MEMORY_BACKFILL` | 服務端 | `on` | 啟動時是否回填既有記憶向量；只接受 `on`／`off`（大小寫不拘），非法值直接拒絕啟動。`off` 只停啟動回填，**新寫入的記憶仍會嵌入**。 |
 | `MNEMOSHELF_INDEX_RATE` | 服務端 | `off` | 索引限速：`normal` 每檔之間休眠 50ms、`low` 250ms，`off` 不休眠。**只作用於檔案與檔案之間**，同一個大檔的嵌入批次仍一次跑完；非法值直接拒絕啟動。 |
 | `MNEMOSHELF_BUILD_COMMIT` | 建置腳本（server）；服務端僅在讀不到 build-info 時後備 | `unknown` | **build 時 fallback**：`git rev-parse HEAD` 不可用時（例如從 tarball build）寫入的 commit；不用於執行期設定。 |
+
+測試專用的變數（`MNEMOSHELF_E2E`、`MNEMOSHELF_AUTOTEST_*`、`MNEMOSHELF_SMOKE_NO_SANDBOX`、
+`MNEMOSHELF_DEV_CORE`、`MNEMOSHELF_PG`）不在上表：它們只給 repo 內的測試／煙霧測試使用，
+不是產品設定。
 
 ## 索引期間的排隊與取消
 
