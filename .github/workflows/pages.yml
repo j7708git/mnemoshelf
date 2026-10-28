@@ -1,0 +1,71 @@
+# 把「給一般讀者看的三個頁面」部署到 GitHub Pages。
+#
+# 為什麼只部署 3 個檔案，而不是整個 docs/：
+# - docs/ 底下還有 8 份工程規格書、架構圖規格 JSON 與第三方授權全文。那些是開發文件，
+#   不是給一般訪客的網站內容；它們留在 repo 裡，GitHub 上直接看得到即可。
+# - 網站只需要首頁（index.html）、白話說明頁（harness-memory.html）與架構圖
+#   （architecture.html）。因此這裡先複製這 3 個檔案到 _site/，再上傳 _site/，
+#   docs/ 本身不會被改動。
+#
+# 注意：
+# - 這個 workflow 不會替你啟用 Pages。repo 必須先在 Settings → Pages 把 Source 設成
+#   「GitHub Actions」，`github-pages` environment 才會存在。
+# - 不要把這個 workflow 設成 branch protection 的必要檢查：它只負責更新網站，
+#   失敗不該阻擋合併。
+# - 三個來源檔缺任何一個就讓 job 失敗，避免部署出殘缺的 _site/。
+
+name: Pages
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "docs/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: 部署三頁網站
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 取出原始碼
+        uses: actions/checkout@v7.0.1
+
+      - name: 組裝 _site（只放 3 個頁面）
+        run: |
+          set -euo pipefail
+          for file in docs/index.html docs/harness-memory.html docs/architecture.html; do
+            if [ ! -f "$file" ]; then
+              echo "缺少來源檔：$file" >&2
+              exit 1
+            fi
+          done
+          mkdir -p _site
+          cp docs/index.html _site/index.html
+          cp docs/harness-memory.html _site/harness-memory.html
+          cp docs/architecture.html _site/architecture.html
+          echo "已組裝 _site："
+          ls -A _site
+
+      - name: 上傳 Pages artifact
+        uses: actions/upload-pages-artifact@v5.0.0
+        with:
+          path: _site
+
+      - name: 部署到 GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5.0.1
