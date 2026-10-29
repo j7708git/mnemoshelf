@@ -61,7 +61,7 @@ ls packages/opencode-plugin/index.js packages/opencode-plugin/dist/index.js
 ### 2.2 把外掛加進 OpenCode 設定
 
 設定檔通常是 `~/.config/opencode/opencode.jsonc`（也可能是同目錄的 `opencode.json`；
-Windows 在 `%APPDATA%\opencode\` 底下）。OpenChamber 用的是同一份設定。
+Windows 在 `C:\Users\<user>\.config\opencode\` 底下）。OpenChamber 也讀同一份設定。
 
 用編輯器打開，在**既有的** `plugins` 陣列尾端加一筆；沒有這個鍵就新增，**不要覆蓋其他設定**：
 
@@ -79,8 +79,9 @@ Windows 在 `%APPDATA%\opencode\` 底下）。OpenChamber 用的是同一份設�
 
 - `package` 必須是**目錄**（不是 `dist/index.js` 檔案）。載入器會在該目錄找
   `index.js`；本套件的根 `index.js` 再導向 `dist/`。
-- 路徑請用**絕對路徑**；`/absolute/path/...` 是 placeholder。Windows 請寫成
-  `C:\\path\\to\\mnemoshelf\\packages\\opencode-plugin`（JSON 字串的 `\` 要跳脫）。
+- 路徑請用**絕對路徑**；`/absolute/path/...` 是 placeholder。**建議用正斜線**（App 產生的
+  片段就是正斜線）；若你堅持用反斜線，Windows 請寫成 `C:\\Users\\…`——JSON 字串裡的 `\`
+  要寫成 `\\`，少一個跳脫整份設定會壞。
 - 設定檔是 JSONC，可以保留註解與結尾逗號；存檔前確認整份仍合法（少一個逗號會讓所有外掛
   都不載入）。改之前先備份。
 - **v1 沒有 npm 套件版，也沒有 `opencode plugin add` 路徑**；若你的 OpenCode 版本支援該
