@@ -240,7 +240,7 @@ describe("讀檔規則", () => {
     expect(state.detection.opencode.matches).toEqual([itemDir]);
   });
 
-  it("plugins 目錄：檔案項目直接讀它本身", async () => {
+  it("plugins 目錄：檔案項目只依路徑判斷（不讀內容）", async () => {
     const pluginsDir = opencodePluginsDir(home);
     const filePath = path.join(pluginsDir, "single-mnemoshelf-plugin.js");
     await writeTextFile(filePath, "export default {};\n");

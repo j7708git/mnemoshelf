@@ -508,9 +508,10 @@ function stripTomlComment(line: string): string {
   return line;
 }
 
-/** 這一行是否在字串外有逗號（多行陣列元素的特徵）。 */
-function hasCommaOutsideStrings(line: string): boolean {
+/** 這一行在字串外的 `[`／`]` 淨增量（用來判斷是否還在一段多行陣列裡；字串內的括號不計）。 */
+function bracketDeltaOutsideStrings(line: string): number {
   let quote: '"' | "'" | null = null;
+  let delta = 0;
   let index = 0;
   while (index < line.length) {
     const char = line[index]!;
@@ -537,12 +538,14 @@ function hasCommaOutsideStrings(line: string): boolean {
       index += 1;
       continue;
     }
-    if (char === ",") {
-      return true;
+    if (char === "[") {
+      delta += 1;
+    } else if (char === "]") {
+      delta -= 1;
     }
     index += 1;
   }
-  return false;
+  return delta;
 }
 
 /**
@@ -551,8 +554,11 @@ function hasCommaOutsideStrings(line: string): boolean {
  * 規則（本卡對「格式壞不可降級」的唯一 TOML 驗證）：
  * - 先移除**字串外**的 `#` 尾端註解（支援 `"…"` 與 `'…'`），再比對；
  * - 忽略空行；
- * - `trim()` 後以 `[` 開頭的行必須是 `[表頭]` 或 `[[表頭]]`，否則整份檔案判 `invalid-format`；
- *   例外：字串外有逗號的行視為多行陣列裡的元素（例如 `  [1, 2],`），跳過不 throw；
+ * - 值行若開啟多行陣列（`key = [`），在括號收合前一律不當表頭——多行陣列的元素即使以
+ *   `[` 開頭（例如 `  [1, 2],`）也不會被誤判成表頭；**陣列到檔尾仍未收合 → `invalid-format`**
+ *   （不可默默忽略後面的表頭，把壞檔說成「未設定」）；
+ * - 其餘 `trim()` 後以 `[` 開頭的行必須是 `[表頭]` 或 `[[表頭]]`，否則整份檔案判
+ *   `invalid-format`（缺 `]` 的壞表頭**不得**降級成「未偵測到」）；
  * - `[mcp_servers.mnemoshelf]` 或其子表頭（例如 `[mcp_servers.mnemoshelf.env]`）→ 已設定 MCP。
  *
  * 這不是完整 TOML 解析：其他語法錯誤（重複鍵、壞值）不偵測，這是刻意的取捨，
@@ -560,21 +566,24 @@ function hasCommaOutsideStrings(line: string): boolean {
  */
 function scanCodexConfig(text: string): boolean {
   let configured = false;
+  /** >0 表示目前在一段多行陣列裡（那是值，不是表頭）。 */
+  let arrayDepth = 0;
   for (const rawLine of text.split(/\r?\n/)) {
     const line = stripTomlComment(rawLine).trim();
     if (line === "") {
       continue;
     }
+    if (arrayDepth > 0) {
+      arrayDepth = Math.max(0, arrayDepth + bracketDeltaOutsideStrings(line));
+      continue;
+    }
     if (!line.startsWith("[")) {
+      // 值行可能開啟多行陣列：`args = [`。
+      arrayDepth = Math.max(0, bracketDeltaOutsideStrings(line));
       continue;
     }
     const isTable = /^\[\[[^\[\]]+\]\]$/.test(line) || /^\[[^\[\]]+\]$/.test(line);
     if (!isTable) {
-      // 多行陣列的元素也以 `[` 開頭（例如 `  [1, 2],`）；有字串外的逗號就跳過，
-      // 不能把合法的 TOML 判成壞掉的表頭。
-      if (hasCommaOutsideStrings(line)) {
-        continue;
-      }
       throw new Error("TOML 表頭括號不匹配");
     }
     const inner = line.startsWith("[[") ? line.slice(2, -2) : line.slice(1, -1);
@@ -582,6 +591,10 @@ function scanCodexConfig(text: string): boolean {
     if (parts[0] === "mcp_servers" && parts[1] === SERVER_NAME) {
       configured = true;
     }
+  }
+  if (arrayDepth > 0) {
+    // 多行陣列沒有收合：整份檔案是壞的。不能默默忽略後面的表頭（那會把壞檔說成「未設定」）。
+    throw new Error("TOML 陣列沒有收合");
   }
   return configured;
 }

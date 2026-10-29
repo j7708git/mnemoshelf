@@ -446,6 +446,36 @@ describe("detectCodex", () => {
     expect(detection.mcpConfigured).toBe(true);
   });
 
+  it("多行陣列最後一個元素沒有尾逗號也不誤判（靠括號深度，不是逗號）", () => {
+    const config = 'allowed = [\n  [1, 2]\n]\n[mcp_servers.mnemoshelf]\ncommand = "node"';
+    const detection = detectCodex({ config: ok(config), hooks: missing() });
+    expect(detection.state).toBe("detected");
+    expect(detection.mcpConfigured).toBe(true);
+  });
+
+  it("缺結尾 `]`、但字串外有逗號的壞表頭 → 仍 invalid-format（不可降級）", () => {
+    const detection = detectCodex({
+      config: ok("[mcp_servers.mnemoshelf,\ncommand = \"node\""),
+      hooks: missing(),
+    });
+    expect(detection.state).toBe("unknown");
+    expect(detection.reason).toBe("invalid-format");
+  });
+
+  it("字串內的 `#` 與 `[` 不當成註解或陣列開頭", () => {
+    const config = 'note = "a # b [c]"\n[mcp_servers.mnemoshelf]\ncommand = "node"';
+    const detection = detectCodex({ config: ok(config), hooks: missing() });
+    expect(detection.state).toBe("detected");
+    expect(detection.mcpConfigured).toBe(true);
+  });
+
+  it("多行陣列沒有收合 → invalid-format（不可默默忽略後面的表頭）", () => {
+    const config = 'args = ["a", "b"\n[mcp_servers.mnemoshelf]\ncommand = "node"';
+    const detection = detectCodex({ config: ok(config), hooks: missing() });
+    expect(detection.state).toBe("unknown");
+    expect(detection.reason).toBe("invalid-format");
+  });
+
   it("hooks.json 的 command 含 mnemoshelf → detected（hookConfigured）", () => {
     const detection = detectCodex({
       config: ok('model = "synthetic-model"'),

@@ -97,7 +97,7 @@ root 記錄建立後、索引開始前先做一次乾跑（dry run），回報�
 - **讀什麼**：
   - OpenCode／OpenChamber：`~/.config/opencode/opencode.jsonc`、
     `~/.config/opencode/opencode.json`，以及 `~/.config/opencode/plugins/` 下每個項目
-    （最多 50 個；目錄讀它的 `package.json`，單一檔案則直接讀該檔）。
+    （最多 50 個；目錄讀它的 `package.json`，單一檔案**只讀路徑、不讀內容**）。
   - codex：`~/.codex/config.toml`、`~/.codex/hooks.json`。
   - dsh：`<DSH_HOME>/profiles/*/package.json`（`DSH_HOME` 未設定時為 `~/.dsh`；最多 50 個
     profile）。
