@@ -435,7 +435,7 @@ describe("detectCodex", () => {
     expect(detection.reason).toBe("ok");
   });
 
-  it("多行陣列的元素（字串外有逗號）跳過，不會被判成壞表頭", () => {
+  it("多行陣列的元素（行首為 `[`）跳過，不會被判成壞表頭", () => {
     const config = 'allowed = [\n  [1, 2],\n  ["a", "b"],\n]\n[mcp_servers.mnemoshelf]\ncommand = "node"';
     const detection = detectCodex({
       config: ok(config),
@@ -474,6 +474,15 @@ describe("detectCodex", () => {
     const detection = detectCodex({ config: ok(config), hooks: missing() });
     expect(detection.state).toBe("unknown");
     expect(detection.reason).toBe("invalid-format");
+  });
+
+  it("多行字串內的一般文字（含未配對 `[`）不會被當成陣列開頭", () => {
+    const config =
+      'instructions = """\nUse [ carefully\n"""\n[mcp_servers.mnemoshelf]\ncommand = "node"';
+    const detection = detectCodex({ config: ok(config), hooks: missing() });
+    expect(detection.state).toBe("detected");
+    expect(detection.reason).toBe("ok");
+    expect(detection.mcpConfigured).toBe(true);
   });
 
   it("hooks.json 的 command 含 mnemoshelf → detected（hookConfigured）", () => {

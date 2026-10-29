@@ -508,6 +508,59 @@ function stripTomlComment(line: string): string {
   return line;
 }
 
+/**
+ * 若這一行是「值為陣列」的賦值（`key = [`），回傳字串外的括號淨增量；否則回傳 0。
+ *
+ * 為什麼要收窄成賦值行：多行字串（`\"\"\"…\"\"\"`）內的一般文字也會被逐行掃到，
+ * 例如 `Use [ carefully` 若被算成陣列深度，後面的合法表頭就會被跳過。
+ */
+function arrayValueDelta(line: string): number {
+  let quote: '"' | "'" | null = null;
+  let sawEquals = false;
+  let opened = false;
+  let delta = 0;
+  let index = 0;
+  while (index < line.length) {
+    const char = line[index]!;
+    if (quote === '"') {
+      if (char === "\\") {
+        index += 2;
+        continue;
+      }
+      if (char === '"') {
+        quote = null;
+      }
+      index += 1;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") {
+        quote = null;
+      }
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      index += 1;
+      continue;
+    }
+    if (char === "=") {
+      sawEquals = true;
+    } else if (char === "[") {
+      if (!sawEquals) {
+        return 0;
+      }
+      opened = true;
+      delta += 1;
+    } else if (char === "]") {
+      delta -= 1;
+    }
+    index += 1;
+  }
+  return opened ? delta : 0;
+}
+
 /** 這一行在字串外的 `[`／`]` 淨增量（用來判斷是否還在一段多行陣列裡；字串內的括號不計）。 */
 function bracketDeltaOutsideStrings(line: string): number {
   let quote: '"' | "'" | null = null;
@@ -562,7 +615,9 @@ function bracketDeltaOutsideStrings(line: string): number {
  * - `[mcp_servers.mnemoshelf]` 或其子表頭（例如 `[mcp_servers.mnemoshelf.env]`）→ 已設定 MCP。
  *
  * 這不是完整 TOML 解析：其他語法錯誤（重複鍵、壞值）不偵測，這是刻意的取捨，
- * 避免為了一個布林值引入 TOML 套件。
+ * 避免為了一個布林值引入 TOML 套件。**多行字串（`\"\"\"`／`'''`）也不辨識**：
+ * 字串內以 `[` 開頭的行仍會被當成表頭候選；字串內若有一行長得像 `key = [`，仍可能被當成
+ * 陣列開頭。這是已知上限，不是可以默默忽略的錯誤。
  */
 function scanCodexConfig(text: string): boolean {
   let configured = false;
@@ -578,8 +633,8 @@ function scanCodexConfig(text: string): boolean {
       continue;
     }
     if (!line.startsWith("[")) {
-      // 值行可能開啟多行陣列：`args = [`。
-      arrayDepth = Math.max(0, bracketDeltaOutsideStrings(line));
+      // 只有「值為陣列」的賦值（`key = [`）才開啟多行陣列；一般值行不影響深度。
+      arrayDepth = Math.max(0, arrayValueDelta(line));
       continue;
     }
     const isTable = /^\[\[[^\[\]]+\]\]$/.test(line) || /^\[[^\[\]]+\]$/.test(line);
