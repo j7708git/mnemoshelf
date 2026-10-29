@@ -151,8 +151,9 @@ async function readOpenCodeInputs(home: string): Promise<{
         result: result.ok || result.reason !== "file-missing" ? result : { ok: true, text: "" },
       });
     } else {
-      // 檔案項目直接讀它的內容（OpenCode 也接受單檔外掛）。
-      pluginDirs.push({ path: itemPath, result: await readSource(itemPath) });
+      // 單檔外掛可能是 JS／README 等非 JSON 內容；這裡只靠路徑判斷，不解析內容，
+      // 否則任何一個無關檔案都會把 OpenCode 偵測打成「無法判讀」。
+      pluginDirs.push({ path: itemPath, result: { ok: true, text: "" } });
     }
   }
   return { configs, pluginDirs };

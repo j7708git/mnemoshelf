@@ -336,7 +336,7 @@ export function App() {
       setMcpConfigNotice(
         result.copied
           ? "已複製 MCP 設定片段到剪貼簿（不含 token）。貼進 MCP client 的設定檔後重新啟動它即可。"
-          : result.reason !== null
+          : typeof result.reason === "string"
             ? COPY_BLOCKED_TEXT[result.reason]
             : "目前無法產生 MCP 設定片段，請稍後再試。",
       );

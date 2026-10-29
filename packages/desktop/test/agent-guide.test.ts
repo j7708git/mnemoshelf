@@ -319,6 +319,14 @@ describe("buildInstallCard：卡片與片段同源", () => {
     expect(card).toContain("/memory");
   });
 
+  it("opencode 卡如實寫召回時機（first-turn+explicit），不誇大成每次請求", () => {
+    const card = buildInstallCard("opencode", input);
+    expect(card).toContain("第一輪");
+    expect(card).toContain("訊息含明示線索");
+    expect(card).toContain("trigger: first-turn+explicit");
+    expect(card).not.toContain("每次模型請求前");
+  });
+
   it("codex 卡含 config.toml、codex mcp list 與「沒有自動召回 hook」", () => {
     const card = buildInstallCard("codex", input);
     expect(card).toContain("~/.codex/config.toml");

@@ -200,6 +200,17 @@ describe("detectOpenCode：mcpConfigured 只看位置欄位", () => {
     expect(detection.mcpConfigured).toBe(true);
   });
 
+  it("只設 MCP、沒有外掛 → detected／ok，matches 為空（MCP 也是正面證據）", () => {
+    const config = JSON.stringify({
+      mcp: { servers: { mnemoshelf: { type: "local", command: ["node", "/opt/synthetic/other.js"] } } },
+    });
+    const detection = detectOpenCode({ configs: [ok(config)], pluginDirs: [] });
+    expect(detection.state).toBe("detected");
+    expect(detection.reason).toBe("ok");
+    expect(detection.matches).toEqual([]);
+    expect(detection.mcpConfigured).toBe(true);
+  });
+
   it("只有 environment 內容含 mnemoshelf → false（內容一律丟棄）", () => {
     const config = JSON.stringify({
       mcp: {
@@ -412,6 +423,27 @@ describe("detectCodex", () => {
     });
     expect(detection.mcpConfigured).toBe(true);
     expect(detection.state).toBe("detected");
+  });
+
+  it("表頭帶字串外的尾端註解 → 仍算已設定", () => {
+    const detection = detectCodex({
+      config: ok('[mcp_servers.mnemoshelf] # 使用者原有的註解\ncommand = "node"'),
+      hooks: missing(),
+    });
+    expect(detection.mcpConfigured).toBe(true);
+    expect(detection.state).toBe("detected");
+    expect(detection.reason).toBe("ok");
+  });
+
+  it("多行陣列的元素（字串外有逗號）跳過，不會被判成壞表頭", () => {
+    const config = 'allowed = [\n  [1, 2],\n  ["a", "b"],\n]\n[mcp_servers.mnemoshelf]\ncommand = "node"';
+    const detection = detectCodex({
+      config: ok(config),
+      hooks: missing(),
+    });
+    expect(detection.state).toBe("detected");
+    expect(detection.reason).toBe("ok");
+    expect(detection.mcpConfigured).toBe(true);
   });
 
   it("hooks.json 的 command 含 mnemoshelf → detected（hookConfigured）", () => {

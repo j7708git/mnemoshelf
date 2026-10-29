@@ -57,17 +57,50 @@ describe("AGENT_GUIDE_TABS", () => {
 });
 
 describe("detectionLineText", () => {
-  it("detected 有 matches 時以「、」連接", () => {
+  it("detected 有 matches 時以「、」連接，並附外掛／MCP 旗標", () => {
     expect(
       detectionLineText({
         tab: "opencode",
         detection: detection({ matches: ["plugin-a", "plugin-b"] }),
       }),
-    ).toBe("偵測到：plugin-a、plugin-b");
+    ).toBe("偵測到：plugin-a、plugin-b（外掛：已設定；MCP：已設定）");
   });
 
-  it("detected 但 matches 為空時不接冒號", () => {
-    expect(detectionLineText({ tab: "codex", detection: detection({ matches: [] }) })).toBe("偵測到");
+  it("detected 但 matches 為空時不接冒號，並附 codex 的 MCP／hook 旗標", () => {
+    expect(detectionLineText({ tab: "codex", detection: detection({ matches: [] }) })).toBe(
+      "偵測到（MCP：已設定；hook：未設定）",
+    );
+  });
+
+  it("opencode 只有 MCP：外掛未設定、MCP 已設定", () => {
+    expect(
+      detectionLineText({
+        tab: "opencode",
+        detection: detection({ matches: [], mcpConfigured: true }),
+      }),
+    ).toBe("偵測到（外掛：未設定；MCP：已設定）");
+  });
+
+  it("opencode 只有外掛：外掛已設定、MCP 未設定", () => {
+    expect(
+      detectionLineText({
+        tab: "opencode",
+        detection: detection({ matches: ["plugin-a"], mcpConfigured: false }),
+      }),
+    ).toBe("偵測到：plugin-a（外掛：已設定；MCP：未設定）");
+  });
+
+  it("codex 只有 hook：MCP 未設定、hook 已設定", () => {
+    expect(
+      detectionLineText({
+        tab: "codex",
+        detection: detection({ matches: [], mcpConfigured: false, hookConfigured: true }),
+      }),
+    ).toBe("偵測到（MCP：未設定；hook：已設定）");
+  });
+
+  it("dsh 的 detected 不加旗標註記", () => {
+    expect(detectionLineText({ tab: "dsh", detection: detection({ matches: ["web"] }) })).toBe("偵測到：web");
   });
 
   it("not-detected + file-missing 逐字", () => {

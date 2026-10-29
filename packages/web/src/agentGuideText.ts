@@ -71,7 +71,23 @@ export function detectionLineText(input: {
   if (input.detection === null) return NO_DESKTOP_DETECTION_TEXT;
   if (input.detection.state === "detected") {
     const matches = input.detection.matches.filter((match) => match.trim() !== "");
-    return matches.length === 0 ? DETECT_REASON_TEXT.ok : `${DETECT_REASON_TEXT.ok}：${matches.join("、")}`;
+    const head =
+      matches.length === 0 ? DETECT_REASON_TEXT.ok : `${DETECT_REASON_TEXT.ok}：${matches.join("、")}`;
+    // 只有 detected 才附加「哪一半設定了」；無法判讀時的旗標不可信，不加註記。
+    switch (input.tab) {
+      case "opencode": {
+        const plugin = matches.length > 0 ? "外掛：已設定" : "外掛：未設定";
+        const mcp = input.detection.mcpConfigured ? "MCP：已設定" : "MCP：未設定";
+        return `${head}（${plugin}；${mcp}）`;
+      }
+      case "codex": {
+        const mcp = input.detection.mcpConfigured ? "MCP：已設定" : "MCP：未設定";
+        const hook = input.detection.hookConfigured ? "hook：已設定" : "hook：未設定";
+        return `${head}（${mcp}；${hook}）`;
+      }
+      case "dsh":
+        return head;
+    }
   }
   return DETECT_REASON_TEXT[input.detection.reason];
 }

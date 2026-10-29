@@ -15,7 +15,7 @@
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AGENT_GUIDE_COPY_KINDS,
   MAX_AGENT_GUIDE_CONFIG_BYTES,
@@ -249,6 +249,55 @@ describe("讀檔規則", () => {
     expect(state.detection.opencode.state).toBe("detected");
     expect(state.detection.opencode.matches).toEqual([filePath]);
     expect(state.detection.opencode.sourcesChecked).toBe(3); // 2 個設定 + 1 個檔案項目
+  });
+
+  it("plugins 目錄的檔案項目只靠路徑判斷，非 JSON 內容不會把偵測打成 unknown", async () => {
+    // 這裡刻意不用共用的 home：暫存目錄前綴含 mnemoshelf，會讓路徑比對誤命中。
+    const neutralHome = await fs.mkdtemp(path.join(os.tmpdir(), "agent-guide-neutral-"));
+    try {
+      const neutralRead = async (): Promise<DesktopAgentGuideState> =>
+        readAgentGuideState({
+          home: neutralHome,
+          env: {},
+          appImage: undefined,
+          runtimeFile,
+          entryPath,
+          now: () => NOW,
+        });
+
+      const pluginsDir = opencodePluginsDir(neutralHome);
+      await writeTextFile(path.join(pluginsDir, "README.md"), "# 合成外掛說明\n");
+      await writeTextFile(path.join(pluginsDir, "unrelated.js"), "export default {};\n");
+
+      const withoutMatch = await neutralRead();
+      expect(withoutMatch.detection.opencode.state).toBe("not-detected");
+      expect(withoutMatch.detection.opencode.reason).toBe("not-configured");
+
+      const itemDir = path.join(pluginsDir, "mnemoshelf-local");
+      await writeJsonFile(path.join(itemDir, "package.json"), {
+        name: "@mnemoshelf/opencode-plugin",
+      });
+
+      const withMatch = await neutralRead();
+      expect(withMatch.detection.opencode.state).toBe("detected");
+      expect(withMatch.detection.opencode.matches).toEqual([itemDir]);
+    } finally {
+      await fs.rm(neutralHome, { recursive: true, force: true });
+    }
+  });
+
+  it("readFile 失敗（stat 成功）→ unknown／read-error", async () => {
+    const [jsonc] = opencodeConfigCandidates(home);
+    await writeJsonFile(jsonc!, { plugins: [] });
+
+    const readFileSpy = vi.spyOn(fs, "readFile").mockRejectedValueOnce(new Error("synthetic read failure"));
+    try {
+      const state = await readState();
+      expect(state.detection.opencode.state).toBe("unknown");
+      expect(state.detection.opencode.reason).toBe("read-error");
+    } finally {
+      readFileSpy.mockRestore();
+    }
   });
 
   it("plugins 目錄列舉失敗（它是一般檔案）→ unknown／read-error", async () => {

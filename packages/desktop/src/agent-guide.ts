@@ -457,15 +457,102 @@ export function detectOpenCode(input: {
     anySourceExists: state.anySourceExists,
     sourcesChecked: state.sourcesChecked,
   });
-  return { ...summary, mcpConfigured, hookConfigured: false };
+  // MCP 已設定也是正面證據：只設 MCP、沒裝外掛時不能顯示成「未偵測到」。
+  const detected = matches.length > 0 || mcpConfigured;
+  return {
+    ...summary,
+    state: detected ? "detected" : summary.state,
+    reason: detected ? "ok" : summary.reason,
+    mcpConfigured,
+    hookConfigured: false,
+  };
+}
+
+/**
+ * 移除 TOML 一行的尾端註解。`#` 只在**字串外**才算註解：
+ * basic string（`"…"`，`\"` 會跳過）與 literal string（`'…'`）內的 `#` 原樣保留。
+ */
+function stripTomlComment(line: string): string {
+  let quote: '"' | "'" | null = null;
+  let index = 0;
+  while (index < line.length) {
+    const char = line[index]!;
+    if (quote === '"') {
+      if (char === "\\") {
+        index += 2;
+        continue;
+      }
+      if (char === '"') {
+        quote = null;
+      }
+      index += 1;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") {
+        quote = null;
+      }
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      index += 1;
+      continue;
+    }
+    if (char === "#") {
+      return line.slice(0, index);
+    }
+    index += 1;
+  }
+  return line;
+}
+
+/** 這一行是否在字串外有逗號（多行陣列元素的特徵）。 */
+function hasCommaOutsideStrings(line: string): boolean {
+  let quote: '"' | "'" | null = null;
+  let index = 0;
+  while (index < line.length) {
+    const char = line[index]!;
+    if (quote === '"') {
+      if (char === "\\") {
+        index += 2;
+        continue;
+      }
+      if (char === '"') {
+        quote = null;
+      }
+      index += 1;
+      continue;
+    }
+    if (quote === "'") {
+      if (char === "'") {
+        quote = null;
+      }
+      index += 1;
+      continue;
+    }
+    if (char === '"' || char === "'") {
+      quote = char;
+      index += 1;
+      continue;
+    }
+    if (char === ",") {
+      return true;
+    }
+    index += 1;
+  }
+  return false;
 }
 
 /**
  * codex：`config.toml` 只做**逐行表頭掃描**（不引入 TOML 依賴）。
  *
  * 規則（本卡對「格式壞不可降級」的唯一 TOML 驗證）：
- * - 忽略空行與 `#` 開頭的行；
+ * - 先移除**字串外**的 `#` 尾端註解（支援 `"…"` 與 `'…'`），再比對；
+ * - 忽略空行；
  * - `trim()` 後以 `[` 開頭的行必須是 `[表頭]` 或 `[[表頭]]`，否則整份檔案判 `invalid-format`；
+ *   例外：字串外有逗號的行視為多行陣列裡的元素（例如 `  [1, 2],`），跳過不 throw；
  * - `[mcp_servers.mnemoshelf]` 或其子表頭（例如 `[mcp_servers.mnemoshelf.env]`）→ 已設定 MCP。
  *
  * 這不是完整 TOML 解析：其他語法錯誤（重複鍵、壞值）不偵測，這是刻意的取捨，
@@ -474,8 +561,8 @@ export function detectOpenCode(input: {
 function scanCodexConfig(text: string): boolean {
   let configured = false;
   for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (line === "" || line.startsWith("#")) {
+    const line = stripTomlComment(rawLine).trim();
+    if (line === "") {
       continue;
     }
     if (!line.startsWith("[")) {
@@ -483,6 +570,11 @@ function scanCodexConfig(text: string): boolean {
     }
     const isTable = /^\[\[[^\[\]]+\]\]$/.test(line) || /^\[[^\[\]]+\]$/.test(line);
     if (!isTable) {
+      // 多行陣列的元素也以 `[` 開頭（例如 `  [1, 2],`）；有字串外的逗號就跳過，
+      // 不能把合法的 TOML 判成壞掉的表頭。
+      if (hasCommaOutsideStrings(line)) {
+        continue;
+      }
       throw new Error("TOML 表頭括號不匹配");
     }
     const inner = line.startsWith("[[") ? line.slice(2, -2) : line.slice(1, -1);
@@ -936,7 +1028,7 @@ export function buildInstallCard(harness: AgentGuideHarnessTab, input: AgentGuid
       lines.push(
         "# 把 Mnemoshelf 接到 OpenCode／OpenChamber（給 agent 的安裝卡）",
         "",
-        "你是協助使用者安裝 Mnemoshelf 的 agent。照下面做完，OpenCode 會在每次模型請求前自動召回記憶，`/memory` 會顯示「已連線」。",
+        "你是協助使用者安裝 Mnemoshelf 的 agent。照下面做完，OpenCode 會在**第一輪**與**訊息含明示線索**時自動召回記憶（預設 `trigger: first-turn+explicit`，見文件 §6.1）；`/memory` 會顯示「已連線」。",
         "",
         ...runtimeStep(input),
         "## 2. 取得並建置外掛",
