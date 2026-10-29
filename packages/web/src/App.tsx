@@ -15,6 +15,8 @@ import {
   type Root,
 } from "./api";
 import { AddRootFlow, modalitiesForImages } from "./AddRootFlow";
+import { AgentGuidePanel } from "./AgentGuidePanel";
+import { COPY_BLOCKED_TEXT } from "./agentGuideText";
 import { BootstrapScreen } from "./BootstrapScreen";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ExplorerPanel } from "./ExplorerPanel";
@@ -33,16 +35,17 @@ type ViewState =
   | { kind: "error"; message: string };
 
 /** 連線後的主要檢視。 */
-type View = "explorer" | "search" | "memories";
+type View = "explorer" | "search" | "memories" | "agent-guide";
 
 const NAV_LABEL: Record<View, string> = {
   explorer: "檔案總管",
   search: "搜尋",
   memories: "記憶管理",
+  "agent-guide": "連接 Agent",
 };
 
 /**
- * 應用根元件：token → 資料夾清單 → 三個主要檢視（檔案總管／搜尋／記憶管理）。
+ * 應用根元件：token → 資料夾清單 → 四個主要檢視（檔案總管／搜尋／記憶管理／連接 Agent）。
  *
  * 兩種執行環境共用同一份 UI：
  * - **桌面模式**（Electron 殼）：preload 掛上 `window.mnemoshelfDesktop`，token 由應用自己管
@@ -333,7 +336,9 @@ export function App() {
       setMcpConfigNotice(
         result.copied
           ? "已複製 MCP 設定片段到剪貼簿（不含 token）。貼進 MCP client 的設定檔後重新啟動它即可。"
-          : "目前無法產生 MCP 設定片段，請確認服務正在執行。",
+          : result.reason !== null
+            ? COPY_BLOCKED_TEXT[result.reason]
+            : "目前無法產生 MCP 設定片段，請稍後再試。",
       );
     } catch (error) {
       setMcpConfigNotice(error instanceof Error ? error.message : "複製 MCP 設定片段失敗");
@@ -472,7 +477,7 @@ export function App() {
                 aria-label="主要檢視"
                 className="inline-flex overflow-hidden rounded-md border border-line"
               >
-                {(["explorer", "search", "memories"] as const).map((item) => (
+                {(["explorer", "search", "memories", "agent-guide"] as const).map((item) => (
                   <button
                     key={item}
                     type="button"
@@ -611,6 +616,8 @@ export function App() {
           {view === "search" && <SearchPanel roots={state.roots} onOpenMemories={() => setView("memories")} />}
 
           {view === "memories" && <MemoriesPanel />}
+
+          {view === "agent-guide" && <AgentGuidePanel />}
         </div>
       )}
 

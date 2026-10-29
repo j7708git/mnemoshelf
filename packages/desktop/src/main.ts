@@ -41,15 +41,26 @@ import {
   DESKTOP_API_VERSION,
   DESKTOP_BRIDGE_NAME,
   DESKTOP_CHANNELS,
+  type DesktopAgentGuideCopyResult,
+  type DesktopAgentGuideState,
   type DesktopAppInfo,
   type DesktopSettingsState,
 } from "./desktop-api.js";
+import {
+  AGENT_GUIDE_COPY_KINDS,
+  buildCopyText,
+  buildHarnessConfig,
+  copyGate,
+  type AgentGuideBlockedReason,
+  type AgentGuideCopyKind,
+} from "./agent-guide.js";
+import { readAgentGuideState } from "./agent-guide-reader.js";
 import { ModelBootstrap, type BootstrapState } from "./model-bootstrap.js";
 import { downloadModelFiles } from "./model-download.js";
 import { MODEL_PROFILE } from "./model-profile.js";
 import { formatProbe, probeNativeModules } from "./native-probe.js";
 import { buildServerEnv, parseCliArgs, resolveDesktopPaths, type DesktopPaths } from "./paths.js";
-import { buildMcpConfigSnippet, canCopyMcpConfig, resolveMcpEntryPath } from "./mcp-entry.js";
+import { resolveMcpEntryPath } from "./mcp-entry.js";
 import { loadOrCreateToken, toTokenInfo, type TokenInfo } from "./token-store.js";
 import { createTrayImage } from "./tray-icon.js";
 import { createFileBackup } from "./updater/backup.js";
@@ -486,9 +497,9 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle(
     DESKTOP_CHANNELS.settingsCopyMcpConfig,
-    async (event): Promise<{ copied: boolean; url: string | null }> => {
+    async (event): Promise<{ copied: boolean; url: string | null; reason: AgentGuideBlockedReason | null }> => {
       assertTrustedSender(event);
-      if (server === null || desktopPaths === null) return { copied: false, url: null };
+      if (server === null || desktopPaths === null) return { copied: false, url: null, reason: null };
       // 片段**不含 token**：MCP 入口會自己讀 runtime.json 取得連線資訊。
       // 這是刻意的——全權憑證不必經過剪貼簿與第三方的 MCP 設定檔。
       const entryPath = resolveMcpEntryPath({
@@ -498,26 +509,89 @@ function registerIpcHandlers(): void {
       });
       // 貼上前先確認兩個路徑真的存在：片段指向不存在的檔案，client 只會啟動失敗。
       // AppImage 的掛載點每次啟動都不同，直接不給片段（改用環境變數連線）。
-      const decision = canCopyMcpConfig({
+      // 閘門與「連接 Agent」頁共用同一支 `copyGate`，不要在這裡另寫一份判斷。
+      const decision = copyGate({
+        kind: "mcp-generic",
         appImage: process.env.APPIMAGE,
         runtimeFileExists: await runtimeFileExists(desktopPaths.runtimeFile),
         entryPathExists: await fileExists(entryPath),
       });
       if (!decision.allowed) {
-        // 診斷輸出走 stderr；只記原因說明，不含 token、不含路徑。
-        console.error(`[mnemoshelf-desktop] 未複製 MCP 設定片段：${decision.message ?? "原因不明"}`);
-        return { copied: false, url: null };
+        // 診斷輸出走 stderr；只記原因碼，不含 token、不含路徑。
+        console.error(`[mnemoshelf-desktop] 未複製 MCP 設定片段：${decision.reason ?? "原因不明"}`);
+        return { copied: false, url: null, reason: decision.reason };
       }
-      const snippet = buildMcpConfigSnippet({
+      // 片段文字只有一個來源（卡 1 的 `buildHarnessConfig`）；不在 handler 另組字串。
+      const snippet = buildHarnessConfig("mcp-generic", {
+        executablePath: process.execPath,
         entryPath,
         runtimeFile: desktopPaths.runtimeFile,
-        // 用桌面版自己的 Electron 執行檔當 command（不必額外安裝 Node.js）：
-        // 片段另帶 ELECTRON_RUN_AS_NODE=1，Electron 會以一般 Node.js 身分執行入口腳本。
-        executablePath: process.execPath,
       });
-      await clipboard.writeText(snippet);
+      try {
+        await clipboard.writeText(snippet);
+      } catch {
+        console.error("[mnemoshelf-desktop] 寫入剪貼簿失敗（MCP 設定片段）");
+        return { copied: false, url: null, reason: "clipboard-failed" };
+      }
       log("已將 MCP 設定片段複製到剪貼簿（不含 token；不寫進 log）");
-      return { copied: true, url: server.url };
+      return { copied: true, url: server.url, reason: null };
+    },
+  );
+  ipcMain.handle(DESKTOP_CHANNELS.agentGuideGetState, async (event): Promise<DesktopAgentGuideState> => {
+    assertTrustedSender(event);
+    if (desktopPaths === null) throw new Error("桌面設定尚未初始化");
+    // 讀檔、判斷與預覽都在 main：renderer 只拿到狀態與原因碼，拿不到 token。
+    return readAgentGuideState({
+      home: homedir(),
+      env: { DSH_HOME: process.env.DSH_HOME },
+      appImage: process.env.APPIMAGE,
+      runtimeFile: desktopPaths.runtimeFile,
+      entryPath: resolveMcpEntryPath({
+        isPackaged: app.isPackaged,
+        resourcesPath: process.resourcesPath,
+        appPath: app.getAppPath(),
+      }),
+    });
+  });
+  ipcMain.handle(
+    DESKTOP_CHANNELS.agentGuideCopy,
+    async (event, kind: unknown): Promise<DesktopAgentGuideCopyResult> => {
+      assertTrustedSender(event);
+      // IPC 參數不信任型別：先用執行期白名單擋掉非字串與未知種類。
+      if (typeof kind !== "string" || !AGENT_GUIDE_COPY_KINDS.includes(kind as AgentGuideCopyKind)) {
+        return { copied: false, reason: "unknown-kind" };
+      }
+      const copyKind = kind as AgentGuideCopyKind;
+      if (desktopPaths === null) throw new Error("桌面設定尚未初始化");
+      const entryPath = resolveMcpEntryPath({
+        isPackaged: app.isPackaged,
+        resourcesPath: process.resourcesPath,
+        appPath: app.getAppPath(),
+      });
+      const decision = copyGate({
+        kind: copyKind,
+        appImage: process.env.APPIMAGE,
+        runtimeFileExists: await runtimeFileExists(desktopPaths.runtimeFile),
+        entryPathExists: await fileExists(entryPath),
+      });
+      if (!decision.allowed) {
+        console.error(`[mnemoshelf-desktop] 未複製 Agent 片段（${copyKind}）：${decision.reason ?? "原因不明"}`);
+        return { copied: false, reason: decision.reason };
+      }
+      // 複製文字只有一個來源：卡 1 的 `buildCopyText`（預覽也用它，兩者逐字相同）。
+      const text = buildCopyText(copyKind, {
+        executablePath: process.execPath,
+        entryPath,
+        runtimeFile: desktopPaths.runtimeFile,
+      });
+      try {
+        await clipboard.writeText(text);
+      } catch {
+        console.error(`[mnemoshelf-desktop] 寫入剪貼簿失敗（${copyKind}）`);
+        return { copied: false, reason: "clipboard-failed" };
+      }
+      log(`已複製連接 Agent 片段（${copyKind}；不含 token）`);
+      return { copied: true, reason: null };
     },
   );
   ipcMain.handle(DESKTOP_CHANNELS.updaterGetState, (event): UpdaterState => {

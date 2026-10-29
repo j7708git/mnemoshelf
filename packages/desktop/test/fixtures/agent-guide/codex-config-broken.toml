@@ -1,0 +1,3 @@
+# 合成 fixture：壞掉的 TOML 表頭（缺少右括號）
+[mcp_servers.mnemoshelf
+command = "node"

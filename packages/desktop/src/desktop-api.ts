@@ -1,5 +1,5 @@
 /**
- * main process 與 renderer 之間的窄介面（desktop shell API v2）。
+ * main process 與 renderer 之間的窄介面（desktop shell API v3）。
  *
  * 這裡只放「契約」：通道名稱與狀態型別。實作有兩份，必須一致：
  * - main 端：`src/main.ts` 的 `ipcMain.handle`；
@@ -9,6 +9,7 @@
  * 安全邊界：renderer 只拿得到**狀態**，拿不到 token 本身（token 只留在 main，
  * 由 `webRequest` 注入標頭）。這裡刻意沒有任何「取得 token」的方法。
  */
+import type { AgentGuideBlockedReason, AgentGuideCopyKind, AgentGuideHarnessDetection } from "./agent-guide.js";
 import type { BootstrapState } from "./model-bootstrap.js";
 import type { TokenInfo } from "./token-store.js";
 import type { AutostartState } from "./autostart.js";
@@ -24,6 +25,8 @@ export const DESKTOP_CHANNELS = {
   settingsSetAgentDiscovery: "mnemoshelf:settings:set-agent-discovery",
   settingsCopyConnectionInfo: "mnemoshelf:settings:copy-connection-info",
   settingsCopyMcpConfig: "mnemoshelf:settings:copy-mcp-config",
+  agentGuideGetState: "mnemoshelf:agent-guide:get-state",
+  agentGuideCopy: "mnemoshelf:agent-guide:copy",
   updaterGetState: "mnemoshelf:updater:get-state",
   updaterCheck: "mnemoshelf:updater:check",
   updaterDownload: "mnemoshelf:updater:download",
@@ -36,8 +39,11 @@ export const DESKTOP_CHANNELS = {
 
 /** `contextBridge` 掛在 renderer 上的全域名稱，以及 API 版本。 */
 export const DESKTOP_BRIDGE_NAME = "mnemoshelfDesktop";
-/** v2：新增 updater 的狀態與操作（U2）。 */
-export const DESKTOP_API_VERSION = 2;
+/**
+ * v2：新增 updater 的狀態與操作（U2）。
+ * v3：新增 `agentGuide`（「連接 Agent」頁的偵測狀態與片段複製）。
+ */
+export const DESKTOP_API_VERSION = 3;
 
 /** 應用與環境資訊（顯示用）。 */
 export interface DesktopAppInfo {
@@ -79,6 +85,44 @@ export interface DesktopSettingsState {
   agentDiscovery: DesktopAgentDiscoveryState;
 }
 
+/** 三個 harness 的偵測結果（單一 harness 的形狀由卡 1 的 `AgentGuideHarnessDetection` 定義）。 */
+export interface AgentGuideDetectionState {
+  opencode: AgentGuideHarnessDetection;
+  codex: AgentGuideHarnessDetection;
+  dsh: AgentGuideHarnessDetection;
+}
+
+/** `agentGuide.copy(kind)` 的回應。 */
+export interface DesktopAgentGuideCopyResult {
+  copied: boolean;
+  /** 失敗原因碼；成功時 null。`unknown-kind` 代表呼叫端傳了白名單外的字串。 */
+  reason: AgentGuideBlockedReason | null;
+}
+
+/** `agentGuide.getState()` 的回應（**不含 token**）。 */
+export interface DesktopAgentGuideState {
+  /** 這次偵測的時間（ISO）。UI 只顯示，不輪詢。 */
+  detectedAt: string;
+  detection: AgentGuideDetectionState;
+  /** 片段會用到的路徑（**不含 token**）；拿不到時 null。 */
+  runtimeFile: string | null;
+  entryPath: string | null;
+  /** 每個 kind 若不能複製的原因碼；可以複製時**不出現在表裡**。 */
+  copy: { blocked: Partial<Record<AgentGuideCopyKind, AgentGuideBlockedReason>> };
+  /**
+   * 片段預覽文字（全部 kind 都有；由 `buildCopyText` 產生、不含 token）。
+   * UI 只顯示用；複製時 main 會**重新產生**，不採信 renderer 傳來的文字。
+   */
+  previews: Record<AgentGuideCopyKind, string>;
+}
+
+/** 「連接 Agent」頁的橋接介面（v3 新增）。 */
+export interface DesktopAgentGuideBridge {
+  getState(): Promise<DesktopAgentGuideState>;
+  /** `kind` 在 IPC 上是未知型別，main 必須自己驗白名單。 */
+  copy(kind: string): Promise<DesktopAgentGuideCopyResult>;
+}
+
 /** renderer 看到的 desktop API（`window.mnemoshelfDesktop`）。 */
 export interface DesktopBridge {
   kind: "mnemoshelf-desktop";
@@ -111,10 +155,16 @@ export interface DesktopBridge {
      * 把可直接貼進 MCP client 的設定片段放進剪貼簿。
      *
      * 片段**不含 token**：MCP 入口會自己讀 `runtime.json` 取得網址與 token。
-     * 回傳不含 token，renderer 只拿到「是否成功」與網址。
+     * 回傳不含 token，renderer 只拿到「是否成功」、網址與失敗原因碼（v3 新增 `reason`）。
      */
-    copyMcpConfig(): Promise<{ copied: boolean; url: string | null }>;
+    copyMcpConfig(): Promise<{ copied: boolean; url: string | null; reason: AgentGuideBlockedReason | null }>;
   };
+  /**
+   * 「連接 Agent」頁（v3 新增）。
+   *
+   * **選擇性**：v2 的 preload 沒有這個成員，renderer 要當成「不支援」。
+   */
+  agentGuide?: DesktopAgentGuideBridge;
   /**
    * 更新（Linux／Windows 為 App 內下載安裝；macOS 只檢查並開啟下載頁）。
    *
