@@ -44,7 +44,7 @@ function fakeBridge(updater?: DesktopUpdaterBridge): DesktopBridge {
       setAutostart: async () => ({}) as DesktopSettingsState,
       setAgentDiscovery: async () => ({}) as DesktopSettingsState,
       copyConnectionInfo: async () => ({ copied: false, url: null }),
-      copyMcpConfig: async () => ({ copied: false, url: null }),
+      copyMcpConfig: async () => ({ copied: false, url: null, reason: null }),
     },
     ...(updater === undefined ? {} : { updater }),
   };

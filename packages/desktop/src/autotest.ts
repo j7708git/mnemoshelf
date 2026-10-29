@@ -14,6 +14,9 @@
  * - `autostart`：設定介面的開機自啟開關（開啟／關閉，並檢查落地檔案）。
  * - `agent`：設定頁的 Agent 連線資訊（預設開啟、狀態顯示可用、複製內容含 url 與 token、
  *   關閉後立即刪除 runtime 檔、重新開啟需重啟才寫出）。複製到的 token 只用於斷言，不進報告。
+ * - `agent-guide`：「連接 Agent」頁的四個 tab（opencode／codex／dsh／other）逐一截圖，
+ *   斷言偵測行是三態之一、預覽非空；複製安裝卡與片段到真剪貼簿，斷言含必要字串且**不含 token**，
+ *   最後驗「剪貼簿內容 === 預覽文字」。剪貼簿內容不進報告或 log。
  * - `hidden`：以 `--hidden` 啟動時，視窗建好、UI 載入完、第一次 `ready-to-show` 之後
  *   仍不可見（開機自啟不彈出視窗）。**必須**以 `--hidden` 啟動才會通過，因此不在 `all` 裡。
  * - `tray`：關窗縮到系統匣（程序存活、視窗隱藏）→ 從系統匣選單「離開」整個結束。
@@ -83,8 +86,13 @@ export interface AutotestResult {
   exitCode: number | null;
 }
 
-/** 全部情境（`all` 展開後的順序；`tray` 一定最後，因為它會結束行程）。 */
-export const ALL_SCENARIOS = ["bootstrap", "app", "single", "browser", "index", "autostart", "agent", "tray"] as const;
+/**
+ * 全部情境（`all` 展開後的順序；`tray` 一定最後，因為它會結束行程）。
+ *
+ * `agent-guide` 必須排在 `agent` **之前**：`agent` 情境為了驗「關閉立即刪檔／重新開啟需重啟」
+ * 會把 runtime 檔刪掉且不補寫；`agent-guide` 的複製與「不含 token」斷言需要 runtime 檔存在。
+ */
+export const ALL_SCENARIOS = ["bootstrap", "app", "agent-guide", "single", "browser", "index", "autostart", "agent", "tray"] as const;
 
 /**
  * 只在特定啟動方式下才成立的情境，**不**含在 `all` 裡（跑 `all` 的啟動方式不一定符合前提）：
@@ -445,6 +453,251 @@ export async function runAutotest(options: AutotestOptions): Promise<AutotestRes
       if (!tokens.bridge) throw new Error("renderer 找不到 desktop bridge（preload 沒生效）");
       if (tokens.form || tokens.text) throw new Error("桌面模式仍出現手動貼 token 的畫面");
       return "沒有 token 表單、也沒有「存取 token」字樣；renderer 只看得到 desktop bridge（401 統計見報告的 authCounters）";
+    });
+  }
+
+  if (scenarios.includes("agent-guide")) {
+    /** 本輪 runtime.json 的 token：只留在記憶體，不寫進任何 detail、報告或 log。 */
+    let runtimeToken: string | null = null;
+    const tokenForChecks = async (): Promise<string> => {
+      if (runtimeToken !== null) return runtimeToken;
+      const raw = await fs.readFile(options.runtimeFile, "utf8").catch(() => null);
+      if (raw === null) {
+        throw new Error("找不到連線資訊檔（runtime.json）；這一輪無法驗「不含 token」，請先確認 Agent 連線資訊已開啟並重新啟動 App");
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        throw new Error("連線資訊檔不是合法 JSON；這一輪無法驗「不含 token」");
+      }
+      const token =
+        typeof parsed === "object" && parsed !== null ? (parsed as { token?: unknown }).token : undefined;
+      if (typeof token !== "string" || token === "") {
+        throw new Error("連線資訊檔沒有 token；這一輪無法驗「不含 token」");
+      }
+      runtimeToken = token;
+      return token;
+    };
+
+    /** 剪貼簿不得含 token；錯誤訊息一律不放剪貼簿內容。 */
+    const assertNoToken = (text: string, token: string): void => {
+      if (text.includes(token)) throw new Error("複製內容含 token");
+    };
+
+    /** 讀某個元素的 `innerText`（不存在時回空字串）。 */
+    const readElementText = async (win: BrowserWindow, selector: string): Promise<string> =>
+      evaluate<string>(
+        win,
+        `(() => {
+  const el = document.querySelector(${JSON.stringify(selector)});
+  return el === null ? "" : (el.innerText || "");
+})()`,
+      );
+
+    /** 切到某個 tab，並等 `aria-selected` 反映這次切換。 */
+    const selectAgentGuideTab = async (win: BrowserWindow, tab: string): Promise<void> => {
+      const selector = `#mnemoshelf-agent-guide-tabs button[data-tab="${tab}"]`;
+      const clicked = await evaluate<boolean>(win, clickSelectorExpression(selector));
+      if (!clicked) throw new Error(`找不到 ${tab} tab 的按鈕`);
+      await waitFor(
+        win,
+        `document.querySelector(${JSON.stringify(`${selector}[aria-selected="true"]`)}) !== null`,
+        `切到 ${tab} tab`,
+        options.stepTimeoutMs,
+      );
+    };
+
+    /**
+     * 等這一頁的偵測結果與預覽就緒。
+     *
+     * 複製片段按鈕不再 disabled 代表 `getState()` 已回來（load.kind === "ready"），
+     * 這樣才不會把「正在偵測…」或「讀取中…」誤當成結果。
+     */
+    const waitForAgentGuideReady = async (win: BrowserWindow, tab: string): Promise<void> => {
+      await waitFor(
+        win,
+        `(() => {
+  const detection = document.querySelector("#mnemoshelf-agent-guide-detection");
+  const preview = document.querySelector("#mnemoshelf-agent-guide-preview");
+  const copySnippet = document.querySelector("#mnemoshelf-agent-guide-copy-snippet");
+  return detection !== null && (detection.innerText || "").trim() !== ""
+    && preview !== null && (preview.innerText || "").trim() !== ""
+    && copySnippet !== null && copySnippet.disabled === false;
+})()`,
+        `${tab} tab 的偵測結果與片段預覽就緒`,
+        options.stepTimeoutMs,
+      );
+    };
+
+    await run("agent-guide", "進入「連接 Agent」頁面", async () => {
+      const win = requireWindow();
+      await waitFor(
+        win,
+        `document.body.innerText.includes("已連線到本機服務") && ${buttonExistsExpression("連接 Agent")}`,
+        "UI 進入已連線狀態（若模型尚未下載，請先跑一次含 bootstrap 的 gui）",
+        options.stepTimeoutMs,
+      );
+      // 前面的情境可能把設定頁打開（例如 autostart）；先關掉，截圖才不會被設定頁蓋住。
+      const settingsOpen = await evaluate<boolean>(win, `document.querySelector("#mnemoshelf-settings") !== null`);
+      if (settingsOpen) {
+        await evaluate(win, clickByTextExpression("關閉"));
+        await waitFor(
+          win,
+          `document.querySelector("#mnemoshelf-settings") === null`,
+          "關閉設定頁",
+          options.stepTimeoutMs,
+        );
+      }
+      const clicked = await evaluate<boolean>(win, clickByTextExpression("連接 Agent"));
+      if (!clicked) throw new Error("找不到導覽項目「連接 Agent」");
+      await waitFor(
+        win,
+        `document.querySelector("#mnemoshelf-agent-guide") !== null`,
+        "連接 Agent 頁面出現",
+        options.stepTimeoutMs,
+      );
+      await waitForAgentGuideReady(win, "opencode");
+      // 讓第一次繪製完成再截圖（capturePage 偶爾會拿到上一個畫面）。
+      await delay(300);
+      shots.push(await shoot(win, options.outputDir, "17-agent-guide-opencode.png"));
+      return "已從主導覽進入「連接 Agent」，預設 OpenCode tab 的偵測結果與預覽已就緒";
+    });
+
+    await run("agent-guide", "四個 tab 都可切換、有偵測結果與片段預覽", async () => {
+      const win = requireWindow();
+      const tabs = ["opencode", "codex", "dsh", "other"] as const;
+      for (const tab of tabs) {
+        await selectAgentGuideTab(win, tab);
+        await waitForAgentGuideReady(win, tab);
+        const detection = (await readElementText(win, "#mnemoshelf-agent-guide-detection")).trim();
+        const preview = (await readElementText(win, "#mnemoshelf-agent-guide-preview")).trim();
+        if (tab === "other") {
+          if (!detection.includes("不偵測")) throw new Error("other tab 的偵測行應含「不偵測」");
+        } else if (!detection.includes("偵測到") && !detection.includes("無法判讀")) {
+          throw new Error(`${tab} tab 的偵測行不是三態之一`);
+        }
+        if (preview === "") throw new Error(`${tab} tab 的片段預覽是空的`);
+        await delay(250);
+        shots.push(await shoot(win, options.outputDir, `18-agent-guide-${tab}.png`));
+      }
+      return "opencode／codex／dsh 的偵測行都是三態之一（不假設偵測到）、other 顯示「不偵測」；四個 tab 的預覽都非空並已截圖";
+    });
+
+    await run("agent-guide", "複製 OpenCode 安裝指令卡：含必要字串、不含 token", async () => {
+      const win = requireWindow();
+      const token = await tokenForChecks();
+      await selectAgentGuideTab(win, "opencode");
+      await waitForAgentGuideReady(win, "opencode");
+      const clicked = await evaluate<boolean>(win, clickSelectorExpression("#mnemoshelf-agent-guide-copy-card"));
+      if (!clicked) throw new Error("找不到「複製安裝指令卡」按鈕");
+      await waitFor(
+        win,
+        `(() => {
+  const notice = document.querySelector("#mnemoshelf-agent-guide-notice");
+  return notice !== null && (notice.innerText || "").includes("已複製");
+})()`,
+        "複製安裝指令卡的成功提示出現",
+        options.stepTimeoutMs,
+      );
+      const copied = await clipboard.readText();
+      assertNoToken(copied, token);
+      if (!copied.includes("<REPO_DIR>")) throw new Error("安裝指令卡缺少 <REPO_DIR>");
+      if (!copied.includes("packages/opencode-plugin")) throw new Error("安裝指令卡缺少 packages/opencode-plugin");
+      if (!copied.includes("runtime.json")) throw new Error("安裝指令卡缺少 runtime.json 字樣");
+      return "剪貼簿含 <REPO_DIR>、packages/opencode-plugin 與 runtime.json；不含 token";
+    });
+
+    await run("agent-guide", "複製 codex 片段：含必要字串、不含 token", async () => {
+      const win = requireWindow();
+      const token = await tokenForChecks();
+      await selectAgentGuideTab(win, "codex");
+      await waitForAgentGuideReady(win, "codex");
+      const clicked = await evaluate<boolean>(win, clickSelectorExpression("#mnemoshelf-agent-guide-copy-snippet"));
+      if (!clicked) throw new Error("找不到「複製片段」按鈕（codex）");
+      await waitFor(
+        win,
+        `(() => {
+  const notice = document.querySelector("#mnemoshelf-agent-guide-notice");
+  return notice !== null && (notice.innerText || "").includes("已複製");
+})()`,
+        "複製 codex 片段的成功提示出現",
+        options.stepTimeoutMs,
+      );
+      const copied = await clipboard.readText();
+      assertNoToken(copied, token);
+      if (!copied.includes("[mcp_servers.mnemoshelf]")) throw new Error("codex 片段缺少 [mcp_servers.mnemoshelf]");
+      if (!copied.includes("ELECTRON_RUN_AS_NODE")) throw new Error("codex 片段缺少 ELECTRON_RUN_AS_NODE");
+      return "剪貼簿含 [mcp_servers.mnemoshelf] 與 ELECTRON_RUN_AS_NODE；不含 token";
+    });
+
+    await run("agent-guide", "複製 dsh 片段：含必要字串、不含 token", async () => {
+      const win = requireWindow();
+      const token = await tokenForChecks();
+      await selectAgentGuideTab(win, "dsh");
+      await waitForAgentGuideReady(win, "dsh");
+      const clicked = await evaluate<boolean>(win, clickSelectorExpression("#mnemoshelf-agent-guide-copy-snippet"));
+      if (!clicked) throw new Error("找不到「複製片段」按鈕（dsh）");
+      await waitFor(
+        win,
+        `(() => {
+  const notice = document.querySelector("#mnemoshelf-agent-guide-notice");
+  return notice !== null && (notice.innerText || "").includes("已複製");
+})()`,
+        "複製 dsh 片段的成功提示出現",
+        options.stepTimeoutMs,
+      );
+      const copied = await clipboard.readText();
+      assertNoToken(copied, token);
+      if (!copied.includes('"dependencies"')) throw new Error('dsh 片段缺少 "dependencies"');
+      if (!copied.includes('"bundles"')) throw new Error('dsh 片段缺少 "bundles"');
+      return '剪貼簿含 "dependencies" 與 "bundles"；不含 token';
+    });
+
+    await run("agent-guide", "預覽與剪貼簿內容一致（dsh）", async () => {
+      const win = requireWindow();
+      const copied = (await clipboard.readText()).trim();
+      const preview = (await readElementText(win, "#mnemoshelf-agent-guide-preview")).trim();
+      if (copied === "") throw new Error("剪貼簿是空的");
+      if (copied !== preview) throw new Error("剪貼簿內容與頁面預覽不一致");
+      return "剪貼簿內容與 dsh 片段預覽逐字相同";
+    });
+
+    await run("agent-guide", "重新偵測後偵測行仍非空", async () => {
+      const win = requireWindow();
+      const clicked = await evaluate<boolean>(win, clickSelectorExpression("#mnemoshelf-agent-guide-redetect"));
+      if (!clicked) throw new Error("找不到「重新偵測」按鈕");
+      // 先給 IPC 一個往返的時間，再確認畫面回到可操作且偵測行仍有內容。
+      await delay(300);
+      await waitFor(
+        win,
+        `(() => {
+  const button = document.querySelector("#mnemoshelf-agent-guide-redetect");
+  const detection = document.querySelector("#mnemoshelf-agent-guide-detection");
+  return button !== null && button.disabled === false
+    && detection !== null && (detection.innerText || "").trim() !== "";
+})()`,
+        "重新偵測完成且偵測行非空",
+        options.stepTimeoutMs,
+      );
+      const detection = (await readElementText(win, "#mnemoshelf-agent-guide-detection")).trim();
+      if (!detection.includes("偵測到") && !detection.includes("無法判讀") && !detection.includes("不偵測")) {
+        throw new Error("重新偵測後偵測行不是三態之一");
+      }
+      return "重新偵測完成；偵測行仍非空（內容不寫進報告）";
+    });
+
+    await run("agent-guide", "回到「檔案總管」", async () => {
+      const win = requireWindow();
+      const clicked = await evaluate<boolean>(win, clickByTextExpression("檔案總管"));
+      if (!clicked) throw new Error("找不到導覽項目「檔案總管」");
+      await waitFor(
+        win,
+        `document.querySelector("#mnemoshelf-agent-guide") === null && ${buttonExistsExpression("加入")}`,
+        "回到檔案總管",
+        options.stepTimeoutMs,
+      );
+      return "已回到「檔案總管」，不影響後續 single／browser／index 情境";
     });
   }
 

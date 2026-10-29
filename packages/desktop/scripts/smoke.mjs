@@ -6,9 +6,15 @@
  *   node packages/desktop/scripts/smoke.mjs [all|gui|interrupt|headless|hidden] [選項]
  *
  * 子命令：
- * - `gui`（預設）：一次啟動跑 `bootstrap,app,single,browser,index,autostart,tray` 七個情境——
- *   模型下載進度→就緒、桌面模式不貼 token、單一實例鎖、瀏覽器模式仍走手動貼 token、
- *   加入資料夾／索引／搜尋、開機自啟開關、關窗縮到系統匣與系統匣離開。
+ * - `gui`（預設）：一次啟動跑
+ *   `bootstrap,app,agent-guide,single,browser,index,autostart,agent,tray` 九個情境——
+ *   模型下載進度→就緒、桌面模式不貼 token、連接 Agent 頁四個 tab 的偵測結果與截圖、
+ *   真剪貼簿複製且不含 token、單一實例鎖、瀏覽器模式仍走手動貼 token、
+ *   加入資料夾／索引／搜尋、開機自啟開關、Agent 連線資訊、關窗縮到系統匣與系統匣離開。
+ * - `agent-guide`（在上述預設清單內）：四個 tab 逐一截圖、複製安裝卡與片段到真剪貼簿，
+ *   斷言含必要字串且不含 token；剪貼簿內容不進報告。順序上必須排在 `agent` 之前：
+ *   `agent` 情境會關閉 Agent 連線資訊並刪掉 `runtime.json`（且要重啟才重寫），
+ *   排後面會讓複製與 token 斷言失去前提。
  * - `interrupt`：模擬「下載中斷」——第一次跑到有進度就 SIGKILL，第二次重啟確認沿用已下載的檔案並完成。
  * - `headless`：以 `--headless` 啟動，確認沒有視窗、服務可以用 curl 帶 token 打到。
  * - `hidden`（M2 的回歸驗收）：以 `--hidden` 啟動（開機自啟那條路徑）跑 `hidden` 情境，確認視窗
@@ -409,7 +415,7 @@ async function main() {
       // 保留模型快取（省下 300MB 下載），但清掉資料庫：同一個資料夾不能加入兩次，
       // 清掉才讓這個子命令可以重複跑。要驗「首次下載」請改用乾淨的 userData 或 interrupt。
       await fs.rm(path.join(userData, "data"), { recursive: true, force: true });
-      const scenarios = args.only ?? "bootstrap,app,single,browser,index,autostart,tray";
+      const scenarios = args.only ?? "bootstrap,app,agent-guide,single,browser,index,autostart,agent,tray";
       console.log(`[smoke] gui：userData=${userData}；產物=${out}；情境=${scenarios}`);
       // 追蹤 autostart 檔的出現／消失（驗收 4 的直接證據）。
       const autostartTransitions = [];

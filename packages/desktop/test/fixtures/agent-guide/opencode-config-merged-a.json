@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "/opt/synthetic/tools/unrelated-plugin",
+      "options": {
+        "note": "第一個設定檔沒有 mnemoshelf"
+      }
+    }
+  ]
+}

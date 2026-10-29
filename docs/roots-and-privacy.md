@@ -89,6 +89,40 @@ root 記錄建立後、索引開始前先做一次乾跑（dry run），回報�
 > 嵌入的 `.DS_Store` 等內容，會在該 root **下一次重新索引**時被清掉。要讓搜尋不再出現
 > 這些亂碼，請對受影響的 root 重跑一次索引。
 
+## App 讀取的 harness 設定（只讀，2026-10-29）
+
+「連接 Agent」頁為了顯示每個 harness「缺什麼、怎麼補」，只讀下列**使用者層**設定，不碰其他
+使用者檔案。
+
+- **讀什麼**：
+  - OpenCode／OpenChamber：`~/.config/opencode/opencode.jsonc`、
+    `~/.config/opencode/opencode.json`，以及 `~/.config/opencode/plugins/` 下每個項目
+    （最多 50 個；目錄讀它的 `package.json`，單一檔案**只讀路徑、不讀內容**）。
+  - codex：`~/.codex/config.toml`、`~/.codex/hooks.json`。
+  - dsh：`<DSH_HOME>/profiles/*/package.json`（`DSH_HOME` 未設定時為 `~/.dsh`；最多 50 個
+    profile）。
+- **Windows 也一樣**：OpenCode／OpenChamber 的使用者層設定在
+  `%USERPROFILE%\.config\opencode\`，**不是** `%APPDATA%\opencode\`。
+- **為什麼讀**：只為了顯示「這個 harness 缺什麼、怎麼補」（外掛、MCP server、hook 的狀態），
+  沒有其他用途。
+- **不讀什麼**：`plugins[].options`、`mcp.servers.*.environment`／`env` 的**值**一律丟棄——
+  不進畫面、不進 IPC、不進 log。token 會藏在這些地方；偵測結果只保留布林值與名稱／路徑字串。
+- **界線**：只讀使用者層，**不含**專案層 `.opencode/`；不寫任何檔案、不執行任何指令、
+  不改 harness 設定。檔案不存在是正常情況（顯示「未偵測到」）。
+- **上限與失敗語意**：先 `stat`，超過 **1 MiB** 的檔案不讀；讀不到、格式壞或過大時，該來源
+  不會被當成「不存在」——若沒有其他來源命中，畫面顯示「無法判讀」並帶原因，**不降級**成
+  「未偵測到」。
+- **symlink**：設定檔本身是 symlink 時會跟隨（dotfiles 常見），但只讀；結果只回布林值與
+  名稱／路徑字串。
+- **已知限制**：codex 的 `config.toml` **沒有**完整 TOML 解析器（不新增依賴），只做**表頭
+  掃描**：逐行檢查 `[...]` 表頭是否成對，並找 `[mcp_servers.mnemoshelf]`。因此它只抓得到
+  「表頭括號不匹配」與「多行陣列沒有收合」這兩種壞法；其他 TOML 語法錯誤（重複鍵、壞值）不會
+  被判為格式錯誤——沒有該表頭時顯示「未偵測到」，表頭在但值壞掉時仍可能顯示已設定。
+  **多行字串（`"""`／`'''`）不辨識**：字串內以 `[` 開頭的行可能被當成壞表頭、字串內長得像
+  `key = [` 的行可能被當成陣列開頭，兩者都會顯示「無法判讀」。不要把它當成 TOML 驗證器。
+- **複製**：一律由 main process 寫剪貼簿，內容不含 token；AppImage 不提供含執行檔路徑的片段
+  （執行檔路徑每次啟動都不同）。
+
 ## Agent 存取
 
 agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目前**沒有 per-agent 授權**

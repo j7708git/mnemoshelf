@@ -861,6 +861,10 @@ MNEMOSHELF_RUNTIME_FILE="$HOME/.local/share/mnemoshelf/runtime.json" node rememb
 
 ### codex（實測 0.147.0）
 
+> **repo 未附 `recall.mjs`。** 下面描述的是 2026-10-28 在本機實測過的做法，腳本不在版本庫內；
+> 本版 App 不提供一鍵安裝 hook，codex 的建議接法是只用 MCP 工具（見本節後半），並在專案
+> `AGENTS.md` 要求模型主動呼叫。
+
 > **先看這點：新增的 hook 在 `/hooks` 核准前不會執行。** `~/.codex/config.toml` 的
 > `[hooks.state]` 目前只有既有 orca hooks 的 `trusted_hash`；`~/.codex/hooks.json` 新增的
 > `UserPromptSubmit` group 要啟動 codex 後輸入 `/hooks`、找到該 group 並信任，才會執行。非互動的
@@ -892,7 +896,8 @@ MNEMOSHELF_RUNTIME_FILE="$HOME/.local/share/mnemoshelf/runtime.json" node rememb
 ]
 ```
 
-- 腳本放 `~/.codex/mnemoshelf-recall/recall.mjs`（權限 `0600`）。它讀 `runtime.json`、打
+- 若你要自己做，腳本要放 `~/.codex/mnemoshelf-recall/recall.mjs`（權限 `0600`；repo 未附，
+  需自行實作）。它讀 `runtime.json`、打
   `POST /memories/search`（`k: 4`、`minScore: 0.65`），把結果印成
   `<memory-context source="mnemoshelf" trust="untrusted" ...>`；上限 900 字元，空召回／
   `degraded: true`／逾時一律不輸出，任何錯誤都 exit 0（fail-open），不印 token。
@@ -911,10 +916,14 @@ MNEMOSHELF_RUNTIME_FILE="$HOME/.local/share/mnemoshelf/runtime.json" node rememb
 
   ```toml
   [mcp_servers.mnemoshelf]
-  command = "node"
+  command = "<Mnemoshelf 執行檔路徑>"
   args = ["<MCP 入口路徑>"]
-  env = { MNEMOSHELF_RUNTIME_FILE = "<runtime.json 路徑>", MNEMOSHELF_PROJECT = "<project-name>" }
+  env = { MNEMOSHELF_RUNTIME_FILE = "<runtime.json 路徑>", MNEMOSHELF_PROJECT = "<project-name>", ELECTRON_RUN_AS_NODE = "1" }
   ```
+
+  `command` 是桌面版執行檔時，`env` **必須**含 `ELECTRON_RUN_AS_NODE = "1"`，否則 client 會
+  再開一個 App 實例，而不是 stdio MCP。想用系統 `node`：把 `command` 換成 `node`、`args`
+  保留入口路徑，並刪掉這個變數。
 
   可與 hook 並存。只想要工具、不想用 hook 時，移除新增的 hook group 即可；模型仍可主動呼叫
   `remember`／`search_memories`。codex 若在沒有 hook 的情況下使用，請在專案的 `AGENTS.md` 明寫

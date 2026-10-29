@@ -151,6 +151,89 @@ export interface UpdaterState {
 }
 
 /**
+ * 「連接 Agent」偵測結果的三態（與 `packages/desktop/src/agent-guide.ts` 一致）。
+ *
+ * web 沒辦法 import desktop 的型別；這裡是契約的鏡像，兩邊要一起改。
+ */
+export type AgentGuideDetectState = "detected" | "not-detected" | "unknown";
+
+/** 穩定的偵測原因碼（`unsupported` 目前不會由偵測回傳，保留給未來 harness）。 */
+export type AgentGuideDetectReason =
+  | "ok"
+  | "file-missing"
+  | "not-configured"
+  | "read-error"
+  | "too-large"
+  | "invalid-format"
+  | "unsupported";
+
+/** 不允許複製的原因（穩定字串；UI 依此查文案）。 */
+export type AgentGuideBlockedReason =
+  | "runtime-missing"
+  | "entry-missing"
+  | "appimage"
+  | "unknown-kind"
+  | "clipboard-failed";
+
+/** 可複製的內容種類（五種片段＋四張安裝指令卡）。 */
+export type AgentGuideCopyKind =
+  | "opencode-plugins"
+  | "opencode-mcp"
+  | "mcp-generic"
+  | "codex-mcp"
+  | "dsh-profile"
+  | "install-card-opencode"
+  | "install-card-codex"
+  | "install-card-dsh"
+  | "install-card-generic";
+
+/** 單一 harness 的偵測結果（不含路徑、token 或設定內容）。 */
+export interface DesktopAgentGuideHarnessDetection {
+  state: AgentGuideDetectState;
+  reason: AgentGuideDetectReason;
+  /** 命中的識別字（已去重、排序）；顯示時以「、」連接。 */
+  matches: string[];
+  mcpConfigured: boolean;
+  hookConfigured: boolean;
+  /** 這次實際讀了幾個來源（含不存在與失敗的）。 */
+  sourcesChecked: number;
+}
+
+/** 「連接 Agent」頁面的完整狀態；片段由 main 產生，renderer 只顯示。 */
+export interface DesktopAgentGuideState {
+  /** 這次偵測的時間（ISO 字串）。 */
+  detectedAt: string;
+  detection: {
+    opencode: DesktopAgentGuideHarnessDetection;
+    codex: DesktopAgentGuideHarnessDetection;
+    dsh: DesktopAgentGuideHarnessDetection;
+  };
+  runtimeFile: string | null;
+  entryPath: string | null;
+  /** 已知不可複製的種類與原因（main 的複製閘門結果）。 */
+  copy: { blocked: Partial<Record<AgentGuideCopyKind, AgentGuideBlockedReason>> };
+  /** 每種可複製內容的預覽（不含 token）。 */
+  previews: Record<AgentGuideCopyKind, string>;
+}
+
+/** `agentGuide.copy()` 的回應；不含片段內容。 */
+export interface DesktopAgentGuideCopyResult {
+  copied: boolean;
+  reason: AgentGuideBlockedReason | null;
+}
+
+/**
+ * 「連接 Agent」的窄介面（desktop shell API v3 新增）。
+ *
+ * 偵測與片段產生都在 main process：renderer 不讀檔案、不自己組片段，也不碰 token。
+ */
+export interface DesktopAgentGuideBridge {
+  getState(): Promise<DesktopAgentGuideState>;
+  /** `kind` 由 main 以白名單驗證；不認識的值回 `unknown-kind`。 */
+  copy(kind: string): Promise<DesktopAgentGuideCopyResult>;
+}
+
+/**
  * 更新相關的窄介面（desktop shell API v2 新增）。
  *
  * `mode === "disabled"` 時所有操作都是 no-op；狀態只帶版本、進度、錯誤代碼與公開的
@@ -196,10 +279,17 @@ export interface DesktopBridge {
     copyConnectionInfo(): Promise<{ copied: boolean; url: string | null }>;
     /**
      * 把可直接貼進 MCP client 的設定片段放進剪貼簿；片段**不含 token**。
-     * 回傳不含 token，renderer 只拿到「是否成功」與網址。
+     * 回傳不含 token，renderer 只拿到「是否成功」、網址與被擋的原因。
      */
-    copyMcpConfig(): Promise<{ copied: boolean; url: string | null }>;
+    copyMcpConfig(): Promise<{ copied: boolean; url: string | null; reason: AgentGuideBlockedReason | null }>;
   };
+  /**
+   * 「連接 Agent」偵測與複製（v3 新增）。
+   *
+   * **選擇性**：v1／v2 的 preload 沒有這個成員，舊殼搭配新 UI 時要當成「不支援」，
+   * 不可直接呼叫（`getDesktopAgentGuide()` 會處理）。
+   */
+  agentGuide?: DesktopAgentGuideBridge;
   /**
    * 更新（v2 新增；Linux／Windows 為 App 內下載安裝，macOS 只檢查並開下載頁）。
    *
@@ -260,4 +350,20 @@ export function getDesktopUpdater(bridge: DesktopBridge | null = getDesktopBridg
     return null;
   }
   return updater;
+}
+
+/**
+ * 取得「連接 Agent」介面；不在桌面殼、或殼是 v1／v2（沒有 agentGuide）時回 null。
+ *
+ * 舊殼搭配新 UI 時不能假設 `bridge.agentGuide` 一定存在：頁面要照樣可看，
+ * 只是偵測與複製顯示「需要桌面版 App」。
+ */
+export function getDesktopAgentGuide(
+  bridge: DesktopBridge | null = getDesktopBridge(),
+): DesktopAgentGuideBridge | null {
+  if (bridge === null) return null;
+  const agentGuide = bridge.agentGuide;
+  if (agentGuide === undefined || agentGuide === null) return null;
+  if (typeof agentGuide.getState !== "function" || typeof agentGuide.copy !== "function") return null;
+  return agentGuide;
 }

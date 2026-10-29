@@ -1,0 +1,24 @@
+{
+  // 使用者層設定：註解、網址與尾逗號都在這裡出現（合成資料）。
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": [
+    {
+      "package": "/opt/synthetic/repo/packages/opencode-plugin",
+      "options": {
+        "token": "SYNTHETIC_OPTIONS_TOKEN_DO_NOT_COPY",
+        "note": "https://example.invalid/*not-a-comment*/",
+      },
+    },
+  ],
+  "mcp": {
+    "servers": {
+      "mnemoshelf": {
+        "type": "local",
+        "command": ["/opt/synthetic/app/Mnemoshelf", "/opt/synthetic/repo/packages/server/dist/scripts/mcp.js"],
+        "environment": {
+          "MNEMOSHELF_TOKEN": "SYNTHETIC_ENVIRONMENT_TOKEN_DO_NOT_COPY",
+        },
+      },
+    },
+  },
+}

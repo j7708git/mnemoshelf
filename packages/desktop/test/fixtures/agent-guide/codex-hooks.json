@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node /opt/synthetic/codex/mnemoshelf-recall/recall.mjs",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

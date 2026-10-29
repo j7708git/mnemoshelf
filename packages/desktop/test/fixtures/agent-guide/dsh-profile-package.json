@@ -1,0 +1,15 @@
+{
+  "name": "synthetic-dsh-profile",
+  "private": true,
+  "dependencies": {
+    "@mnemoshelf/dsh-plugin": "link:/opt/synthetic/repo/packages/dsh-plugin"
+  },
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "existing-bundle",
+        "@mnemoshelf/dsh-plugin"
+      ]
+    }
+  }
+}
