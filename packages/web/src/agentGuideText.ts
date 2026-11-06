@@ -129,7 +129,7 @@ const STEPS: Record<AgentGuideTabId, readonly string[]> = {
   codex: [
     STEP_RUNTIME,
     "把 MCP 片段貼進 ~/.codex/config.toml，重新啟動 codex。",
-    "codex mcp list 應看到 mnemoshelf；本版沒有自動召回 hook（repo 未附 recall.mjs），請在專案 AGENTS.md 指示模型主動呼叫工具。",
+    "codex mcp list 應看到 mnemoshelf。若要自動召回，請依「完整說明」建置並設定選配的 hook。",
   ],
   dsh: [
     STEP_RUNTIME,

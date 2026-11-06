@@ -259,7 +259,7 @@ describe("stepsFor", () => {
   it("codex／dsh／other 的其餘兩步逐字固定", () => {
     expect(stepsFor("codex").slice(1)).toEqual([
       "把 MCP 片段貼進 ~/.codex/config.toml，重新啟動 codex。",
-      "codex mcp list 應看到 mnemoshelf；本版沒有自動召回 hook（repo 未附 recall.mjs），請在專案 AGENTS.md 指示模型主動呼叫工具。",
+      "codex mcp list 應看到 mnemoshelf。若要自動召回，請依「完整說明」建置並設定選配的 hook。",
     ]);
     expect(stepsFor("dsh").slice(1)).toEqual([
       "用 dsh plugin --profile <PROFILE> add <絕對路徑>/packages/dsh-plugin 安裝（給絕對路徑，不要用 ./），再跑 dsh plugin --profile <PROFILE> install。",

@@ -859,80 +859,12 @@ MNEMOSHELF_RUNTIME_FILE="$HOME/.local/share/mnemoshelf/runtime.json" node rememb
 > 1.39 秒；`initialize`／`tools/list`／`remember`／`recall` 四個呼叫，不含寫文件與安裝 Node）。
 > 含找設定檔、重啟 client 的**完整人工流程目標 ≤30 分鐘**；不要把上面的機械秒數當成完整流程時間。
 
-### codex（實測 0.147.0）
+### Codex
 
-> **repo 未附 `recall.mjs`。** 下面描述的是 2026-10-28 在本機實測過的做法，腳本不在版本庫內；
-> 本版 App 不提供一鍵安裝 hook，codex 的建議接法是只用 MCP 工具（見本節後半），並在專案
-> `AGENTS.md` 要求模型主動呼叫。
+- **手動使用工具**。在 App 的「連接 Agent → codex」複製 MCP 片段，併入 `~/.codex/config.toml`，重新啟動 Codex。`codex mcp list` 應顯示 `mnemoshelf`。若使用 Electron 執行檔作為 MCP 入口，請保留 `ELECTRON_RUN_AS_NODE = "1"`。
+- **自動召回（選配）**。在本機 Codex 工作階段使用 `UserPromptSubmit` hook。從原始碼建置腳本後可搭配已安裝的 v0.6.0 App，步驟見 [Codex 自動召回](codex-recall.md)。
 
-> **先看這點：新增的 hook 在 `/hooks` 核准前不會執行。** `~/.codex/config.toml` 的
-> `[hooks.state]` 目前只有既有 orca hooks 的 `trusted_hash`；`~/.codex/hooks.json` 新增的
-> `UserPromptSubmit` group 要啟動 codex 後輸入 `/hooks`、找到該 group 並信任，才會執行。非互動的
-> `codex exec` 可單次加 `--dangerously-bypass-hook-trust`，但這是危險選項，不要長期使用。
-
-**結論：codex 的 `UserPromptSubmit` hook 可以回注上下文。** 兩個獨立證據：
-
-- codex-cli `0.147.0` 的內建輸出 schema `user-prompt-submit.command.output` 有
-  `hookSpecificOutput.additionalContext`（string，可為 null）。
-- 官方 Hooks 文件（`https://developers.openai.com/codex/hooks`）的 `UserPromptSubmit` 節明寫：
-  JSON 的 `hookSpecificOutput.additionalContext` 會「added as extra developer context」；
-  純文字 stdout 也會被當成額外 developer context。
-
-本機做法是在 `~/.codex/hooks.json` 的 `UserPromptSubmit` **新增一個獨立的 matcher group**
-（不動既有的 orca hook）：
-
-```json
-"UserPromptSubmit": [
-  {
-    "hooks": [
-      { "type": "command", "command": "<原有的 orca hook，原樣保留>", "timeout": 10 }
-    ]
-  },
-  {
-    "hooks": [
-      { "type": "command", "command": "node <recall.mjs 路徑>", "timeout": 3 }
-    ]
-  }
-]
-```
-
-- 若你要自己做，腳本要放 `~/.codex/mnemoshelf-recall/recall.mjs`（權限 `0600`；repo 未附，
-  需自行實作）。它讀 `runtime.json`、打
-  `POST /memories/search`（`k: 4`、`minScore: 0.65`），把結果印成
-  `<memory-context source="mnemoshelf" trust="untrusted" ...>`；上限 900 字元，空召回／
-  `degraded: true`／逾時一律不輸出，任何錯誤都 exit 0（fail-open），不印 token。
-- Windows 的 codex hook 要另給 `commandWindows`；本節與本機實測都是 Linux，**Windows 未實測**。
-- hook 的 `timeout` 設 3 秒；腳本內部還有 `/health` 500ms、搜尋 800ms 與整體 2.5 秒 watchdog，
-  不會拖慢每個 prompt。
-- 專案名：hook 會用 `MNEMOSHELF_PROJECT`，沒有就用 codex session 的 cwd 資料夾名稱。要固定專案名
-  可在 command 前加 `MNEMOSHELF_PROJECT=<project-name>`（POSIX），或改成包裝腳本。
-- 未信任時 prompt 不受影響：TUI 會提示 `hooks need review`，`codex exec` 則直接跳過該 hook；
-  信任步驟與非互動的例外做法見本節開頭。
-- **復原**：把 `~/.codex/hooks.json` 還原成備份 `hooks.json.bak-mnemoshelf-2026-10-28`，
-  或在 `/hooks` 停用該 hook；不需要刪 orca。
-- **MCP 工具（選配；本機尚未啟用）**：codex 的 MCP 設定放在 `~/.codex/config.toml` 的
-  `[mcp_servers.mnemoshelf]`。以下只是片段；**本機 `config.toml` 目前沒有 `[mcp_servers]` 區段**，
-  貼上後要重啟 codex，並用 `codex mcp list` 確認：
-
-  ```toml
-  [mcp_servers.mnemoshelf]
-  command = "<Mnemoshelf 執行檔路徑>"
-  args = ["<MCP 入口路徑>"]
-  env = { MNEMOSHELF_RUNTIME_FILE = "<runtime.json 路徑>", MNEMOSHELF_PROJECT = "<project-name>", ELECTRON_RUN_AS_NODE = "1" }
-  ```
-
-  `command` 是桌面版執行檔時，`env` **必須**含 `ELECTRON_RUN_AS_NODE = "1"`，否則 client 會
-  再開一個 App 實例，而不是 stdio MCP。想用系統 `node`：把 `command` 換成 `node`、`args`
-  保留入口路徑，並刪掉這個變數。
-
-  可與 hook 並存。只想要工具、不想用 hook 時，移除新增的 hook group 即可；模型仍可主動呼叫
-  `remember`／`search_memories`。codex 若在沒有 hook 的情況下使用，請在專案的 `AGENTS.md` 明寫
-  「需要查／寫記憶時呼叫 Mnemoshelf 的 MCP 工具」，不要依賴模型自己記得。
-- **實測**（2026-10-28）：`codex --version` 回 `codex-cli 0.147.0`；以
-  `codex exec --dangerously-bypass-hook-trust` 送一個會命中記憶的 prompt，session rollout
-  出現 `role: "developer"` 的 `response_item`，內容就是 hook 印出的
-  `<memory-context ...>` 區塊，證明回注確實進入模型輸入。另以能處理 developer context 的模型
-  實測，回覆直接引用了注入的記憶內容（模型相容性見下方「常見失敗」）。
+兩種接法可一起使用。若只設定 MCP 工具，可在專案 `AGENTS.md` 說明何時主動呼叫 `remember` 或 `search_memories`。
 
 ### 其他 client 的欄位對照（只列已確認）
 
@@ -971,9 +903,9 @@ MNEMOSHELF_RUNTIME_FILE="$HOME/.local/share/mnemoshelf/runtime.json" node rememb
 | `url-not-loopback` | `runtime.json` 的 `url` 不是單純的 loopback 基底網址 | 不要用外部網址；確認檔案沒被改寫。入口不會送任何請求。 |
 | AppImage 路徑失效 | AppImage 的掛載點每次啟動都不同，片段貼了下次就找不到 | 改用解壓後的版本、系統 `node`＋固定入口，或改用 `MNEMOSHELF_URL`／`MNEMOSHELF_TOKEN` 連線。 |
 | 工具沒出現 | client 沒載到 server | 看 client 的 MCP log／MCP 入口 stderr；確認 JSON 可解析、入口路徑存在、`node --version` ≥ 22。 |
-| codex 顯示 hooks need review | 新 hook 尚未信任 | 在 codex 輸入 `/hooks` 信任該 group；或單次 `--dangerously-bypass-hook-trust`。 |
-| codex 注入後回空字串 | 模型不適應 developer context，或把記憶內容當成指令 | 先換一個能處理 developer context 的模型（本機實測 `deepseek-v4.1-flash` 正常、`deepseek-v4-flash-0731` 會空回），或在 `/hooks` 停用 hook；rollout 的 `role: "developer"` 訊息可確認注入本身是否成功。 |
-| codex hook 壞掉 | 每個 prompt 都變慢或報錯 | 在 `/hooks` 停用該 hook，或還原 `~/.codex/hooks.json.bak-mnemoshelf-2026-10-28`；prompt 本身不受影響（hook fail-open）。 |
+| codex 顯示 hooks need review | 新 hook 尚未信任 | 在 Codex 輸入 `/hooks` 並審查該 hook。 |
+| codex 注入後回空字串 | 模型不適應 developer context，或把記憶內容當成指令 | 先在 `/hooks` 確認命令是否啟用。若上下文已注入但模型仍沒有採用，可移除該 hook 設定後比較行為。 |
+| codex hook 壞掉 | 每個 prompt 都變慢或報錯 | 從 `hooks.json` 移除該組設定後開啟新工作階段。診斷步驟見 [Codex 自動召回](codex-recall.md)。 |
 
 ### 驗收清單
 
