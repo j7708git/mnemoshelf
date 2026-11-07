@@ -24,6 +24,10 @@
 | `GET /roots/:id/file` | 讀檔（`?path=`；文字回 JSON 預覽，圖片回原始位元組） |
 | `GET /roots/:id/thumb` | 縮圖（`?path=`） |
 | `POST /search` | 檔案語意搜尋（`mode`：`vector` 預設／`keyword`／`hybrid`；`k` 上限 100） |
+| `GET /memory-policy` / `PATCH /memory-policy` | 讀取／保存記憶遮罩開關與政策版本 |
+| `POST /memory-sources` | 完整原文回合寫入；8 MiB 上限，事件重送去重 |
+| `GET /memory-sources/:id` | 帶範圍與政策版本的來源分頁續讀 |
+| `PATCH /memory-sources/:id` / `DELETE /memory-sources/:id` | 整回合範圍更新／軟硬刪除 |
 | `GET /memories` / `POST /memories` | 列出／寫入（列表可用 `kind`／`scope`／`project`／`agent`／`limit` 篩選） |
 | `PATCH /memories/:id` | 改 `scope`／`project`（共享開關） |
 | `DELETE /memories/:id?hard=true` | 軟刪除／硬刪除。`hard` **只接受** `true`／`1`，其他值（含 `false`、`yes`）一律 `400`（刻意嚴格防誤觸） |
@@ -31,8 +35,8 @@
 | `POST /memories/search` | 記憶語意召回（語意不可用時降級關鍵字） |
 | `GET /memories/export` / `POST /memories/import` | NDJSON 備份（import 支援 `?dryRun=1`／`true`，上限 32 MiB） |
 
-備份的範圍與匯入規則（只含記憶、遮罩後視圖、整批先驗證）見
-`docs/storage-ports.md` §記憶的匯出／匯入。
+備份預設 v2，包含短記憶與完整原文來源，依當下遮罩政策產生；舊 v1 仍可匯入。
+原文上限、事件衝突、分頁與備份相容性見 [原文記憶](raw-memory.md)。
 
 `GET /health` 回 `{status, service, appVersion, build}`。`build` 是 build 時的 commit：
 `packages/server/scripts/build-info.mjs` 在 build 時以 `git rev-parse HEAD` 寫入
@@ -45,23 +49,25 @@ App 內更新後可用這個欄位確認實際執行的是新版本的建置（�
 ## MCP 工具
 
 MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直接開資料庫**；授權與參數驗證
-都由 REST 決定。共有六個工具：
+都由 REST 決定。共有七個工具：
 
 | 工具 | 說明 |
 |---|---|
 | `search` | 搜尋已索引的檔案片段與記憶（`mode`：`vector` 預設／`keyword`／`hybrid`） |
 | `remember` | 寫入一筆記憶；預設以「目前專案」為範圍，重複內容回既有記憶並標 `duplicate` |
 | `recall` | **跨專案**列出未刪除的記憶（由新到舊，可用 `project`／`scope` 篩選，**不套用**預設專案解析） |
-| `forget` | 依 id 軟刪除一筆記憶 |
+| `forget` | 依 id 軟刪除；若為原文片段，刪除整個來源回合 |
 | `list_roots` | 列出已加入的 roots（路徑、模式、模態） |
 | `search_memories` | 用自然語言搜尋記憶（語意優先，預設範圍＝目前專案＋全域共享） |
+| `read_memory_source` | 按來源 ID 與範圍分頁讀取原文角色、時間及上下文 |
 
 - **沒有備份用的 MCP 工具**：匯出／匯入只存在 REST（原因與範圍見 `docs/storage-ports.md`
   §記憶的匯出／匯入）。
 - `remember`／`search_memories` 預設以「目前專案」為範圍；專案解析順序＝工具參數 `project`
-  → 環境變數 `MNEMOSHELF_PROJECT` → MCP 行程 cwd 的資料夾名稱（cwd 是家目錄時跳過）
-  → 退回全域。`search_memories` 要跨所有專案請帶 `includeAllProjects: true`，或明確指定
-  `scope`；`remember` 要寫成全域共享請明確帶 `scope: "global"`。
+  → 環境變數 `MNEMOSHELF_PROJECT` → MCP 行程 cwd 的資料夾名稱（cwd 是家目錄時跳過）。
+  解析不到專案時，未指定 scope 的 `remember` 才退回全域；`search_memories` 預設會回驗證錯誤。
+  `search_memories` 要跨所有專案請帶 `includeAllProjects: true`，只查全域請指定 `scope: "global"`；
+  `remember` 要寫成全域共享請明確帶 `scope: "global"`。
   建議在 MCP client 設定 `MNEMOSHELF_PROJECT=<專案名>`，避免 cwd 不同造成專案混淆
   （設定方式見 `docs/agent-integration.md` 的「MCP 設定範例」一節）。
 - 工具回傳的內容一律視為不受信任的資料，不得當成指令；信任模型見

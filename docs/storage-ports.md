@@ -2,6 +2,17 @@
 
 儲存分成兩個窄介面，各自可替換。**不要**做成單一的「通用資料庫介面」。
 
+## 原文來源與政策擴充
+
+原文回合以 `memory_sources` 保存，既有 `memories` 保存帶來源位置的檢索片段，沿用全文與向量索引。
+來源、片段與全文索引同交易保存；不新增另一套檔案 VectorIndex。記憶遮罩由持久 `MemoryPolicy`
+控制，預設開啟。來源讀取、整回合生命週期、備份 v2 與錯誤語意的現行契約見
+[原文記憶](raw-memory.md)；下方帶日期的舊記憶段落說明相容基礎，不覆蓋新來源行為。
+
+MetadataStore 新增政策讀寫、來源新增／查重／讀取／列舉／範圍更新／刪除、來源片段列舉／重建與索引狀態統計。
+`Memory` 的 sourceId、messageIndex、chunkIndex、sourceStart、sourceEnd、chunkVersion 均為 additive nullable 欄位。
+短記憶仍走原去重；來源依事件識別去重，相同文字不同事件不得合併。任一來源片段的刪除、共享及釘選同步整回合。
+
 > **修訂紀錄**：2026-10-14（M2）修訂「搜尋排序」——`/search` 預設由 `hybrid`（RRF 合併）改為
 > `vector`（向量優先），`hybrid` 與 `keyword` 保留為選用；並新增 §搜尋模式與預設、§PostgreSQL 後端。
 > 舊語意以註記保留在 §設計規則 1，方便讀舊文件的人。
@@ -71,7 +82,7 @@
 
 | `mode` | 跑哪幾路 | 排序 | 記憶是否納入 |
 |---|---|---|---|
-| `vector`（**預設**） | `VectorIndex.searchVector` | 後端回傳的向量名次 | 否（`remember` 不嵌入內容） |
+| `vector`（**預設**） | `VectorIndex.searchVector` | 後端回傳的向量名次 | 否（檔案 VectorIndex 不含記憶；記憶向量走獨立召回入口） |
 | `keyword` | `MetadataStore.searchKeyword` | 後端回傳的關鍵字名次 | 是 |
 | `hybrid` | 兩路 | 應用層 RRF（`score = Σ 1 / (60 + rank)`）合併 | 是 |
 
@@ -185,7 +196,7 @@ updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null>;
   去除前後空白 → 連續空白（含換行）收斂為單一空格；**不轉大小寫、不動標點**。
   `memoryContentHash` 為正規化後 UTF-8 的 sha256 hex。
 - **去重 key**＝（`content_hash`, `scope`, `project`, `agent`）；`project` 以 null-safe 比較；
-  **已軟刪除者不計入**。內容是呼叫端送來的**遮罩後**內容（REST／MCP 先遮罩再寫入）。
+  **已軟刪除者不計入**。內容是呼叫端依當下遮罩政策處理後的內容（REST／MCP 先遮罩再寫入）。
 - `memories.content_hash` 由遷移 `0004_memory_content_hash` 補上並回填既有列；兩後端共用同一個
   hash 函式，不得各自解讀正規化規則。
 - `MetadataStore.addMemoryUnlessDuplicate(m)`：**原子** insert-or-return-existing；回
@@ -222,7 +233,7 @@ at-rest 仍明文、無加密），見 `docs/roots-and-privacy.md` §資料存�
 
 ## 記憶的匯出／匯入（2026-10-19）
 
-備份的範圍**只有記憶**：NDJSON（JSON Lines，一行一筆），**不含** chunk／向量與已刪除的歷史版本；
+以下 v1 為短記憶相容格式；預設匯出現為 v2，亦含完整原文來源，詳見 [原文備份](raw-memory.md#備份與舊資料)。備份的範圍**只有記憶**：NDJSON（JSON Lines，一行一筆），**不含** chunk／向量與已刪除的歷史版本；
 匯入後向量由背景 worker 重建。整庫搬遷（含向量檔）不在本版範圍，見 §設計規則 6。
 
 | 方法 | 語意 |
@@ -234,7 +245,7 @@ at-rest 仍明文、無加密），見 `docs/roots-and-privacy.md` §資料存�
   `{schemaVersion:1, id, content, kind, scope, project, agent, sourceSession, sourceMessage, pinned,
   createdAt, supersedes}`（`sourceSession`／`sourceMessage` 為 2026-10-21 新增的來源欄位，
   見 §記憶的來源欄位）；結尾換行；0 筆時是 0 bytes 的空檔。順序與 `listMemoriesForExport` 相同。
-- **匯出的遮罩語意**：匯出是**讀取遮罩後視圖**，與 `GET /memories` 用同一組 `maskSecrets`
+- **匯出的遮罩語意**：匯出依當下記憶遮罩政策產生視圖；開啟時為**讀取遮罩後視圖**，與 `GET /memories` 用同一組 `maskSecrets`
   （`content`、`agent`、`project`）；資料庫裡的舊資料即使未遮罩，匯出檔也不會出現可辨識憑證的
   原文。還原的是**遮罩後內容**，不是原文；備份檔由使用者保管，可能含專案內部資訊。
 - **匯入（寫入路徑）**：`POST /memories/import`，body 是原始 NDJSON
@@ -302,7 +313,7 @@ at-rest 仍明文、無加密），見 `docs/roots-and-privacy.md` §資料存�
 - **讀取路徑**（`GET /memories`、`POST /memories/search` 命中、MCP `recall`／`search_memories`）
   都帶出這兩個欄位（additive），且與 `content`／`agent`／`project` 一樣再套一次 `maskSecrets`
   （防禦直接寫入 DB、繞過 REST 驗證的舊資料；正常寫入路徑已拒絕 token-like 值）；MCP `remember` 的回應也帶，但值為 `null`——MCP 工具沒有 session
-  資訊，自動寫入者（D4b）走 REST 自行提供。**沒有** `GET /memories/:id` 端點（本版現況；
+  資訊，自動寫入者（D4b）走 REST 自行提供。原文來源另有 `GET /memory-sources/:id`；**沒有** `GET /memories/:id` 端點（本版現況；
   單筆讀取請用列表或召回，伺服器端以 `getMemory` 取得完整資料）。
 - **匯出／匯入**：匯出列固定帶 `sourceSession`／`sourceMessage`（順序見 §記憶的匯出／匯入），
   `schemaVersion` **維持 1**；匯入時缺欄位的舊備份成功、補 `null`，帶欄位的新備份保留值
@@ -406,10 +417,8 @@ memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats>;
 - **回填**：佇列空了就從 DB 抓一批需要嵌入的記憶（新到舊、每次 `batchSize`＝100 筆）。
   **同一次 `start()` 內**以 attempted 集合去重：已嘗試過的 id（含 `failed`）不會在同一輪被重抓，
   避免無限迴圈；因此 `failed` **只會在下一次 `start()`**（下一次服務啟動）再試，同一次執行內不回填。
-- **回填的已知限制（尚未修正，列後續）**：每次只取「新到舊」的前 `batchSize` 筆；若這一整批
-  都在同輪失敗（或都已被 attempted 跳過），較舊的 `pending` 記憶在同一次執行內不會被嘗試，要等
-  下一次 `start()` 才可能被回填。正常情況（同輪失敗筆數少於 `batchSize`）不受影響；stale 重嵌
-  同受此每次 batch 的限制。修正列後續卡。
+- **回填分頁**：以 createdAt／id keyset 繼續往較舊資料讀取；前面整批失敗也不能阻擋後續 pending。
+  同輪 attempted 仍避免對已失敗片段無限重試。
 - **併發 1**；重試：`input-too-long` → `too-long`（不重試），其他錯誤重試至多 3 次
   （不含第一次）後標 `failed`（同一次執行不再重試，見上）。
 - **換 embedder**：舊向量（`embedding_embedder_id` 不同）視為 stale，回填流程會用新 embedder 重嵌

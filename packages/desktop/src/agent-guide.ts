@@ -670,7 +670,7 @@ function containsMnemoshelfString(value: unknown): boolean {
 
 /**
  * codex：`config.toml` 有 `[mcp_servers.mnemoshelf]` 或 `hooks.json` 有含 `mnemoshelf`
- * 的字串（例如 `command` 指向 `recall.mjs`）就算偵測到。`matches` 一律 `[]`。
+ * 的字串（例如 `command` 指向 Mnemoshelf 的召回腳本）就算偵測到。`matches` 一律 `[]`。
  */
 export function detectCodex(input: {
   config: AgentGuideConfigInput;
@@ -1135,7 +1135,7 @@ export function buildInstallCard(harness: AgentGuideHarnessTab, input: AgentGuid
       lines.push(
         "# 把 Mnemoshelf 接到 codex（給 agent 的安裝卡）",
         "",
-        "你是協助使用者安裝 Mnemoshelf 的 agent。照下面做完，codex 會多出 Mnemoshelf 的六個 MCP 工具（本版沒有自動召回 hook）。",
+        "你是協助使用者安裝 Mnemoshelf 的 agent。照下面做完，codex 會多出 Mnemoshelf 的六個 MCP 工具。",
         "",
         ...runtimeStep(input),
         "## 2. 把 MCP 片段貼進 `~/.codex/config.toml`",
@@ -1148,11 +1148,10 @@ export function buildInstallCard(harness: AgentGuideHarnessTab, input: AgentGuid
         "",
         "完整結束 codex 再啟動，然後執行 `codex mcp list`；清單應出現 `mnemoshelf`。",
         "",
-        "## 4. 自動召回的本版限制",
+        "## 4. 自動召回（選配）",
         "",
-        "本版 repo 未附 `recall.mjs`，**沒有**自動召回 hook；codex 只有 MCP 工具。",
-        "請在專案的 `AGENTS.md` 明寫：需要查詢或寫入記憶時，主動呼叫 Mnemoshelf 的 MCP 工具，",
-        "不要依賴模型自己記得。",
+        "從原始碼建置 `codex-recall.js`，依 `docs/codex-recall.md` 加入 `hooks.json`，再到 codex 的 `/hooks` 審查。",
+        "若使用者只需要手動查詢，可在專案的 `AGENTS.md` 指示模型使用 Mnemoshelf 的 MCP 工具。",
         "",
         `這個 agent 的預設專案是 \`${project}\`（片段中的 \`MNEMOSHELF_PROJECT\` 可自行改）。`,
       );
@@ -1164,7 +1163,7 @@ export function buildInstallCard(harness: AgentGuideHarnessTab, input: AgentGuid
       lines.push(
         "# 把 Mnemoshelf 接到 dsh（給 agent 的安裝卡）",
         "",
-        "你是協助使用者安裝 Mnemoshelf 的 agent。照下面做完，dsh 會在回合前自動召回記憶、回合結束寫入回合卡。",
+        "你是協助使用者安裝 Mnemoshelf 的 agent。照下面做完，dsh 會在回合前自動召回記憶，並在回合結束後依外掛設定保存對話原文。",
         "",
         ...runtimeStep(input),
         "## 2. 用 `dsh plugin` 指令安裝（優先做法）",

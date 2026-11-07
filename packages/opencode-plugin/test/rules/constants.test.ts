@@ -11,17 +11,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_SETTINGS,
-  DEFAULT_DIGEST_TIMEOUT_MS,
   DEFAULT_RECENT_TURNS,
-  DIGEST_TIMEOUT_MAX_MS,
-  DIGEST_TIMEOUT_MIN_MS,
   RECENT_TURNS_MAX,
   readSettings,
 } from "../../src/config.js";
 import {
   DIGEST_AGENT,
   DIGEST_KINDS,
-  DIGEST_TIMEOUT_MS,
   DIGEST_TURN_AGENT,
   MAX_DIGEST_ITEMS,
   MAX_TURN_CONTENT_CHARS,
@@ -41,24 +37,6 @@ function lockConstant(name: string, actual: unknown, expected: unknown): void {
 }
 
 describe("digest 常數鎖", () => {
-  it("寫入 timeout 固定 8 秒（DIGEST_TIMEOUT_MS）", () => {
-    lockConstant("DIGEST_TIMEOUT_MS", DIGEST_TIMEOUT_MS, 8000);
-  });
-
-  it("模型 timeout 預設 45 秒，且合法範圍是 3000–120000（DEFAULT_DIGEST_TIMEOUT_MS）", () => {
-    lockConstant("DEFAULT_DIGEST_TIMEOUT_MS", DEFAULT_DIGEST_TIMEOUT_MS, 45000);
-    lockConstant("DIGEST_TIMEOUT_MIN_MS", DIGEST_TIMEOUT_MIN_MS, 3000);
-    lockConstant("DIGEST_TIMEOUT_MAX_MS", DIGEST_TIMEOUT_MAX_MS, 120000);
-    expect(
-      DEFAULT_DIGEST_TIMEOUT_MS,
-      `DEFAULT_DIGEST_TIMEOUT_MS 必須落在 ${DIGEST_TIMEOUT_MIN_MS}–${DIGEST_TIMEOUT_MAX_MS} 之間，實際 ${DEFAULT_DIGEST_TIMEOUT_MS}`,
-    ).toBeGreaterThanOrEqual(DIGEST_TIMEOUT_MIN_MS);
-    expect(
-      DEFAULT_DIGEST_TIMEOUT_MS,
-      `DEFAULT_DIGEST_TIMEOUT_MS 必須落在 ${DIGEST_TIMEOUT_MIN_MS}–${DIGEST_TIMEOUT_MAX_MS} 之間，實際 ${DEFAULT_DIGEST_TIMEOUT_MS}`,
-    ).toBeLessThanOrEqual(DIGEST_TIMEOUT_MAX_MS);
-  });
-
   it("回合內容門檻為 40 字（MIN_DIGEST_TURN_CHARS）", () => {
     lockConstant("MIN_DIGEST_TURN_CHARS", MIN_DIGEST_TURN_CHARS, 40);
   });
@@ -105,9 +83,6 @@ describe("召回與 digest 設定預設值鎖", () => {
     lockConstant("DEFAULT_SETTINGS.kMax", DEFAULT_SETTINGS.kMax, 8);
   });
 
-  it("digestTimeoutMs 預設等於模型 timeout 常數", () => {
-    lockConstant("DEFAULT_SETTINGS.digestTimeoutMs", DEFAULT_SETTINGS.digestTimeoutMs, DEFAULT_DIGEST_TIMEOUT_MS);
-  });
 
   it("readSettings({}) 的結果與 DEFAULT_SETTINGS 完全一致（避免兩份預設值漂移）", () => {
     // 逐鍵比對：失敗訊息會指出是哪個鍵不一致，比單純 toEqual 的 diff 好讀。
@@ -127,12 +102,6 @@ describe("設定範圍鎖（超出範圍一律夾住，不是靜默接受）", (
     lockConstant("recentTurns(9)", readSettings({ recentTurns: 9 }).recentTurns, 5);
   });
 
-  it("digestTimeoutMs 夾在 3000–120000", () => {
-    lockConstant("digestTimeoutMs(1000)", readSettings({ digestTimeoutMs: 1000 }).digestTimeoutMs, 3000);
-    lockConstant("digestTimeoutMs(3000)", readSettings({ digestTimeoutMs: 3000 }).digestTimeoutMs, 3000);
-    lockConstant("digestTimeoutMs(120000)", readSettings({ digestTimeoutMs: 120000 }).digestTimeoutMs, 120000);
-    lockConstant("digestTimeoutMs(999999)", readSettings({ digestTimeoutMs: 999999 }).digestTimeoutMs, 120000);
-  });
 
   it("minScore 夾在 0–1，maxItems 夾在 1–8", () => {
     lockConstant("minScore(-1)", readSettings({ minScore: -1 }).minScore, 0);
@@ -146,9 +115,9 @@ describe("設定範圍鎖（超出範圍一律夾住，不是靜默接受）", (
     lockConstant("kMax(99)", readSettings({ kMax: 99 }).kMax, 20);
   });
 
-  it("digest 配額之外的鍵回退預設：digestEnabled 預設關閉", () => {
-    lockConstant("DEFAULT_SETTINGS.digestEnabled", DEFAULT_SETTINGS.digestEnabled, false);
-    lockConstant("digestEnabled('yes')", readSettings({ digestEnabled: "yes" }).digestEnabled, false);
-    lockConstant("digestEnabled(true)", readSettings({ digestEnabled: true }).digestEnabled, true);
+  it("原文擷取預設關閉，保留舊布林開關遷移", () => {
+    lockConstant("DEFAULT_SETTINGS.captureEnabled", DEFAULT_SETTINGS.captureEnabled, false);
+    lockConstant("digestEnabled('yes')", readSettings({ digestEnabled: "yes" }).captureEnabled, false);
+    lockConstant("digestEnabled(true)", readSettings({ digestEnabled: true }).captureEnabled, true);
   });
 });

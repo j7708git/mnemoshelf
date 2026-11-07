@@ -1,17 +1,21 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   clearToken,
   downloadDiagnostics,
   fetchDiagnostics,
+  fetchMemoryPolicy,
   getToken,
   listRoots,
+  MemoryPolicyUnavailableError,
   NetworkError,
   removeRoot,
   setToken,
   UNAUTHORIZED_EVENT,
   UnauthorizedApiError,
+  updateMemoryPolicy,
   updateRootModalities,
   type DiagnosticsEmbedderRuntime,
+  type MemoryPolicy,
   type Root,
 } from "./api";
 import { AddRootFlow, modalitiesForImages } from "./AddRootFlow";
@@ -21,6 +25,7 @@ import { BootstrapScreen } from "./BootstrapScreen";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { ExplorerPanel } from "./ExplorerPanel";
 import { MemoriesPanel } from "./MemoriesPanel";
+import type { MemoryPolicyState } from "./MemoryPolicySetting";
 import { RootsList } from "./RootsList";
 import { SearchPanel } from "./SearchPanel";
 import { SettingsPanel } from "./SettingsPanel";
@@ -80,6 +85,10 @@ export function App() {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [memoryPolicy, setMemoryPolicy] = useState<MemoryPolicyState>({ kind: "loading" });
+  const [memoryViewKey, setMemoryViewKey] = useState(0);
+  const lastMemoryPolicy = useRef<MemoryPolicy | null>(null);
+  const memoryPolicyBusy = useRef(false);
   /** 「複製連線資訊」的結果提示（桌面模式）。 */
   const [connectionNotice, setConnectionNotice] = useState<string | null>(null);
   const [mcpConfigNotice, setMcpConfigNotice] = useState<string | null>(null);
@@ -93,6 +102,63 @@ export function App() {
    */
   const [embedderRuntime, setEmbedderRuntime] = useState<DiagnosticsEmbedderRuntime | null | undefined>(undefined);
   const [embedderRuntimeError, setEmbedderRuntimeError] = useState<string | null>(null);
+
+  const readMemoryPolicy = useCallback(async (): Promise<void> => {
+    if (memoryPolicyBusy.current) return;
+    memoryPolicyBusy.current = true;
+    setMemoryPolicy({ kind: "loading" });
+    try {
+      const value = await fetchMemoryPolicy();
+      const previous = lastMemoryPolicy.current;
+      if (previous?.version !== value.version || previous.maskSecrets !== value.maskSecrets) {
+        setMemoryViewKey((key) => key + 1);
+      }
+      lastMemoryPolicy.current = value;
+      setMemoryPolicy({ kind: "ready", value, error: null });
+    } catch (error) {
+      // 無法確認有效政策時，不保留任何在舊政策下讀取的內容。
+      lastMemoryPolicy.current = null;
+      setMemoryViewKey((key) => key + 1);
+      setMemoryPolicy(error instanceof MemoryPolicyUnavailableError
+        ? { kind: "unavailable", message: error.message }
+        : { kind: "error", message: "讀取記憶遮罩設定失敗。" });
+    } finally {
+      memoryPolicyBusy.current = false;
+    }
+  }, []);
+
+  const connected = state.kind === "ready";
+  useEffect(() => {
+    if (!connected) return;
+    const refreshPolicy = (): void => { void readMemoryPolicy(); };
+    refreshPolicy();
+    window.addEventListener("focus", refreshPolicy);
+    return () => window.removeEventListener("focus", refreshPolicy);
+  }, [connected, readMemoryPolicy]);
+
+  useEffect(() => {
+    if (connected && showSettings) void readMemoryPolicy();
+  }, [connected, readMemoryPolicy, showSettings]);
+
+  const toggleMemoryPolicy = async (enabled: boolean): Promise<void> => {
+    if (memoryPolicyBusy.current || memoryPolicy.kind !== "ready" || memoryPolicy.value.maskSecrets === enabled) return;
+    const previous = memoryPolicy.value;
+    memoryPolicyBusy.current = true;
+    setMemoryPolicy({ kind: "saving", value: previous, error: null });
+    try {
+      const value = await updateMemoryPolicy(enabled);
+      lastMemoryPolicy.current = value;
+      setMemoryPolicy({ kind: "ready", value, error: null });
+    } catch (error) {
+      setMemoryPolicy(error instanceof MemoryPolicyUnavailableError
+        ? { kind: "unavailable", message: error.message }
+        : { kind: "ready", value: previous, error: "儲存記憶遮罩設定失敗。" });
+    } finally {
+      // 即使儲存回應在連線中遺失，也讓各頁重新向服務取得有效政策下的內容。
+      setMemoryViewKey((key) => key + 1);
+      memoryPolicyBusy.current = false;
+    }
+  };
 
   const load = useCallback(async (): Promise<void> => {
     setState({ kind: "loading" });
@@ -532,6 +598,9 @@ export function App() {
           {showSettings && (
             <SettingsPanel
               settings={settings}
+              memoryPolicy={memoryPolicy}
+              onToggleMemoryPolicy={(enabled) => void toggleMemoryPolicy(enabled)}
+              onReloadMemoryPolicy={() => void readMemoryPolicy()}
               error={settingsError}
               busy={settingsBusy}
               embedderRuntime={embedderRuntime}
@@ -613,9 +682,13 @@ export function App() {
             </div>
           )}
 
-          {view === "search" && <SearchPanel roots={state.roots} onOpenMemories={() => setView("memories")} />}
-
-          {view === "memories" && <MemoriesPanel />}
+          {(view === "search" || view === "memories") && memoryPolicy.kind === "saving" && (
+            <p role="status" className="text-sm text-muted">正在更新記憶遮罩設定…</p>
+          )}
+          {view === "search" && memoryPolicy.kind !== "saving" && (
+            <SearchPanel key={memoryViewKey} roots={state.roots} onOpenMemories={() => setView("memories")} />
+          )}
+          {view === "memories" && memoryPolicy.kind !== "saving" && <MemoriesPanel key={memoryViewKey} />}
 
           {view === "agent-guide" && <AgentGuidePanel />}
         </div>

@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe } from "vitest";
 import { Pool } from "pg";
-import { runMetadataStoreContract } from "@mnemoshelf/core/testing";
+import { runMemorySourceStoreContract, runMetadataStoreContract } from "@mnemoshelf/core/testing";
 import { PgMetadataStore } from "../src/index.js";
 import { createFreshSchema, PG_ENABLED, startPgContainer, type StartedPgContainer } from "./helpers.js";
 
@@ -28,5 +28,32 @@ describe.skipIf(!PG_ENABLED)("PostgreSQL MetadataStore（需 MNEMOSHELF_PG=1）"
     if (pool === undefined) throw new Error("連線池尚未初始化（beforeAll 未執行）");
     const schema = await createFreshSchema(pool);
     return new PgMetadataStore(pool, { schema });
+  });
+
+  runMemorySourceStoreContract("postgres", async () => {
+    if (pool === undefined) throw new Error("連線池尚未初始化（beforeAll 未執行）");
+    const connection = pool;
+    const schema = await createFreshSchema(connection);
+    return {
+      store: new PgMetadataStore(connection, { schema }),
+      async failSecondChunkInsert(enabled) {
+        if (enabled) {
+          await connection.query(`
+            create function "${schema}".fail_chunk_insert() returns trigger language plpgsql as $$
+            begin raise exception 'test_chunk_insert'; end; $$;
+            create trigger fail_second_chunk before insert on "${schema}".memories
+            for each row when (new.chunk_index = 1) execute function "${schema}".fail_chunk_insert()`);
+        } else {
+          await connection.query(`drop trigger fail_second_chunk on "${schema}".memories`);
+        }
+      },
+      async failPolicyUpdate() {
+        await connection.query(`
+          create function "${schema}".fail_policy_update() returns trigger language plpgsql as $$
+          begin raise exception 'test_policy_update'; end; $$;
+          create trigger fail_policy_update before update on "${schema}".memory_policy
+          for each row execute function "${schema}".fail_policy_update()`);
+      },
+    };
   });
 });

@@ -327,13 +327,12 @@ describe("buildInstallCard：卡片與片段同源", () => {
     expect(card).not.toContain("每次模型請求前");
   });
 
-  it("codex 卡含 config.toml、codex mcp list 與「沒有自動召回 hook」", () => {
+  it("codex 卡含 MCP 設定與選配的自動召回指引", () => {
     const card = buildInstallCard("codex", input);
     expect(card).toContain("~/.codex/config.toml");
     expect(card).toContain("codex mcp list");
-    expect(card).toContain("recall.mjs");
-    expect(card).toContain("AGENTS.md");
-    expect(card).toContain("沒有**自動召回 hook");
+    expect(card).toContain("docs/codex-recall.md");
+    expect(card).toContain("/hooks");
   });
 
   it("dsh 卡優先給 dsh plugin add 絕對路徑，並含兩段手動片段與 install", () => {

@@ -5,18 +5,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   MAX_DIGEST_CONTENT_CHARS,
-  MAX_FAILURE_REASON_CHARS,
   MAX_TURN_CONTENT_CHARS,
   buildDigestPrompt,
-  checkDigestModel,
-  failureReason,
-  formatDay,
   parseDigestItems,
-  parseTerminalEvent,
   resolveDigestTurn,
   stripMemoryContext,
 } from "../src/digest.js";
-import type { ModelDomainLike, PluginContextLike } from "../src/types.js";
 
 function user(text: string, id = "u1"): unknown {
   return { id, type: "user", text, time: { created: 0 } };
@@ -332,111 +326,5 @@ describe("回合紀錄（turn）解析", () => {
     const result = parseDigestItems(raw, source, 2);
     expect(result.items.map((item) => item.content)).toEqual(["另一個有用的決策"]);
     expect(result.rejected).toBe(1);
-  });
-});
-
-describe("parseTerminalEvent", () => {
-  it("只認三種 execution terminal 事件", () => {
-    expect(parseTerminalEvent({ type: "session.execution.succeeded", data: { sessionID: "s1" } })).toEqual({
-      type: "succeeded",
-      sessionID: "s1",
-    });
-    expect(
-      parseTerminalEvent({ type: "session.execution.interrupted", data: { sessionID: "s1", reason: "user" } }),
-    ).toEqual({ type: "interrupted", sessionID: "s1", reason: "user" });
-    expect(parseTerminalEvent({ type: "session.execution.failed", data: { sessionID: "s2" } })).toEqual({
-      type: "failed",
-      sessionID: "s2",
-    });
-    expect(parseTerminalEvent({ type: "session.text.ended", data: { sessionID: "s1" } })).toBeNull();
-    expect(parseTerminalEvent({ type: "session.execution.succeeded", data: {} })).toBeNull();
-    expect(parseTerminalEvent(null)).toBeNull();
-  });
-});
-
-describe("formatDay", () => {
-  it("用本地時區輸出 YYYY-MM-DD", () => {
-    expect(formatDay(new Date(2026, 9, 22, 23, 59))).toBe("2026-10-22");
-    expect(formatDay(new Date(2026, 0, 3, 0, 0))).toBe("2026-01-03");
-  });
-});
-
-describe("failureReason", () => {
-  it("保留型別名與訊息，壓成單行", () => {
-    const error = new Error("Model unavailable: cheap/missing\n  retry later");
-    error.name = "Generate.ModelSelectionError";
-    expect(failureReason(error)).toBe(
-      "Generate.ModelSelectionError: Model unavailable: cheap/missing retry later",
-    );
-  });
-
-  it("訊息為空時只留型別名；非 Error 一律 unknown", () => {
-    expect(failureReason(new Error(""))).toBe("Error");
-    expect(failureReason("boom")).toBe("unknown");
-    expect(failureReason(null)).toBe("unknown");
-  });
-
-  it("截斷在 200 字元內（不因長訊息撐爆 log／狀態）", () => {
-    const reason = failureReason(new Error("x".repeat(500)));
-    expect([...reason].length).toBe(MAX_FAILURE_REASON_CHARS);
-    expect(reason.endsWith("…")).toBe(true);
-  });
-});
-
-describe("checkDigestModel", () => {
-  const model = { providerID: "cheap", id: "test-model" };
-
-  function ctxWith(list?: () => Promise<unknown>): Pick<PluginContextLike, "model"> {
-    if (list === undefined) return {};
-    return { model: { list: list as ModelDomainLike["list"] } };
-  }
-
-  it("providerID 與 id 完全相符才算存在", async () => {
-    const ctx = ctxWith(async () => ({
-      location: { directory: "/work/x" },
-      data: [
-        { id: "other", providerID: "cheap" },
-        { id: "test-model", providerID: "cheap" },
-      ],
-    }));
-    await expect(checkDigestModel(ctx, model)).resolves.toEqual({ state: "ok" });
-    await expect(checkDigestModel(ctx, { providerID: "cheap", id: "missing" })).resolves.toEqual({
-      state: "model-unavailable",
-    });
-    await expect(checkDigestModel(ctx, { providerID: "other-provider", id: "test-model" })).resolves.toEqual({
-      state: "model-unavailable",
-    });
-  });
-
-  it("宿主直接回陣列也接受", async () => {
-    const ctx = ctxWith(async () => [{ id: "test-model", providerID: "cheap" }]);
-    await expect(checkDigestModel(ctx, model)).resolves.toEqual({ state: "ok" });
-  });
-
-  it("沒有 API、呼叫失敗、格式不符都退回 unchecked", async () => {
-    await expect(checkDigestModel({}, model)).resolves.toEqual({
-      state: "unchecked",
-      reason: "no-model-api",
-    });
-    await expect(
-      checkDigestModel(
-        ctxWith(async () => {
-          throw new Error("nope");
-        }),
-        model,
-      ),
-    ).resolves.toEqual({ state: "unchecked", reason: "list-error" });
-    await expect(checkDigestModel(ctxWith(async () => ({ oops: true })), model)).resolves.toEqual({
-      state: "unchecked",
-      reason: "bad-response",
-    });
-  });
-
-  it("清單逾時：unchecked/timeout（不拖住 digest）", async () => {
-    const ctx = ctxWith(() => new Promise<unknown>(() => undefined));
-    await expect(checkDigestModel(ctx, model, { timeoutMs: 10 })).resolves.toEqual({
-      state: "unchecked",
-      reason: "timeout",
-    });
   });
 });

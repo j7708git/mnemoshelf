@@ -847,6 +847,7 @@ describe("MCP 入口透過連線資訊檔啟動（端到端）", () => {
       expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
         "forget",
         "list_roots",
+        "read_memory_source",
         "recall",
         "remember",
         "search",

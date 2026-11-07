@@ -2,14 +2,14 @@
  * 對話記憶的規則矩陣（L1）。
  *
  * 把 `skipReason`、`decideTrigger`、`resolveProjectTarget`、`parseDigestItems`、
- * `parseDigestModel` 與 digest 的回合門檻，逐格釘成表格式的案例。這裡的每一格都
+ * digest 的回合門檻，逐格釘成表格式的案例。這裡的每一格都
  * 對應 docs 的一條契約；改動任何一格都應該先改 docs，再改這裡。
  */
 import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { parseDigestModel, readSettings } from "../../src/config.js";
+import { readSettings } from "../../src/config.js";
 import { parseDigestItems, resolveDigestTurn } from "../../src/digest.js";
 import { resolveProjectTarget } from "../../src/project.js";
 import { decideTrigger, skipReason } from "../../src/recall.js";
@@ -304,38 +304,6 @@ describe("parseDigestItems：模型輸出驗證", () => {
   });
 });
 
-describe("parseDigestModel：provider/model 的切分", () => {
-  it("單層 `/` → provider 與 model id", () => {
-    expect(parseDigestModel("opencode-go/deepseek-v4.1-flash")).toEqual({
-      providerID: "opencode-go",
-      id: "deepseek-v4.1-flash",
-    });
-  });
-
-  it("多層 `/` → 只在第一個 `/` 切", () => {
-    expect(parseDigestModel("openrouter/qwen/qwen3.7-flash")).toEqual({
-      providerID: "openrouter",
-      id: "qwen/qwen3.7-flash",
-    });
-  });
-
-  it("沒有 `/` → null", () => {
-    expect(parseDigestModel("deepseek-v4.1-flash")).toBeNull();
-  });
-
-  it("前後空白會 trim（provider 與 id 各自 trim）", () => {
-    expect(parseDigestModel("  opencode-go / qwen3.7-flash  ")).toEqual({
-      providerID: "opencode-go",
-      id: "qwen3.7-flash",
-    });
-  });
-
-  it("只有空白字元、或空的一側 → null", () => {
-    expect(parseDigestModel("   ")).toBeNull();
-    expect(parseDigestModel("openrouter/")).toBeNull();
-    expect(parseDigestModel("/qwen3.7-flash")).toBeNull();
-  });
-});
 
 describe("resolveDigestTurn：回合內容的 40 字門檻", () => {
   it("39 字（user 20＋assistant 19）→ short", () => {

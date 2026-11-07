@@ -9,7 +9,6 @@ import {
   describeConnectionFailure,
   isProcessAlive,
   normalizeBaseUrl,
-  parseDigestModel,
   parseRuntimeFile,
   readSettings,
   resolveConnection,
@@ -120,15 +119,6 @@ describe("readSettings", () => {
     expect(DEFAULT_SETTINGS.timeoutMs).toBe(150);
   });
 
-  it("digestTimeoutMs 預設 45000、可設 30000、夾在 3000–120000", () => {
-    expect(readSettings({}).digestTimeoutMs).toBe(45000);
-    expect(readSettings({ digestTimeoutMs: 30000 }).digestTimeoutMs).toBe(30000);
-    expect(readSettings({ digestTimeoutMs: 119999 }).digestTimeoutMs).toBe(119999);
-    expect(readSettings({ digestTimeoutMs: 2999 }).digestTimeoutMs).toBe(3000);
-    expect(readSettings({ digestTimeoutMs: 120001 }).digestTimeoutMs).toBe(120000);
-    expect(readSettings({ digestTimeoutMs: "2500" }).digestTimeoutMs).toBe(3000);
-  });
-
   it("recentTurns 預設 3、夾在 0–5（0＝關閉）", () => {
     expect(readSettings({}).recentTurns).toBe(3);
     expect(readSettings({ recentTurns: 0 }).recentTurns).toBe(0);
@@ -143,59 +133,6 @@ describe("readSettings", () => {
     expect(invalid).toEqual([{ key: "recentTurns", reason: "invalid" }]);
   });
 
-  it("digestTimeoutMs 超範圍會回報 out-of-range、非法型別回報 invalid", () => {
-    const outOfRange: { key: string; reason: string }[] = [];
-    readSettings({ digestTimeoutMs: 1000 }, (warning) => outOfRange.push(warning));
-    expect(outOfRange).toEqual([{ key: "digestTimeoutMs", reason: "out-of-range" }]);
-
-    const invalid: { key: string; reason: string }[] = [];
-    readSettings({ digestTimeoutMs: "很久" }, (warning) => invalid.push(warning));
-    expect(invalid).toEqual([{ key: "digestTimeoutMs", reason: "invalid" }]);
-  });
-
-  it("digest 預設關閉、沒有模型", () => {
-    const settings = readSettings(undefined);
-    expect(settings.digestEnabled).toBe(false);
-    expect(settings.digestModel).toBeNull();
-    expect(settings.digestOnInterrupted).toBe(false);
-  });
-
-  it("digest 設定值合法時不回報 warning", () => {
-    const warnings: { key: string; reason: string }[] = [];
-    const settings = readSettings(
-      {
-        digestEnabled: true,
-        digestModel: "cheap/test-model",
-        digestOnInterrupted: true,
-      },
-      (warning) => warnings.push(warning),
-    );
-    expect(settings.digestEnabled).toBe(true);
-    expect(settings.digestModel).toBe("cheap/test-model");
-    expect(settings.digestOnInterrupted).toBe(true);
-    expect(warnings).toEqual([]);
-  });
-
-  it("digest 非法型別回退預設並記 warning（不含值）", () => {
-    const warnings: { key: string; reason: string }[] = [];
-    const settings = readSettings(
-      {
-        digestEnabled: "yes",
-        digestModel: "沒有斜線的模型",
-        digestOnInterrupted: 1,
-      },
-      (warning) => warnings.push(warning),
-    );
-    expect(settings.digestEnabled).toBe(false);
-    expect(settings.digestModel).toBeNull();
-    expect(settings.digestOnInterrupted).toBe(false);
-    expect(warnings.map((warning) => warning.key).sort()).toEqual([
-      "digestEnabled",
-      "digestModel",
-      "digestOnInterrupted",
-    ]);
-    expect(warnings.every((warning) => warning.reason === "invalid")).toBe(true);
-  });
   it("已移除的張數上限鍵：留著不生效，但每個鍵各記一筆 removed 警告（不帶值）", () => {
     const warnings: { key: string; reason: string }[] = [];
     const settings = readSettings(
@@ -216,33 +153,33 @@ describe("readSettings", () => {
     expect(settings).toEqual(DEFAULT_SETTINGS);
   });
 
-  it("沒有舊鍵時不發 removed 警告", () => {
+  it("原文擷取預設關閉，舊開關只在新開關未設定時遷移", () => {
+    expect(readSettings({}).captureEnabled).toBe(false);
+    expect(readSettings({ digestEnabled: false }).captureEnabled).toBe(false);
+    expect(readSettings({ digestEnabled: "yes" }).captureEnabled).toBe(false);
+    expect(readSettings({ digestEnabled: true }).captureEnabled).toBe(true);
+    expect(readSettings({ digestEnabled: true, captureEnabled: false }).captureEnabled).toBe(false);
+    expect(readSettings({ digestEnabled: false, captureEnabled: true }).captureEnabled).toBe(true);
+    expect(readSettings({ digestEnabled: true, captureEnabled: "invalid" }).captureEnabled).toBe(false);
+    expect(readSettings({ digestOnInterrupted: true }).captureOnInterrupted).toBe(true);
+  });
+
+  it("退役的模型與逾時不驗值，遷移警告只含設定鍵名", () => {
     const warnings: { key: string; reason: string }[] = [];
-    readSettings({ digestEnabled: true, digestModel: "cheap/test-model" }, (warning) =>
-      warnings.push(warning),
-    );
-    expect(warnings.some((warning) => warning.reason === "removed")).toBe(false);
-  });
-});
-
-describe("parseDigestModel", () => {
-  it("只在第一個斜線切分", () => {
-    expect(parseDigestModel("cheap/test-model")).toEqual({ providerID: "cheap", id: "test-model" });
-    expect(parseDigestModel("openrouter/anthropic/claude-x")).toEqual({
-      providerID: "openrouter",
-      id: "anthropic/claude-x",
-    });
-    expect(parseDigestModel("  provider/model  ")).toEqual({ providerID: "provider", id: "model" });
-  });
-
-  it("格式不符一律 null", () => {
-    expect(parseDigestModel(undefined)).toBeNull();
-    expect(parseDigestModel(null)).toBeNull();
-    expect(parseDigestModel("")).toBeNull();
-    expect(parseDigestModel("no-slash")).toBeNull();
-    expect(parseDigestModel("/model")).toBeNull();
-    expect(parseDigestModel("provider/")).toBeNull();
-    expect(parseDigestModel("pro vider/model")).toBeNull();
+    const parsed = readSettings({
+      digestEnabled: true,
+      digestModel: "私人值",
+      digestTimeoutMs: { arbitrary: "私人值" },
+    }, (warning) => warnings.push(warning));
+    expect(parsed.captureEnabled).toBe(true);
+    expect(parsed).not.toHaveProperty("digestModel");
+    expect(parsed).not.toHaveProperty("digestTimeoutMs");
+    expect(warnings).toEqual([
+      { key: "digestModel", reason: "removed" },
+      { key: "digestTimeoutMs", reason: "removed" },
+      { key: "digestEnabled", reason: "migrated" },
+    ]);
+    expect(JSON.stringify(warnings)).not.toContain("私人值");
   });
 });
 

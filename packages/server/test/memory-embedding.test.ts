@@ -12,6 +12,9 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   openDatabase,
+  RAW_MEMORY_CHUNK_VERSION,
+  chunkMemorySourceMessages,
+  memorySourceRequestHash,
   SqliteMetadataStore,
   type DocumentInput,
   type Embedder,
@@ -253,6 +256,35 @@ describe("MemoryEmbeddingWorker", () => {
 
     expect(worker.stats().embedded).toBe(3);
     expect(await store.listMemoriesNeedingEmbedding(embedder.info.id)).toEqual([]);
+  });
+
+  it("整批較新的片段失敗後，仍跨過 100 筆回填較舊來源的 pending 片段", async () => {
+    const addSource = async (sourceTurn: string, content: string) => {
+      const source = {
+        agent: "worker-test", scope: "global" as const, project: null,
+        sourceSession: "session-a", sourceTurn,
+        messages: [{ role: "user" as const, sourceMessage: "message-a", content, occurredAt: null }],
+      };
+      return store.addMemorySource({
+        ...source, requestHash: memorySourceRequestHash(source), chunkVersion: RAW_MEMORY_CHUNK_VERSION,
+      }, chunkMemorySourceMessages(source.messages));
+    };
+
+    const older = await addSource("older", "較舊的待處理原文");
+    const newer = await addSource("newer", "f".repeat(92_000));
+    expect(newer.memories.length).toBeGreaterThan(100);
+    const inner = new FakeEmbedder();
+    const embedder = new ControlEmbedder({
+      impl: async (text) => {
+        if (text.startsWith("f")) throw new Error("模擬失敗");
+        return inner.embedDocument(text);
+      },
+    });
+    const worker = workerFor(embedder, { batchSize: 100, retryAttempts: 0 });
+    worker.start();
+    await waitFor(async () => (await store.memorySourceEmbeddingStats(older.source.id, embedder.info.id)).ready === 1);
+    expect(worker.stats()).toMatchObject({ embedded: 1, failed: newer.memories.length });
+    expect(embedder.calls).toBe(newer.memories.length + 1);
   });
 
   it("換 embedder 後回填會重嵌 stale 的記憶", async () => {

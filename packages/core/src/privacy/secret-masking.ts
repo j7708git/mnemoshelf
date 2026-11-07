@@ -31,6 +31,18 @@ export interface MaskSecretsResult {
   count: number;
 }
 
+/** 一段被替換文字在原文與遮罩後文字中的 UTF-16 半開區間。 */
+export interface MaskedSecretSpan {
+  start: number;
+  end: number;
+  maskedStart: number;
+  maskedEnd: number;
+}
+
+export interface MaskSecretsWithSpansResult extends MaskSecretsResult {
+  spans: MaskedSecretSpan[];
+}
+
 /**
  * 遮罩規則（依序套用）。每條規則的 replacement 都刻意讓結果**不再符合同一條規則**，
  * 這是 idempotency 的來源：所有規則都排除 `[REDACTED:` 開頭的值。
@@ -128,44 +140,122 @@ function looksLikeCodeReference(value: string): boolean {
  * 非字串輸入直接拋 `TypeError`（呼叫端只會傳字串；避免默默吞掉程式錯誤）。
  */
 export function maskSecrets(text: string): MaskSecretsResult {
-  if (typeof text !== "string") throw new TypeError("maskSecrets 只接受字串");
+  const { text: masked, redacted, count } = runMaskRules(text, false);
+  return { text: masked, redacted, count };
+}
 
+/** 完整套用相同遮罩規則，並保留可用來對應舊片段位置的替換區間。 */
+export function maskSecretsWithSpans(text: string): MaskSecretsWithSpansResult {
+  return runMaskRules(text, true);
+}
+
+function runMaskRules(text: string, trackSpans: boolean): MaskSecretsWithSpansResult {
+  if (typeof text !== "string") throw new TypeError("maskSecrets 只接受字串");
   let current = text;
   let count = 0;
+  let spans: MaskedSecretSpan[] = [];
 
   for (const rule of RULES) {
+    const edits: MaskedSecretSpan[] = [];
+    let shift = 0;
     current = current.replace(rule.pattern, (...args: unknown[]) => {
       // 最後兩個參數是 offset 與原字串；前面的捕獲群組用在需要保留結構的規則。
-      const groups = args.slice(0, -2).map((value) => (typeof value === "string" ? value : undefined));
-      const placeholder = `${REDACTED_PREFIX}${rule.kind}]`;
+      const match = args[0] as string;
+      const offset = args.at(-2) as number;
+      let replacement = `${REDACTED_PREFIX}${rule.kind}]`;
+      let prefixLength = 0;
+      let suffixLength = 0;
 
       if (rule.kind === "connection-string") {
-        count += 1;
-        // 保留 scheme：`scheme://[REDACTED:connection-string]@host`。
-        return `${groups[1]}://${placeholder}@`;
+        // 保留 scheme 和帳密後的 @。
+        prefixLength = (args[1] as string).length + 3;
+        suffixLength = 1;
+      } else if (rule.kind === "bearer") {
+        // 維持既有規則的單一空格與 Bearer 大小寫。
+        prefixLength = (args[1] as string).length;
+        if (match[prefixLength] === " ") prefixLength += 1;
+        else replacement = ` ${replacement}`;
+      } else if (rule.kind === "assignment") {
+        const quoted = args[3] !== undefined || args[4] !== undefined;
+        if (!quoted && looksLikeCodeReference(args[5] as string)) return match;
+        suffixLength = quoted ? 1 : 0;
+        prefixLength = (args[1] as string).length + (args[2] as string).length + suffixLength;
       }
-      if (rule.kind === "bearer") {
-        count += 1;
-        // 保留原本的 `Bearer` / `bearer` 大小寫。
-        return `${groups[1]} ${placeholder}`;
-      }
-      if (rule.kind === "assignment") {
-        // groups：0=整個 match、1=名稱、2=分隔符（可含 JSON 的引號）、3=雙引號值、
-        // 4=單引號值、5=未引號值。
-        const value = groups[3] ?? groups[4] ?? groups[5] ?? "";
-        const quote = groups[3] !== undefined ? '"' : groups[4] !== undefined ? "'" : "";
-        // 引號值一律視為字面值；只有未引號值才用程式參考判斷（見 looksLikeCodeReference）。
-        if (quote === "" && looksLikeCodeReference(value)) return args[0] as string; // 不遮、不計數
-        count += 1;
-        const prefix = `${groups[1] ?? ""}${groups[2] ?? ""}`;
-        return quote === "" ? `${prefix}${placeholder}` : `${prefix}${quote}${placeholder}${quote}`;
-      }
+
       count += 1;
-      return placeholder;
+      const matchEnd = match.length - suffixLength;
+      if (trackSpans) {
+        const start = offset + prefixLength;
+        const end = offset + matchEnd;
+        edits.push({ start, end, maskedStart: start + shift, maskedEnd: start + shift + replacement.length });
+        shift += replacement.length - (end - start);
+      }
+      return match.slice(0, prefixLength) + replacement + match.slice(matchEnd);
     });
+    if (edits.length > 0) spans = composeSpans(spans, edits);
   }
 
-  return { text: current, redacted: count > 0, count };
+  return { text: current, redacted: count > 0, count, spans };
+}
+
+/**
+ * 以套用本輪規則前的座標合併舊替換與新替換。相交的區間必須一併擴張，
+ * 例如先遮賦值裡的 token，後續規則又把整個引號值遮掉。
+ */
+function composeSpans(previous: readonly MaskedSecretSpan[], edits: readonly MaskedSecretSpan[]): MaskedSecretSpan[] {
+  const spans: MaskedSecretSpan[] = [];
+  let oldIndex = 0;
+  let editIndex = 0;
+  let originalShift = 0;
+  let maskedShift = 0;
+  while (oldIndex < previous.length || editIndex < edits.length) {
+    const start = Math.min(previous[oldIndex]?.maskedStart ?? Infinity, edits[editIndex]?.start ?? Infinity);
+    const originalStart = start + originalShift;
+    const maskedStart = start + maskedShift;
+    let end = start;
+    do {
+      const old = previous[oldIndex];
+      const edit = edits[editIndex];
+      const oldStart = old?.maskedStart ?? Infinity;
+      const editStart = edit?.start ?? Infinity;
+      const nextStart = Math.min(oldStart, editStart);
+      if (end > start && nextStart >= end) break;
+      if (old !== undefined && oldStart <= editStart) {
+        end = Math.max(end, old.maskedEnd);
+        originalShift += (old.end - old.start) - (old.maskedEnd - old.maskedStart);
+        oldIndex += 1;
+      } else if (edit !== undefined) {
+        end = Math.max(end, edit.end);
+        maskedShift += (edit.maskedEnd - edit.maskedStart) - (edit.end - edit.start);
+        editIndex += 1;
+      }
+    } while (oldIndex < previous.length || editIndex < edits.length);
+    spans.push({ start: originalStart, end: end + originalShift, maskedStart, maskedEnd: end + maskedShift });
+  }
+  return spans;
+}
+
+/** 把保存文字的範圍轉到遮罩後文字，碰到替換區間時保留完整的遮罩字樣。 */
+export function mapMaskedRange(
+  spans: readonly MaskedSecretSpan[],
+  start: number,
+  end: number,
+): { start: number; end: number } {
+  return { start: maskedOffset(start, spans, false), end: maskedOffset(end, spans, true) };
+}
+
+function maskedOffset(offset: number, spans: readonly MaskedSecretSpan[], end: boolean): number {
+  let low = 0;
+  let high = spans.length;
+  while (low < high) {
+    const mid = Math.floor((low + high) / 2);
+    if (spans[mid]!.start < offset) low = mid + 1;
+    else high = mid;
+  }
+  const span = spans[low - 1];
+  if (span === undefined) return offset;
+  if (offset < span.end) return end ? span.maskedEnd : span.maskedStart;
+  return offset + span.maskedEnd - span.end;
 }
 
 /** 是否含已遮罩片段（給測試／診斷用；不影響遮罩流程）。 */

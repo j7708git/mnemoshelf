@@ -5,7 +5,7 @@
  * 原始碼裡不會出現連續、可被 secret scanner 判真的字面憑證；樣本本身也是明顯假的。
  */
 import { describe, expect, it } from "vitest";
-import { containsRedacted, maskSecrets, REDACTED_PREFIX } from "../src/privacy/secret-masking.js";
+import { containsRedacted, mapMaskedRange, maskSecrets, maskSecretsWithSpans, REDACTED_PREFIX } from "../src/privacy/secret-masking.js";
 
 /** 以片段拼接組出測試樣本（避免原始碼出現連續的憑證樣式）。 */
 function fake(...parts: string[]): string {
@@ -39,6 +39,59 @@ const samples = {
   connectionEmptyUser: fake("post", "gres://", ":", "s3cretpass", "@", "db.example.test/app"),
   connectionSlashPassword: fake("my", "sql://", "demo", ":", "pa/ss", "@", "db.example.test/app"),
 };
+
+describe("maskSecretsWithSpans", () => {
+  it("在同一份完整文字上套用原規則，並對應長度縮短及變長的位置", () => {
+    const leading = "前🙂" + "x".repeat(995) + " Bearer ";
+    const shortToken = fake("xox", "b-", "abcdefgh");
+    const text = leading + samples.bearer.slice("Bearer ".length) + " 中 " + shortToken + " 後😺";
+    const { spans, ...result } = maskSecretsWithSpans(text);
+    expect(result).toEqual(maskSecrets(text));
+    expect(spans).toHaveLength(2);
+    const [first, second] = spans;
+    expect(first!.start).toBeLessThan(1024);
+    expect(first!.end).toBeGreaterThan(1024);
+    expect(first!.maskedEnd - first!.maskedStart).toBeLessThan(first!.end - first!.start);
+    expect(second!.maskedEnd - second!.maskedStart).toBeGreaterThan(second!.end - second!.start);
+
+    const mapped = (start: number, end: number) => {
+      const range = mapMaskedRange(spans, start, end);
+      return result.text.slice(range.start, range.end);
+    };
+    expect(mapped(0, leading.length)).toBe(leading);
+    expect(mapped(first!.start + 3, first!.end - 4)).toBe("[REDACTED:bearer]");
+    expect(mapped(first!.start + 3, second!.start + 3)).toBe("[REDACTED:bearer] 中 [REDACTED:token]");
+    expect(mapped(first!.end, second!.start)).toBe(" 中 ");
+    expect(mapped(second!.end, text.length)).toBe(" 後😺");
+  });
+
+  it("合併依序重疊的規則並保留賦值的引號", () => {
+    const prefix = '🙂 token = "';
+    const value = "開頭 " + samples.githubStyle;
+    const text = prefix + value + '" 尾';
+    const result = maskSecretsWithSpans(text);
+    expect(result.count).toBe(2);
+    expect(result.text).toBe(prefix + '[REDACTED:assignment]" 尾');
+    expect(result.spans).toEqual([{
+      start: prefix.length,
+      end: prefix.length + value.length,
+      maskedStart: prefix.length,
+      maskedEnd: prefix.length + "[REDACTED:assignment]".length,
+    }]);
+    const clipped = mapMaskedRange(result.spans, prefix.length + 4, text.length);
+    expect(result.text.slice(clipped.start, clipped.end)).toBe('[REDACTED:assignment]" 尾');
+    expect(maskSecretsWithSpans(result.text)).toEqual({ text: result.text, redacted: false, count: 0, spans: [] });
+  });
+
+  it("連線保留 scheme 與 host，Bearer 中的 tab 正規化後也能對應", () => {
+    const text = `${samples.connection} bearer\t ${"ab".repeat(16)}`;
+    const result = maskSecretsWithSpans(text);
+    expect(result.text).toBe("postgres://[REDACTED:connection-string]@db.example.test/app bearer [REDACTED:bearer]");
+    const first = result.spans[0]!;
+    const middle = mapMaskedRange(result.spans, first.end, text.indexOf("\t"));
+    expect(result.text.slice(middle.start, middle.end)).toBe("@db.example.test/app bearer");
+  });
+});
 
 describe("maskSecrets：規則命中（真陽性）", () => {
   it("PEM 私鑰（RSA／OPENSSH、含截斷標頭）整段遮罩", () => {

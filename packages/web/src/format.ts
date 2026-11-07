@@ -1,6 +1,6 @@
 /** 顯示用的格式化工具（純函式）。 */
 
-import type { MemoryKind, MemoryScope } from "./api";
+import type { MemoryKind, MemoryScope, MemorySourceRole } from "./api";
 
 /** 人類可讀的位元組大小。 */
 export function formatBytes(bytes: number): string {
@@ -43,6 +43,16 @@ export const MEMORY_SCOPE_LABEL: Record<MemoryScope, string> = {
   project: "專案",
   agent: "agent",
 };
+
+export function memorySourceRoleLabel(role: MemorySourceRole): string {
+  return role === "user" ? "使用者" : "助理";
+}
+
+export function memoryOriginLabel(memory: { agent: string; sourceId?: number | null }): string {
+  if (memory.sourceId != null) return "原文回合片段";
+  if (memory.agent === "opencode-plugin" || memory.agent === "opencode-plugin/turn") return "舊版摘要";
+  return "舊版記憶";
+}
 
 /** 取路徑最後一段當顯示名稱；不假設平台分隔符。 */
 export function basename(target: string): string {

@@ -76,7 +76,7 @@ describe("buildMemoryBlock", () => {
     expect(built.block).not.toContain("D".repeat(50));
   });
 
-  it("最多 k=4 筆", () => {
+  it("舊記憶仍最多四筆", () => {
     const hits = Array.from({ length: 8 }, (_, index) => hit(`記憶 ${index}`, { id: index }));
     const built = buildMemoryBlock({
       hits,
@@ -110,7 +110,7 @@ describe("buildMemoryBlock", () => {
 });
 
 describe("searchMemories", () => {
-  it("有專案：送 project、k=4、minScore=0.65", async () => {
+  it("有專案：送 project、k=8、minScore=0.65", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
       calls.push({ url: String(url), init });
@@ -129,7 +129,7 @@ describe("searchMemories", () => {
     expect(body).toEqual({
       query: "召回 timeout 是多少",
       project: "mnemoshelf",
-      k: 4,
+      k: 8,
       minScore: 0.65,
     });
     const headers = calls[0]?.init?.headers as Record<string, string>;
@@ -149,7 +149,7 @@ describe("searchMemories", () => {
       project: null,
       fetchImpl,
     });
-    expect(body).toMatchObject({ query: "x", scope: "global", k: 4, minScore: 0.65 });
+    expect(body).toMatchObject({ query: "x", scope: "global", k: 8, minScore: 0.65 });
     expect(body).not.toHaveProperty("project");
   });
 
@@ -202,8 +202,9 @@ describe("recallForMessages", () => {
   });
 
   it("注入完整區塊", async () => {
-    const fetchImpl = (async () =>
-      jsonResponse({ hits: [hit("使用者偏好深色模式")], degraded: false })) as typeof fetch;
+    const fetchImpl: typeof fetch = async (url) => String(url).endsWith("/memory-policy")
+      ? jsonResponse({ maskSecrets: true, version: 1 })
+      : jsonResponse({ hits: [hit("使用者偏好深色模式")], degraded: false, policyVersion: 1 });
     const result = await recallForMessages({
       messages: [human("我們之前說偏好什麼主題？")],
       connection: CONNECTION,
@@ -217,8 +218,9 @@ describe("recallForMessages", () => {
   });
 
   it("degraded 不注入", async () => {
-    const fetchImpl = (async () =>
-      jsonResponse({ hits: [hit("x")], degraded: true })) as typeof fetch;
+    const fetchImpl: typeof fetch = async (url) => String(url).endsWith("/memory-policy")
+      ? jsonResponse({ maskSecrets: true, version: 1 })
+      : jsonResponse({ hits: [hit("x")], degraded: true, policyVersion: 1 });
     const result = await recallForMessages({
       messages: [human("問題")],
       connection: CONNECTION,
@@ -229,7 +231,9 @@ describe("recallForMessages", () => {
   });
 
   it("空召回不注入", async () => {
-    const fetchImpl = (async () => jsonResponse({ hits: [], degraded: false })) as typeof fetch;
+    const fetchImpl: typeof fetch = async (url) => String(url).endsWith("/memory-policy")
+      ? jsonResponse({ maskSecrets: true, version: 1 })
+      : jsonResponse({ hits: [], degraded: false, policyVersion: 1 });
     const result = await recallForMessages({
       messages: [human("問題")],
       connection: CONNECTION,
@@ -273,6 +277,98 @@ describe("recallForMessages", () => {
       project: null,
       fetchImpl,
     });
-    expect(result).toMatchObject({ block: "", skip: "network" });
+    expect(result).toMatchObject({ block: "", skip: "policy-unavailable" });
   });
+});
+
+describe("原文片段與政策", () => {
+  const message: MessageLike = { role: "user", source: { kind: "user" }, content: [{ type: "text", text: "之前的精確答案" }] };
+
+  it("沒有向量時可採用原文關鍵字命中，使用角色與續讀來源 ID，預算先保錨點", async () => {
+    const raw = "A".repeat(96) + "中段錨點🧭" + "B".repeat(320);
+    const hits = [
+      hit("舊短記憶".repeat(400)),
+      hit(raw, { id: 2, sourceType: "raw-turn", sourceId: 42, role: "assistant", source: "keyword", truncated: true }),
+      hit("相鄰重複不送", { id: 3, sourceType: "raw-turn", sourceId: 42, role: "assistant", source: "keyword" }),
+    ];
+    const fetchImpl: typeof fetch = async (url) => String(url).endsWith("/memory-policy")
+      ? jsonResponse({ maskSecrets: true, version: 2 })
+      : jsonResponse({ hits, degraded: true, policyVersion: 2 });
+    const result = await recallForMessages({ messages: [message], connection: CONNECTION, project: null, fetchImpl });
+    expect(result.block).toContain(raw);
+    expect(result.block).toContain("[source id=42]\n  assistant:");
+    expect(result.block).not.toContain("舊短記憶");
+    expect(result.block).not.toContain("相鄰重複不送");
+    expect(result.chars).toBeLessThanOrEqual(900);
+    const small = buildMemoryBlock({ hits, project: null, now: new Date(), maxChars: 250 });
+    expect(small.block).toContain("中段錨點🧭");
+    expect(small.block).toContain("…");
+    expect(small.chars).toBeLessThanOrEqual(250);
+  });
+
+  it("查詢後遮罩切換或無法確認政策，舊的明文不進本次 context", async () => {
+    let calls = 0;
+    const secretHit = hit("敏感合成片段", { sourceType: "raw-turn", sourceId: 2, role: "assistant" });
+    const fetchImpl: typeof fetch = async (url) => {
+      if (String(url).endsWith("/memory-policy")) {
+        calls += 1;
+        return jsonResponse({ maskSecrets: calls !== 1, version: calls === 1 ? 1 : 2 });
+      }
+      return jsonResponse({ hits: [secretHit], policyVersion: 1 });
+    };
+    const result = await recallForMessages({ messages: [message], connection: CONNECTION, project: null, fetchImpl });
+    expect(result.block).toBe("");
+    expect(result.skip).toBe("policy-changed");
+    const unavailable = await recallForMessages({
+      messages: [message], connection: CONNECTION, project: null,
+      fetchImpl: async () => new Response("<html>not API</html>"),
+    });
+    expect(unavailable).toMatchObject({ block: "", skip: "upgrade-required" });
+  });
+});
+
+it("同來源保留不重疊的兩段，較窄預算依服務錨點縮短", () => {
+  const anchor = "緊急碼為 MAPLE-421 🧭";
+  const long = "前".repeat(294) + anchor + "後".repeat(90);
+  const hits = [
+    hit("第一段是另一個位置的說明。", {
+      id: 1, sourceId: 45, sourceType: "raw-turn", role: "assistant",
+      messageIndex: 1, snippetStart: 0, snippetEnd: 40,
+    }),
+    hit("重疊的近鄰", {
+      id: 2, sourceId: 45, sourceType: "raw-turn", role: "assistant",
+      messageIndex: 1, snippetStart: 35, snippetEnd: 60,
+    }),
+    hit(long, {
+      id: 3, sourceId: 45, sourceType: "raw-turn", role: "assistant",
+      messageIndex: 1, snippetStart: 400, snippetEnd: 820, snippetAnchor: 294,
+    }),
+  ];
+  const result = buildMemoryBlock({ hits, project: null, now: new Date(), maxChars: 290 });
+  expect(result.block).toContain("第一段是另一個位置的說明。");
+  expect(result.block).not.toContain("重疊的近鄰");
+  expect(result.block).toContain(anchor);
+  expect(result.block).toContain("…");
+  expect(result.block.match(/source id=45/g)).toHaveLength(1);
+  expect(result.kept).toBe(2);
+  expect(result.chars).toBeLessThanOrEqual(290);
+});
+
+it("同一來源兩段證據的排序可勝過較前的單一候選，仍最多四來源", () => {
+  const raw = (id: number, sourceId: number, role: "user" | "assistant", content: string) =>
+    hit(content, { id, sourceId, role, sourceType: "raw-turn" });
+  const result = buildMemoryBlock({
+    project: null, now: new Date(), maxChars: 900,
+    hits: [
+      raw(1, 1, "user", "首要來源。"),
+      raw(2, 2, "user", "第二來源。"),
+      raw(3, 3, "user", "第三來源。"),
+      raw(4, 4, "user", "單一候選。"),
+      raw(5, 5, "user", "使用者要求記錄實測。"),
+      raw(6, 5, "assistant", "助理確認固定臂已卡扣。"),
+    ],
+  });
+  expect(result.block).toContain("助理確認固定臂已卡扣。");
+  expect(result.block).not.toContain("單一候選。");
+  expect(result.block.match(/source id=/g)).toHaveLength(4);
 });

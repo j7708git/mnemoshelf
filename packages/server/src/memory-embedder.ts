@@ -100,6 +100,8 @@ export class MemoryEmbeddingWorker {
   private readonly queuedIds = new Set<number>();
   /** 本次 start 內回填已嘗試過的 id：避免同一輪反覆抓回 failed 的記憶造成無限迴圈。 */
   private readonly backfillAttempted = new Set<number>();
+  private backfillBefore: Pick<Memory, "createdAt" | "id"> | undefined;
+  private backfillExhausted = false;
 
   private started = false;
   private closed = false;
@@ -128,9 +130,9 @@ export class MemoryEmbeddingWorker {
   start(): void {
     if (this.started || this.closed) return;
     this.started = true;
-    this.loopPromise = this.loop().catch((error: unknown) => {
-      // 背景工作不能留下未處理的 rejection（Node 22 預設會終止行程）；記錄到 stderr 供診斷。
-      console.error("[mnemoshelf] 記憶嵌入 worker 發生未預期的錯誤：", error);
+    this.loopPromise = this.loop().catch(() => {
+      // 驅動或模型的錯誤細節可能包含原文，只記錄固定的診斷訊息。
+      console.error("[mnemoshelf] 記憶嵌入 worker 發生未預期的錯誤");
     });
   }
 
@@ -183,7 +185,7 @@ export class MemoryEmbeddingWorker {
         if (id !== undefined) {
           // 任何被處理過的 id 都算「本次執行已嘗試」：失敗後不要立刻被回填同一輪重抓，
           // 否則一次 start 內會無限重試同一批 failed 記憶（卡 B1 的「避免無限迴圈」）。
-          this.backfillAttempted.add(id);
+          if (this.backfillOnStart && !this.backfillExhausted) this.backfillAttempted.add(id);
           try {
             await this.processOne(id);
           } finally {
@@ -213,16 +215,23 @@ export class MemoryEmbeddingWorker {
    * 否則 `listMemoriesNeedingEmbedding` 會一直回傳它，迴圈永遠不停。
    */
   private async enqueueBackfillBatch(): Promise<boolean> {
-    if (this.closed) return false;
-    const memories = await this.store.listMemoriesNeedingEmbedding(this.embedder.info.id, this.batchSize);
-    let added = false;
-    for (const memory of memories) {
-      if (this.backfillAttempted.has(memory.id)) continue;
-      this.backfillAttempted.add(memory.id);
-      this.enqueue(memory.id);
-      added = true;
+    while (!this.closed && !this.backfillExhausted) {
+      const memories = await this.store.listMemoriesNeedingEmbedding(
+        this.embedder.info.id, this.batchSize, this.backfillBefore,
+      );
+      const last = memories.at(-1);
+      if (last === undefined) {
+        this.backfillExhausted = true;
+        this.backfillAttempted.clear();
+        break;
+      }
+      this.backfillBefore = { createdAt: last.createdAt, id: last.id };
+      for (const memory of memories) {
+        if (!this.backfillAttempted.has(memory.id)) this.enqueue(memory.id);
+      }
+      if (this.queue.length > 0) return true;
     }
-    return added;
+    return false;
   }
 
   /** 處理單筆：成功 → ready；`input-too-long` → too-long；其他錯誤重試後 → failed。 */

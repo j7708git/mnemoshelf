@@ -9,7 +9,8 @@
 import { useCallback, useState } from "react";
 import { search, SEARCH_MODES, type ChunkSearchHit, type DirEntry, type Root, type SearchHit, type SearchMode } from "./api";
 import { FilePreview } from "./FilePreview";
-import { basename, MEMORY_KIND_LABEL, MEMORY_SCOPE_LABEL } from "./format";
+import { RawMemorySourceDisclosure } from "./RawMemorySourcePanel";
+import { basename, formatDateTime, MEMORY_KIND_LABEL, MEMORY_SCOPE_LABEL, memoryOriginLabel, memorySourceRoleLabel } from "./format";
 
 /** 模式的中文標籤（附上英文名稱，與 API 的 `mode` 對應）。 */
 const MODE_LABEL: Record<SearchMode, string> = {
@@ -177,7 +178,8 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
                       <div className="rounded-lg border border-line bg-white/70 px-3 py-2">
                         <div className="flex items-center justify-between gap-2">
                           <span className="rounded bg-surface px-1.5 py-0.5 text-[11px] font-medium text-muted">
-                            記憶・{MEMORY_KIND_LABEL[hit.kind]}
+                            {memoryOriginLabel(hit)}{hit.role == null ? "" : `・${memorySourceRoleLabel(hit.role)}`}
+                            {hit.sourceId == null ? `・${MEMORY_KIND_LABEL[hit.kind]}` : ""}
                           </span>
                           <span className="shrink-0 text-[11px] text-muted">
                             #{hit.rank}・分數 {hit.score.toFixed(4)}
@@ -191,6 +193,12 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
                           來源：{hit.agent}・範圍 {MEMORY_SCOPE_LABEL[hit.scope]}
                           {hit.project === null ? "" : `・${hit.project}`}
                         </p>
+                        {hit.sourceId != null && (
+                          <>
+                            <p className="mt-1 text-[11px] text-muted">{hit.occurredAt == null ? "對話時間未知" : formatDateTime(hit.occurredAt)}</p>
+                            <RawMemorySourceDisclosure id={hit.sourceId} agent={hit.agent} scope={hit.scope} project={hit.project} />
+                          </>
+                        )}
                         {onOpenMemories !== undefined && (
                           <button
                             type="button"

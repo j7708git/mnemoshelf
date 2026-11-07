@@ -1,180 +1,107 @@
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { flushSpool, postMemory, spoolHash, writeSpool } from "../src/spool.js";
-import type { Connection, LogFn, MemoryWritePayload } from "../src/types.js";
+import { createSourceSpool } from "../src/spool.js";
+import type { SourceWriteRequest } from "../src/raw-memory.js";
 
-const CONNECTION: Connection = {
-  baseUrl: "http://127.0.0.1:12345",
-  token: "test-token",
-  source: "env",
-};
+const connection = { baseUrl: "http://127.0.0.1:43117", token: "fixture-auth" };
+let dir: string;
+beforeEach(async () => {
+  dir = await fs.mkdtemp(path.join(os.tmpdir(), "mnemoshelf-dsh-raw-spool-"));
+});
+afterEach(async () => {
+  await fs.rm(dir, { recursive: true, force: true });
+});
 
-const log: LogFn = () => {
-  // 測試不輸出 log。
-};
-
-function payload(index: number, content?: string): MemoryWritePayload {
+function payload(turn: number, content = "fixture"): SourceWriteRequest {
   return {
-    content: content ?? `第 ${index} 筆合成記憶內容，用來驗證 spool 行為。`,
-    kind: "fact",
-    scope: "project",
-    project: "mnemoshelf",
-    agent: "dsh/turn",
-    sourceSession: "session-test",
-    sourceMessage: String(index),
+    scope: "global", agent: "dsh/turn", sourceSession: "s", sourceTurn: String(turn),
+    messages: [{ role: "user", sourceMessage: "u", content, occurredAt: null }],
   };
 }
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
+function success(source: SourceWriteRequest, duplicate = false): Response {
+  return Response.json({
+    source: {
+      ...source, messages: undefined, messageCount: source.messages.length, id: 1,
+      createdAt: "2026-01-01T00:00:00.000Z", chunkVersion: "raw-v1",
+    },
+    saved: true, duplicate, policyVersion: 1, memoryIds: [1], redacted: false, redactedCount: 0,
+  }, { status: duplicate ? 200 : 201 });
 }
 
-let dir = "";
-
-beforeEach(async () => {
-  dir = await mkdtemp(path.join(tmpdir(), "mnemoshelf-spool-test-"));
-});
-
-afterEach(async () => {
-  await rm(dir, { recursive: true, force: true });
-});
-
-describe("writeSpool", () => {
-  it("原子寫入：檔名含時間與雜湊、0600、目錄 0700、不含 token", async () => {
-    const name = await writeSpool({
-      dir,
-      payload: payload(1),
-      now: new Date("2026-10-28T10:00:00.000Z"),
-      log,
-    });
-    expect(name).toMatch(/^\d+-[0-9a-f]{12}\.json$/);
-    const files = await readdir(dir);
-    expect(files).toEqual([name]);
-
-    const fileStat = await stat(path.join(dir, name as string));
-    expect(fileStat.mode & 0o777).toBe(0o600);
-    const dirStat = await stat(dir);
-    expect(dirStat.mode & 0o777).toBe(0o700);
-
-    const text = await readFile(path.join(dir, name as string), "utf8");
-    const record = JSON.parse(text);
-    expect(Object.keys(record).sort()).toEqual(["createdAt", "payload", "schemaVersion"]);
-    expect(text).not.toContain("test-token");
-    expect(text).not.toContain("127.0.0.1");
-    expect(record.payload.agent).toBe("dsh/turn");
-  });
-
-  it("同內容只留一份（用雜湊去重）", async () => {
-    const first = await writeSpool({ dir, payload: payload(1), log });
-    const second = await writeSpool({ dir, payload: payload(1), log });
-    expect(first).not.toBeNull();
-    expect(second).toBeNull();
-    expect(await readdir(dir)).toHaveLength(1);
-  });
-
-  it("上限 200 筆，超過丟最舊", async () => {
-    const base = new Date("2026-10-01T00:00:00.000Z").getTime();
-    for (let index = 0; index < 202; index += 1) {
-      await writeSpool({
-        dir,
-        payload: payload(index),
-        now: new Date(base + index),
-        log,
-      });
+describe("原文 spool", () => {
+  it("離線遮完整訊息，重送相同事件不覆蓋；合法 duplicate 才刪除", async () => {
+    const logs: unknown[] = [];
+    const first = createSourceSpool({ dir, log: (event, fields) => logs.push([event, fields]) });
+    const secret = "m".repeat(28);
+    const visible = "前面".repeat(650) + "Bearer " + secret + " 中尾🚦\r\n";
+    await first.add(payload(1, visible), async () => null);
+    await first.add(payload(1, "重新收到的改稿"), async () => null);
+    const names = await fs.readdir(dir);
+    expect(names).toHaveLength(1);
+    expect(names[0]).toMatch(/^raw-[0-9a-f]{64}\.json$/);
+    const file = path.join(dir, names[0]!);
+    const saved = JSON.parse(await fs.readFile(file, "utf8"));
+    const expected = payload(1, visible.replace(secret, "[REDACTED:bearer]"));
+    expect(saved).toEqual({ schemaVersion: 2, payload: expected });
+    expect(JSON.stringify(saved)).not.toContain(connection.token);
+    if (process.platform !== "win32") {
+      expect((await fs.stat(dir)).mode & 0o777).toBe(0o700);
+      expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
     }
-    const files = await readdir(dir);
-    expect(files).toHaveLength(200);
-    const names = files.map((name) => path.basename(name));
-    expect(names.some((name) => name.endsWith(`-${spoolHash(payload(0))}.json`))).toBe(false);
-    expect(names.some((name) => name.endsWith(`-${spoolHash(payload(1))}.json`))).toBe(false);
-    expect(names.some((name) => name.endsWith(`-${spoolHash(payload(201))}.json`))).toBe(true);
-  });
-});
-
-describe("flushSpool", () => {
-  async function spoolOne(index = 1): Promise<string> {
-    const name = await writeSpool({ dir, payload: payload(index), log });
-    return name as string;
-  }
-
-  it("201 成功後刪除", async () => {
-    const name = await spoolOne();
-    const fetchImpl = (async () => jsonResponse({ id: 7, duplicate: false }, 201)) as typeof fetch;
-    const result = await flushSpool({ dir, connection: CONNECTION, log, fetchImpl });
-    expect(result).toMatchObject({ sent: 1, failed: 0, deferred: 0, remaining: 0 });
-    expect(await readdir(dir)).not.toContain(name);
-  });
-
-  it("200 duplicate 視為成功並刪除", async () => {
-    const name = await spoolOne();
-    const fetchImpl = (async () => jsonResponse({ id: 7, duplicate: true }, 200)) as typeof fetch;
-    const result = await flushSpool({ dir, connection: CONNECTION, log, fetchImpl });
-    expect(result).toMatchObject({ duplicate: 1, remaining: 0 });
-    expect(await readdir(dir)).not.toContain(name);
-  });
-
-  it("4xx（非 429）移到 failed/，不無限重試", async () => {
-    const name = await spoolOne();
-    const fetchImpl = (async () => jsonResponse({}, 400)) as typeof fetch;
-    const result = await flushSpool({ dir, connection: CONNECTION, log, fetchImpl });
-    expect(result).toMatchObject({ failed: 1, remaining: 0 });
-    expect(await readdir(dir)).not.toContain(name);
-    expect(await readdir(path.join(dir, "failed"))).toContain(name);
-  });
-
-  it("429 與 5xx 保留，留給下一輪", async () => {
-    const name = await spoolOne();
-    for (const status of [429, 503]) {
-      const fetchImpl = (async () => jsonResponse({}, status)) as typeof fetch;
-      const result = await flushSpool({ dir, connection: CONNECTION, log, fetchImpl });
-      expect(result).toMatchObject({ deferred: 1, remaining: 1 });
-      expect(await readdir(dir)).toContain(name);
-    }
-  });
-
-  it("連線失敗保留；沒有連線時全部 deferred", async () => {
-    await spoolOne(1);
-    await spoolOne(2);
-    const offline = await flushSpool({ dir, connection: null, log });
-    expect(offline).toMatchObject({ deferred: 2, remaining: 2 });
-
-    const fetchImpl = (async () => {
-      throw new Error("ECONNREFUSED");
-    }) as typeof fetch;
-    const failed = await flushSpool({ dir, connection: CONNECTION, log, fetchImpl });
-    expect(failed).toMatchObject({ deferred: 1, remaining: 2 });
-  });
-
-  it("損壞的 spool 檔移到 failed/", async () => {
-    await writeSpool({ dir, payload: payload(1), log });
-    const name = "1-badbadbadbad.json";
-    await writeFile(path.join(dir, name), "{not json", "utf8");
-
-    const result = await flushSpool({ dir, connection: CONNECTION, log });
-    expect(result.failed).toBeGreaterThanOrEqual(1);
-    expect(await readdir(path.join(dir, "failed"))).toContain(name);
-  });
-});
-
-describe("postMemory", () => {
-  it("200／201 成功，其餘視為失敗", async () => {
-    const ok = await postMemory({
-      connection: CONNECTION,
-      payload: payload(1),
-      fetchImpl: (async () => jsonResponse({ duplicate: true }, 200)) as typeof fetch,
+    const posts: unknown[] = [];
+    const second = createSourceSpool({
+      dir, log: () => undefined,
+      fetchImpl: async (url, init) => {
+        if (String(url).endsWith("/memory-policy")) return Response.json({ maskSecrets: false, version: 2 });
+        const body = JSON.parse(String(init?.body));
+        posts.push(body);
+        return success(body, true);
+      },
     });
-    expect(ok).toEqual({ ok: true, status: 200, duplicate: true });
-
-    const bad = await postMemory({
-      connection: CONNECTION,
-      payload: payload(1),
-      fetchImpl: (async () => jsonResponse({}, 422)) as typeof fetch,
-    });
-    expect(bad).toEqual({ ok: false, status: 422, reason: "http" });
+    await second.flush(async () => connection);
+    expect(posts).toEqual([expected]);
+    expect(await fs.readdir(dir)).toEqual([]);
+    expect(JSON.stringify(logs)).not.toContain(secret);
   });
+
+  it("政策明確關閉時保持原文；舊 schema 保留而不誤送，413 不阻擋其他事件", async () => {
+    const logs: string[] = [];
+    const legacyFile = path.join(dir, "old.json");
+    const legacy = JSON.stringify({ schemaVersion: 1, payload: { content: "舊卡片" } });
+    await fs.writeFile(legacyFile, legacy);
+    let accept = false;
+    const posts: SourceWriteRequest[] = [];
+    const spool = createSourceSpool({
+      dir, log: (_event, fields) => { if (typeof fields?.reason === "string") logs.push(fields.reason); },
+      fetchImpl: async (url, init) => {
+        if (String(url).endsWith("/memory-policy")) return Response.json({ maskSecrets: accept, version: accept ? 2 : 1 });
+        const body = JSON.parse(String(init?.body)) as SourceWriteRequest;
+        posts.push(body);
+        if (!accept) return Response.json({}, { status: 503 });
+        if (body.sourceTurn === "1") return Response.json({}, { status: 413 });
+        return success(body);
+      },
+    });
+    const plain = payload(1, "Bearer " + "k".repeat(24));
+    await spool.add(plain, async () => connection);
+    await spool.add(payload(2), async () => connection);
+    expect(await fs.readdir(dir)).toHaveLength(3);
+    accept = true;
+    await spool.flush(async () => connection);
+    expect(posts.filter((body) => body.sourceTurn === "1")).toEqual([plain, plain]);
+    expect(posts.filter((body) => body.sourceTurn === "2")).toHaveLength(2);
+    expect(await fs.readFile(legacyFile, "utf8")).toBe(legacy);
+    expect(await fs.readdir(dir)).toHaveLength(2);
+    expect(logs).toContain("legacy-spool-needs-migration");
+    expect(logs).toContain("source-too-large");
+  });
+
+  it("超過舊上限仍保留所有事件", async () => {
+    const spool = createSourceSpool({ dir, log: () => undefined });
+    await Promise.all(Array.from({ length: 205 }, (_, index) => spool.add(payload(index), async () => null)));
+    expect(await fs.readdir(dir)).toHaveLength(205);
+  }, 15000);
 });

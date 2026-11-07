@@ -257,10 +257,10 @@ interface EmbedDocumentsOptions {
 涵蓋範圍：
 
 - `embedDocuments` 的**單筆視窗**：`inputs` 只有一筆，或批次視窗因預算縮窗縮到剩一筆時。
-- 單筆文字入口：`embedQuery`／`embedDocument`。生產路徑目前只有兩處：`/search` 的
-  `embedQuery` 查詢，以及 desktop 啟動時的模型驗證短字串；`embedDocument` 是介面方法，
-  目前非熱路徑（索引走批次方法 `embedDocuments`）。**記憶寫入（`POST /memories`）不經
-  embedder**：它只寫 metadata store，不產生向量、不進索引，因此不受這條上限保護。
+- 單筆文字入口：`embedQuery`／`embedDocument`。檔案搜尋與記憶召回使用 `embedQuery`；
+  記憶背景 worker 使用 `embedDocument`，同樣受實際 token 上限保護。寫入端點先保存、
+  不同步等待嵌入；原文來源先以確定性規則切塊，再逐片段嵌入，完整回合不當成單一輸入。
+  超限片段保留來源並標記 `too-long`，不得截短後假稱索引完整。原文契約見 [原文記憶](raw-memory.md)。
 - **不涵蓋圖片**：影像前處理的 token 數由模型設定自然有界（本專案實測 `pixel_values`
   一律 `[1,630,768]`，與圖尺寸無關），因此圖片路徑沒有這條上限。
 
