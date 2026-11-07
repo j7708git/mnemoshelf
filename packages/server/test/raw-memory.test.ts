@@ -454,6 +454,72 @@ it("v2 備份保存來源關係，重複匯入去重且預檢衝突時全批未�
   expect(await backup(target)).not.toContain("不應新增");
 });
 
+it.each([true, false])("v2 備份還原到空庫後保留原文整回合的釘選狀態（pinned=%s）", async (pinned) => {
+  const original = await start();
+  const target = await start();
+  const saved = await write(original, event({ messages: [
+    message("question", "需要保留的合成提問"),
+    message("answer", "完整合成答覆".repeat(240), "assistant"),
+  ] }));
+  expect(saved.memoryIds.length).toBeGreaterThan(2);
+  const memoryId = saved.memoryIds[1]!;
+  expect((await api(original, "POST", `/memories/${memoryId}/pin`)).status).toBe(200);
+  if (!pinned) expect((await api(original, "POST", `/memories/${memoryId}/pin`, { body: { pinned: false } })).status).toBe(200);
+  expect((await original.store.listMemorySourceChunks(saved.source.id)).every((memory) => memory.pinned === pinned)).toBe(true);
+
+  const file = await backup(original);
+  expect(JSON.parse(file)).toMatchObject({ schemaVersion: 2, type: "source", pinned });
+  expect(await restore(target, file, true)).toMatchObject({ status: 200, body: { created: 0, wouldCreate: 1 } });
+  expect(await target.store.listMemoriesForExport()).toEqual([]);
+  expect(await target.store.listMemorySourcesForExport()).toEqual([]);
+  expect(await restore(target, file)).toMatchObject({ status: 200, body: { created: 1, duplicates: 0 } });
+  const [source] = await target.store.listMemorySourcesForExport();
+  const chunks = await target.store.listMemorySourceChunks(source!.id);
+  expect(chunks).toHaveLength(saved.memoryIds.length);
+  expect(chunks.map((memory) => memory.pinned)).toEqual(saved.memoryIds.map(() => pinned));
+
+  // 同事件重送不應將使用者後來的釘選選擇還原成備份時的值。
+  expect((await api(target, "POST", `/memories/${chunks[0]!.id}/pin`, { body: { pinned: !pinned } })).status).toBe(200);
+  for (const dryRun of [true, false]) {
+    expect(await restore(target, file, dryRun)).toMatchObject({ status: 200, body: { created: 0, duplicates: 1 } });
+    expect((await target.store.listMemorySourceChunks(source!.id)).map((memory) => memory.pinned))
+      .toEqual(saved.memoryIds.map(() => !pinned));
+  }
+  expect(JSON.parse(await backup(target))).toMatchObject({ pinned: !pinned });
+});
+
+it("舊 v2 來源備份未帶 pinned 時仍可預檢及還原，預設整回合未釘選", async () => {
+  const target = await start();
+  const payload = event({ messages: [message("question", "合成提問"), message("answer", "合成答覆", "assistant")] });
+  const file = JSON.stringify({ schemaVersion: 2, type: "source", source: payload, createdAt: "2026-01-01T00:00:00Z" });
+  expect(await restore(target, file, true)).toMatchObject({ status: 200, body: { created: 0, wouldCreate: 1 } });
+  expect(await target.store.listMemorySourcesForExport()).toEqual([]);
+  expect(await restore(target, file)).toMatchObject({ status: 200, body: { created: 1 } });
+  const [source] = await target.store.listMemorySourcesForExport();
+  expect(source?.messages).toEqual(payload.messages);
+  expect((await target.store.listMemorySourceChunks(source!.id)).map((memory) => memory.pinned)).toEqual([false, false]);
+});
+
+it.each([null, 1, "true", [], {}].map((pinned) => ({ pinned })))(
+  "v2 原文 pinned 非布林值時預檢與匯入都拒絕整批（$pinned）",
+  async ({ pinned }) => {
+    const target = await start();
+    const row = { schemaVersion: 2, type: "source", source: event(), createdAt: "2026-01-01T00:00:00Z", pinned: true };
+    const file = [
+      row,
+      { schemaVersion: 2, type: "memory", memory: { content: "不應寫入的短記憶", agent: "legacy" } },
+      { ...row, source: event({ sourceTurn: "another" }), pinned },
+    ].map((value) => JSON.stringify(value)).join("\n");
+    for (const dryRun of [true, false]) {
+      expect(await restore(target, file, dryRun)).toMatchObject({
+        status: 400, body: { created: 0, wouldCreate: 0, invalid: [{ line: 3, reason: "pinned 必須是布林值" }] },
+      });
+      expect(await target.store.listMemoriesForExport()).toEqual([]);
+      expect(await target.store.listMemorySourcesForExport()).toEqual([]);
+    }
+  },
+);
+
 it("匯入預檢與其他來源寫入共用佇列，衝突事件不會搶在批次內寫入", async () => {
   const instance = await start();
   const payload = event();

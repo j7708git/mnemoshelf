@@ -76,7 +76,7 @@ export interface MemoryImportPlan {
   /** 通過驗證的資料列。 */
   entries: MemoryImportEntry[];
   /** 通過驗證且已依同一政策快照備妥的原文來源。 */
-  sources: ReturnType<typeof prepareMemorySource>[];
+  sources: Array<ReturnType<typeof prepareMemorySource> & { pinned: boolean }>;
   /** 前 `MAX_MEMORY_IMPORT_ERRORS` 筆錯誤。 */
   invalid: MemoryImportLineError[];
   /** 不合法的行數（可能大於 `invalid.length`，用於計算 `valid`）。 */
@@ -143,7 +143,7 @@ export function serializeMemoriesExport(memories: readonly Memory[]): Buffer {
 
 /** 匯出 v2 的記憶與原文來源列，來源片段由匯入端重建。 */
 export function serializeRawMemoriesExport(
-  memories: readonly Memory[], sources: readonly MemorySource[], policy: MemoryPolicy,
+  memories: readonly Memory[], sources: readonly (MemorySource & { pinned: boolean })[], policy: MemoryPolicy,
 ): Buffer {
   const schemaVersion = RAW_MEMORY_EXPORT_SCHEMA_VERSION;
   const rows = memories.map((memory) => {
@@ -156,6 +156,7 @@ export function serializeRawMemoriesExport(
       type: "source",
       source: sourceBackupView(source, policy),
       createdAt: source.createdAt,
+      pinned: source.pinned,
     }));
   }
   return rows.length === 0 ? Buffer.alloc(0) : Buffer.from(`${rows.join("\n")}\n`, "utf8");
@@ -349,8 +350,11 @@ export function planMemoryImport(
           if (typeof parsed.createdAt !== "string" || !Number.isFinite(Date.parse(parsed.createdAt))) {
             lineError("createdAt 必須是有效的 ISO 8601 時間");
           }
+          if (parsed.pinned !== undefined && typeof parsed.pinned !== "boolean") {
+            lineError("pinned 必須是布林值");
+          }
           const source = prepareMemorySource(parseSourceWriteRequest(parsed.source), policy);
-          sources.push(source);
+          sources.push({ ...source, pinned: parsed.pinned ?? false });
           if (source.redactedCount > 0) redacted += 1;
           continue;
         }

@@ -1869,6 +1869,11 @@ export function createRestApp(deps: RestAppDeps): RestApp {
           });
         }
         const rows = await deps.store.listMemoriesForExport();
+        // 原文釘選保存在片段上；備份按整回合記錄，不另匯出每個片段。
+        const pinnedSourceIds = new Set(rows.flatMap((memory) =>
+          memory.sourceId != null && memory.pinned ? [memory.sourceId] : [],
+        ));
+        const sourceRecords = sources.map((source) => ({ ...source, pinned: pinnedSourceIds.has(source.id) }));
         return (policy) => {
           const present = createMemoryPresenter(policy);
           const memories = rows.flatMap((memory) => {
@@ -1879,7 +1884,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
             status: 200,
             bytes: schemaVersion === "1"
               ? serializeMemoriesExport(memories)
-              : serializeRawMemoriesExport(memories, sources, policy),
+              : serializeRawMemoriesExport(memories, sourceRecords, policy),
             contentType: MEMORY_EXPORT_CONTENT_TYPE,
             headers: { "content-disposition": `attachment; filename="${memoryExportFilename()}"` },
           };
@@ -1937,10 +1942,12 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       }
 
       let created = 0;
-      for (const { input, chunks } of newSources) {
+      for (const { input, chunks, pinned } of newSources) {
         const result = await deps.store.addMemorySource(input, chunks);
         if (result.duplicate) duplicates += 1;
         else {
+          const firstMemory = result.memories[0];
+          if (pinned && firstMemory !== undefined) await deps.store.setMemoryPinned(firstMemory.id, true);
           for (const memory of result.memories) deps.memoryEmbedder.enqueue(memory.id);
           created += 1;
         }
