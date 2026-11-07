@@ -4,7 +4,7 @@
  * 另一端用 SDK 的 `Client` 連上同一個框架（newline-delimited JSON），
  * 因此 initialize／tools/list／tools/call 都是真的協定往返。
  *
- * 驗收 3：initialize → tools/list（6 工具）→ tools/call（remember→search 找回同一筆；forget 後搜不到）；
+ * 驗收 3：initialize → tools/list（7 工具）→ tools/call（remember→search 找回同一筆；forget 後搜不到）；
  * token 錯誤時工具回報錯誤。
  */
 import { PassThrough } from "node:stream";
@@ -98,7 +98,7 @@ afterEach(async () => {
 });
 
 describe("MCP stdio 入口", () => {
-  it("initialize → tools/list（6 工具，描述含不受信任資料警語）", async () => {
+  it("initialize → tools/list（7 工具，描述含不受信任資料警語）", async () => {
     const harness = await startMcp();
     rest = harness.rest;
     mcp = harness.mcp;
@@ -113,6 +113,7 @@ describe("MCP stdio 入口", () => {
     expect(tools.tools.map((tool) => tool.name).sort()).toEqual([
       "forget",
       "list_roots",
+      "read_memory_source",
       "recall",
       "remember",
       "search",
@@ -154,6 +155,50 @@ describe("MCP stdio 入口", () => {
     ]);
     expect(searchMemories.description).toContain("MNEMOSHELF_PROJECT");
     expect(searchMemories.description).toContain("includeAllProjects");
+  });
+
+  it("read_memory_source 透過 REST 依範圍及政策版本讀取，回應標記不受信任", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+    const instance = rest.instance;
+    const synthetic = "fixture-value-" + "q".repeat(30);
+    await api(instance, "PATCH", "/memory-policy", { body: { maskSecrets: false } });
+    const saved = await api(instance, "POST", "/memory-sources", { body: {
+      agent: "source-fixture",
+      scope: "agent",
+      sourceSession: "session-a",
+      sourceTurn: "turn-a",
+      messages: [{
+        sourceMessage: "message-a",
+        role: "assistant",
+        content: ['合成回覆 password = "', synthetic, '"', "🪴".repeat(100)].join(""),
+        occurredAt: null,
+      }],
+    } });
+    expect(saved.status).toBe(201);
+    const { id } = (saved.body as { source: { id: number } }).source;
+    const call = (args: Record<string, unknown>) => harness.mcp.client.callTool({
+      name: "read_memory_source", arguments: { id, scope: "agent", ...args },
+    });
+    const noAgent = await call({});
+    expect(noAgent.isError).toBe(true);
+    const wrongAgent = await call({ agent: "other-fixture" });
+    expect(wrongAgent.isError).toBe(true);
+    const first = await call({ agent: "source-fixture", maxChars: 100 });
+    expect(first.isError).not.toBe(true);
+    expect(textOf(first)).toContain(synthetic);
+    const page = jsonOf<{ next: Record<string, number> }>(first);
+    expect(page).toMatchObject({ untrusted: true, policyVersion: 2, messages: [{ role: "assistant" }] });
+    expect(page.next).toMatchObject({ messageIndex: 0, policyVersion: 2 });
+
+    await api(instance, "PATCH", "/memory-policy", { body: { maskSecrets: true } });
+    const stale = await call({ agent: "source-fixture", ...page.next });
+    expect(stale.isError).toBe(true);
+    expect(textOf(stale)).toContain("policy-changed");
+    const current = await call({ agent: "source-fixture" });
+    expect(textOf(current)).toContain("[REDACTED:assignment]");
+    expect(textOf(current)).not.toContain(synthetic);
   });
 
   it("list_roots／search 轉發 REST，命中帶來源", async () => {
@@ -516,7 +561,7 @@ describe("MCP stdio 入口", () => {
 
     // 協定握手不需要 token（MCP 不重複實作授權）
     expect(harness.mcp.client.getServerVersion()?.name).toBe("mnemoshelf");
-    expect((await harness.mcp.client.listTools()).tools).toHaveLength(6);
+    expect((await harness.mcp.client.listTools()).tools).toHaveLength(7);
 
     const result = await harness.mcp.client.callTool({ name: "list_roots", arguments: {} });
     expect(result.isError).toBe(true);
@@ -1201,7 +1246,7 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
     const client = new Client({ name: "io-client", version: "0.0.0" });
     await client.connect(new StdioServerTransport(serverToClient, clientToServer));
     try {
-      expect((await client.listTools()).tools).toHaveLength(6);
+      expect((await client.listTools()).tools).toHaveLength(7);
       const result = await client.callTool({ name: "list_roots", arguments: {} });
       expect(result.isError).toBeFalsy();
     } finally {

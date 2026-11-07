@@ -60,7 +60,7 @@ root 記錄建立後、索引開始前先做一次乾跑（dry run），回報�
    - 瀏覽器設定檔與憑證存放區；
    - `.env`、`.env.*`（`.env.example` 除外）、`*.pem`、`*.key`、`id_rsa*`、`*.p12`、`*.kdbx`。
 3. **過寬的 root 要警告或拒絕**：根目錄、家目錄本身。要求使用者改選更具體的子目錄。
-4. **機密遮罩**：**記憶**與**檔案索引（文字／程式碼）**都已套用 curated 遮罩（見 §機密遮罩）；
+4. **機密遮罩**：**記憶**依 App 設定套用 curated 遮罩（預設開啟）；**檔案索引（文字／程式碼）**仍固定遮罩（見 §機密遮罩）；
    檔案索引在切塊、嵌入、入庫之前遮罩，媒體檔不套文字遮罩。仍是 curated 規則、**不是完整 DLP**，
    極少數程式內容可能被誤遮。
 5. **唯讀**：第一版對使用者檔案只讀不寫。
@@ -153,8 +153,12 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
 
 ## 機密遮罩（實作語意）
 
-記憶內容在**寫入前**與**讀取時**、以及檔案索引的文字／程式碼在**切塊前**，都會套用同一組 curated
-遮罩（實作在 `packages/core/src/privacy/secret-masking.ts`；server 端 `src/secret-masking.ts`
+記憶的「自動遮罩記憶中的機密」開關預設開啟，由同一資料目錄的服務持久保存。開啟時在
+**寫入前**與**讀取時**遮罩；關閉時保存／回傳已接收的內容。切換不改寫既有 DB、向量或舊 spool，
+不會還原已遮文字，也不能追回已送至 Agent 的內容。設定 API、原文跨 chunk 的完整訊息遮罩及
+分頁政策版本見 [原文記憶](raw-memory.md)。metadata 驗證、診斷與連線 token 不受開關影響。
+
+檔案索引的文字／程式碼仍在**切塊前**固定遮罩。兩者共用 curated 規則（實作在 `packages/core/src/privacy/secret-masking.ts`；server 端 `src/secret-masking.ts`
 只是轉出 shim，公開 API 不變）：
 
 - 規則涵蓋：PEM 私鑰區塊、常見 token 前綴（`sk-`、GitHub `ghp_`／`github_pat_`、Slack `xox?-`、
@@ -164,12 +168,11 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
   另帶 `redacted`／`redactedCount`（additive 欄位；`Memory` 公開型別不變）。
 - **不做全面熵遮罩**：常見的 commit SHA、UUID 不會被誤遮；但 curated 規則仍可能對**極少數**
   程式識別字誤判（例如特定長度的 dotted 名稱或套件名稱）。**寫入時的遮罩會改寫內容**（不可回復），
-  請以 `POST /memories` 回應的 `redacted`／`redactedCount` 確認是否被改寫；若在意原文，請先自行
-  檢查或不要把憑證寫進記憶。
+  請以 `POST /memories` 回應的 `redacted`／`redactedCount` 確認是否被改寫；使用者可在 App 關閉記憶內容遮罩，之後新寫入才保留原文；已遮內容無法復原。
 - **metadata 也受保護**：`agent`／`project` 在寫入時若偵測到 token-like 機密會直接 `400`
   （它們是查詢鍵，不能在寫入時改寫）；既有資料的 `agent`／`project` 在讀取回應中會套同一組遮罩。
-- 讀取路徑（`GET /memories`、`POST /memories/search`、`POST /search` 的記憶命中、MCP）會再遮一次，
-  因此**既有 DB 的未遮罩舊資料**也不會原文外流；遮罩是 idempotent。
+- 讀取路徑（`GET /memories`、`POST /memories/search`、`POST /search` 的記憶命中、MCP）在設定開啟時會再遮一次，
+  因此開啟時**既有 DB 的未遮罩舊資料**也會經規則處理；遮罩是 idempotent。
 - **檔案索引路徑**：文字／程式碼檔案在**切塊、嵌入、寫入 DB 之前**套用同一組遮罩，索引後的 chunk
   文字只有 `[REDACTED:<kind>]`、不含可辨識憑證；送進 embedder 的 `title`（相對路徑檔名）也先
   套同一組遮罩；使用者磁碟上的檔案**只讀不寫**（原文不變）。
@@ -196,9 +199,10 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
   帶 `?hard=true`（或 `hard=1`）則是**硬刪除**：資料列（含 FTS；向量同列欄位）真的刪除，
   API／查詢不再可見；可刪已軟刪除者。但**不做取證級抹除**（SQLite WAL／檔案系統頁面可能仍有
   殘留、at-rest 仍為明文）、也沒有加密（列後續）。
-- **JSONL 備份（已實作）**：`GET /memories/export`／`POST /memories/import` 只涵蓋**記憶**，
-  不含 chunk／向量與已刪除的歷史版本；匯入後向量由背景 worker 重建。匯出是**遮罩後視圖**
-  （與畫面同一組機密遮罩、只含未刪除的記憶），還原的是遮罩後內容而不是原文。
+- 原文片段的刪除／共享／釘選作用於整個回合；硬刪僅保留事件識別 hash 防止舊補送復活，不保留來源文字。詳見 [原文來源生命週期](raw-memory.md#來源的生命週期)。
+- **JSONL 備份**：`GET /memories/export`／`POST /memories/import` 只涵蓋**短記憶與原文來源**，
+  不含檢索 chunk／向量與已刪除的歷史版本；匯入後向量由背景 worker 重建。匯出依當下有效政策產生
+  （只含未刪除的記憶與原文來源）；開啟時還原的是遮罩後內容，關閉時保留已保存文字。
   備份檔案由**使用者自行保管**（下載位置、分享對象、保存期限都取決於使用者），內容可能包含
   專案內部資訊，請比照記憶本身的敏感度處理；不要把備份檔留在共用目錄或提交進版本控制。
 - 關閉注意（**取消索引、等一個推論批次、安全結束**）：服務關閉時會先**取消在途索引**（該輪
@@ -237,7 +241,7 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
 - **只改範圍欄位**：共享開關只改 `scope`／`project`；內容、種類、寫入者、取代關係、釘選與建立時間
   都原樣保留（內容編輯仍走 supersede，產生新版本）。不存在的 id 或已軟刪除的記憶 → `404`；
   不合法的主體 → `400`（未知欄位不靜默忽略，至少提供一個欄位）。
-- **寫入去重**：`POST /memories`（與 MCP `remember`）在寫入前用「遮罩後＋正規化後內容」的 sha256
+- **寫入去重**：`POST /memories`（與 MCP `remember`）在寫入前用「依政策處理後＋正規化後內容」的 sha256
   加上 `scope`／`project`／`agent` 比對**未刪除**記憶；重複時不新增，回 `200`＋既有記憶＋
   `duplicate: true`，呼叫端可帶 `force: true` 強制新增。`supersedes` 的編輯流程不套用去重。
   去重 hash 只存在本機 DB（`memories.content_hash`），不含原文、不做網路傳輸。
@@ -262,7 +266,7 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
   後者召回仍回 `200`＋關鍵字結果（與 `/search` 對過長查詢回 `400` 不同，因為召回有降級路徑）。
   關鍵字只在語意不足時「補足」，不會重排語意結果。
 - 每筆召回結果都帶 `source`（`semantic`／`keyword`）、`untrusted: true`、分數與完整記憶欄位
-  （含寫入者）；內容在讀取時會再遮一次機密；
+  （含寫入者）；內容在讀取時依有效記憶政策處理；
   記憶內容**仍是不受信任的資料**，不得當成指令。
 - `minScore`（0..1）只過濾語意結果；`k` 預設 10，**大於 100 會靜默夾到 100**（不是 `400`）。
 

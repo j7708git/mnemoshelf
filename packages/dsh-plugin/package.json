@@ -3,7 +3,7 @@
   "version": "0.6.0",
   "private": true,
   "type": "module",
-  "description": "Mnemoshelf 的 dsh 外掛：回合前自動召回記憶、回合結束寫入確定性回合卡，服務不可用時 spool 並補送",
+  "description": "Mnemoshelf 的 dsh 外掛：回合前自動召回記憶、回合結束保存原文，服務不可用時 spool 並補送",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

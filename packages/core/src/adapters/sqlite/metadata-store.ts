@@ -1,6 +1,23 @@
 import { DuplicateRootError } from "../../errors.js";
 import { memoryContentHash } from "../../memory/content-normalize.js";
 import {
+  assertMemorySourceChunks,
+  MemorySourceConflictError,
+  memorySourceEventHash,
+  normalizeMemorySourceEventCheck,
+  normalizeMemorySourceScope,
+  readMemoryPolicy,
+  validateMemorySourceWrite,
+  type MemoryPolicy,
+  type MemorySource,
+  type MemorySourceEventCheck,
+  type MemorySourceMessage,
+  type MemorySourceWriteResult,
+  type NewMemorySource,
+  type NewMemorySourceChunk,
+} from "../../memory/source.js";
+import {
+  assertMemoryEmbeddingCursor,
   assertMemoryEmbeddingFailure,
   assertMemoryEmbeddingInput,
   assertMemoryQueryVector,
@@ -42,7 +59,10 @@ import { buildMatchExpression, segmentText } from "./segment.js";
 const ROOT_COLUMNS = "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at";
 const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash";
 const MEMORY_COLUMNS =
-  "id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at";
+  `id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at,
+   source_id, message_index, chunk_index, source_start, source_end, chunk_version`;
+const MEMORY_SOURCE_COLUMNS =
+  "id, agent, scope, project, source_session, source_turn, messages_json, request_hash, chunk_version, created_at, deleted_at";
 
 function parseStringArray(value: unknown): string[] {
   if (typeof value !== "string") return [];
@@ -88,8 +108,30 @@ function rowToMemory(row: Record<string, unknown>): Memory {
     pinned: Number(row.pinned) !== 0,
     sourceSession: row.source_session === null || row.source_session === undefined ? null : String(row.source_session),
     sourceMessage: row.source_message === null || row.source_message === undefined ? null : String(row.source_message),
+    sourceId: row.source_id == null ? null : Number(row.source_id),
+    messageIndex: row.message_index == null ? null : Number(row.message_index),
+    chunkIndex: row.chunk_index == null ? null : Number(row.chunk_index),
+    sourceStart: row.source_start == null ? null : Number(row.source_start),
+    sourceEnd: row.source_end == null ? null : Number(row.source_end),
+    chunkVersion: row.chunk_version == null ? null : String(row.chunk_version),
     createdAt: String(row.created_at),
     deletedAt: row.deleted_at === null || row.deleted_at === undefined ? null : String(row.deleted_at),
+  };
+}
+
+function rowToMemorySource(row: Record<string, unknown>): MemorySource {
+  return {
+    id: Number(row.id),
+    agent: String(row.agent),
+    scope: String(row.scope) as MemoryScope,
+    project: row.project == null ? null : String(row.project),
+    sourceSession: String(row.source_session),
+    sourceTurn: String(row.source_turn),
+    messages: JSON.parse(String(row.messages_json)) as MemorySourceMessage[],
+    requestHash: String(row.request_hash),
+    chunkVersion: String(row.chunk_version),
+    createdAt: String(row.created_at),
+    deletedAt: row.deleted_at == null ? null : String(row.deleted_at),
   };
 }
 
@@ -182,6 +224,172 @@ export class SqliteMetadataStore implements MetadataStore {
 
   async migrate(): Promise<void> {
     runMigrations(this.db);
+  }
+
+  async getMemoryPolicy(): Promise<MemoryPolicy> {
+    return readMemoryPolicy(selectRow(this.db, "select mask_secrets, version from memory_policy where id = 1"));
+  }
+
+  async setMemoryPolicy(maskSecrets: boolean): Promise<MemoryPolicy> {
+    if (typeof maskSecrets !== "boolean") throw new TypeError("maskSecrets 必須是布林值");
+    return this.db.transaction(() => {
+      const current = readMemoryPolicy(selectRow(this.db, "select mask_secrets, version from memory_policy where id = 1"));
+      if (current.maskSecrets === maskSecrets) return current;
+      const row = selectRow(this.db, `
+        insert into memory_policy (id, mask_secrets, version) values (1, ?, ?)
+        on conflict (id) do update set mask_secrets = excluded.mask_secrets, version = excluded.version
+        returning mask_secrets, version`,
+      maskSecrets ? 1 : 0, current.version + 1);
+      if (row === undefined) throw new Error("記憶遮罩政策未寫入");
+      return readMemoryPolicy(row);
+    }).immediate();
+  }
+
+  async checkMemorySource(input: MemorySourceEventCheck): Promise<"available" | "duplicate"> {
+    const event = normalizeMemorySourceEventCheck(input);
+    return this.db.transaction(() => this.findSourceEvent(event, false) === undefined ? "available" : "duplicate")();
+  }
+
+  async addMemorySource(input: NewMemorySource, chunks: NewMemorySourceChunk[]): Promise<MemorySourceWriteResult> {
+    const sourceInput = validateMemorySourceWrite(input, chunks);
+    const { agent, scope, project, sourceSession, sourceTurn, messages, requestHash, chunkVersion } = sourceInput;
+    return this.db.transaction(() => {
+      const existing = this.findSourceEvent(sourceInput, true);
+      if (existing !== undefined) {
+        const source = rowToMemorySource(existing);
+        return { source, memories: this.readSourceChunks(source.id), duplicate: true };
+      }
+      const row = selectRow(this.db, `
+        insert into memory_sources (agent, scope, project, source_session, source_turn, messages_json, request_hash, chunk_version, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?) returning ${MEMORY_SOURCE_COLUMNS}`,
+      agent, scope, project, sourceSession, sourceTurn, JSON.stringify(messages), requestHash, chunkVersion, new Date().toISOString());
+      if (row === undefined) throw new Error("原文來源未寫入");
+      const source = rowToMemorySource(row);
+      return { source, memories: this.insertSourceChunks(source, chunks, false), duplicate: false };
+    }).immediate();
+  }
+
+  async getMemorySource(id: number): Promise<MemorySource | null> {
+    return this.readSource(id);
+  }
+
+  async listMemorySourcesForExport(): Promise<MemorySource[]> {
+    return selectRows(this.db,
+      `select ${MEMORY_SOURCE_COLUMNS} from memory_sources where deleted_at is null order by created_at, id`,
+    ).map(rowToMemorySource);
+  }
+
+  async listMemorySourceChunks(id: number): Promise<Memory[]> {
+    return this.readSourceChunks(id);
+  }
+
+  async memorySourceEmbeddingStats(id: number, embedderId: string): Promise<MemoryEmbeddingStats> {
+    return this.readMemoryEmbeddingStats(embedderId, id);
+  }
+
+  async replaceMemorySourceChunks(id: number, chunkVersion: string, chunks: NewMemorySourceChunk[]): Promise<Memory[]> {
+    return this.db.transaction(() => {
+      const source = this.readSource(id);
+      if (source === null || source.deletedAt !== null) return [];
+      assertMemorySourceChunks(source.messages, chunkVersion, chunks);
+      const pinned = selectRow(this.db, "select 1 from memories where source_id = ? and pinned = 1 limit 1", id) !== undefined;
+      this.removeSourceChunks(id);
+      this.db.prepare("update memory_sources set chunk_version = ? where id = ?").run(chunkVersion, id);
+      return this.insertSourceChunks({ ...source, chunkVersion }, chunks, pinned);
+    }).immediate();
+  }
+
+  async updateMemorySource(id: number, patch: MemoryPatch): Promise<MemorySource | null> {
+    return this.db.transaction(() => this.updateSource(id, patch)).immediate();
+  }
+
+  async deleteMemorySource(id: number, hard = false): Promise<boolean> {
+    return this.db.transaction(() => this.deleteSource(id, hard)).immediate();
+  }
+
+  private findSourceEvent(input: MemorySourceEventCheck, full: boolean): Record<string, unknown> | undefined {
+    const tombstone = selectRow(this.db, "select 1 from deleted_memory_sources where event_key_hash = ?", memorySourceEventHash(input));
+    if (tombstone !== undefined) throw new MemorySourceConflictError();
+    const columns = full ? MEMORY_SOURCE_COLUMNS : "deleted_at, request_hash";
+    const existing = selectRow(this.db,
+      `select ${columns} from memory_sources where agent = ? and source_session = ? and source_turn = ?`,
+      input.agent, input.sourceSession, input.sourceTurn);
+    if (existing !== undefined && (existing.deleted_at !== null || existing.request_hash !== input.requestHash)) {
+      throw new MemorySourceConflictError();
+    }
+    return existing;
+  }
+
+  private readSource(id: number): MemorySource | null {
+    const row = selectRow(this.db, `select ${MEMORY_SOURCE_COLUMNS} from memory_sources where id = ?`, id);
+    return row === undefined ? null : rowToMemorySource(row);
+  }
+
+  private readSourceChunks(id: number): Memory[] {
+    return selectRows(this.db,
+      `select ${MEMORY_COLUMNS} from memories where source_id = ? and deleted_at is null order by chunk_index`, id,
+    ).map(rowToMemory);
+  }
+
+  private insertSourceChunks(source: MemorySource, chunks: readonly NewMemorySourceChunk[], pinned: boolean): Memory[] {
+    const insert = this.db.prepare<unknown[], Record<string, unknown>>(`
+      insert into memories (
+        content, kind, scope, project, agent, pinned, source_session, source_message, created_at,
+        source_id, message_index, chunk_index, source_start, source_end, chunk_version
+      ) values (?, 'fact', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning ${MEMORY_COLUMNS}`);
+    return chunks.map(({ content, messageIndex, chunkIndex, start, end }) => {
+      const row = insert.get(
+        content, source.scope, source.project, source.agent, pinned ? 1 : 0,
+        source.sourceSession, source.messages[messageIndex]!.sourceMessage, source.createdAt,
+        source.id, messageIndex, chunkIndex, start, end, source.chunkVersion,
+      );
+      if (row === undefined) throw new Error("原文切塊未寫入");
+      const memory = rowToMemory(row);
+      this.insertMemoryFts(memory.id, content);
+      return memory;
+    });
+  }
+
+  private insertMemoryFts(id: number, content: string): void {
+    if (content.trim().length > 0) {
+      this.db.prepare("insert into memories_fts(rowid, seg) values (?, ?)").run(id, segmentText(content));
+    }
+  }
+
+  private removeSourceChunks(id: number): void {
+    this.db.prepare("delete from memories_fts where rowid in (select id from memories where source_id = ?)").run(id);
+    this.db.prepare("delete from memories where source_id = ?").run(id);
+  }
+
+  private updateSource(id: number, patch: MemoryPatch): MemorySource | null {
+    const source = this.readSource(id);
+    if (source === null || source.deletedAt !== null) return null;
+    const next = normalizeMemorySourceScope(source, patch);
+    this.db.prepare("update memory_sources set scope = ?, project = ? where id = ?").run(next.scope, next.project, id);
+    this.db.prepare("update memories set scope = ?, project = ? where source_id = ?").run(next.scope, next.project, id);
+    return { ...source, ...next };
+  }
+
+  private deleteSource(id: number, hard: boolean): boolean {
+    const source = this.readSource(id);
+    if (source === null) return false;
+    if (hard) {
+      this.db.prepare("insert into deleted_memory_sources (event_key_hash) values (?) on conflict do nothing")
+        .run(memorySourceEventHash(source));
+      this.removeSourceChunks(id);
+      this.db.prepare("delete from memory_sources where id = ?").run(id);
+    } else if (source.deletedAt === null) {
+      const deletedAt = new Date().toISOString();
+      this.db.prepare("update memory_sources set deleted_at = ? where id = ?").run(deletedAt, id);
+      this.db.prepare("update memories set deleted_at = ? where source_id = ?").run(deletedAt, id);
+    }
+    return true;
+  }
+
+  private markSuperseded(id: number, deletedAt: string): void {
+    const existing = selectRow(this.db, "select source_id from memories where id = ?", id);
+    if (existing?.source_id != null) throw new MemorySourceConflictError();
+    this.db.prepare("update memories set deleted_at = ? where id = ? and deleted_at is null").run(deletedAt, id);
   }
 
   async addRoot(r: NewRoot): Promise<Root> {
@@ -350,9 +558,7 @@ export class SqliteMetadataStore implements MetadataStore {
     const createdAt = new Date().toISOString();
     const insert = this.db.transaction((): number => {
       if (m.supersedes !== null) {
-        this.db
-          .prepare("update memories set deleted_at = ? where id = ? and deleted_at is null")
-          .run(createdAt, m.supersedes);
+        this.markSuperseded(m.supersedes, createdAt);
       }
       const info = this.db
         .prepare(
@@ -372,13 +578,11 @@ export class SqliteMetadataStore implements MetadataStore {
           memoryContentHash(m.content),
         );
       const memoryId = Number(info.lastInsertRowid);
-      if (m.content.trim().length > 0) {
-        this.db.prepare("insert into memories_fts(rowid, seg) values (?, ?)").run(memoryId, segmentText(m.content));
-      }
+      this.insertMemoryFts(memoryId, m.content);
       return memoryId;
     });
 
-    const memoryId = insert();
+    const memoryId = insert.immediate();
     const created = await this.getMemory(memoryId);
     if (created === null) throw new Error("新增記憶後讀不回資料列");
     return created;
@@ -401,9 +605,7 @@ export class SqliteMetadataStore implements MetadataStore {
 
     const attempt = this.db.transaction((): { id: number; duplicate: boolean } => {
       if (m.supersedes !== null) {
-        this.db
-          .prepare("update memories set deleted_at = ? where id = ? and deleted_at is null")
-          .run(createdAt, m.supersedes);
+        this.markSuperseded(m.supersedes, createdAt);
       }
 
       const info = this.db
@@ -412,7 +614,7 @@ export class SqliteMetadataStore implements MetadataStore {
            select ?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?
             where not exists (
               select 1 from memories
-               where content_hash = ? and scope = ? and project is ? and agent = ? and deleted_at is null
+               where content_hash = ? and scope = ? and project is ? and agent = ? and deleted_at is null and source_id is null
             )`,
         )
         .run(
@@ -436,7 +638,7 @@ export class SqliteMetadataStore implements MetadataStore {
         const existing = selectRow(
           this.db,
           `select ${MEMORY_COLUMNS} from memories
-            where content_hash = ? and scope = ? and project is ? and agent = ? and deleted_at is null
+            where content_hash = ? and scope = ? and project is ? and agent = ? and deleted_at is null and source_id is null
             order by id
             limit 1`,
           contentHash,
@@ -449,25 +651,34 @@ export class SqliteMetadataStore implements MetadataStore {
       }
 
       const memoryId = Number(info.lastInsertRowid);
-      if (m.content.trim().length > 0) {
-        this.db.prepare("insert into memories_fts(rowid, seg) values (?, ?)").run(memoryId, segmentText(m.content));
-      }
+      this.insertMemoryFts(memoryId, m.content);
       return { id: memoryId, duplicate: false };
     });
 
-    const { id, duplicate } = attempt();
+    const { id, duplicate } = attempt.immediate();
     const memory = await this.getMemory(id);
     if (memory === null) throw new Error("新增記憶後讀不回資料列");
     return { memory, duplicate };
   }
 
   async getMemory(id: number): Promise<Memory | null> {
+    return this.readMemory(id);
+  }
+
+  private readMemory(id: number): Memory | null {
     const row = selectRow(this.db, `select ${MEMORY_COLUMNS} from memories where id = ?`, id);
     return row === undefined ? null : rowToMemory(row);
   }
 
   async forgetMemory(id: number): Promise<void> {
-    this.db.prepare("update memories set deleted_at = ? where id = ? and deleted_at is null").run(new Date().toISOString(), id);
+    this.db.transaction(() => {
+      const row = selectRow(this.db, "select source_id from memories where id = ?", id);
+      if (row?.source_id != null) {
+        this.deleteSource(Number(row.source_id), false);
+      } else {
+        this.db.prepare("update memories set deleted_at = ? where id = ? and deleted_at is null").run(new Date().toISOString(), id);
+      }
+    }).immediate();
   }
 
   /**
@@ -480,13 +691,13 @@ export class SqliteMetadataStore implements MetadataStore {
   async normalizeLegacyMemoryScopes(): Promise<{ updated: number }> {
     const normalize = this.db.transaction((): number => {
       const clearedProject = this.db
-        .prepare("update memories set project = null where scope in ('global', 'agent') and project is not null")
+        .prepare("update memories set project = null where scope in ('global', 'agent') and project is not null and source_id is null")
         .run();
       const promotedScope = this.db
         .prepare(
           `update memories
               set scope = 'global', project = null
-            where scope = 'project' and (project is null or trim(project) = '')`,
+            where scope = 'project' and (project is null or trim(project) = '') and source_id is null`,
         )
         .run();
       return Number(clearedProject.changes) + Number(promotedScope.changes);
@@ -503,18 +714,26 @@ export class SqliteMetadataStore implements MetadataStore {
    */
   async hardDeleteMemory(id: number): Promise<boolean> {
     const remove = this.db.transaction((): boolean => {
-      const existing = selectRow(this.db, "select id from memories where id = ?", id);
+      const existing = selectRow(this.db, "select source_id from memories where id = ?", id);
       if (existing === undefined) return false;
+      if (existing.source_id != null) return this.deleteSource(Number(existing.source_id), true);
       this.db.prepare("delete from memories_fts where rowid = ?").run(id);
       this.db.prepare("delete from memories where id = ?").run(id);
       return true;
     });
-    return remove();
+    return remove.immediate();
   }
 
   /** 設定釘選（冪等）；不存在的 id 更新不到任何列，等同無操作。 */
   async setMemoryPinned(id: number, pinned: boolean): Promise<void> {
-    this.db.prepare("update memories set pinned = ? where id = ?").run(pinned ? 1 : 0, id);
+    this.db.transaction(() => {
+      const row = selectRow(this.db, "select source_id from memories where id = ?", id);
+      if (row?.source_id != null) {
+        this.db.prepare("update memories set pinned = ? where source_id = ? and deleted_at is null").run(pinned ? 1 : 0, row.source_id);
+      } else {
+        this.db.prepare("update memories set pinned = ? where id = ?").run(pinned ? 1 : 0, id);
+      }
+    }).immediate();
   }
 
   /**
@@ -525,14 +744,17 @@ export class SqliteMetadataStore implements MetadataStore {
    * 的競態也回 `null`，與 PG 端的 `returning` 語意一致。內容沒動，因此 FTS 列不必更新。
    */
   async updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null> {
-    const existing = await this.getMemory(id);
-    if (existing === null || existing.deletedAt !== null) return null;
-
-    const next = normalizeMemoryPatch(existing, patch);
-    this.db
-      .prepare("update memories set scope = ?, project = ? where id = ? and deleted_at is null")
-      .run(next.scope, next.project, id);
-    return await this.getMemory(id);
+    return this.db.transaction(() => {
+      const existing = this.readMemory(id);
+      if (existing === null || existing.deletedAt !== null) return null;
+      if (existing.sourceId != null) {
+        const source = this.updateSource(existing.sourceId, patch);
+        return source === null ? null : { ...existing, scope: source.scope, project: source.project };
+      }
+      const next = normalizeMemoryPatch(existing, patch);
+      this.db.prepare("update memories set scope = ?, project = ? where id = ?").run(next.scope, next.project, id);
+      return { ...existing, ...next };
+    }).immediate();
   }
 
   /**
@@ -571,7 +793,8 @@ export class SqliteMetadataStore implements MetadataStore {
    * `embedding_embedder_id is null` 也視為 stale：`ready` 正常一定有 embedder id，但防禦
    * 早期手動改資料或未來遷移留下的半套狀態。
    */
-  async listMemoriesNeedingEmbedding(embedderId: string, limit?: number): Promise<Memory[]> {
+  async listMemoriesNeedingEmbedding(embedderId: string, limit?: number, before?: Pick<Memory, "createdAt" | "id">): Promise<Memory[]> {
+    assertMemoryEmbeddingCursor(before);
     const normalized = normalizeMemoryLimit(limit);
     if (normalized === 0) return [];
 
@@ -582,15 +805,21 @@ export class SqliteMetadataStore implements MetadataStore {
           and (embedding_state in ('pending', 'failed')
                or (embedding_state = 'ready'
                    and (embedding_embedder_id is null or embedding_embedder_id <> ?)))
+          ${before === undefined ? "" : "and (created_at, id) < (?, ?)"}
         order by created_at desc, id desc
         limit ?`,
       embedderId,
+      ...(before === undefined ? [] : [before.createdAt, before.id]),
       normalized,
     ).map(rowToMemory);
   }
 
   /** 統計未刪除記憶的語意化狀態（見 `MetadataStore.memoryEmbeddingStats`；四個狀態數自洽）。 */
   async memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats> {
+    return this.readMemoryEmbeddingStats(embedderId);
+  }
+
+  private readMemoryEmbeddingStats(embedderId: string, sourceId?: number): MemoryEmbeddingStats {
     const row = selectRow(
       this.db,
       `select
@@ -604,8 +833,9 @@ export class SqliteMetadataStore implements MetadataStore {
                 and (embedding_embedder_id is null or embedding_embedder_id <> ?)
                then 1 else 0
              end) as stale
-       from memories where deleted_at is null`,
+       from memories where deleted_at is null ${sourceId === undefined ? "" : "and source_id = ?"}`,
       embedderId,
+      ...(sourceId === undefined ? [] : [sourceId]),
     );
 
     const count = (value: unknown): number => Number(value ?? 0);

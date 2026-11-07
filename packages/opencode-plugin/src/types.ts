@@ -36,14 +36,11 @@ export interface Settings {
   dedupeTTL: number;
   /** 每次召回固定注入最近幾筆回合紀錄（0–5；0＝關閉）。 */
   recentTurns: number;
-  /** 回合結束自動摘要（digest）總開關；預設關閉。 */
-  digestEnabled: boolean;
-  /** digest 用的模型（`<providerID>/<modelID>`）；未設定＝跳過，不退回目前 session 模型。 */
-  digestModel: string | null;
-  /** `interrupted`（非 shutdown）是否也補寫；預設關閉。 */
-  digestOnInterrupted: boolean;
-  /** digest 模型呼叫／模型清單檢查的 timeout（毫秒，3000–120000）；預設 45000。 */
-  digestTimeoutMs: number;
+  /** 回合結束後保存原文，預設關閉。 */
+  captureEnabled: boolean;
+  /** 明確允許保存非 shutdown／superseded 的中斷回合。 */
+  captureOnInterrupted: boolean;
+  spoolDir?: string;
 }
 
 /** 連線來源（除錯與 `/memory` 顯示用；不含 token）。 */
@@ -87,6 +84,14 @@ export interface RecallHit {
   /** `semantic`＝cosine；`keyword`＝`1/rank`（僅供排序，不是 cosine）。 */
   source: "semantic" | "keyword";
   score: number;
+  sourceType?: "raw-turn" | "legacy-memory";
+  sourceId?: number | null;
+  role?: "user" | "assistant";
+  messageIndex?: number | null;
+  snippetStart?: number;
+  snippetEnd?: number;
+  snippetAnchor?: number;
+  truncated?: boolean;
   rank?: number;
 }
 
@@ -159,64 +164,12 @@ export interface CommandEditorLike {
   }): void;
 }
 
-/** 宿主 `Session.Info` 中本外掛會用到的欄位（digest 的 ownership／subagent 判斷）。 */
+/** 宿主 `Session.Info` 中本外掛會用到的欄位（原文擷取的 ownership／subagent 判斷）。 */
 export interface SessionInfoLike {
-  /** 非空代表這是 subagent session（digest 跳過）。 */
+  /** 非空代表這是 subagent session（原文擷取跳過）。 */
   parentID?: string | null;
   /** session 所屬的 location（worktree／目錄）。 */
   location?: { directory?: string } | null;
-}
-
-/** 送給 `ctx.generate.text` 的模型參照（`GenerateTextInput.model`）。 */
-export interface GenerateModelRefLike {
-  id: string;
-  providerID: string;
-  variant?: string;
-}
-
-/** 本外掛用到的 `ctx.generate` 子集。 */
-export interface GenerateDomainLike {
-  text(
-    input: { prompt: string; model?: GenerateModelRefLike | null },
-    options?: { signal?: AbortSignal },
-  ): Promise<{ text: string }>;
-}
-
-/** 本外掛用到的 `ctx.storage` 子集（plugin 專屬的持久 KV）。 */
-export interface StorageLike {
-  get(key: string): Promise<unknown>;
-  set(key: string, value: unknown): Promise<void>;
-  remove(key: string): Promise<void>;
-  scan(options: {
-    prefix: string;
-    after?: string;
-    limit?: number;
-  }): Promise<{ entries: readonly { readonly key: string; readonly value: unknown }[]; next?: string }>;
-}
-
-/**
- * 宿主模型清單的一筆（`ctx.model.list()` 回傳的 `data`）。
- *
- * `@opencode/plugin` 2.1.1 的 `ModelDomain.list()` 回 `{ location, data: Model.Info[] }`，
- * 其中 `Model.Info` 同時有 `id` 與 `modelID`（多數 provider 兩者相同）。`generate.text`
- * 解析模型時比對的是 `providerID` + `id`，所以 digest 的啟動期驗證也用這兩個欄位。
- */
-export interface ModelInfoLike {
-  /** 模型在宿主內的 id（`generate.text` 接受的那個）。 */
-  id: string;
-  /** provider 原始 model id；部分宿主會與 `id` 不同（別名）。 */
-  modelID?: string;
-  providerID: string;
-}
-
-/** `ctx.model.list()` 的回傳（只宣告本外掛會用到的欄位）。 */
-export interface ModelListOutputLike {
-  data?: readonly ModelInfoLike[];
-}
-
-/** 本外掛用到的 `ctx.model` 子集（digest 的啟動期模型驗證）。 */
-export interface ModelDomainLike {
-  list(input?: { location?: { directory?: string } }): Promise<ModelListOutputLike>;
 }
 
 /** 本外掛用到的 `ctx.session` 子集。 */
@@ -226,9 +179,9 @@ export interface SessionDomainLike {
     callback: (event: ContextEventLike) => Promise<void> | void,
   ): Promise<RegistrationLike | void>;
   synthetic(input: { sessionID: string; text: string }): Promise<unknown>;
-  /** 取整個 session 的訊息（digest 的回合邊界靠它）。 */
+  /** 取整個 session 的訊息（原文擷取的回合邊界靠它）。 */
   context?(input: { sessionID: string }): Promise<unknown>;
-  /** 取 session 資訊（digest 的 ownership／subagent 判斷靠它）。 */
+  /** 取 session 資訊（原文擷取的 ownership／subagent 判斷靠它）。 */
   get?(input: { sessionID: string }): Promise<unknown>;
 }
 
@@ -244,14 +197,9 @@ export interface PluginContextLike {
   command?: {
     transform(callback: (editor: CommandEditorLike) => void): Promise<RegistrationLike | void>;
   };
-  /** 全域事件流（digest 訂閱 `session.execution.*`；召回不使用）。 */
+  /** 全域事件流（原文擷取訂閱 `session.execution.*`；召回不使用）。 */
   event?: { subscribe(options?: unknown): AsyncIterable<unknown> };
-  /** 指定模型的單次文字生成（digest 摘要用）。 */
-  generate?: GenerateDomainLike;
-  /** 宿主可用模型清單（digest 啟動期驗證 `digestModel` 是否存在）。 */
-  model?: ModelDomainLike;
-  /** plugin 專屬持久 KV（digest 的去重鍵與今日統計）。 */
-  storage?: StorageLike;
+
 }
 
 /** 結構化的單行 log。 */

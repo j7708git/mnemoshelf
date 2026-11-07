@@ -653,3 +653,64 @@ describe("最近回合紀錄（recent turns）", () => {
     expect(result.stats.turns).toBe(0);
   });
 });
+
+describe("原文片段的公平預算", () => {
+  it("高順位使用者片段不擠掉同來源較低順位的助理證據", () => {
+    const userClaim = "現在貼的是已撤回的條件，不可使用。";
+    const assistantAnswer = "正式條件是停機後確認輪盤無轉動，才可卸除固定架。";
+    const raw = (id: number, sourceId: number, role: "user" | "assistant", content: string): RecallHit => ({
+      id, sourceId, role, content, sourceType: "raw-turn", kind: "fact", project: "fixture",
+      createdAt: "", score: 1, source: "keyword",
+    });
+    const hits = [
+      raw(1, 10, "user", userClaim),
+      raw(2, 20, "assistant", "不相干的長資料。".repeat(75)),
+      raw(3, 30, "user", "次要使用者短訊息。"),
+      raw(4, 40, "user", "另一個來源的短訊息。"),
+      raw(5, 50, "assistant", "第五個來源不送出。"),
+      raw(6, 10, "assistant", assistantAnswer),
+      raw(7, 10, "user", "同一位置的重疊候選。"),
+      raw(8, 20, "user", "同一來源可保留第二角色。"),
+    ];
+    const result = planRecall({
+      hits, query: "正式條件是什麼？", project: "fixture", now: new Date(),
+      settings: { ...DEFAULT_SETTINGS, hardChars: 900 }, dedupe: new Map(), turn: 1,
+    });
+    expect(result.block).toContain(`[source id=10]\n  user: ${userClaim}\n  assistant: ${assistantAnswer}`);
+    expect(result.block).not.toContain("第五個來源");
+    expect(result.block).not.toContain("同一位置的重疊候選");
+    expect(result.block.length).toBeLessThanOrEqual(900);
+    expect(result.injected.map(({ id, sourceId }) => [id, sourceId])).toContainEqual([6, 10]);
+    expect(result.stats.kept).toBe(result.injected.length);
+  });
+});
+
+it.each([
+  {
+    text: "ANCHOR中文" + "🧪".repeat(100),
+    anchor: 0,
+    expected: /^ANCHOR中文(?:🧪)+…$/u,
+  },
+  {
+    text: "🧪".repeat(100) + "中文ANCHOR",
+    anchor: 200,
+    expected: /^…(?:🧪)+中文ANCHOR$/u,
+  },
+])("UTF-16 預算縮短高密度 emoji，保留靠近邊界的錨點 $anchor", ({ text, anchor, expected }) => {
+  const sourceLabel = "- [source id=7]";
+  const roleLabel = "  assistant: ";
+  const bodyLimit = 150;
+  const result = planRecall({
+    hits: [{
+      id: 1, sourceId: 7, role: "assistant", content: text, snippetAnchor: anchor,
+      sourceType: "raw-turn", kind: "fact", project: "fixture", createdAt: "", score: 1, source: "keyword",
+    }],
+    settings: { ...DEFAULT_SETTINGS, softChars: sourceLabel.length + roleLabel.length + bodyLimit + 2 },
+    project: "fixture", now: new Date(), dedupe: new Map(), turn: 1,
+  });
+  const line = result.block.split("\n").find((part) => part.startsWith(roleLabel));
+  const content = line?.slice(roleLabel.length) ?? "";
+  expect(content).toMatch(expected);
+  expect(content.length).toBeLessThanOrEqual(bodyLimit);
+  expect(content).not.toMatch(/[\uD800-\uDFFF]/u);
+});

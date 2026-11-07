@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.test.json",
+  "compilerOptions": {
+    "paths": {
+      "@mnemoshelf/core": ["../../../core/src/index.ts"],
+      "@mnemoshelf/core/testing": ["../../../core/src/testing/index.ts"],
+      "@mnemoshelf/embedder-transformers": ["../../../embedder-transformers/src/index.ts"],
+      "@huggingface/transformers": ["../../../embedder-transformers/node_modules/@huggingface/transformers/types/transformers.d.ts"]
+    }
+  },
+  "include": ["*.ts"]
+}

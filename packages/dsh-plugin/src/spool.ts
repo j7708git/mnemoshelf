@@ -1,275 +1,276 @@
 /**
- * 寫入 `POST /memories` 與 spool（離線補送）。
- *
- * spool 契約（T3 卡 §6.3）：
- * - 目錄 `~/.dsh/mnemoshelf-spool/`（0700），檔名 `<epoch-ms>-<sha256前12>.json`；
- * - tmp＋rename 原子寫入、檔案 0600；
- * - **不含 token／url**：補送時才從 runtime.json 取當下連線；
- * - 上限 200 筆，超過丟最舊；4xx（非 429）視為永久失敗移到 `failed/`。
+ * 原文回合的本機補送佇列。每個事件保留第一份準備好的 payload；
+ * 只有服務以正確格式確認保存後才移除。舊版 spool 仍保留在原處。
  */
 import { createHash, randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { constants, promises as fs } from "node:fs";
 import path from "node:path";
-import { SPOOL_LIMIT, WRITE_TIMEOUT_MS } from "./config.js";
-import { asRecord } from "./strip.js";
-import type { Connection, LogFn, MemoryWritePayload, SpoolRecord } from "./types.js";
+import { asRecord, isPositiveId, prepareSource, readMemoryPolicy } from "./raw-memory.js";
+import type { RawConnection, SourceWriteRequest } from "./raw-memory.js";
 
-export type PostResult =
-  | { ok: true; status: number; duplicate: boolean }
-  | { ok: false; status?: number; reason: "http" | "network" | "timeout" };
+type LogFn = (event: string, fields?: Record<string, string | number | boolean | null>) => void;
 
-/** 送出一張記憶卡；200（duplicate）與 201 都算成功。 */
-export async function postMemory(input: {
-  connection: Connection;
-  payload: MemoryWritePayload;
-  timeoutMs?: number;
-  fetchImpl?: typeof fetch;
-}): Promise<PostResult> {
-  const fetchImpl = input.fetchImpl ?? fetch;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), input.timeoutMs ?? WRITE_TIMEOUT_MS);
-  try {
-    const response = await fetchImpl(`${input.connection.baseUrl}/memories`, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        accept: "application/json",
-        authorization: `Bearer ${input.connection.token}`,
+interface SpoolRecord {
+  schemaVersion: 2;
+  payload: SourceWriteRequest;
+}
+
+type SpoolRead = { kind: "raw"; record: SpoolRecord } | { kind: "legacy" | "invalid" | "missing" };
+
+type PostResult =
+  | { ok: true; duplicate: boolean; status: number }
+  | { ok: false; reason: string; status?: number };
+
+function spoolName(payload: SourceWriteRequest): string {
+  const key = JSON.stringify([payload.agent, payload.sourceSession, payload.sourceTurn]);
+  return `raw-${createHash("sha256").update(key).digest("hex")}.json`;
+}
+
+function parseSpool(value: unknown): SpoolRead {
+  const record = asRecord(value);
+  if (record?.schemaVersion === 1) return { kind: "legacy" };
+  const payload = asRecord(record?.payload);
+  if (
+    record?.schemaVersion !== 2 || !payload ||
+    typeof payload.agent !== "string" || typeof payload.sourceSession !== "string" ||
+    typeof payload.sourceTurn !== "string" ||
+    (payload.scope !== "global" && payload.scope !== "project") ||
+    (payload.scope === "project" && typeof payload.project !== "string") ||
+    !Array.isArray(payload.messages) || payload.messages.length === 0 ||
+    !payload.messages.every((entry) => {
+      const message = asRecord(entry);
+      return message !== null &&
+        (message.role === "user" || message.role === "assistant") &&
+        typeof message.sourceMessage === "string" && typeof message.content === "string" &&
+        (message.occurredAt === null || typeof message.occurredAt === "string");
+    })
+  ) return { kind: "invalid" };
+  // 只允許協定所需欄位，手動修改／損壞的 spool 不會把額外資料帶到服務。
+  const source = payload as unknown as SourceWriteRequest;
+  return {
+    kind: "raw",
+    record: {
+      schemaVersion: 2,
+      payload: {
+        agent: source.agent,
+        scope: source.scope,
+        ...(source.scope === "project" ? { project: source.project } : {}),
+        sourceSession: source.sourceSession,
+        sourceTurn: source.sourceTurn,
+        messages: source.messages.map(({ sourceMessage, role, content, occurredAt }) =>
+          ({ sourceMessage, role, content, occurredAt })),
       },
-      body: JSON.stringify(input.payload),
-      signal: controller.signal,
-    });
-    if (response.status === 200 || response.status === 201) {
-      let duplicate = false;
-      try {
-        const parsed = asRecord(await response.json());
-        duplicate = parsed?.duplicate === true;
-      } catch {
-        // 回應不是 JSON 不影響「已寫入」的判定（狀態碼已足夠）。
-      }
-      return { ok: true, status: response.status, duplicate };
+    },
+  };
+}
+
+function fileMissing(error: unknown): boolean {
+  return (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT";
+}
+
+async function readSpool(file: string): Promise<SpoolRead> {
+  try {
+    const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      if (!(await handle.stat()).isFile()) return { kind: "invalid" };
+      return parseSpool(JSON.parse(await handle.readFile("utf8")));
+    } finally {
+      await handle.close();
     }
-    return { ok: false, status: response.status, reason: "http" };
-  } catch {
-    return { ok: false, reason: controller.signal.aborted ? "timeout" : "network" };
-  } finally {
-    clearTimeout(timer);
+  } catch (error) {
+    return { kind: fileMissing(error) ? "missing" : "invalid" };
   }
 }
 
-/** spool payload 的內容雜湊（前 12 碼 hex）；同內容不會重複入 spool。 */
-export function spoolHash(payload: MemoryWritePayload): string {
-  return createHash("sha256").update(JSON.stringify(payload)).digest("hex").slice(0, 12);
-}
-
-async function ensurePrivateDir(dir: string): Promise<void> {
+async function writeSpool(dir: string, file: string, record: SpoolRecord): Promise<void> {
   await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+  if (!(await fs.lstat(dir)).isDirectory()) throw new Error("invalid-spool-directory");
+  if (process.platform !== "win32") await fs.chmod(dir, 0o700);
+  const temporary = path.join(dir, `.${randomUUID()}.tmp`);
   try {
-    await fs.chmod(dir, 0o700);
-  } catch {
-    // Windows 沒有 POSIX 權限語意；資料夾落在使用者 profile 內。
-  }
-}
-
-async function listSpoolFiles(dir: string): Promise<string[]> {
-  let names: string[];
-  try {
-    names = await fs.readdir(dir);
-  } catch {
-    return [];
-  }
-  return names
-    .filter((name) => name.endsWith(".json") && !name.startsWith("."))
-    .sort((left, right) => left.localeCompare(right));
-}
-
-/** 寫入一筆 spool；回傳檔名或 null（已存在同內容、或寫入失敗）。 */
-export async function writeSpool(input: {
-  dir: string;
-  payload: MemoryWritePayload;
-  now?: Date;
-  log?: LogFn;
-}): Promise<string | null> {
-  const now = input.now ?? new Date();
-  const hash = spoolHash(input.payload);
-  try {
-    await ensurePrivateDir(input.dir);
-    const existing = await listSpoolFiles(input.dir);
-    if (existing.some((name) => name.endsWith(`-${hash}.json`))) {
-      input.log?.("spool-duplicate");
-      return null;
-    }
-
-    const createdAt = now.getTime();
-    const name = `${createdAt}-${hash}.json`;
-    const target = path.join(input.dir, name);
-    const tmp = path.join(input.dir, `.${name}.${process.pid}.${randomUUID()}.tmp`);
-    const record: SpoolRecord = { schemaVersion: 1, createdAt, payload: input.payload };
-    const handle = await fs.open(tmp, "w", 0o600);
+    const handle = await fs.open(temporary, "wx", 0o600);
     try {
       await handle.writeFile(JSON.stringify(record), "utf8");
       await handle.sync();
     } finally {
       await handle.close();
     }
-    await fs.rename(tmp, target);
     try {
-      await fs.chmod(target, 0o600);
-    } catch {
-      // Windows：略過。
+      // link 不覆蓋另一行程已經排入的事件；JSON 永遠以完整檔案出現。
+      await fs.link(temporary, file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | undefined)?.code !== "EEXIST") throw error;
     }
-
-    // 上限：超過就丟最舊（檔名以 epoch 開頭，字典序即時間序）。
-    const files = await listSpoolFiles(input.dir);
-    if (files.length > SPOOL_LIMIT) {
-      const excess = files.length - SPOOL_LIMIT;
-      for (const old of files.slice(0, excess)) {
-        try {
-          await fs.unlink(path.join(input.dir, old));
-        } catch {
-          // 單筆刪不掉不影響新寫入。
-        }
+    if (process.platform !== "win32") {
+      const directory = await fs.open(dir, "r");
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
       }
-      input.log?.("spool-trim", { removed: excess });
     }
-    input.log?.("spool-write");
-    return name;
-  } catch {
-    input.log?.("spool-error");
-    return null;
+  } finally {
+    await fs.unlink(temporary).catch(() => undefined);
   }
 }
 
-function isPayload(value: unknown): value is MemoryWritePayload {
-  const record = asRecord(value);
-  if (record === null) return false;
-  if (typeof record.content !== "string" || record.content.trim() === "") return false;
-  if (record.kind !== "fact") return false;
-  if (record.scope !== "project" && record.scope !== "global") return false;
-  if (record.scope === "project" && typeof record.project !== "string") return false;
-  if (record.agent !== "dsh/turn") return false;
-  if (typeof record.sourceSession !== "string" || record.sourceSession === "") return false;
-  if (typeof record.sourceMessage !== "string" || record.sourceMessage === "") return false;
-  return true;
-}
-
-function parseSpoolRecord(text: string): SpoolRecord | null {
-  let parsed: unknown;
+async function listSpool(dir: string): Promise<string[]> {
   try {
-    parsed = JSON.parse(text);
-  } catch {
-    return null;
+    if (!(await fs.lstat(dir)).isDirectory()) throw new Error("invalid-spool-directory");
+    return (await fs.readdir(dir)).filter((name) => !name.startsWith(".") && name.endsWith(".json")).sort();
+  } catch (error) {
+    if (fileMissing(error)) return [];
+    throw error;
   }
-  const record = asRecord(parsed);
-  if (record === null || record.schemaVersion !== 1) return null;
-  if (typeof record.createdAt !== "number" || !Number.isFinite(record.createdAt)) return null;
-  if (!isPayload(record.payload)) return null;
-  return { schemaVersion: 1, createdAt: record.createdAt, payload: record.payload };
 }
 
-async function moveToFailed(dir: string, name: string): Promise<void> {
-  const failedDir = path.join(dir, "failed");
+async function postSource(
+  connection: RawConnection,
+  payload: SourceWriteRequest,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+): Promise<PostResult> {
   try {
-    await ensurePrivateDir(failedDir);
-    await fs.rename(path.join(dir, name), path.join(failedDir, name));
-  } catch {
-    // 搬不動就留在原目錄，下輪再試（不會無限重試成功，但至少不消失）。
+    const response = await fetchImpl(`${connection.baseUrl}/memory-sources`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+        authorization: `Bearer ${connection.token}`,
+      },
+      body: JSON.stringify(payload),
+      redirect: "error",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const status = response.status;
+    if (status === 404) return { ok: false, status, reason: "upgrade-required" };
+    if (status === 413) return { ok: false, status, reason: "source-too-large" };
+    if (status === 409) return { ok: false, status, reason: "source-conflict" };
+    if (status !== 200 && status !== 201) return { ok: false, status, reason: "http" };
+
+    const result = asRecord(await response.json().catch(() => null));
+    const source = asRecord(result?.source);
+    if (
+      result?.saved !== true || !source || !isPositiveId(source.id) ||
+      source.agent !== payload.agent || source.sourceSession !== payload.sourceSession ||
+      source.sourceTurn !== payload.sourceTurn || source.messageCount !== payload.messages.length ||
+      typeof source.chunkVersion !== "string" || source.chunkVersion === "" ||
+      typeof source.createdAt !== "string" ||
+      !isPositiveId(result.policyVersion) || result.duplicate !== (status === 200) ||
+      typeof result.redacted !== "boolean" || typeof result.redactedCount !== "number" ||
+      !Number.isSafeInteger(result.redactedCount) || result.redactedCount < 0 ||
+      !Array.isArray(result.memoryIds) || !result.memoryIds.every(isPositiveId)
+    ) return { ok: false, status, reason: "upgrade-required" };
+    return { ok: true, status, duplicate: result.duplicate };
+  } catch (error) {
+    return { ok: false, reason: (error as Error | undefined)?.name === "TimeoutError" ? "timeout" : "network" };
   }
 }
 
-export interface FlushResult {
-  sent: number;
-  duplicate: number;
-  failed: number;
-  deferred: number;
-  remaining: number;
-}
-
-/**
- * 補送 spool。成功或 `duplicate` 刪除；4xx（非 429）移到 `failed/`；
- * 其餘（429／5xx／連線失敗／逾時）保留，並停在這裡避免風暴。
- */
-export async function flushSpool(input: {
+export function createSourceSpool(input: {
   dir: string;
-  connection: Connection | null;
   log: LogFn;
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
-  batch?: number;
-}): Promise<FlushResult> {
-  const files = await listSpoolFiles(input.dir);
-  const result: FlushResult = {
-    sent: 0,
-    duplicate: 0,
-    failed: 0,
-    deferred: 0,
-    remaining: files.length,
+}) {
+  const { dir, log, fetchImpl = fetch, timeoutMs = 5000 } = input;
+  let pending = Promise.resolve();
+  let lastState: string | undefined;
+  const report: LogFn = (event, fields) => {
+    if (event === "spool-ok" || event === "spool-deferred" || event === "spool-error") {
+      lastState = typeof fields?.reason === "string" ? fields.reason : event;
+    }
+    log(event, fields);
   };
-  if (files.length === 0) return result;
-  if (input.connection === null) {
-    result.deferred = files.length;
-    return result;
+
+  // 單一行程內依序讀寫，避免補送與新事件同時處理同一份檔。
+  function run<T>(task: () => Promise<T>): Promise<T> {
+    const work = pending.then(task);
+    pending = work.then(() => undefined, () => undefined);
+    return work;
   }
 
-  const batch = Math.max(1, input.batch ?? Number.POSITIVE_INFINITY);
-  let processed = 0;
-  for (const name of files) {
-    if (processed >= batch) break;
-    processed += 1;
-
-    let record: SpoolRecord | null = null;
-    try {
-      record = parseSpoolRecord(await fs.readFile(path.join(input.dir, name), "utf8"));
-    } catch {
-      record = null;
+  const deliver = async (file: string, payload: SourceWriteRequest, connection: RawConnection): Promise<PostResult> => {
+    const result = await postSource(connection, payload, fetchImpl, timeoutMs);
+    if (result.ok) {
+      await fs.unlink(file).catch((error: unknown) => {
+        if (!fileMissing(error)) report("spool-error", { reason: "cleanup-failed" });
+      });
+      report("spool-ok", { status: result.status, duplicate: result.duplicate });
+    } else {
+      report("spool-deferred", { reason: result.reason, status: result.status ?? null });
     }
-    if (record === null) {
-      await moveToFailed(input.dir, name);
-      result.failed += 1;
-      input.log("spool-failed", { reason: "invalid" });
-      continue;
-    }
+    return result;
+  };
 
-    const posted = await postMemory({
-      connection: input.connection,
-      payload: record.payload,
-      ...(input.timeoutMs === undefined ? {} : { timeoutMs: input.timeoutMs }),
-      ...(input.fetchImpl === undefined ? {} : { fetchImpl: input.fetchImpl }),
+  const add = (payload: SourceWriteRequest, getConnection: () => Promise<RawConnection | null>): Promise<void> =>
+    run(async () => {
+      try {
+        const file = path.join(dir, spoolName(payload));
+        let existing = await readSpool(file);
+        const connection = await getConnection().catch(() => null);
+        const policy = connection === null
+          ? { ok: false as const, reason: "offline" }
+          : await readMemoryPolicy(connection, fetchImpl, timeoutMs);
+        if (existing.kind === "missing") {
+          const prepared = prepareSource(payload, policy.ok ? policy.policy : null);
+          await writeSpool(dir, file, { schemaVersion: 2, payload: prepared.payload });
+          existing = await readSpool(file);
+          if (prepared.redactedCount > 0) report("capture-redacted", { count: prepared.redactedCount });
+        }
+        if (existing.kind !== "raw") {
+          report("spool-error", { reason: "spool-record-unavailable" });
+          return;
+        }
+        if (!policy.ok || connection === null) {
+          report("spool-deferred", { reason: policy.ok ? "offline" : policy.reason });
+          return;
+        }
+        await deliver(file, existing.record.payload, connection);
+      } catch {
+        report("spool-error", { reason: "local-write-failed" });
+      }
     });
 
-    if (posted.ok) {
-      try {
-        await fs.unlink(path.join(input.dir, name));
-      } catch {
-        // 刪不掉：下一輪會是 duplicate，仍算成功。
+  const flush = (getConnection: () => Promise<RawConnection | null>): Promise<void> => run(async () => {
+    try {
+      const names = await listSpool(dir);
+      if (names.length === 0) return;
+      const legacy = names.filter((name) => !name.startsWith("raw-")).length;
+      if (legacy > 0) report("spool-deferred", { reason: "legacy-spool-needs-migration", count: legacy });
+      const raw = names.filter((name) => name.startsWith("raw-"));
+      if (raw.length === 0) return;
+      const connection = await getConnection().catch(() => null);
+      if (connection === null) {
+        report("spool-deferred", { reason: "offline", count: raw.length });
+        return;
       }
-      if (posted.duplicate) result.duplicate += 1;
-      else result.sent += 1;
-      continue;
-    }
-
-    if (posted.reason === "http" && posted.status !== undefined) {
-      if (posted.status >= 400 && posted.status < 500 && posted.status !== 429) {
-        await moveToFailed(input.dir, name);
-        result.failed += 1;
-        input.log("spool-failed", { reason: "http", status: posted.status });
-        continue;
+      const policy = await readMemoryPolicy(connection, fetchImpl, timeoutMs);
+      if (!policy.ok) {
+        report("spool-deferred", { reason: policy.reason, count: raw.length });
+        return;
       }
+      for (const name of raw) {
+        const file = path.join(dir, name);
+        const item = await readSpool(file);
+        if (item.kind === "missing") continue;
+        if (item.kind !== "raw") {
+          report("spool-deferred", { reason: item.kind === "legacy" ? "legacy-spool-needs-migration" : "invalid-spool-record" });
+          continue;
+        }
+        const result = await deliver(file, item.record.payload, connection);
+        // 明確的內容拒絕保留該事件，其他事件仍可補送；連線／服務錯誤留到下一輪。
+        if (!result.ok && ![400, 409, 413].includes(result.status ?? 0)) break;
+      }
+    } catch {
+      report("spool-error", { reason: "local-read-failed" });
     }
-
-    // 429／5xx／連線失敗：保留，停止本輪（服務可能整個不可用）。
-    result.deferred += 1;
-    break;
-  }
-
-  const left = await listSpoolFiles(input.dir);
-  result.remaining = left.length;
-  input.log("spool-flush", {
-    sent: result.sent,
-    duplicate: result.duplicate,
-    failed: result.failed,
-    deferred: result.deferred,
-    remaining: result.remaining,
   });
-  return result;
+
+  return {
+    add,
+    flush,
+    awaitIdle: () => pending,
+    lastState: () => lastState,
+  };
 }

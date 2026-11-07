@@ -4,7 +4,7 @@
  * 生命週期：
  * - `agent/created`：記住自己的 session id（`session/event` 是全域廣播，必須過濾）。
  * - `agent/pre-step`：回合第一步、且有真人輸入時，召回並追加一則 `user/message`。
- * - `session/event`：緩衝本 session 的 user／assistant 文字；`turn/end` 後寫一張回合卡。
+ * - `session/event`：緩衝本 session 的 user／assistant 文字；`turn/end` 後保存原文回合。
  * - 啟動與每 5 分鐘補送 spool。
  *
  * 所有 handler 都 fail-open：召回失敗只影響「這次不注入」，寫入失敗進 spool；
@@ -20,10 +20,11 @@ import {
   resolveProject,
   resolveSpoolDir,
 } from "./config.js";
-import { buildCapturePayload, buildTurnCard } from "./capture.js";
+import { buildCapturePayload, captureMessage } from "./capture.js";
 import { RECALL_FORM, RECALL_SOURCE_KIND, isHumanMessage, recallForMessages } from "./recall.js";
-import { flushSpool, postMemory, writeSpool } from "./spool.js";
-import { asRecord, textOfContent } from "./strip.js";
+import { createSourceSpool } from "./spool.js";
+import type { MemorySourceMessage } from "./raw-memory.js";
+import { asRecord } from "./strip.js";
 import type {
   AgentLike,
   LogFn,
@@ -39,13 +40,12 @@ export const name = "mnemoshelf-dsh-plugin";
 export const inject = ["sessions"];
 
 interface TurnBuffer {
-  turn: number | undefined;
-  lastUser: string;
-  lastAssistant: string;
+  turn: number;
+  messages: MemorySourceMessage[];
 }
 
-function newTurnBuffer(): TurnBuffer {
-  return { turn: undefined, lastUser: "", lastAssistant: "" };
+function turnNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
 function sessionIdOf(value: unknown): string | null {
@@ -87,6 +87,7 @@ export interface PluginRuntime {
   dispose(): void;
   /** 測試用：等待背景工作結束（正式流程不需要）。 */
   readonly flush: () => Promise<void>;
+  readonly awaitIdle: () => Promise<void>;
 }
 
 /**
@@ -118,84 +119,39 @@ export function createRuntime(
   const connections = createConnectionManager({ settings, deps, log });
   const ownSessionIds = new Set<string>();
   const buffers = new Map<string, TurnBuffer>();
+  const captureEnabled = settings.captureEnabled !== false;
+  const spool = createSourceSpool({ dir: spoolDir, log, fetchImpl: deps.fetchImpl });
   let warnedOffline = false;
   let flushRunning = false;
   let disposed = false;
+  const pendingWrites = new Set<Promise<void>>();
 
-  const bufferFor = (sessionId: string): TurnBuffer => {
-    let buffer = buffers.get(sessionId);
-    if (buffer === undefined) {
-      buffer = newTurnBuffer();
-      buffers.set(sessionId, buffer);
-    }
-    return buffer;
+  const addMessage = (sessionId: string, role: MemorySourceMessage["role"], message: Record<string, unknown>, time: unknown): void => {
+    const buffer = buffers.get(sessionId);
+    if (buffer === undefined) return;
+    const captured = captureMessage({ id: message.id, role, content: message.content, time, ordinal: buffer.messages.length });
+    if (captured === null || buffer.messages.some((entry) => entry.sourceMessage === captured.sourceMessage)) return;
+    buffer.messages.push(captured);
   };
 
-  const writeTurn = async (input: {
-    sessionId: string;
-    turn: number;
-    userText: string;
-    assistantText: string;
-    reason: string;
-  }): Promise<void> => {
-    if (input.reason !== "completed") {
-      log("turn-skip", { reason: input.reason });
-      return;
-    }
-    const card = buildTurnCard(input.userText, input.assistantText);
-    if (!card.ok) {
-      log("turn-skip", { reason: card.skip });
-      return;
-    }
-    const payload = buildCapturePayload({
-      sessionId: input.sessionId,
-      turn: input.turn,
-      userText: input.userText,
-      assistantText: input.assistantText,
-      project,
-    });
-    if (payload === null) {
-      log("turn-skip", { reason: "empty" });
-      return;
-    }
-
-    let connection = await connections.get(CONNECTION_WAIT_MS);
-    if (connection === null) {
-      // 寫入發生在回合結束後，可以多等一次完整解析（含 /health）。
-      connection = (await connections.ensure()).connection;
-    }
+  const writeTurn = async (payload: NonNullable<ReturnType<typeof buildCapturePayload>>): Promise<void> => {
+    const ready = await connections.get(CONNECTION_WAIT_MS);
+    const connection = ready ?? (await connections.ensure()).connection;
     if (connection === null) {
       const resolution = connections.lastResolution();
-      // 曾連上、之後 runtime.json 被移除（服務正常關閉會刪檔）也值得 spool：
-      // spool 不含 token，服務回來後用新的 runtime.json 補送。
-      if (resolution?.spoolable === true || connections.everConnected()) {
-        await writeSpool({ dir: spoolDir, payload, now: now(), log });
-        log("write-spooled", { reason: resolution?.reason ?? "offline" });
-      } else {
-        log("write-disabled", { reason: resolution?.reason ?? "offline" });
+      const reason = resolution?.reason;
+      const invalid = reason === "url-invalid" || reason === "url-not-loopback" ||
+        reason === "identity-mismatch" || reason === "health-identity-mismatch" || reason === "runtime-invalid";
+      if (invalid || (resolution?.spoolable !== true && !connections.everConnected())) {
+        log("write-disabled", { reason: reason ?? "offline" });
+        return;
       }
-      return;
     }
-
-    const posted = await postMemory({
-      connection,
-      payload,
-      ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
-    });
-    if (posted.ok) {
-      log("write-ok", { status: posted.status, duplicate: posted.duplicate });
-      warnedOffline = false;
-      return;
-    }
-    connections.invalidate();
-    await writeSpool({ dir: spoolDir, payload, now: now(), log });
-    log("write-spooled", {
-      reason: posted.reason,
-      status: posted.status ?? null,
-    });
+    await spool.add(payload, async () => connection);
   };
 
   const onSessionEvent = (sessionValue: unknown, eventValue: unknown): void => {
+    if (disposed || !captureEnabled) return;
     try {
       const sessionId = sessionIdOf(sessionValue);
       if (sessionId === null || !ownSessionIds.has(sessionId)) return;
@@ -205,44 +161,45 @@ export function createRuntime(
 
       switch (event.type) {
         case "turn/start": {
-          const buffer = bufferFor(sessionId);
-          buffer.turn = typeof data.turn === "number" ? data.turn : undefined;
-          buffer.lastUser = "";
-          buffer.lastAssistant = "";
+          const turn = turnNumber(data.turn);
+          if (turn !== null) buffers.set(sessionId, { turn, messages: [] });
+          else buffers.delete(sessionId);
           return;
         }
         case "user/message": {
           const source = asRecord(data.source);
-          if (source?.kind !== "user") return;
-          const buffer = bufferFor(sessionId);
-          buffer.lastUser = textOfContent(data.content);
+          if (source?.kind === "user") addMessage(sessionId, "user", data, event.time);
           return;
         }
         case "assistant/message": {
           const message = asRecord(data.message);
-          const text = textOfContent(message?.content);
-          if (text.trim() === "") return;
-          bufferFor(sessionId).lastAssistant = text;
+          const buffer = buffers.get(sessionId);
+          if (message && buffer && (data.turn === undefined || turnNumber(data.turn) === buffer.turn)) {
+            addMessage(sessionId, "assistant", message, event.time);
+          }
           return;
         }
         case "turn/end": {
           const buffer = buffers.get(sessionId);
-          if (buffer === undefined) return;
-          const turn = typeof data.turn === "number" ? data.turn : buffer.turn;
-          const userText = buffer.lastUser;
-          const assistantText = buffer.lastAssistant;
+          const turn = turnNumber(data.turn);
+          if (buffer === undefined || (turn !== null && turn !== buffer.turn)) {
+            log("turn-skip", { reason: "incomplete-turn" });
+            return;
+          }
+          buffers.delete(sessionId);
           const reason = reasonKindOf({ type: event.type, data });
-          buffers.set(sessionId, newTurnBuffer());
-          if (turn === undefined) return;
-          void writeTurn({
-            sessionId,
-            turn,
-            userText,
-            assistantText,
-            reason: reason ?? "unknown",
-          }).catch(() => {
-            log("write-error", { reason: "handler" });
-          });
+          if (reason !== "completed") {
+            log("turn-skip", { reason: "not-completed" });
+            return;
+          }
+          const payload = buildCapturePayload({ sessionId, turn: buffer.turn, messages: buffer.messages, project });
+          if (payload === null) {
+            log("turn-skip", { reason: "no-user-or-text" });
+            return;
+          }
+          const write = writeTurn(payload).catch(() => log("spool-error", { reason: "connection-resolution" }));
+          pendingWrites.add(write);
+          void write.then(() => pendingWrites.delete(write));
           return;
         }
         default:
@@ -313,21 +270,10 @@ export function createRuntime(
   };
 
   const runFlush = async (): Promise<void> => {
-    if (disposed || flushRunning) return;
+    if (disposed || !captureEnabled || flushRunning) return;
     flushRunning = true;
     try {
-      const resolution = await connections.refresh();
-      const result = await flushSpool({
-        dir: spoolDir,
-        connection: resolution.connection,
-        log,
-        ...(deps.fetchImpl === undefined ? {} : { fetchImpl: deps.fetchImpl }),
-      });
-      if (result.remaining > 0 && resolution.connection === null) {
-        log("spool-offline", { reason: resolution.reason ?? "offline", remaining: result.remaining });
-      }
-    } catch {
-      log("spool-error", { phase: "flush" });
+      await spool.flush(async () => (await connections.refresh()).connection);
     } finally {
       flushRunning = false;
     }
@@ -348,7 +294,7 @@ export function createRuntime(
 
   let initialTimer: NodeJS.Timeout | undefined;
   let interval: NodeJS.Timeout | undefined;
-  if (deps.disableStartupFlush !== true) {
+  if (captureEnabled && deps.disableStartupFlush !== true) {
     initialTimer = setTimeout(() => {
       void runFlush();
     }, 0);
@@ -364,7 +310,6 @@ export function createRuntime(
       const agent = agentOf(payloadValue);
       if (agent === null) return;
       ownSessionIds.add(agent.session.id);
-      bufferFor(agent.session.id);
     } catch {
       log("event-error", { reason: "agent-created" });
     }
@@ -394,7 +339,14 @@ export function createRuntime(
 
   ctx.effect?.(() => dispose, "mnemoshelf-dsh-plugin: dispose");
 
-  return { dispose, flush: runFlush };
+  return {
+    dispose,
+    flush: runFlush,
+    async awaitIdle() {
+      while (pendingWrites.size !== 0) await Promise.allSettled([...pendingWrites]);
+      await spool.awaitIdle();
+    },
+  };
 }
 
 /** cordis 外掛入口。 */

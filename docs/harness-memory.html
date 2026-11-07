@@ -669,6 +669,7 @@
 </style>
 </head>
 <body>
+<aside class="note" style="margin:1rem auto;max-width:1100px"><strong>原文記憶：</strong>本圖已更新為無摘要模型流程。來源、切塊、遮罩開關與備份的完整契約見 <a href="raw-memory.md">原文記憶說明</a>。</aside>
 <a class="skip-link" href="#intro">跳到正文</a>
 <main>
 
@@ -852,13 +853,13 @@
         <tr>
           <td data-label="接法"><strong>OpenCode／OpenChamber 外掛</strong></td>
           <td data-label="誰在什麼時候動作">外掛掛在 harness 裡，每次模型請求前自動查一次記憶</td>
-          <td data-label="自動寫入"><strong>選用</strong>：回合摘要預設<strong>關閉</strong>，要自己開啟並指定模型</td>
+          <td data-label="自動寫入"><strong>選用</strong>：原文擷取預設<strong>關閉</strong>，啟用後不需要摘要模型</td>
           <td data-label="你要準備什麼">把外掛目錄加進 OpenCode 設定的 <code>plugins</code>；外掛由使用者手動加入，不會自動改設定</td>
         </tr>
         <tr>
           <td data-label="接法"><strong>dsh 外掛</strong></td>
           <td data-label="誰在什麼時候動作">每個回合的第一步自動查一次；回合結束處理寫入</td>
-          <td data-label="自動寫入"><strong>固定</strong>：每個成功完成的回合寫一張回合卡</td>
+          <td data-label="自動寫入"><strong>預設開啟</strong>：成功完成回合保存原文，可自行關閉</td>
           <td data-label="你要準備什麼">把套件加進 dsh profile 的 dependencies 與 bundles，再安裝一次</td>
         </tr>
         <tr>
@@ -874,9 +875,9 @@
   <p><strong>什麼時候會自動動作：</strong>OpenCode 外掛在<strong>每次模型請求前</strong>判斷要不要查；dsh 外掛在<strong>每個回合的第一步</strong>查、
     <strong>回合結束</strong>寫；MCP-only 則完全由呼叫端決定時機，沒有背景動作。實際的六個步驟見第 4 章。</p>
 
-  <p><strong>MCP</strong> 是一個讓 agent 用固定介面呼叫外部工具的規格。Mnemoshelf 的 MCP 入口是六個工具：
-    <code>search</code>、<code>remember</code>、<code>recall</code>、<code>search_memories</code>、<code>forget</code>、<code>list_roots</code>。
-    這六個工具都只是把請求轉給本機服務，入口程式自己不開資料庫。</p>
+  <p><strong>MCP</strong> 是一個讓 agent 用固定介面呼叫外部工具的規格。Mnemoshelf 的 MCP 入口是七個工具：
+    <code>search</code>、<code>remember</code>、<code>recall</code>、<code>search_memories</code>、<code>forget</code>、<code>list_roots</code>、<code>read_memory_source</code>。
+    這七個工具都只是把請求轉給本機服務，入口程式自己不開資料庫。</p>
 
   <p>codex-cli 另外有一種「自己動手」的變形：用它的 hook 在自己的 prompt 前面貼上記憶。
     這仍然算 MCP-only 這一類（自己寫程式接），不是第四套介面。</p>
@@ -937,7 +938,7 @@
     <li>
       <span class="dot">3</span>
       <span class="step-title">拿你的訊息去搜記憶</span>
-      <p>外掛呼叫本機的 <code>POST /memories/search</code>。預算大致是：送出 8 筆候選、最多採用 4 筆、
+      <p>外掛呼叫本機的 <code>POST /memories/search</code>。預算大致是：取 8 筆候選、原文最多採用 4 個來源（每來源最多兩個不同片段）、
         只留相似度 ≥ <code>0.65</code> 的語意命中；另外固定附上最近 3 筆「回合紀錄」（上次聊到哪）。</p>
       <span class="fail"><b>如果失敗</b>逾時或連不上時，外掛當作「沒有記憶」繼續送出請求（這種做法叫 fail-open），
         不重試、不影響回覆。dsh 在同樣情況下也不注入；OpenCode 若「最近回合紀錄」那段查得到，仍然會貼上那幾行。</span>
@@ -964,20 +965,14 @@
     </li>
     <li>
       <span class="dot">6</span>
-      <span class="step-title">回合結束，把重點寫回去</span>
-      <p>這一步<strong>兩種外掛的做法不同</strong>，照實分開講：</p>
+      <span class="step-title">回合結束，保存原文並切塊</span>
+      <p>兩個外掛都保存宿主提供的可見使用者與助理文字，不呼叫摘要模型。服務依設定遮罩完整訊息，保存來源後以程式切塊、背景嵌入。</p>
       <ul>
-        <li><strong>dsh 外掛</strong>：每個「成功完成」的回合<strong>固定</strong>寫一張回合卡。作法是抽取式的——
-          取這回合最後一則你的話與最後一則助理回覆，先<strong>剝除</strong>（把附件、系統提示、先前貼上的記憶片段拿掉）再裁短，格式固定為
-          「User: …／Assistant: …」。它<strong>不呼叫模型</strong>、不改寫內容，同一回合重算會逐字相同。
-          剝除後你的話少於 40 個字元就不寫。</li>
-        <li><strong>OpenCode 外掛</strong>：回合摘要是<strong>選用功能，預設關閉</strong>。要同時開啟
-          <code>digestEnabled</code> 並指定 <code>digestModel</code> 才會動作；它會請你指定的模型整理成
-          「1 張回合紀錄＋最多 2 則原子記憶」。模型判斷這回合沒什麼好記、回空的時候，就什麼都不寫。</li>
-        <li><strong>MCP-only</strong>：沒有自動寫入。要留下記憶，得由模型或你的程式呼叫 <code>remember</code>。</li>
+        <li><strong>dsh 外掛</strong>：預設在成功完成回合時擷取，可用 <code>captureEnabled</code> 關閉。保留角色、時間與順序，不沿用舊卡片截斷。</li>
+        <li><strong>OpenCode 外掛</strong>：原文擷取<strong>預設關閉</strong>；<code>captureEnabled</code> 開啟即可，舊 <code>digestEnabled</code> 可遷移，摘要模型設定已退役。</li>
+        <li><strong>MCP-only</strong>：<code>remember</code> 保存主動提供的短記憶；需要完整來源時呼叫 <code>read_memory_source</code>。</li>
       </ul>
-      <span class="fail"><b>如果失敗</b>寫入失敗不影響回覆。dsh 會把卡片先排隊（spool），服務回來後每 5 分鐘補送一次，
-        最多留 200 筆；OpenCode 的摘要失敗只記一行診斷紀錄，也不補跑。內容與既有記憶完全相同時，服務回「重複」而不是錯誤。</span>
+      <span class="fail"><b>如果失敗</b>外掛保存固定事件到 spool。舊服務、內容衝突或超限明確提示，不截短、不靜默丟棄；相同事件重送去重。原文已存不等於索引已完成。</span>
     </li>
   </ol>
 
@@ -1010,8 +1005,8 @@
         </tr>
         <tr>
           <td data-label="項目">查詢預算</td>
-          <td data-label="dsh 外掛">固定 <code>k: 4</code>、<code>minScore 0.65</code>、timeout 800 毫秒</td>
-          <td data-label="OpenCode 外掛"><code>kMax 8</code>、最多貼 4 筆、<code>minScore 0.65</code>；timeout 程式預設 150 毫秒（可調）</td>
+          <td data-label="dsh 外掛">固定 <code>k: 8</code>、<code>minScore 0.65</code>、timeout 800 毫秒</td>
+          <td data-label="OpenCode 外掛"><code>kMax 8</code>、原文最多 4 個來源、<code>minScore 0.65</code>；timeout 程式預設 150 毫秒（可調）</td>
         </tr>
         <tr>
           <td data-label="項目">語意降級時</td>
@@ -1020,8 +1015,8 @@
         </tr>
         <tr>
           <td data-label="項目">回合寫入</td>
-          <td data-label="dsh 外掛">固定一張抽取式回合卡</td>
-          <td data-label="OpenCode 外掛">選用摘要，預設關閉</td>
+          <td data-label="dsh 外掛">原文回合，預設開啟</td>
+          <td data-label="OpenCode 外掛">原文回合，預設關閉</td>
         </tr>
         <tr>
           <td data-label="項目">服務不在時</td>
@@ -1074,7 +1069,7 @@
       <colgroup><col style="width:30%"><col style="width:70%"></colgroup>
       <thead><tr><th scope="col">欄位</th><th scope="col">白話意思</th></tr></thead>
       <tbody>
-        <tr><td data-label="欄位"><code>content</code></td><td data-label="白話意思">文字本身，上限 8000 字元</td></tr>
+        <tr><td data-label="欄位"><code>content</code></td><td data-label="白話意思">舊短記憶文字，上限 8000 字元；完整回合走 memory-sources</td></tr>
         <tr><td data-label="欄位"><code>kind</code></td><td data-label="白話意思">四種：<code>fact</code>（事實）、<code>decision</code>（決定）、<code>pitfall</code>（踩過的坑）、<code>preference</code>（偏好）</td></tr>
         <tr><td data-label="欄位"><code>scope</code></td><td data-label="白話意思">三種：<code>global</code>（所有專案）、<code>project</code>（某個專案）、<code>agent</code>（某個 agent 的約定範圍）</td></tr>
         <tr><td data-label="欄位"><code>project</code></td><td data-label="白話意思">專案名稱；<code>scope</code> 是 <code>project</code> 時必填</td></tr>
@@ -1095,11 +1090,11 @@
   <figure>
     <div class="fig-frame">
       <div class="flow">
-        <div class="node"><span class="n-title">1. 遮罩</span><span class="n-sub">先把看起來像憑證的東西換成 <code>[REDACTED:…]</code></span></div>
+        <div class="node"><span class="n-title">1. 遮罩</span><span class="n-sub">依 App 開關，把辨識出的憑證換成 <code>[REDACTED:…]</code></span></div>
         <div class="flow-arrow" aria-hidden="true"></div>
-        <div class="node"><span class="n-title">2. 去重</span><span class="n-sub">同內容＋同範圍＋同寫入者只留一筆</span></div>
+        <div class="node"><span class="n-title">2. 去重</span><span class="n-sub">原文以來源事件識別，同事件重送不重存</span></div>
         <div class="flow-arrow" aria-hidden="true"></div>
-        <div class="node"><span class="n-title">3. 存檔</span><span class="n-sub">寫進本機資料庫，立刻回應成功</span></div>
+        <div class="node"><span class="n-title">3. 存檔</span><span class="n-sub">完整來源存入資料庫，再以程式切塊</span></div>
         <div class="flow-arrow" aria-hidden="true"></div>
         <div class="node accent-green"><span class="n-title">4. 算向量</span><span class="n-sub">背景慢慢做，不擋寫入</span></div>
       </div>
@@ -1108,11 +1103,10 @@
   </figure>
 
   <ul>
-    <li><strong>遮罩：</strong>寫入前與讀取時都會套同一組規則，把常見的憑證格式（私鑰、常見 token 前綴、JWT、
+    <li><strong>遮罩：</strong>App 開關預設開啟；開啟時寫入前與讀取時套同一組規則，把常見的憑證格式（私鑰、常見 token 前綴、JWT、
       連線字串裡的帳密等）換成穩定的 <code>[REDACTED:種類]</code>。這是<strong>盡力而為</strong>，不是萬無一失（第 6 章）。</li>
-    <li><strong>去重：</strong>先做最基本的正規化（統一 Unicode 形式、去頭尾空白、連續空白收成一個；<strong>不轉大小寫</strong>），
-      再用「內容＋範圍＋專案＋寫入者」比對。重複時回 <code>200 duplicate</code>，不新增一筆——對呼叫端來說仍是成功。</li>
-    <li><strong>跳過去重：</strong>帶 <code>force: true</code> 可以強制新增。代價是重送可能多一張，所以只有「自己能確保每回合只送一次」的情境才適合。</li>
+    <li><strong>原文去重：</strong>以寫入者、session、回合 ID 識別事件，相同內容重送回 <code>200 duplicate</code>；同 ID 卻有不同內容回 <code>409</code>。文字空白、換行與 Unicode 原樣保留，不套舊卡片的內容正規化。</li>
+    <li><strong>舊記憶：</strong>手動短記憶仍按內容、範圍、專案與寫入者去重；其 <code>force</code> 選項不適用原文事件。</li>
     <li><strong>算向量：</strong>剛寫完的新記憶狀態是 <code>pending</code>，背景工作算出向量後變成 <code>ready</code>；
       內容太長會標 <code>too-long</code> 永久跳過，其他失敗標 <code>failed</code> 之後可重試。</li>
   </ul>
@@ -1130,7 +1124,7 @@
         <div class="flow-arrow" aria-hidden="true"></div>
         <div class="node"><span class="n-title">4. 關鍵字補位</span><span class="n-sub">語意不夠 k 筆才補，不重排</span></div>
         <div class="flow-arrow" aria-hidden="true"></div>
-        <div class="node accent-green"><span class="n-title">5. 裁剪</span><span class="n-sub">最多 4 筆、整塊不超過預算</span></div>
+        <div class="node accent-green"><span class="n-title">5. 裁剪</span><span class="n-sub">最多 4 個來源、整塊不超過預算</span></div>
       </div>
     </div>
     <figcaption><b>圖 5｜找回來的五步。</b>重點在第一步：<strong>先過濾、再排名</strong>。如果反過來（先取前幾名再過濾），
@@ -1138,7 +1132,7 @@
   </figure>
 
   <p><strong>為什麼要「先過濾」？</strong>因為記憶有範圍：<code>global</code> 是所有專案共用、<code>project</code> 只屬於某個專案、
-    <code>agent</code> 是約定上的個人範圍。先把你這個情境看得到的挑出來，再排名，才不會拿到別人的東西。</p>
+    <code>agent</code> 是約定上的個人範圍。先把你這個情境看得到的挑出來，再排名，避免帶入其他專案的內容；這是個人 owner 下的檢索範圍，不是多使用者權限邊界。</p>
 
   <p><strong>語意不等於萬能：</strong>如果向量還沒準備好（例如剛寫完、或剛換過 embedding 模型），服務會<strong>降級</strong>成關鍵字比對，
     並在回應裡標 <code>degraded: true</code> 與原因：<code>no-embeddings</code>（沒有可用的向量）或
@@ -1218,7 +1212,7 @@
       只能降低、不能消除 <strong>prompt injection</strong> 的風險：有人把指令藏進看起來像資料的內容，
       而模型無法百分之百分辨兩者，就可能照做。</li>
     <li><strong>記憶內容可能離開這台電腦。</strong>召回時記憶會放進當次模型請求；如果模型在雲端，內容就送出去了。
-      開啟回合摘要則是<strong>額外</strong>的暴露：那一輪的對話文字會送給你指定的模型（預設關閉）。</li>
+      原文寫入與切塊本身不需要另一個生成模型。</li>
   </ul>
 
   <div class="note warn">
@@ -1233,7 +1227,7 @@
   <ul>
     <li>不要把通行證貼給不受信任的程式，也不要把 <code>runtime.json</code> 放進 repo 或共用資料夾。</li>
     <li>不想讓某個 harness 自動讀記憶，就別裝它的外掛；改用 MCP-only，由你或模型明確呼叫。</li>
-    <li>在意雲端暴露，就關掉回合摘要（預設就是關的），或把摘要模型換成本機執行的端點。</li>
+    <li>在 App 選擇記憶遮罩政策，並自行決定哪些 Agent 可以連接；召回內容仍會進入該 Agent 使用的模型。</li>
     <li>需要真正的隔離（不同 agent 不同權限）時，目前只能靠「不同的作業系統帳號＋不同的資料目錄」，
       而不是靠 <code>scope</code> 或 <code>agent</code>。</li>
   </ul>
@@ -1289,15 +1283,13 @@
     <li><strong>沒有自動的跨專案召回</strong>：OpenCode 外掛只提供一次性的 <code>/memory-all</code> 查詢，不改變預設範圍。</li>
     <li><strong>沒有話題切換偵測</strong>；召回只看第一則提示與明示線索。</li>
     <li><strong>dsh 外掛</strong>不注入整份快照、不改 system prompt、不提供工具介面；只處理成功完成的回合。</li>
-    <li><strong>OpenCode 的回合摘要</strong>不存逐字稿、不做推理式整理、不做衰減式遺忘；也不會自動刪除或改寫已寫入的卡片。</li>
-    <li><strong>沒有張數型寫入上限</strong>：摘要的「1 張回合紀錄＋最多 2 則原子記憶」是輸出格式，不是配額；
-      外掛不會因為「今天寫夠了」而停。</li>
+    <li><strong>原文擷取</strong>只保存宿主提供的可見文字，不包括隱藏推理、工具、附件或全量歷史；舊摘要無法還原成逐字稿。</li>
+    <li><strong>超限明確拒絕</strong>：原文 body 上限 8 MiB，超限不部分保存，也不冒稱完整成功。</li>
   </ul>
 
   <h3>7.5 已知限制</h3>
   <ul>
-    <li><strong>回合卡可能重複：</strong>OpenCode 的回合紀錄刻意跳過去重（帶 <code>force</code>），
-      重試或同時開多個實例時可能留下兩張同內容的卡。</li>
+    <li><strong>事件身分必須穩定：</strong>相同事件重送去重；同 ID 不同內容回 409，不自動改 ID 來製造副本。</li>
     <li><strong>dsh 的注入塊：</strong>文件如此記載（宿主行為，尚未實機確認）——它會留在對話裡，直到對話被壓縮；所以長度被嚴格限制在 900 字元以內。</li>
     <li><strong>「最近回合紀錄」是獨立查詢：</strong>OpenCode 即使語意搜尋失敗，只要回合紀錄查得到就會注入——
       這是刻意的取捨，不是契約要求。</li>
@@ -1321,15 +1313,15 @@
     <li>
       <a href="https://github.com/j7708git/mnemoshelf/blob/main/docs/opencode-plugin.md">docs/opencode-plugin.md（GitHub 上的文件）</a>
       <span>OpenCode／OpenChamber 外掛：安裝、每個參數的預設值、<code>/memory</code> 與 <code>/memory-all</code>、
-        回合摘要（digest）的開啟方式與隱私說明。</span>
+        原文擷取的開啟方式、舊設定遷移與隱私說明。</span>
     </li>
     <li>
       <a href="https://github.com/j7708git/mnemoshelf/blob/main/packages/dsh-plugin/README.md">packages/dsh-plugin/README.md（GitHub 上的文件）</a>
-      <span>dsh 外掛：安裝到 profile、選項、回合卡內容、spool 補送、疑難排解。</span>
+      <span>dsh 外掛：安裝到 profile、選項、原文擷取、spool 補送、疑難排解。</span>
     </li>
     <li>
       <a href="https://github.com/j7708git/mnemoshelf/blob/main/docs/operations.md">docs/operations.md（GitHub 上的文件）</a>
-      <span>REST 端點速查、六個 MCP 工具、環境變數總表。</span>
+      <span>REST 端點速查、七個 MCP 工具、環境變數總表。</span>
     </li>
     <li>
       <a href="https://github.com/j7708git/mnemoshelf/blob/main/docs/roots-and-privacy.md">docs/roots-and-privacy.md（GitHub 上的文件）</a>
@@ -1371,7 +1363,7 @@
       <tbody>
         <tr><td data-label="章">1–2</td><td data-label="來源"><code>README.md</code></td><td data-label="章節">README「這是什麼」「功能」</td></tr>
         <tr><td data-label="章">3</td><td data-label="來源"><code>docs/agent-integration.md</code>；<code>docs/opencode-plugin.md</code>；<code>packages/dsh-plugin/README.md</code></td><td data-label="章節">agent-integration §這個檔案是什麼／§開啟與關閉／§預設路徑／§讀取與使用／§MCP 設定片段／§三層接入模型／§安全說明；opencode-plugin §3 連線來源與身分驗證；dsh README §設定</td></tr>
-        <tr><td data-label="章">4</td><td data-label="來源"><code>docs/opencode-plugin.md</code>；<code>packages/dsh-plugin/README.md</code>；<code>docs/agent-integration.md</code></td><td data-label="章節">opencode-plugin §6 召回行為／§7 回合結束自動摘要；dsh README §行為；agent-integration §召回契約／§注入標記與剝除</td></tr>
+        <tr><td data-label="章">4</td><td data-label="來源"><code>docs/opencode-plugin.md</code>；<code>packages/dsh-plugin/README.md</code>；<code>docs/agent-integration.md</code></td><td data-label="章節">opencode-plugin §召回與來源續讀／§回合擷取；dsh README §行為；agent-integration §召回契約／§注入標記與剝除</td></tr>
         <tr><td data-label="章">5</td><td data-label="來源"><code>docs/storage-ports.md</code>；<code>docs/roots-and-privacy.md</code>；<code>docs/operations.md</code></td><td data-label="章節">storage-ports §記憶的來源欄位／§記憶的語意化／§記憶檢索／§記憶的寫入去重與硬刪除；roots-and-privacy §機密遮罩／§召回；operations §REST 端點速查</td></tr>
         <tr><td data-label="章">6</td><td data-label="來源"><code>docs/roots-and-privacy.md</code>；<code>docs/agent-integration.md</code>；<code>docs/opencode-plugin.md</code></td><td data-label="章節">roots-and-privacy §Agent 存取／§信任模型／§資料存放與刪除／§記憶的範圍與共享；agent-integration §安全說明；opencode-plugin §8 隱私與模型暴露</td></tr>
         <tr><td data-label="章">7</td><td data-label="來源"><code>README.md</code>；<code>docs/agent-integration.md</code>；<code>docs/opencode-plugin.md</code>；<code>packages/dsh-plugin/README.md</code></td><td data-label="章節">README 狀態句；agent-integration §版本與相容性／§MCP-only 快速上手；opencode-plugin §11 限制；dsh README §已知限制</td></tr>

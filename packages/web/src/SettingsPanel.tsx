@@ -9,10 +9,14 @@
  */
 import type { DiagnosticsEmbedderRuntime, DiagnosticsEmbedderSelfTest } from "./api";
 import type { DesktopSettingsState } from "./desktop";
+import { MemoryPolicySetting, type MemoryPolicyState } from "./MemoryPolicySetting";
 import { UpdaterPanel } from "./UpdaterPanel";
 
 export interface SettingsPanelProps {
   settings: DesktopSettingsState | null;
+  memoryPolicy: MemoryPolicyState;
+  onToggleMemoryPolicy: (enabled: boolean) => void;
+  onReloadMemoryPolicy: () => void;
   error: string | null;
   busy: boolean;
   /**
@@ -106,6 +110,9 @@ export function describeEmbedderRuntime(
 
 export function SettingsPanel({
   settings,
+  memoryPolicy,
+  onToggleMemoryPolicy,
+  onReloadMemoryPolicy,
   error,
   busy,
   embedderRuntime,
@@ -142,6 +149,8 @@ export function SettingsPanel({
           關閉
         </button>
       </div>
+
+      <MemoryPolicySetting state={memoryPolicy} onChange={onToggleMemoryPolicy} onRetry={onReloadMemoryPolicy} />
 
       {settings !== null && (
         <div className="space-y-2">

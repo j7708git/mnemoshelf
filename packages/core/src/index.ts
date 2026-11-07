@@ -27,6 +27,29 @@ export type {
 export type { MetadataStore } from "./ports/metadata-store.js";
 export { memoryContentHash, normalizeMemoryContentForHash } from "./memory/content-normalize.js";
 export {
+  assertMemorySourceChunks,
+  chunkMemorySourceMessages,
+  MemorySourceConflictError,
+  memorySourceEventHash,
+  memorySourceRequestHash,
+  normalizeMemorySourceEventCheck,
+  normalizeMemorySourceRequest,
+  normalizeMemorySourceScope,
+  RAW_MEMORY_CHUNK_VERSION,
+  readMemoryPolicy,
+  validateMemorySourceWrite,
+} from "./memory/source.js";
+export type {
+  MemoryPolicy,
+  MemorySource,
+  MemorySourceEventCheck,
+  MemorySourceMessage,
+  MemorySourceWriteResult,
+  NewMemorySource,
+  NewMemorySourceChunk,
+} from "./memory/source.js";
+export {
+  assertMemoryEmbeddingCursor,
   assertMemoryEmbeddingFailure,
   assertMemoryEmbeddingInput,
   assertMemoryQueryVector,
@@ -76,8 +99,8 @@ export {
 export { rrfMerge, RRF_DEFAULT_K } from "./search/rrf.js";
 
 // 機密遮罩（記憶與檔案索引共用同一組 curated 規則；卡 C1）
-export { containsRedacted, maskSecrets, REDACTED_PREFIX } from "./privacy/secret-masking.js";
-export type { MaskSecretsResult, SecretKind } from "./privacy/secret-masking.js";
+export { containsRedacted, mapMaskedRange, maskSecrets, maskSecretsWithSpans, REDACTED_PREFIX } from "./privacy/secret-masking.js";
+export type { MaskedSecretSpan, MaskSecretsResult, MaskSecretsWithSpansResult, SecretKind } from "./privacy/secret-masking.js";
 
 export { blockedReason, isBlocked } from "./roots/blacklist.js";
 export {

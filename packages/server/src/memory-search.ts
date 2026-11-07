@@ -10,6 +10,7 @@
  *   `buildMemorySearchBuckets`）；只有未指定 scope 的預設路徑才包含自己的 agent。
  * - **語意為主**：語意結果依 cosine 排序；只有不足 `k` 時才用關鍵字結果**補足**（dedupe、不重排）。
  *   語意不可用（沒有**可用**的就緒向量／embedder 查詢失敗）→ 全部退回關鍵字，回應標 `degraded`。
+ * - 原文可在同一路徑以一筆不同訊息補位，保留其餘命中的相對順序及原始分數。
  * - `minScore` 只過濾語意結果（0..1）；`k` 由呼叫端驗證（REST 上限 100）。
  *
  * 這個模組不碰 HTTP、也不碰資料庫抽象以外的東西；REST 與 MCP 都只做參數驗證／轉發。
@@ -25,7 +26,14 @@ import type {
   MetadataStore,
 } from "@mnemoshelf/core";
 import { ValidationError } from "./errors.js";
-import { maskSecrets } from "./secret-masking.js";
+import {
+  createMemoryPresenter,
+  loadCurrentMemoryPresentations,
+  memoryContentView,
+  type MemoryView,
+  type PrepareMemoryPresentation,
+} from "./memory-policy.js";
+import { isMemoryVisible } from "./memory-source.js";
 
 /** 未指定 `k` 時的預設回傳筆數。 */
 export const MEMORY_SEARCH_DEFAULT_K = 10;
@@ -39,7 +47,7 @@ export type MemoryRecallDegradedReason = "no-embeddings" | "embedder-unavailable
 export type MemoryRecallSource = "semantic" | "keyword";
 
 /** 一筆召回結果：完整記憶欄位（與 `GET /memories` 一致）＋排名、分數與來源。 */
-export interface MemoryRecallHit extends Memory {
+export type MemoryRecallHit = MemoryView & {
   /** 從 1 起算的結果順序。 */
   rank: number;
   /**
@@ -50,7 +58,7 @@ export interface MemoryRecallHit extends Memory {
   source: MemoryRecallSource;
   /** 記憶內容一律視為不受信任資料（agent 僅是來源標記，不是身分驗證）。 */
   untrusted: true;
-}
+};
 
 /** `POST /memories/search`／`search_memories` 的輸入（形狀驗證由 REST 負責）。 */
 export interface MemoryRecallInput {
@@ -74,6 +82,7 @@ export interface MemoryRecallInput {
 export interface MemoryRecallResponseBody {
   query: string;
   k: number;
+  policyVersion: number;
   degraded: boolean;
   degradedReason: MemoryRecallDegradedReason | null;
   /** 記憶語意化統計（與 `GET /diagnostics` 的 `memories` 相同來源）。 */
@@ -136,32 +145,93 @@ export function buildMemorySearchBuckets(
   return [{ scope: "global" }, { scope: "project", project: projectName }, ...agentBuckets];
 }
 
-/** 用 id 取回完整記憶；不存在／已刪除（搜尋後被刪）者略過。 */
-async function loadHits(
+type RankedMemory = { id: number; score: number; source: MemoryRecallSource };
+type RankedMemoryCandidate = { memory: Memory; item: RankedMemory };
+
+/** 讓較高順位的來源補入另一則訊息，至多取代一筆較低順位來源的重複名額。 */
+async function fillSourceComplement(
   store: MetadataStore,
-  ordered: { id: number; score: number; source: MemoryRecallSource }[],
-): Promise<MemoryRecallHit[]> {
-  const hits: MemoryRecallHit[] = [];
-  for (const item of ordered) {
-    const memory = await store.getMemory(item.id);
-    if (memory === null || memory.deletedAt !== null) continue;
-    // 讀取路徑再遮一次（既有 DB 可能有未遮罩資料；metadata 也保護）；
-    // `untrusted` 讓呼叫端不會把內容當指令。
-    const content = maskSecrets(memory.content);
-    const agent = maskSecrets(memory.agent);
-    const project = memory.project === null ? null : maskSecrets(memory.project).text;
-    hits.push({
-      ...memory,
-      content: content.text,
-      agent: agent.text,
-      project,
-      rank: hits.length + 1,
-      score: item.score,
-      source: item.source,
-      untrusted: true,
-    });
+  remainder: readonly RankedMemory[],
+  selected: RankedMemoryCandidate[],
+  laneStart: number,
+  bySource: Map<number, Memory[]>,
+  buckets: MemorySearchBucket[],
+): Promise<void> {
+  const heads = new Map<number, number>();
+  const redundant: Array<{ index: number; head: number }> = [];
+  for (let index = laneStart; index < selected.length; index += 1) {
+    const { memory } = selected[index]!;
+    if (memory.sourceId == null) continue;
+    const head = heads.get(memory.sourceId);
+    if (head === undefined) heads.set(memory.sourceId, index);
+    else redundant.push({ index, head });
   }
-  return hits;
+  if (redundant.length === 0) return;
+  const weakestHead = Math.max(...redundant.map(({ head }) => head));
+  const targets = new Map([...heads].filter(([id, rank]) => rank < weakestHead && bySource.get(id)?.length === 1));
+  if (targets.size === 0) return;
+
+  let complement: RankedMemoryCandidate | undefined;
+  let bestHead = weakestHead;
+  const strongestTarget = Math.min(...targets.values());
+  const seen = new Set(selected.map(({ memory }) => memory.id));
+  for (const item of remainder) {
+    if (seen.has(item.id)) continue;
+    const memory = await store.getMemory(item.id);
+    if (memory?.sourceId == null || memory.deletedAt !== null || !isMemoryVisible(memory, buckets)) continue;
+    const head = targets.get(memory.sourceId);
+    if (head === undefined || head >= bestHead || selected[head]?.memory.messageIndex === memory.messageIndex) continue;
+    complement = { memory, item };
+    bestHead = head;
+    if (head === strongestTarget) break;
+  }
+
+  if (complement === undefined) return;
+  const donor = redundant.findLast(({ head }) => head > bestHead)!;
+  selected.splice(donor.index, 1);
+  selected.push(complement);
+}
+
+async function selectHits(
+  store: MetadataStore,
+  ordered: RankedMemory[],
+  buckets: MemorySearchBucket[],
+  k: number,
+  selected: RankedMemoryCandidate[] = [],
+) {
+  const seen = new Set(selected.map(({ memory }) => memory.id));
+  const bySource = new Map<number, Memory[]>();
+  for (const { memory } of selected) {
+    if (memory.sourceId == null) continue;
+    const group = bySource.get(memory.sourceId) ?? [];
+    group.push(memory);
+    bySource.set(memory.sourceId, group);
+  }
+  const laneStart = selected.length;
+  let scanned = 0;
+  for (const item of ordered) {
+    if (selected.length >= k) break;
+    scanned += 1;
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    const memory = await store.getMemory(item.id);
+    if (memory === null || memory.deletedAt !== null || !isMemoryVisible(memory, buckets)) continue;
+    if (memory.sourceId != null) {
+      const group = bySource.get(memory.sourceId) ?? [];
+      if (group.length >= 2 || group.some((other) =>
+        other.messageIndex === memory.messageIndex &&
+        (other.sourceStart ?? 0) < (memory.sourceEnd ?? 0) &&
+        (memory.sourceStart ?? 0) < (other.sourceEnd ?? 0),
+      )) continue;
+      group.push(memory);
+      bySource.set(memory.sourceId, group);
+    }
+    selected.push({ memory, item });
+  }
+  if (scanned < ordered.length) {
+    await fillSourceComplement(store, ordered.slice(scanned), selected, laneStart, bySource, buckets);
+  }
+  return selected;
 }
 
 /**
@@ -169,10 +239,10 @@ async function loadHits(
  *
  * @throws ValidationError 範圍不明確（見 `buildMemorySearchBuckets`）；其餘例外（資料層錯誤）往上拋。
  */
-export async function searchMemories(
+export async function prepareMemoryRecall(
   deps: MemorySearchDeps,
   input: MemoryRecallInput,
-): Promise<MemoryRecallResponseBody> {
+): Promise<PrepareMemoryPresentation<MemoryRecallResponseBody>> {
   const buckets = buildMemorySearchBuckets(input);
   const k = input.k ?? MEMORY_SEARCH_DEFAULT_K;
   const filter: MemorySearchFilter = {
@@ -188,7 +258,9 @@ export async function searchMemories(
 
   let degraded = false;
   let degradedReason: MemoryRecallDegradedReason | null = null;
-  const semantic: { id: number; score: number }[] = [];
+  const semantic: RankedMemory[] = [];
+  // 多取候選，避免同一個長來源的相鄰片段擠掉其他來源。
+  const candidateLimit = Math.min(500, Math.max(k * 4, 40));
 
   if (usableReady <= 0) {
     // 沒有可用的就緒向量：連模型都不必載入，直接關鍵字。
@@ -204,44 +276,53 @@ export async function searchMemories(
       degradedReason = "embedder-unavailable";
     }
     if (queryVector !== undefined) {
-      const vectorHits = await deps.store.searchMemoriesByVector(queryVector, embedderId, filter, k);
+      const vectorHits = await deps.store.searchMemoriesByVector(queryVector, embedderId, filter, candidateLimit);
       for (const hit of vectorHits) {
         if (input.minScore !== undefined && hit.score < input.minScore) continue;
-        semantic.push(hit);
+        semantic.push({ ...hit, source: "semantic" });
       }
     }
   }
 
-  // 語意為主：只有在降級、或語意結果不足 k 時才用關鍵字（補足時不重排語意結果）。
-  const keywordHits =
-    degraded || semantic.length < k
-      ? await deps.store.searchMemoriesKeyword(input.query, filter, k)
-      : [];
-
-  const ordered: { id: number; score: number; source: MemoryRecallSource }[] = semantic.map((hit) => ({
-    id: hit.id,
-    score: hit.score,
-    source: "semantic" as const,
-  }));
-
-  if (degraded) {
-    // 全部關鍵字：來源標 keyword，分數用 1/rank（僅排序輔助）。
-    for (const hit of keywordHits) ordered.push({ id: hit.id, score: 1 / hit.rank, source: "keyword" });
-  } else {
-    const seen = new Set(ordered.map((hit) => hit.id));
-    for (const hit of keywordHits) {
-      if (seen.has(hit.id)) continue;
-      seen.add(hit.id);
-      ordered.push({ id: hit.id, score: 1 / hit.rank, source: "keyword" });
-    }
+  const selected = await selectHits(deps.store, semantic, buckets, k);
+  if (selected.length < k) {
+    const keyword = await deps.store.searchMemoriesKeyword(input.query, filter, candidateLimit);
+    await selectHits(deps.store, keyword.map(({ id, rank }) => ({ id, score: 1 / rank, source: "keyword" })),
+      buckets, k, selected);
   }
 
-  return {
-    query: input.query,
-    k,
-    degraded,
-    degradedReason,
-    memoryEmbedding,
-    hits: await loadHits(deps.store, ordered.slice(0, k)),
+  const ranks = new Map(selected.map(({ memory, item }) => [memory.id, item]));
+  return async () => {
+    const presentations = await loadCurrentMemoryPresentations(deps.store, [...ranks.keys()]);
+    return (policy) => {
+      const present = createMemoryPresenter(policy);
+      const hits: MemoryRecallHit[] = [];
+      for (const entry of presentations) {
+        if (!isMemoryVisible(entry.memory, buckets)) continue;
+        const item = ranks.get(entry.memory.id)!;
+        const view = present(entry, { query: input.query, maxChars: 420 });
+        if (view !== null) {
+          hits.push({ ...view, rank: hits.length + 1, score: item.score, source: item.source, untrusted: true });
+        }
+      }
+      return {
+        query: memoryContentView(input.query, policy).text,
+        k,
+        policyVersion: policy.version,
+        degraded,
+        degradedReason,
+        memoryEmbedding,
+        hits,
+      };
+    };
   };
+}
+
+export async function searchMemories(
+  deps: MemorySearchDeps,
+  input: MemoryRecallInput,
+): Promise<MemoryRecallResponseBody> {
+  const prepare = await prepareMemoryRecall(deps, input);
+  const render = await prepare();
+  return render(await deps.store.getMemoryPolicy());
 }

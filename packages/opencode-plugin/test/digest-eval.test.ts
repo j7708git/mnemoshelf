@@ -1,19 +1,9 @@
-/**
- * L3：`buildDigestCards` 抽取的 parity 測試、fixture 規則與量測邏輯測試。
- *
- * 這一檔刻意分成三層：
- * 1. **純函式 parity**：抽出後的 `buildDigestCards` 與重構前寫在 `runDigest()` 裡的組卡邏輯
- *    逐位元等價（含截斷）。
- * 2. **runtime parity**：真 `createMemoryRuntime` 的 POST 內容 ≡ `buildDigestCards` 的輸出，
- *    證明「harness 量到的卡片」就是「產品送出的卡片」。
- * 3. **fixture／量測規則**：30 回合、隱私、針長度、正規化與指標口徑。
- */
+/** 歷史摘要評測的純函式、fixture 與量測測試。 */
 import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   MAX_DIGEST_ITEMS,
@@ -21,14 +11,6 @@ import {
   parseDigestItems,
   resolveDigestTurn,
 } from "../src/digest.js";
-import { createMemoryRuntime, type RuntimeCleanup } from "../src/recall.js";
-import type {
-  CommandEditorLike,
-  ModelDomainLike,
-  ModelInfoLike,
-  PluginContextLike,
-  StorageLike,
-} from "../src/types.js";
 import { cannedBaselineResponse, promptSections, splitSentences } from "../eval/digest/lib/canned.mjs";
 import { loadFixtures, privacyFindings } from "../eval/digest/lib/fixtures.mjs";
 import { aggregateMetrics, evaluateTurn, hardConditions, softThresholds } from "../eval/digest/lib/metrics.mjs";
@@ -39,12 +21,6 @@ import { includesNeedle, needleLength, normalizeForMatch } from "../eval/digest/
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const PACKAGE_DIR = path.resolve(HERE, "..");
 const FIXTURE_DIR = path.join(PACKAGE_DIR, "eval", "digest", "fixtures");
-
-const tempDirs: string[] = [];
-
-afterEach(async () => {
-  await Promise.all(tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
-});
 
 /* ------------------------------------------------------------------ *
  * 1. 輸出形狀（寫死，不可設定）
@@ -97,189 +73,6 @@ describe("buildDigestCards：輸出形狀固定", () => {
     expect(buildDigestCards(parsed).length).toBe(0);
   });
 });
-
-/* ------------------------------------------------------------------ *
- * 2. runtime parity：真 runtime 的 POST ≡ buildDigestCards
- * ------------------------------------------------------------------ */
-
-const LOCATION = "/work/eval-parity";
-const MODEL = "canned/parity-model";
-
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
-}
-
-function tick(ms = 0): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-class EventFeed {
-  private items: unknown[] = [];
-  private resolver: ((result: IteratorResult<unknown>) => void) | undefined;
-
-  push(value: unknown): void {
-    if (this.resolver !== undefined) {
-      const resolve = this.resolver;
-      this.resolver = undefined;
-      resolve({ value, done: false });
-      return;
-    }
-    this.items.push(value);
-  }
-
-  async *stream(): AsyncGenerator<unknown, void, void> {
-    for (;;) {
-      if (this.items.length > 0) {
-        yield this.items.shift();
-        continue;
-      }
-      const next = await new Promise<IteratorResult<unknown>>((resolve) => {
-        this.resolver = resolve;
-      });
-      if (next.done === true) return;
-      yield next.value;
-    }
-  }
-}
-
-function memoryStorage(): StorageLike {
-  const map = new Map<string, unknown>();
-  return {
-    get: async (key) => map.get(key),
-    set: async (key, value) => {
-      map.set(key, value);
-    },
-    remove: async (key) => {
-      map.delete(key);
-    },
-    scan: async ({ prefix, after, limit }) => {
-      const keys = [...map.keys()].filter((key) => key.startsWith(prefix)).sort();
-      const start = after === undefined ? 0 : keys.indexOf(after) + 1;
-      const size = limit ?? 100;
-      const page = keys.slice(start, start + size);
-      const next = keys[start + page.length];
-      return {
-        entries: page.map((key) => ({ key, value: map.get(key) })),
-        ...(next === undefined ? {} : { next }),
-      };
-    },
-  };
-}
-
-const USER_TEXT =
-  "請整理這一回合的三件事：指數退避的重試策略、快取上限，以及日誌欄位命名；最後附上下一步。";
-const ASSISTANT_TEXT =
-  "這一輪確認了指數退避可以避免重試風暴，也確認快取需要上限。日誌欄位統一用 snake_case，下一步補測試。";
-
-const RAW_RESPONSE = JSON.stringify({
-  turn: "這一輪確認了抽取後的組卡行為，並記下下一步。",
-  items: [
-    { content: "指數退避可以避免重試風暴。", kind: "decision", quote: "指數退避" },
-    { content: "快取需要上限，否則長時間執行會吃光記憶體。", kind: "pitfall", quote: "快取上限" },
-    { content: "日誌欄位統一用 snake_case。", kind: "preference", quote: "日誌欄位" },
-  ],
-});
-
-async function runParityRuntime(): Promise<{ posts: Record<string, unknown>[]; cleanup: RuntimeCleanup }> {
-  const posts: Record<string, unknown>[] = [];
-  const messages = [
-    { id: "u-1", type: "user", role: "user", content: [{ type: "text", text: USER_TEXT }] },
-    { id: "a-1", type: "assistant", role: "assistant", content: [{ type: "text", text: ASSISTANT_TEXT }] },
-  ];
-  const feed = new EventFeed();
-  const logDir = await fs.mkdtemp(path.join(os.tmpdir(), "mnemoshelf-digest-eval-parity-"));
-  tempDirs.push(logDir);
-
-  const ctx: PluginContextLike = {
-    app: { version: "2.1.1" },
-    options: {
-      digestEnabled: true,
-      digestModel: MODEL,
-    },
-    location: { directory: LOCATION, project: { canonical: LOCATION, directory: LOCATION } },
-    session: {
-      hook: async () => ({ dispose: async () => undefined }),
-      synthetic: async () => ({}),
-      get: async () => ({ location: { directory: LOCATION } }),
-      context: async () => messages,
-    },
-    command: {
-      transform: async (callback: (editor: CommandEditorLike) => void) => {
-        callback({ add: () => undefined });
-        return { dispose: async () => undefined };
-      },
-    },
-    generate: {
-      text: async () => ({ text: RAW_RESPONSE }),
-    },
-    model: {
-      list: async () => ({ data: [{ id: "parity-model", modelID: "parity-model", providerID: "canned" } satisfies ModelInfoLike] }),
-    } satisfies ModelDomainLike,
-    storage: memoryStorage(),
-    event: { subscribe: () => feed.stream() },
-  };
-
-  const cleanup = await createMemoryRuntime(ctx, {
-    env: { MNEMOSHELF_URL: "http://127.0.0.1:43118", MNEMOSHELF_TOKEN: "test-token-value" },
-    platform: "linux",
-    home: logDir,
-    log: () => undefined,
-    fetchImpl: async (request, init) => {
-      const url = String(request);
-      if (url.endsWith("/memories/search")) return jsonResponse({ hits: [] });
-      if (url.endsWith("/memories")) {
-        posts.push(JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>);
-        return jsonResponse({ id: posts.length, duplicate: false }, 201);
-      }
-      return jsonResponse({}, 404);
-    },
-    readFileImpl: async () => {
-      throw new Error("ENOENT");
-    },
-    digestLogFile: path.join(logDir, "digest.log"),
-  });
-
-  feed.push({ id: "evt-1", type: "session.execution.succeeded", data: { sessionID: "s1" } });
-  await tick();
-  await cleanup.awaitIdle?.();
-  await tick(5);
-  return { posts, cleanup };
-}
-
-describe("runtime POST 內容 ≡ buildDigestCards", () => {
-  it("真 runtime 送出的每一張卡都等於純函式的輸出（形狀固定：turn＋最多 2 則）", async () => {
-    const { posts, cleanup } = await runParityRuntime();
-    try {
-      const resolved = resolveDigestTurn([
-        { id: "u-1", type: "user", content: [{ type: "text", text: USER_TEXT }] },
-        { id: "a-1", type: "assistant", content: [{ type: "text", text: ASSISTANT_TEXT }] },
-      ]);
-      expect("turn" in resolved).toBe(true);
-      if (!("turn" in resolved)) return;
-
-      const parsed = parseDigestItems(RAW_RESPONSE, resolved.turn.sourceText, MAX_DIGEST_ITEMS);
-      const cards = buildDigestCards(parsed);
-      const expected = cards.map((card) =>
-        digestPostBody(card, { sessionID: "s1", messageID: "a-1", project: "eval-parity" }),
-      );
-
-      expect(cards).toHaveLength(3); // 回合卡 + 2 則 item
-      expect(posts).toEqual(expected);
-      // 額外鎖住「回合卡先寫、force=true；原子記憶 force 不帶」。
-      expect(posts[0]).toMatchObject({ agent: "opencode-plugin/turn", kind: "fact", force: true });
-      expect(posts[1]).toMatchObject({ agent: "opencode-plugin", kind: "decision" });
-      expect(posts[1].force).toBeUndefined();
-      expect(posts[2]).toMatchObject({ agent: "opencode-plugin", kind: "pitfall" });
-      expect(posts[2].force).toBeUndefined();
-    } finally {
-      await cleanup();
-    }
-  });
-});
-
-/* ------------------------------------------------------------------ *
- * 3. fixture 與量測規則
- * ------------------------------------------------------------------ */
 
 describe("30 回合 synthetic fixture", () => {
   it("30 回合、涵蓋跳過／decision／pitfall／preference／fact／跨專案，且通過隱私樣式", async () => {
@@ -443,8 +236,8 @@ describe("canned 基線與原始 items 計數", () => {
   });
 
   it("countRawItems 數的是模型原始 items 陣列（不是 parser 保留數）", () => {
-    expect(countRawItems(RAW_RESPONSE)).toBe(3);
-    expect(countRawItems("```json\n" + RAW_RESPONSE + "\n```")).toBe(3);
+    expect(countRawItems(JSON.stringify({ items: THREE_ITEMS }))).toBe(3);
+    expect(countRawItems("```json\n" + JSON.stringify({ items: THREE_ITEMS }) + "\n```")).toBe(3);
     expect(countRawItems("不是 JSON")).toBe(0);
   });
 });
