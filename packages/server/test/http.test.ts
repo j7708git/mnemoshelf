@@ -26,6 +26,7 @@ import {
 } from "./helpers.js";
 import { MAX_REQUEST_URL_LENGTH, type IndexRootResponse, type ListMemoriesResponse } from "../src/index.js";
 import type { RootPreview } from "@mnemoshelf/core";
+import { toHttpError } from "../src/http/app.js";
 
 let server: TestServer | undefined;
 const fixtureDirs: string[] = [];
@@ -91,6 +92,31 @@ describe("REST：health 與授權", () => {
 });
 
 describe("REST：roots 生命週期", () => {
+  it("影音預覽與索引一致回報未支援，文字仍可完成", async () => {
+    server = await startTestServer();
+    const dir = await fixture();
+    await fs.writeFile(path.join(dir, "sound.wav"), Buffer.from([1]));
+    await fs.writeFile(path.join(dir, "clip.mp4"), Buffer.from([2]));
+    const created = await api(server.instance, "POST", "/roots", {
+      body: { path: dir, modalities: ["text", "code", "audio", "video"] },
+    });
+    const id = (created.body as { id: number }).id;
+    const preview = (await api(server.instance, "POST", `/roots/${id}/preview`)).body as RootPreview;
+    expect(preview.skipped).toContainEqual({ relPath: "sound.wav", reason: "unsupported-modality" });
+    const indexed = await api(server.instance, "POST", `/roots/${id}/index`);
+    expect(indexed.status).toBe(200);
+    const result = indexed.body as IndexRootResponse;
+    expect(result.scanSkippedFiles).toContainEqual({ relPath: "clip.mp4", reason: "unsupported-modality" });
+    expect(result.failedFiles).toEqual([]);
+    expect(result.processed).toBeGreaterThan(0);
+  });
+
+  it("排程超載回傳可重試的 503 並遮蔽原始錯誤內容", () => {
+    const response = toHttpError(Object.assign(new Error("private input"), { code: "EEMBEDDERQUEUEFULL" }));
+    expect(response.status).toBe(503);
+    expect(response.headers["retry-after"]).toBe("1");
+    expect(JSON.stringify(response.body)).not.toContain("private input");
+  });
   it("加入 → 列出 → 取得 → preview（無寫入）→ index → 增量 → 搜尋 → 刪除", async () => {
     server = await startTestServer();
     const dir = await fixture();

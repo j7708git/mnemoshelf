@@ -14,7 +14,7 @@ export const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
  * 跳過的原因。除了任務卡明列的 `blocked`／`excluded`／`modality-off`／`too-large`／
  * `unresolved-symlink`，另補五個由本實作決定的具名原因（見下方各處註解）：
  * `symlink-dir`、`unsupported-type`（含系統／垃圾檔）、`binary-content`、`not-a-file`、
- * `undecodable`。
+ * `undecodable`；呼叫端限制處理能力時另有 `unsupported-modality`。
  *
  * `binary-content` 不由掃描產生：掃描**只列舉、不讀內容**，因此它是在索引階段
  * （`indexer.processFile`）讀入後才判定的（見 `docs/roots-and-privacy.md` 的兩道防線）。
@@ -25,6 +25,7 @@ export type SkipReason =
   | "blocked"
   | "excluded"
   | "modality-off"
+  | "unsupported-modality"
   | "too-large"
   | "unresolved-symlink"
   | "symlink-dir"
@@ -61,6 +62,8 @@ export interface ScanRoot {
 }
 
 export interface ScanOptions {
+  /** 呼叫端實際已接通的模態；未提供時只負責列舉，不判斷處理能力。 */
+  supportedModalities?: readonly Modality[];
   /** 單檔大小上限，預設 `DEFAULT_MAX_FILE_BYTES`（10 MB）。 */
   maxFileBytes?: number;
   /**
@@ -439,6 +442,10 @@ export async function walkRoot(root: ScanRoot, options: ScanOptions = {}): Promi
     }
     if (!root.modalities.includes(kind)) {
       skipped.push({ relPath: rel, reason: "modality-off" });
+      return;
+    }
+    if (options.supportedModalities !== undefined && !options.supportedModalities.includes(kind)) {
+      skipped.push({ relPath: rel, reason: "unsupported-modality" });
       return;
     }
     if (size > maxFileBytes) {

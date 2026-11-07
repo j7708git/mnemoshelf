@@ -98,7 +98,7 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
 | `MNEMOSHELF_EMBED_DML_DEVICE_ID` | embedder（Windows 的 DirectML） | `0`（預設顯示卡） | DirectML adapter 索引；多顯卡時指定獨顯。只接受十進位非負整數字串，非法值直接拒絕啟動（不靜默回預設）。 |
 | `MNEMOSHELF_EMBED_ORT_LOG` | embedder | 未設定（不覆寫 ORT 預設） | ONNX Runtime log 等級 `0`–`4`（`0`＝verbose），僅診斷用。 |
 | `MNEMOSHELF_MEMORY_BACKFILL` | 服務端 | `on` | 啟動時是否回填既有記憶向量；只接受 `on`／`off`（大小寫不拘），非法值直接拒絕啟動。`off` 只停啟動回填，**新寫入的記憶仍會嵌入**。 |
-| `MNEMOSHELF_INDEX_RATE` | 服務端 | `off` | 索引限速：`normal` 每檔之間休眠 50ms、`low` 250ms，`off` 不休眠。**只作用於檔案與檔案之間**，同一個大檔的嵌入批次仍一次跑完；非法值直接拒絕啟動。 |
+| `MNEMOSHELF_INDEX_RATE` | 服務端 | `off` | 索引限速：`normal` 每檔之間休眠 50ms、`low` 250ms，`off` 不休眠。**只作用於檔案與檔案之間**；大檔內的讓渡由下述視窗排程負責。非法值直接拒絕啟動。 |
 | `MNEMOSHELF_BUILD_COMMIT` | 建置腳本（server）；服務端僅在讀不到 build-info 時後備 | `unknown` | **build 時 fallback**：`git rev-parse HEAD` 不可用時（例如從 tarball build）寫入的 commit；不用於執行期設定。 |
 
 測試專用的變數（`MNEMOSHELF_E2E`、`MNEMOSHELF_AUTOTEST_*`、`MNEMOSHELF_SMOKE_NO_SANDBOX`、
@@ -110,10 +110,21 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
 - **一次只跑一個推論**：推論在 **server 行程的 worker thread** 執行（`node:worker_threads`），
   主執行緒只做 HTTP、DB 與索引編排，worker 內只有一個模型 session——索引、搜尋與記憶背景嵌入
   共用這條序列佇列。需要嵌入的請求（`POST /search`、`POST /memories/search`、記憶的背景嵌入）
-  會排在**目前批次**之後，索引期間可能等數十秒。要避免等待請等索引完成，或把大 root 拆成
-  小 root 分批索引；讓查詢插隊的**查詢優先權**目前列為後續工作。
+  在有界工作視窗間排程。文字查詢優先，連續最多 4 個查詢後讓等待中的背景工作執行一窗；
+  背景工作輪流前進。每個文字視窗最多 16 筆且不超過裝置上限，模型仍可依 token 預算縮窗。
+  正在執行的 native 推論不能搶占，因此不保證固定毫秒回應。
 - **取消**（`POST /roots/:id/index/cancel`）在 native 推論的**下一個邊界**生效，最長等目前
-  一個檔案的嵌入批次（大檔可能數十秒），不是立即中斷。
+  一個排程視窗；排隊中的文字／圖片直接取消，不再啟動新視窗，已在 native 中的工作等待收尾。
 - 不需要嵌入的請求（`GET /health`、`GET /diagnostics`、`GET /roots/:id/index/status` 等）
   在索引期間照常回應。
 - 關閉服務時的取消與等待語意，見 `docs/roots-and-privacy.md` §資料存放與刪除。
+
+診斷新增 `embedderScheduling`（不提供排程資訊的實作為 `null`），包含准入數、輸入位元組、
+已完成視窗／邏輯請求、累計排隊時間、worker 往返時間與上限。`indexingTimings` 是本行程
+累計的 scan／read／prepare／embed／write 次數及耗時；prepare 含增量檢查，embed 含排隊、
+解碼、tokenize 與推論，尚未細拆為純模型時間；併發時各階段加總不等於整輪牆鐘時間。
+上述只含計數與耗時，不含檔案內容。視窗完成與逐檔持久化完成分開，不將部分向量假報為索引成功。
+
+排程准入預設最多 128 個邏輯請求、8,192 個輸入與 64 MiB 輸入位元組（含正在執行的工作）。
+搜尋超限回 `503 EmbedderQueueFullError`、碼 `EEMBEDDERQUEUEFULL`，附 `Retry-After: 1`；
+單一請求本身超限應縮小輸入。詳細契約見 [embedder-contract.md](embedder-contract.md)。

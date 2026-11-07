@@ -21,6 +21,7 @@ import {
   type TestServer,
 } from "./helpers.js";
 import { maskHomePath, type DiagnosticsResponse } from "../src/index.js";
+import { WorkerEmbedder } from "../src/worker-embedder.js";
 
 /**
  * 假 embedder ＋ 自訂 `runtimeStatus`（模擬 DML／CPU 實作；`FakeEmbedder` 本身不提供此成員）。
@@ -101,6 +102,24 @@ describe("maskHomePath", () => {
 });
 
 describe("GET /diagnostics", () => {
+  it("排程診斷只回報彙總；索引階段計時可觀察且不帶內容", async () => {
+    const metadata = new WorkerEmbedder({ metadataEmbedder: new FakeEmbedder() });
+    const embedder = Object.assign(new FakeEmbedder(), { schedulingStatus: metadata.schedulingStatus });
+    const home = await tempDir("mnemoshelf-timing-");
+    const rootDir = await makeRootIn(home, "root");
+    server = await startTestServer({ embedder, homeDir: home });
+    const created = await api(server.instance, "POST", "/roots", { body: { path: rootDir } });
+    const id = (created.body as { id: number }).id;
+    await api(server.instance, "POST", `/roots/${id}/index`);
+    const body = (await api(server.instance, "GET", "/diagnostics")).body as DiagnosticsResponse;
+    expect(body.embedderScheduling).toEqual(metadata.schedulingStatus);
+    for (const value of Object.values(body.indexingTimings)) {
+      expect(value.calls).toBeGreaterThan(0);
+      expect(value.durationMs).toBeGreaterThanOrEqual(0);
+    }
+    expect(JSON.stringify(body.indexingTimings)).not.toContain("alpha");
+    await metadata.dispose();
+  });
   it("無 token → 401", async () => {
     server = await startTestServer();
     const response = await api(server.instance, "GET", "/diagnostics", { token: null });
@@ -134,6 +153,7 @@ describe("GET /diagnostics", () => {
     expect(body.embedder.capabilities.image).toBe(true);
     expect(Array.isArray(body.roots)).toBe(true);
     expect(Array.isArray(body.indexing)).toBe(true);
+    expect(body.embedderScheduling).toBeNull();
   });
 
   it("家目錄前綴遮成 ~，輸出不含原始家目錄字串", async () => {

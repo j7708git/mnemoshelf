@@ -76,8 +76,8 @@ const TEXT_CHUNK_SECONDS = 0.4;
 const IMAGE_SECONDS = 5;
 /**
  * 其他媒體（音訊／影片）：目前的 embedder 宣告不支援（`capabilities.audio／video` 為 false），
- * 因此這些檔案實際上不會產生向量。這裡仍給保守值，避免「勾了模態卻顯示零成本」；
- * 取與圖片同級＝已知最慢的媒體成本。
+ * 預設能力守衛會將它們列為 unsupported-modality，不計入成本。這個保守估值僅供呼叫端
+ * 明確傳入 supportedModalities 的未來實作使用；取與圖片同級，不代表影音已驗收。
  */
 const OTHER_MEDIA_SECONDS = IMAGE_SECONDS;
 
@@ -105,7 +105,11 @@ export async function previewRoot(input: PreviewRootInput, options: ScanOptions 
     respectGitignore: input.respectGitignore ?? true,
   };
 
-  const scanOptions: ScanOptions = {};
+  // 目前索引器只有文字／程式碼與圖片入口；型別有影音不代表已能處理。
+  const scanOptions: ScanOptions = {
+    supportedModalities: options.supportedModalities ?? ["text", "code", "image"],
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+  };
   if (input.maxFileBytes !== undefined) scanOptions.maxFileBytes = input.maxFileBytes;
   else if (options.maxFileBytes !== undefined) scanOptions.maxFileBytes = options.maxFileBytes;
 

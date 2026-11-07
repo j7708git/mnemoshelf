@@ -155,7 +155,7 @@ export interface Embedder {
    */
   embedDocuments(inputs: readonly DocumentInput[], opts?: EmbedDocumentsOptions): Promise<Float32Array[]>;
   /** 圖片。 */
-  embedImage(image: ImageInput): Promise<Float32Array>;
+  embedImage(image: ImageInput, opts?: EmbedDocumentsOptions): Promise<Float32Array>;
   /** 啟動探測。 */
   probe(): Promise<ProbeResult>;
   dispose(): Promise<void>;

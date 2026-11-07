@@ -102,7 +102,8 @@ export class FakeEmbedder implements Embedder {
     return vectors;
   }
 
-  async embedImage(image: ImageInput): Promise<Float32Array> {
+  async embedImage(image: ImageInput, opts?: EmbedDocumentsOptions): Promise<Float32Array> {
+    throwIfAborted(opts?.signal);
     const digest = createHash("sha256").update("image:").update(image.bytes).digest();
     return hashToVector(digest);
   }

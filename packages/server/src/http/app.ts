@@ -49,6 +49,7 @@ import {
   isBlocked,
   type IndexRootOptions,
   type IndexRootResult,
+  type IndexTimingEvent,
   MEMORY_SCOPES,
   type Memory,
   type MemoryKind,
@@ -75,6 +76,7 @@ import {
   type RootPreview,
 } from "@mnemoshelf/core";
 import { LOOPBACK_HOST } from "../config.js";
+import type { EmbedderSchedulingStatus } from "../worker-embedder.js";
 import {
   FileTooLargeError,
   IndexInProgressError,
@@ -396,6 +398,10 @@ export interface DiagnosticsResponse {
    * `device` 是依平台與設定解析出的計畫值（`loaded: false`）。
    */
   embedderRuntime: EmbedderRuntimeStatus | null;
+  /** 推論排程狀態；完成視窗不代表檔案已寫入。未提供此能力時為 null。 */
+  embedderScheduling: EmbedderSchedulingStatus | null;
+  /** 本行程累計階段計時；embed 含排隊，prepare 含增量檢查。 */
+  indexingTimings: Record<IndexTimingEvent["stage"], { calls: number; durationMs: number }>;
   roots: DiagnosticsRoot[];
   /** 進行中的索引任務（本行程；沒有時為空陣列）。 */
   indexing: { rootId: number; startedAt: string | null }[];
@@ -470,7 +476,7 @@ export interface ListEntriesResponse {
 export interface RestAppDeps {
   store: MetadataStore;
   vec: VectorIndex;
-  embedder: Embedder;
+  embedder: Embedder & { readonly schedulingStatus?: EmbedderSchedulingStatus };
   /** 記憶向量背景 worker（卡 B1）：`POST /memories` enqueue、診斷讀 stats。 */
   memoryEmbedder: MemoryEmbeddingWorker;
   token: string;
@@ -591,6 +597,13 @@ export function toHttpError(error: unknown): {
       status: 400,
       body: named("InputTooLongError", "輸入超過模型的單筆輸入上限（token 數過多），請縮短後再試"),
       headers: {},
+    };
+  }
+  if (errorCodeOf(error) === "EEMBEDDERQUEUEFULL") {
+    return {
+      status: 503,
+      body: { error: { name: "EmbedderQueueFullError", code: "EEMBEDDERQUEUEFULL", message: "嵌入工作已達資源上限，請稍後再試或縮小單次輸入" } },
+      headers: { "retry-after": "1" },
     };
   }
   if (error instanceof MemoryPolicyChangedError) {
@@ -1005,6 +1018,11 @@ export function parseRequestTarget(request: IncomingMessage): { url: URL; segmen
 }
 
 export function createRestApp(deps: RestAppDeps): RestApp {
+  const indexingTimings: DiagnosticsResponse["indexingTimings"] = {
+    scan: { calls: 0, durationMs: 0 }, read: { calls: 0, durationMs: 0 },
+    prepare: { calls: 0, durationMs: 0 }, embed: { calls: 0, durationMs: 0 },
+    write: { calls: 0, durationMs: 0 },
+  };
   // 匯入的衝突預檢和寫入同排佇列，避免其他 REST 請求在兩者間改動來源。
   let memoryWrites = Promise.resolve();
   const serializeMemoryWrite = <T>(work: () => Promise<T>): Promise<T> => {
@@ -1237,6 +1255,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       vec: deps.vec,
       signal: controller.signal,
       onProgress: (progress) => indexStatus.report(id, progress),
+      onTiming: ({ stage, durationMs }) => {
+        indexingTimings[stage].calls += 1;
+        indexingTimings[stage].durationMs += durationMs;
+      },
       ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
       ...(deps.indexThrottle === undefined ? {} : { throttle: deps.indexThrottle }),
     });
@@ -1437,6 +1459,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       embedder: deps.embedder.info,
       // 執行裝置狀態（選填能力）：DML／CPU、退回原因、批次視窗；未提供時為 null。
       embedderRuntime: deps.embedder.runtimeStatus ?? null,
+      embedderScheduling: deps.embedder.schedulingStatus ?? null,
+      indexingTimings,
       roots: rootSummaries,
       indexing: [...indexing.keys()].map((rootId) => ({ rootId, startedAt: indexStatus.status(rootId).startedAt })),
       memories: {

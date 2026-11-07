@@ -93,7 +93,7 @@ function buffersOf(vectors: readonly Float32Array[]): Transferable[] {
 export function startEmbedderWorker(port: WorkerPort): void {
   /** 真正的 embedder；模型 session 只在這個執行緒內。 */
   let embedder: TransformersEmbedder | null = null;
-  /** 進行中的可取消 request（目前只有 `embedDocuments`）。 */
+  /** 進行中的可取消 request（文件批次與圖片）。 */
   const controllers = new Map<number, AbortController>();
 
   const post = (message: EmbedderWorkerOutboundMessage, transferList?: Transferable[]): void => {
@@ -149,7 +149,7 @@ export function startEmbedderWorker(port: WorkerPort): void {
       replyError(id, new Error("embedder worker 尚未初始化"));
       return;
     }
-    const controller = method === "embedDocuments" ? new AbortController() : null;
+    const controller = method === "embedDocuments" || method === "embedImage" ? new AbortController() : null;
     if (controller !== null) controllers.set(id, controller);
     try {
       switch (method) {
@@ -177,7 +177,9 @@ export function startEmbedderWorker(port: WorkerPort): void {
           return;
         }
         case "embedImage": {
-          const vector = await embedder.embedImage(readImage(message.params));
+          const vector = await embedder.embedImage(readImage(message.params), {
+            ...(controller === null ? {} : { signal: controller.signal }),
+          });
           reply(id, vector, buffersOf([vector]));
           return;
         }

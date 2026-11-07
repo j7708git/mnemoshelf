@@ -29,6 +29,22 @@ afterAll(async () => {
 });
 
 describe("previewRoot", () => {
+  it("已開啟但尚未接通的影音回報 unsupported-modality，不列入預估", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mnemoshelf-preview-media-"));
+    try {
+      await fs.writeFile(path.join(dir, "sound.wav"), Buffer.from([1]));
+      await fs.writeFile(path.join(dir, "clip.mp4"), Buffer.from([2]));
+      const preview = await previewRoot({ path: dir, modalities: ["audio", "video"] });
+      expect(preview.totalFiles).toBe(0);
+      expect(preview.estimatedSeconds).toBe(0);
+      expect(preview.skipped).toEqual([
+        { relPath: "clip.mp4", reason: "unsupported-modality" },
+        { relPath: "sound.wav", reason: "unsupported-modality" },
+      ]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
   it("統計與實際檔案相符，並回報各類型分佈", async () => {
     const preview = await previewRoot({ path: rootPath, modalities: ["text", "code"], maxFileBytes: 1000 });
 

@@ -409,6 +409,7 @@ export type {
 export {
   EmbedderWorkerClosedError,
   EmbedderWorkerCrashError,
+  EmbedderQueueFullError,
   WorkerEmbedder,
 } from "./worker-embedder.js";
 export type {
@@ -416,6 +417,8 @@ export type {
   EmbedderWorkerLike,
   EmbedderWorkerMethod,
   WorkerEmbedderOptions,
+  EmbedderSchedulingStatus,
+  EmbedderSchedulingLimits,
 } from "./worker-embedder.js";
 export {
   FileTooLargeError,

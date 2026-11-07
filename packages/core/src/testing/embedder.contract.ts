@@ -196,6 +196,15 @@ export function runEmbedderContract(name: string, factory: EmbedderFactory): voi
       }
     });
 
+    it("已取消的文字批次與圖片必須拒絕，不回傳成功向量", async () => {
+      const controller = new AbortController();
+      controller.abort();
+      await expect(embedder.embedDocuments([{ text: "取消的文件" }], { signal: controller.signal }))
+        .rejects.toMatchObject({ name: "AbortError" });
+      await expect(embedder.embedImage(distinctImage("a"), { signal: controller.signal }))
+        .rejects.toMatchObject({ name: "AbortError" });
+    });
+
     it("dispose() 冪等：可重複呼叫且不拋錯", async () => {
       await embedder.dispose();
       await embedder.dispose();

@@ -49,6 +49,14 @@ async function embedBadImage(): Promise<unknown> {
 }
 
 describe("EmbedderInputError 的去識別化", () => {
+  it("圖片已取消時不解碼、不載入模型，也不誤報圖片損壞", async () => {
+    const embedder = new TransformersEmbedder({ platform: "linux", cacheDir: "unused" });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(embedder.embedImage({ bytes: new Uint8Array(0) }, { signal: controller.signal }))
+      .rejects.toMatchObject({ name: "AbortError" });
+    expect(embedder.runtimeStatus.loaded).toBe(false);
+  });
   it("訊息遮罩家目錄，且帶穩定錯誤碼", async () => {
     const error = await embedBadImage();
     expect(error).toBeInstanceOf(EmbedderInputError);
@@ -72,7 +80,7 @@ describe("EmbedderInputError 的去識別化", () => {
     const dumped = `${inspect(error)}\n${String((error as Error).stack)}`;
     expect(dumped).not.toContain(LEAKY_PATH);
     expect(dumped).not.toContain(path.dirname(LEAKY_PATH));
-    expect(dumped).toContain("~/Photos/sample.heic");
+    expect(dumped).toContain(path.join("~", "Photos", "sample.heic"));
   });
 
   it("已是 EmbedderInputError 者原樣拋出，不重複包裝", async () => {

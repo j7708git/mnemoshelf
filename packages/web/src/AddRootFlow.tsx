@@ -55,6 +55,7 @@ const SKIP_REASON_LABEL: Record<string, string> = {
   blocked: "黑名單",
   excluded: "排除規則",
   "modality-off": "未開啟的模態",
+  "unsupported-modality": "尚未支援的媒體類型",
   "too-large": "超過大小上限",
   "unsupported-type": "不支援的型別",
   "unresolved-symlink": "無法解析的連結",

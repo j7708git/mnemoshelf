@@ -148,6 +148,7 @@ export {
   type IndexProgress,
   type IndexRootOptions,
   type IndexRootResult,
+  type IndexTimingEvent,
 } from "./indexer/indexer.js";
 export {
   DEFAULT_PREVIEW_MODALITIES,

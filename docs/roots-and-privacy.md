@@ -46,9 +46,13 @@ root 記錄建立後、索引開始前先做一次乾跑（dry run），回報�
   而跳過**：索引階段會對文字／程式碼套用遮罩（見 §機密遮罩），原檔案仍會被納入、只讀不寫。
 
 使用者確認後才開始索引。索引可取消，也可限速，避免占滿 CPU。
+目前產品索引入口只接通文字、程式碼與圖片；即使 root 設定包含 `audio` 或 `video`，
+預覽與索引仍以 `unsupported-modality` 跳過，不會送進圖片模型。索引結果的 `scanSkippedFiles`
+記錄掃描階段跳過原因，不計入 `total`；處理階段的 `skippedFiles` 仍計入 `total`，既有對帳語意不變。
+重新索引會依既有清理規則移除未支援模態的舊索引，來源檔案保持不變。
   <!-- 2026-10-19 更新：`POST /roots/:id/index/cancel` 已實作；限速 `MNEMOSHELF_INDEX_RATE=off|normal|low`
        也已實作（`normal` 50ms、`low` 250ms，`off` 為預設），只作用於「檔案與檔案之間」，
-       同一個大檔的嵌入批次仍一次跑完。預設值與完整行為以 `docs/operations.md` 與
+       大檔內部的讓渡由 WorkerEmbedder 視窗排程負責。預設值與完整行為以 `docs/operations.md` 與
        `packages/server/src/config.ts` 為準。 -->
 
 ## 路徑安全（所有檔案存取都要通過）

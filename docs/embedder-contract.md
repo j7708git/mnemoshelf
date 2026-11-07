@@ -38,7 +38,7 @@ interface Embedder {
   /** 文件文字批次；輸出與 inputs 一一對應且順序相同（見「批次方法」一節）。 */
   embedDocuments(inputs: readonly DocumentInput[], opts?: EmbedDocumentsOptions): Promise<Float32Array[]>;
   /** 圖片。輸入為已解碼的像素或檔案位元組，由實作決定，但必須明確定義。 */
-  embedImage(image: ImageInput): Promise<Float32Array>;
+  embedImage(image: ImageInput, opts?: EmbedDocumentsOptions): Promise<Float32Array>;
   /** 啟動探測，見「啟動探測」一節。 */
   probe(): Promise<ProbeResult>;
   dispose(): Promise<void>;
@@ -283,6 +283,28 @@ token ≈ 最多約 2,048 真實 token）離這個值很遠，這是安全網而
 （在 Electron 內必死）；連**超出**預算的 `16×522`（T=8,352）也有 1.60 GiB——可見 token 預算
 並不保證配置低於 PartitionAlloc 的單一配置上限。**不要**因為預算「看起來夠小」就把 pattern 打開：
 那條路正是 macOS 索引閃退的成因。
+
+## 服務端批次排程
+
+`WorkerEmbedder` 保留 `embedDocuments` 的順序、數量與整批成功／失敗契約，內部將文件拆成
+不超過 16 筆、且不超過目前裝置 `batchSize` 的工作視窗。每個視窗仍受模型實作的實際 token
+預算約束；模型內部可能再縮窗。視窗完成後讓出執行機會，同時最多一個 worker 請求進行推論。
+查詢優先，但連續最多 4 個查詢後，已等待的背景工作可前進一個視窗；背景請求輪流執行。
+這是工作視窗邊界的公平性，不保證正在執行的 native Run 可搶占或固定毫秒延遲。
+
+預設准入上限含正在執行的邏輯請求：128 個請求、8,192 個輸入、64 MiB 輸入 UTF-8／媒體
+位元組。文件標題也計入；准入後才複製輸入。超限拋 `EEMBEDDERQUEUEFULL`，服務搜尋端點
+回 `503` 與 `Retry-After: 1`；單一輸入本身超限時需要縮小輸入。索引仍按檔案記錄失敗並於下次重跑補齊。
+這些限制控制排程持有的輸入，並非整個行程 RSS 或圖片解碼像素的上限。
+
+圖片也接受選用的 `signal`；排隊中的文件／圖片取消可立即拒絕，圖片在解碼與前處理邊界檢查取消。
+執行中的 native 推論等待安全邊界，之後不再啟動下一視窗，
+累積的部分向量不回傳為成功。關閉會拒絕尚未執行的工作並等待目前視窗收尾；`drain()`
+涵蓋視窗間隙。保留既有 memory-pattern／CPU arena 與 token 護欄。
+
+`GET /diagnostics` 的 `embedderScheduling` 只回傳彙總計數、排隊／worker 往返耗時及上限。
+`completedWindows` 是完成的工作視窗；`completedDocumentInputs` 是整個邏輯文件呼叫成功的輸入數，
+兩者都不代表索引資料已持久化；逐檔的 `processedChunks` 才是成功寫入量。
 
 ## 啟動探測（probe）
 

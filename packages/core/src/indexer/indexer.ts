@@ -80,6 +80,8 @@ export interface IndexRootOptions {
   concurrency?: number;
   signal?: AbortSignal;
   onProgress?: (progress: IndexProgress) => void;
+  /** 各階段耗時，不含路徑／內容；併發階段加總不等於牆鐘時間。觀測失敗不影響索引。 */
+  onTiming?: (event: IndexTimingEvent) => void;
   /** 單檔大小上限，預設 10 MB（見 scan.walkRoot）。 */
   maxFileBytes?: number;
   /**
@@ -99,6 +101,8 @@ export interface IndexRootOptions {
 }
 
 export interface IndexRootResult {
+  /** 掃描時跳過的檔案（不計入 total）；與處理期間 skippedFiles 分開對帳。 */
+  scanSkippedFiles?: SkippedEntry[];
   total: number;
   processed: number;
   skippedUnchanged: number;
@@ -130,6 +134,20 @@ export interface IndexRootResult {
    * 對帳語意：`processed + skippedUnchanged + skippedFiles.length + failedFiles.length === total`。
    */
   failedFiles: FailedFileEntry[];
+}
+
+/** 階段計時；embed 含排隊與前處理，不能當作純模型推論耗時。 */
+export interface IndexTimingEvent {
+  stage: "scan" | "read" | "prepare" | "embed" | "write";
+  durationMs: number;
+}
+
+function reportTiming(hook: IndexRootOptions["onTiming"], stage: IndexTimingEvent["stage"], start: number): void {
+  try {
+    hook?.({ stage, durationMs: Math.max(0, performance.now() - start) });
+  } catch {
+    // 診斷觀測者不可改變索引成功／失敗語意。
+  }
 }
 
 /** 內容層二進位偵測只看檔案前段這麼多 bytes（成本固定、與檔案大小無關）。 */
@@ -371,7 +389,7 @@ async function embedInputs(
   if (isMediaKind(file.kind)) {
     throwIfAborted(signal);
     const image: ImageInput = file.mimeType === null ? { bytes } : { bytes, mimeType: file.mimeType };
-    return [await embedder.embedImage(image)];
+    return [await embedder.embedImage(image, { signal })];
   }
 
   // title 用相對路徑：spike 顯示帶 title 對檢索顯著有利。
@@ -478,11 +496,15 @@ async function processFile(
   deps: ProcessDeps,
   signal: AbortSignal | undefined,
   hooks: ProcessHooks = {},
+  onTiming?: IndexRootOptions["onTiming"],
 ): Promise<FileOutcome> {
   const target = await revalidateReadPath(root, file);
   if (!target.ok) return { status: "skipped", reason: target.reason };
 
+  const readStart = performance.now();
   const bytes = await fs.readFile(target.abs);
+  reportTiming(onTiming, "read", readStart);
+  const prepareStart = performance.now();
 
   // 內容層防線放在增量判斷**之前**：hash 未變的舊資料也必須被清掉。
   if (
@@ -518,12 +540,17 @@ async function processFile(
   if (existing.length > 0 && existing.every((chunk) => chunk.contentHash === contentHash)) {
     const keys = existing.map((chunk) => `c:${chunk.id}`);
     const present = await deps.vec.existingKeys(keys);
-    if (keys.every((key) => present.has(key))) return { status: "unchanged" };
+    if (keys.every((key) => present.has(key))) {
+      reportTiming(onTiming, "prepare", prepareStart);
+      return { status: "unchanged" };
+    }
   }
 
   const inputs = buildChunkInputs(file, contentHash, content);
+  reportTiming(onTiming, "prepare", prepareStart);
   hooks.onChunked?.(inputs.length);
   let vectors: Float32Array[];
+  const embedStart = performance.now();
   try {
     vectors = await embedInputs(inputs, file, bytes, deps.embedder, signal);
   } catch (error) {
@@ -539,8 +566,11 @@ async function processFile(
     // 若保留舊向量，搜尋會一直撈到讀不出來的舊內容。
     await purgeChunks(root.id, file.relPath, deps);
     return { status: "skipped", reason: "undecodable" };
+  } finally {
+    reportTiming(onTiming, "embed", embedStart);
   }
   throwIfAborted(signal);
+  const writeStart = performance.now();
 
   // 舊 chunk 的向量先回收（replaceChunks 會換成新的 autoincrement id）。
   if (existing.length > 0) {
@@ -555,6 +585,7 @@ async function processFile(
     vec: vectors[index]!,
   }));
   await deps.vec.upsert(items);
+  reportTiming(onTiming, "write", writeStart);
   return { status: "processed", chunks: inputs.length, masked };
 }
 
@@ -598,12 +629,15 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
   const concurrency = serialized ? 1 : Math.max(1, Math.floor(options.concurrency ?? 2));
   // 限速（預設 0＝不限速、不建立 timer）：夾成非負整數，負值／NaN 一律視為 0。
   const betweenFilesMs = Math.max(0, Math.floor(options.throttle?.betweenFilesMs ?? 0));
-  const scanOptions: ScanOptions = {};
+  // capability 宣告仍須配合真正的處理入口；尚未有 audio/video port，不能送 embedImage。
+  const scanOptions: ScanOptions = { supportedModalities: ["text", "code", "image"] };
   if (options.maxFileBytes !== undefined) scanOptions.maxFileBytes = options.maxFileBytes;
   // 把 signal 一路帶進掃描層：大目錄下取消不必等整輪走訪結束（見 ScanOptions.signal）。
   if (signal !== undefined) scanOptions.signal = signal;
 
+  const scanStart = performance.now();
   const scan = await walkRoot(root, scanOptions);
+  reportTiming(options.onTiming, "scan", scanStart);
   const files = scan.files;
   const total = files.length;
 
@@ -661,7 +695,7 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
             estimatedChunks += chunkCount;
             report();
           },
-        });
+        }, options.onTiming);
       } catch (error) {
         // 中止優先於「壞檔」：取消不是檔案失敗，整輪就此結束（見 throwIfAborted）。
         throwIfAborted(signal);
@@ -682,7 +716,11 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
   };
 
   const workerCount = Math.min(concurrency, files.length);
-  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  // 取消時不可由第一個拒絕的 worker 提早結束整輪：其餘 worker 可能仍在 native 推論或寫入。
+  // 全部收尾後才允許呼叫端重跑／關閉資料庫，避免前一輪的非同步工作混入下一輪。
+  const outcomes = await Promise.allSettled(Array.from({ length: workerCount }, () => worker()));
+  const rejected = outcomes.find((outcome) => outcome.status === "rejected");
+  if (rejected?.status === "rejected") throw rejected.reason;
 
-  return { total, processed, skippedUnchanged, maskedFiles, removedFiles, skippedFiles, failedFiles };
+  return { total, processed, skippedUnchanged, maskedFiles, removedFiles, skippedFiles, failedFiles, scanSkippedFiles: scan.skipped };
 }

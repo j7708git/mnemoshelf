@@ -659,7 +659,8 @@ export class TransformersEmbedder implements Embedder {
     return vectors;
   }
 
-  async embedImage(image: ImageInput): Promise<Float32Array> {
+  async embedImage(image: ImageInput, opts?: EmbedDocumentsOptions): Promise<Float32Array> {
+    throwIfAborted(opts?.signal);
     if (image.bytes.length === 0) throw new EmptyImageInputError();
 
     // transformers.js 在 Node 以 sharp 解碼；load_image 接受 Blob。先複製成
@@ -668,13 +669,17 @@ export class TransformersEmbedder implements Embedder {
     const blob = new Blob([bytes], { type: image.mimeType ?? "application/octet-stream" });
 
     const rows = await this.runWithFallback(async ({ processor, model }) => {
+      throwIfAborted(opts?.signal);
       // 解碼與圖片前處理都不碰 ONNX session：這一段的失敗一律標成 EmbedderInputError
       // （見 asImageInputError），因此不會被 shouldFallBack 當成裝置失敗。真正的推論
       // 錯誤發生在下面的 runModel，維持原本「dml 失敗即退回」的判定。
       const rawImage = await this.inImageInputPhase(() => load_image(blob));
+      throwIfAborted(opts?.signal);
       const inputs = await this.inImageInputPhase(() => processor(null, [[rawImage]]));
+      throwIfAborted(opts?.signal);
       return await runModel(this.modelId, model, inputs);
-    }, undefined);
+    }, opts?.signal);
+    throwIfAborted(opts?.signal);
     return this.toVector(rows);
   }
 

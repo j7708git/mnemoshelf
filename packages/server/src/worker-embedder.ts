@@ -12,8 +12,8 @@
  *   metadata 實例**強制 `cpu`**：建構子在 macOS 的 `auto` 會讀／寫裝置決定快取，主執行緒再走一次
  *   會讓「載入期崩潰重試」計數被重複推進；`info` 只看模型與 dtype，換裝置不改變 `info.id`。
  *   也因為繞過了裝置選項，這裡先自行呼叫 `parseEmbedDeviceOption`，維持「非法值啟動失敗」。
- * - **一次只有一個進行中的呼叫**：worker 只有一個模型 session，proxy 以 promise 鏈序列化所有
- *   `embed*`／`probe`（含多個索引 job、搜尋與記憶背景嵌入），呼叫端不需自行排隊。
+ * - **一次只有一個進行中的呼叫**：worker 只有一個模型 session，proxy 以有界雙佇列序列化所有
+ *   `embed*`／`probe`。文件批次逐窗交還排程；查詢優先且有連續查詢上限，背景工作不會飢餓。
  * - **取消**：`embedDocuments` 的 `AbortSignal` 以 `{type:"cancel"}` 訊息送進 worker；native 推論
  *   不可中斷，因此取消在**下一個邊界**（下一個批次視窗／下一次取消檢查）生效。呼叫端若在
  *   完成後才 abort，proxy 也會以 `AbortError` 拒絕（語意一致：取消後不採用結果）。
@@ -22,7 +22,7 @@
  *   清楚錯誤，避免無限 crash loop。
  * - **安全關閉**：native 推論不可中斷，terminate 一個正在推論的 worker、或讓行程在 native
  *   返回前結束，都會在 teardown 拋 `Napi::Error` abort 整個行程（SIGABRT）。因此 `dispose()`
- *   會先 `drain()`（等目前在途／已排隊的呼叫全部結束），worker 閒置後才 terminate；
+ *   會拒絕尚未執行的工作，再 `drain()` 等目前在途的視窗結束，worker 閒置後才 terminate；
  *   `createServer.close()` 回傳時已無 native 推論在跑，呼叫端之後 `process.exit()` 是安全的。
  *   只有 drain 超過上限（worker 卡死，預設 120 秒）才記錄並放棄：**不 terminate** 推論中的
  *   worker，此時呼叫端不得 `process.exit()`（理論邊界，見 `docs/roots-and-privacy.md` 的「資料存放與刪除」一節）。
@@ -150,6 +150,8 @@ export interface WorkerEmbedderOptions {
    * 此時呼叫端**不得** `process.exit()`（行程 teardown 仍可能 abort；理論邊界）。
    */
   drainTimeoutMs?: number;
+  /** 推論排程護欄；未提供時使用有界預設。 */
+  scheduling?: Partial<EmbedderSchedulingLimits>;
   /** 連續崩潰且沒有成功呼叫時，最多自動重建幾次；預設 1（卡上要求「至少一次」）。 */
   maxRestarts?: number;
 }
@@ -174,6 +176,61 @@ export class EmbedderWorkerClosedError extends Error {
     super(message);
     this.name = "EmbedderWorkerClosedError";
   }
+}
+
+/** 邏輯請求的准入與視窗上限（包含正在執行的工作）。 */
+export interface EmbedderSchedulingLimits {
+  maxRequests: number;
+  maxInputs: number;
+  maxInputBytes: number;
+  maxWindowInputs: number;
+  maxQueryBurst: number;
+}
+
+/** 僅含彙總數字，不保留文字、標題、路徑或請求識別值。 */
+export interface EmbedderSchedulingStatus {
+  admittedRequests: number;
+  admittedInputs: number;
+  admittedInputBytes: number;
+  queuedQueries: number;
+  queuedBackground: number;
+  active: number;
+  completedWindows: number;
+  completedRequests: number;
+  completedDocumentInputs: number;
+  cancelledRequests: number;
+  rejectedRequests: number;
+  failedRequests: number;
+  queueWaitMs: number;
+  workerRunMs: number;
+  maxObservedRequests: number;
+  maxObservedInputs: number;
+  maxObservedInputBytes: number;
+  maxObservedWindowInputs: number;
+  limits: EmbedderSchedulingLimits;
+}
+
+/** 准入超限；不截短輸入、不回傳部分向量，呼叫端可以稍後重試。 */
+export class EmbedderQueueFullError extends Error {
+  readonly code = "EEMBEDDERQUEUEFULL";
+  constructor() {
+    super("嵌入排程已達請求數、輸入數或位元組上限，請稍後重試");
+    this.name = "EmbedderQueueFullError";
+  }
+}
+
+interface ScheduledCall {
+  query: boolean;
+  inputs: number;
+  documents: number;
+  bytes: number;
+  signal: AbortSignal | undefined;
+  onAbort: (() => void) | undefined;
+  settled: boolean;
+  queuedAt: number;
+  step: (state: WorkerState) => Promise<{ done: boolean; value?: unknown }>;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
 }
 
 interface PendingRequest {
@@ -374,9 +431,28 @@ export class WorkerEmbedder implements Embedder {
   private state: WorkerState | null = null;
   /** 已送出但尚未回應的 request（序列化下最多一個；dispose／崩潰時會全部拒絕）。 */
   private readonly pending = new Map<number, PendingRequest>();
-  /** proxy 層的序列化鏈：worker 只有一個模型 session，所有呼叫依序執行。 */
-  private chain: Promise<void> = Promise.resolve();
-  /** 已排入序列化鏈、尚未完成的呼叫數（含排隊中與在途）。 */
+  private readonly limits: EmbedderSchedulingLimits;
+  private readonly queryQueue: ScheduledCall[] = [];
+  private readonly backgroundQueue: ScheduledCall[] = [];
+  private readonly admitted = new Set<ScheduledCall>();
+  private active: ScheduledCall | null = null;
+  private scheduled = false;
+  private queryBurst = 0;
+  private inputCount = 0;
+  private inputBytes = 0;
+  private completedWindows = 0;
+  private completedRequests = 0;
+  private completedDocumentInputs = 0;
+  private cancelledRequests = 0;
+  private rejectedRequests = 0;
+  private failedRequests = 0;
+  private queueWaitMs = 0;
+  private workerRunMs = 0;
+  private maxObservedRequests = 0;
+  private maxObservedInputs = 0;
+  private maxObservedInputBytes = 0;
+  private maxObservedWindowInputs = 0;
+  /** 已准入但尚未結算的邏輯呼叫數（跨視窗保持不變）。 */
   private busy = 0;
   /** `drain()` 的等待者：`busy` 歸零時喚醒。 */
   private readonly idleWaiters = new Set<() => void>();
@@ -386,6 +462,7 @@ export class WorkerEmbedder implements Embedder {
   /** 連續失敗次數（任何一次成功回應就歸零）。 */
   private consecutiveCrashes = 0;
   private closed = false;
+  private disposal: Promise<void> | null = null;
 
   constructor(options: WorkerEmbedderOptions = {}) {
     this.embedderOptions = options.embedderOptions ?? {};
@@ -394,6 +471,14 @@ export class WorkerEmbedder implements Embedder {
     this.disposeTimeoutMs = positiveInteger(options.disposeTimeoutMs, 5_000);
     this.drainTimeoutMs = positiveInteger(options.drainTimeoutMs, 120_000);
     this.maxRestarts = nonNegativeInteger(options.maxRestarts, 1);
+    const limits = options.scheduling;
+    this.limits = {
+      maxRequests: positiveInteger(limits?.maxRequests, 128),
+      maxInputs: positiveInteger(limits?.maxInputs, 8192),
+      maxInputBytes: positiveInteger(limits?.maxInputBytes, 64 * 1024 * 1024),
+      maxWindowInputs: positiveInteger(limits?.maxWindowInputs, 16),
+      maxQueryBurst: positiveInteger(limits?.maxQueryBurst, 4),
+    };
     const metadata = options.metadataEmbedder ?? createMetadataEmbedder(this.embedderOptions);
     this.info = metadata.info;
   }
@@ -407,15 +492,38 @@ export class WorkerEmbedder implements Embedder {
     return this.statusValue;
   }
 
+  get schedulingStatus(): EmbedderSchedulingStatus {
+    return {
+      admittedRequests: this.busy,
+      admittedInputs: this.inputCount,
+      admittedInputBytes: this.inputBytes,
+      queuedQueries: this.queryQueue.length,
+      queuedBackground: this.backgroundQueue.length,
+      active: this.active === null ? 0 : 1,
+      completedWindows: this.completedWindows,
+      completedRequests: this.completedRequests,
+      completedDocumentInputs: this.completedDocumentInputs,
+      cancelledRequests: this.cancelledRequests,
+      rejectedRequests: this.rejectedRequests,
+      failedRequests: this.failedRequests,
+      queueWaitMs: this.queueWaitMs,
+      workerRunMs: this.workerRunMs,
+      maxObservedRequests: this.maxObservedRequests,
+      maxObservedInputs: this.maxObservedInputs,
+      maxObservedInputBytes: this.maxObservedInputBytes,
+      maxObservedWindowInputs: this.maxObservedWindowInputs,
+      limits: { ...this.limits },
+    };
+  }
+
   async embedQuery(text: string): Promise<Float32Array> {
-    return await this.call<Float32Array>("embedQuery", { text }, undefined);
+    return await this.call<Float32Array>("embedQuery", { text }, undefined, this.textBytes(text));
   }
 
   async embedDocument(text: string, title?: string): Promise<Float32Array> {
     return await this.call<Float32Array>(
-      "embedDocument",
-      title === undefined ? { text } : { text, title },
-      undefined,
+      "embedDocument", title === undefined ? { text } : { text, title }, undefined,
+      this.textBytes(text, title),
     );
   }
 
@@ -423,18 +531,53 @@ export class WorkerEmbedder implements Embedder {
     inputs: readonly DocumentInput[],
     opts?: EmbedDocumentsOptions,
   ): Promise<Float32Array[]> {
-    return await this.call<Float32Array[]>("embedDocuments", { inputs: [...inputs] }, opts?.signal);
+    const signal = opts?.signal;
+    if (this.closed) throw new EmbedderWorkerClosedError();
+    throwIfAborted(signal);
+    if (inputs.length === 0) return [];
+    this.checkAdmission(inputs.length, 0);
+    let bytes = 0;
+    for (const input of inputs) {
+      bytes += this.textBytes(input.text, input.title);
+      this.checkAdmission(inputs.length, bytes);
+    }
+    return await this.enqueue<Float32Array[]>(false, inputs.length, bytes, signal, () => {
+      // 准入後才擷取有界快照，避免呼叫端在排隊期間修改輸入。
+      const snapshot = inputs.map(({ text, title }) => title === undefined ? { text } : { text, title });
+      const vectors: Float32Array[] = [];
+      let offset = 0;
+      return async (state) => {
+        throwIfAborted(signal);
+        const windowSize = Math.min(this.limits.maxWindowInputs, positiveInteger(this.statusValue?.batchSize, 1));
+        const window = snapshot.slice(offset, offset + windowSize);
+        this.maxObservedWindowInputs = Math.max(this.maxObservedWindowInputs, window.length);
+        const result = await this.send(state, "embedDocuments", { inputs: window }, signal);
+        throwIfAborted(signal);
+        if (!Array.isArray(result) || result.length !== window.length) {
+          throw new Error("embedder worker 的批次輸出數量不符");
+        }
+        vectors.push(...result as Float32Array[]);
+        offset += window.length;
+        if (this.closed && offset < snapshot.length) throw new EmbedderWorkerClosedError();
+        return { done: offset === snapshot.length, value: vectors };
+      };
+    }, inputs.length);
   }
 
-  async embedImage(image: ImageInput): Promise<Float32Array> {
-    // 先複製一份再轉移：不能 detach 呼叫端的 buffer（core 在嵌入後還會用到原始位元組的 hash）。
-    const bytes = new Uint8Array(image.bytes);
-    return await this.call<Float32Array>(
-      "embedImage",
-      image.mimeType === undefined ? { bytes } : { bytes, mimeType: image.mimeType },
-      undefined,
-      [bytes.buffer],
-    );
+  async embedImage(image: ImageInput, opts?: EmbedDocumentsOptions): Promise<Float32Array> {
+    const signal = opts?.signal;
+    throwIfAborted(signal);
+    return await this.enqueue<Float32Array>(false, 1, image.bytes.byteLength + this.textBytes(image.mimeType ?? ""), signal, () => {
+      // 准入後才複製；不可 detach 呼叫端仍需用來計算 hash 的 buffer。
+      const bytes = new Uint8Array(image.bytes);
+      const params = image.mimeType === undefined ? { bytes } : { bytes, mimeType: image.mimeType };
+      return async (state) => {
+        throwIfAborted(signal);
+        const value = await this.send(state, "embedImage", params, signal, [bytes.buffer]);
+        throwIfAborted(signal);
+        return { done: true, value };
+      };
+    });
   }
 
   async probe(): Promise<ProbeResult> {
@@ -456,7 +599,7 @@ export class WorkerEmbedder implements Embedder {
   /**
    * 關閉 worker（冪等、**不 hang**）。
    *
-   * - **有在途／排隊呼叫（native 推論可能正在跑）**：先 `drain()` 等它們結束，
+   * - **有在途／排隊呼叫（native 推論可能正在跑）**：先拒絕排隊工作，再等目前 native 視窗，
    *   worker 閒置後才 terminate。**不**在推論中 terminate、也不放手讓行程先結束：
    *   實測 macOS CPU 的 onnxruntime 會拋出 `Napi::Error` abort 整個行程（SIGABRT）。
    *   等「目前一個批次」跑完是安全關閉的必要代價（`close()` 回傳前完成）。
@@ -466,20 +609,29 @@ export class WorkerEmbedder implements Embedder {
    * - **沒有在途呼叫**：先請 worker 釋放模型 session（有上限），再 `terminate()`。
    * - 優雅關閉請求也逾時（worker 沒回報，可能卡在 native）：走同一條放棄路徑。
    *
-   * 在途呼叫一律以 `EmbedderWorkerClosedError` 拒絕（已完成且已送達的結果例外：它會正常
-   * 回給呼叫端，但 `dispose()` 會等它完成）；之後再呼叫任何方法也一樣。
+   * 尚未執行的工作與未完成的多窗文件以 `EmbedderWorkerClosedError` 拒絕；正在執行的單窗
+   * 工作仍可正常取得結果。drain 超時則拒絕所有呼叫；關閉後不再接受任何新呼叫。
    *
    * @param options.timeoutMs 覆寫這次等待 drain 的上限（0＝不重複等待，直接走放棄路徑；
    *   供 `createServer.close()` 在整體期限已用完時使用）。
    */
   async dispose(options: { timeoutMs?: number } = {}): Promise<void> {
+    this.disposal ??= this.disposeInternal(options);
+    await this.disposal;
+  }
+
+  private async disposeInternal(options: { timeoutMs?: number }): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    this.rejectQueued(new EmbedderWorkerClosedError());
     const state = this.state;
-    if (state === null) return;
+    if (state === null) {
+      await this.waitForIdle();
+      return;
+    }
     state.closing = true;
 
-    // 1) 先等目前在途（含已排隊）的呼叫結束：native 推論不可中斷，推論中 terminate 或讓
+    // 1) 排隊工作已拒絕；等目前在途視窗結束：native 推論不可中斷，推論中 terminate 或讓
     //    行程先結束都會 abort。關閉後新呼叫會因 `closed` 立刻失敗，不影響這裡的收斂。
     if (this.busy > 0 || this.pending.size > 0) {
       const budget = options.timeoutMs ?? this.drainTimeoutMs;
@@ -527,29 +679,20 @@ export class WorkerEmbedder implements Embedder {
   }
 
   /**
-   * 等到序列化鏈上已排入的呼叫全部完成、且沒有在途 request。
-   *
-   * `busy` 在 `serialize()` 排入時遞增、鏈的結算時遞減；`pending` 是最後一道防線
-   * （response 已到但鏈還沒結算的極短窗口）。關閉之後不會再有新呼叫排進來，
-   * 因此這個迴圈一定會收斂（除非 worker 卡在 native，那就是 `dispose()` 的上限處理）。
+   * 等所有已准入的邏輯呼叫完成，包括視窗間空隙、handshake 與 native 回應後的結算。
+   * 關閉之後不會有新准入；只有 native 卡住時才需由 dispose 的期限放棄等待。
    */
   private async waitForIdle(): Promise<void> {
-    while (this.busy > 0 || this.pending.size > 0) {
+    while (this.busy > 0 || this.pending.size > 0 || this.active !== null) {
       await new Promise<void>((resolve) => {
         this.idleWaiters.add(resolve);
       });
     }
   }
 
-  /** 一個序列化呼叫結算（成功或失敗）：遞減 `busy`，完全閒置時喚醒 `drain()` 的等待者。 */
-  private finishCall(): void {
-    this.busy -= 1;
-    this.notifyIdle();
-  }
-
   /** 狀態變動後：若已完全閒置（沒有排隊、也沒有在途 request）就喚醒 `drain()` 的等待者。 */
   private notifyIdle(): void {
-    if (this.busy > 0 || this.pending.size > 0) return;
+    if (this.busy > 0 || this.pending.size > 0 || this.active !== null) return;
     for (const resolve of [...this.idleWaiters]) resolve();
     this.idleWaiters.clear();
   }
@@ -565,6 +708,7 @@ export class WorkerEmbedder implements Embedder {
    *   避免在推論中途 terminate 造成 `Napi::Error` abort。
    */
   private abandon(state: WorkerState, error: unknown): void {
+    const nativePending = this.pending.size > 0;
     state.closing = true;
     state.abandoned = true;
     this.state = null;
@@ -578,7 +722,10 @@ export class WorkerEmbedder implements Embedder {
       state.readyReject(error);
     }
     this.rejectPending(error);
-    // 刻意不 unref、也不 terminate：見上面的說明（native 推論中結束行程會 abort）。
+    for (const job of [...this.admitted]) this.finishJob(job, error);
+    // handshake 期間尚無 native 請求，可以立即安全釋放。
+    if (!nativePending) void this.terminateAbandoned(state);
+    // 其餘情況刻意不 unref、也不 terminate：native 推論中結束行程會 abort。
   }
 
   /** 已放棄的 worker 回報（native 邊界）後，安全 terminate。 */
@@ -589,38 +736,149 @@ export class WorkerEmbedder implements Embedder {
     await this.terminate(state.worker);
   }
 
-  /** 所有對 worker 的呼叫都經過這裡：先排隊、再確保 handshake、最後送出。 */
+  /** 單筆方法與探測共用排程入口。 */
   private call<T>(
     method: EmbedderWorkerMethod,
     params: unknown,
     signal: AbortSignal | undefined,
-    transfer?: Transferable[],
+    bytes = 0,
   ): Promise<T> {
-    return this.serialize(async () => {
+    return this.enqueue<T>(method === "embedQuery", 1, bytes, signal, () => async (state) => {
       throwIfAborted(signal);
-      const state = await this.ensureReady();
+      const value = await this.send(state, method, params, signal);
       throwIfAborted(signal);
-      const value = await this.send(state, method, params, signal, transfer);
-      // worker 完成後才 abort（例如取消在最後一個視窗才到）：不採用結果，統一以取消拒絕。
-      if (signal?.aborted === true) throw abortError(signal);
-      return value as T;
+      return { done: true, value };
+    }, method === "embedDocument" ? 1 : 0);
+  }
+
+  /** 先以字元長度擋掉明顯超限輸入，再精確計算 UTF-8 位元組，期間不複製文字。 */
+  private textBytes(text: string, title?: string): number {
+    if (this.closed) throw new EmbedderWorkerClosedError();
+    if (text.length + (title?.length ?? 0) > this.limits.maxInputBytes) {
+      this.rejectedRequests += 1;
+      throw new EmbedderQueueFullError();
+    }
+    return Buffer.byteLength(text) + (title === undefined ? 0 : Buffer.byteLength(title));
+  }
+
+  private checkAdmission(inputs: number, bytes: number): void {
+    if (this.closed) throw new EmbedderWorkerClosedError();
+    if (this.busy >= this.limits.maxRequests || this.inputCount + inputs > this.limits.maxInputs ||
+        this.inputBytes + bytes > this.limits.maxInputBytes) {
+      this.rejectedRequests += 1;
+      throw new EmbedderQueueFullError();
+    }
+  }
+
+  /** 准入記帳涵蓋整個邏輯請求，視窗間也不會暫時變成 idle。 */
+  private enqueue<T>(
+    query: boolean, inputs: number, bytes: number, signal: AbortSignal | undefined,
+    createStep: () => ScheduledCall["step"], documents = 0,
+  ): Promise<T> {
+    try {
+      throwIfAborted(signal);
+      this.checkAdmission(inputs, bytes);
+      const step = createStep();
+      throwIfAborted(signal);
+      return new Promise<T>((resolve, reject) => {
+        const job: ScheduledCall = {
+          query, inputs, documents, bytes, signal, onAbort: undefined, settled: false, queuedAt: performance.now(), step,
+          resolve: (value) => resolve(value as T), reject,
+        };
+        this.busy += 1;
+        this.inputCount += inputs;
+        this.inputBytes += bytes;
+        this.admitted.add(job);
+        this.maxObservedRequests = Math.max(this.maxObservedRequests, this.busy);
+        this.maxObservedInputs = Math.max(this.maxObservedInputs, this.inputCount);
+        this.maxObservedInputBytes = Math.max(this.maxObservedInputBytes, this.inputBytes);
+        if (signal !== undefined) {
+          job.onAbort = () => {
+            if (this.active !== job || this.pending.size === 0) this.finishJob(job, abortError(signal));
+          };
+          signal.addEventListener("abort", job.onAbort, { once: true });
+        }
+        (query ? this.queryQueue : this.backgroundQueue).push(job);
+        this.schedule();
+      });
+    } catch (error) {
+      return Promise.reject(error);
+    }
+  }
+
+  private finishJob(job: ScheduledCall, error?: unknown, value?: unknown): void {
+    if (job.settled) return;
+    job.settled = true;
+    // 移除排隊 payload 的 closure；handshake 取消不必等 ready 才釋放大批文字／圖片。
+    job.step = async () => ({ done: true });
+    if (job.onAbort !== undefined) job.signal?.removeEventListener("abort", job.onAbort);
+    for (const queue of [this.queryQueue, this.backgroundQueue]) {
+      const index = queue.indexOf(job);
+      if (index >= 0) queue.splice(index, 1);
+    }
+    this.admitted.delete(job);
+    this.busy -= 1;
+    this.inputCount -= job.inputs;
+    this.inputBytes -= job.bytes;
+    if (error !== undefined) {
+      if (job.signal?.aborted === true) this.cancelledRequests += 1;
+      else this.failedRequests += 1;
+      job.reject(error);
+    } else {
+      this.completedRequests += 1;
+      this.completedDocumentInputs += job.documents;
+      job.resolve(value);
+    }
+    this.notifyIdle();
+  }
+
+  private rejectQueued(error: unknown): void {
+    for (const job of [...this.admitted]) {
+      if (job !== this.active) this.finishJob(job, error);
+    }
+  }
+
+  /** 每一窗交還 event loop；查詢優先，但背景工作最多只讓過固定數量的查詢。 */
+  private schedule(): void {
+    if (this.scheduled || this.active !== null || this.closed || this.busy === 0) return;
+    this.scheduled = true;
+    setImmediate(() => {
+      this.scheduled = false;
+      if (this.closed || this.active !== null) return;
+      const chooseQuery = this.queryQueue.length > 0 &&
+        (this.backgroundQueue.length === 0 || this.queryBurst < this.limits.maxQueryBurst);
+      const job = (chooseQuery ? this.queryQueue : this.backgroundQueue).shift();
+      if (job === undefined) return;
+      this.queryBurst = chooseQuery ? Math.min(this.queryBurst + 1, this.limits.maxQueryBurst) : 0;
+      this.active = job;
+      this.queueWaitMs += performance.now() - job.queuedAt;
+      void this.runStep(job);
     });
   }
 
-  /**
-   * 把呼叫排進單一序列。
-   *
-   * 前一項失敗不影響後續（以 `then(task, task)` 讓鏈繼續），呼叫端的 rejection 各自獨立。
-   * 同時維護 `busy`：`drain()` 以它（加上 `pending`）判斷是否已無在途／排隊工作。
-   */
-  private serialize<T>(task: () => Promise<T>): Promise<T> {
-    this.busy += 1;
-    const run = this.chain.then(task, task);
-    this.chain = run.then(
-      () => this.finishCall(),
-      () => this.finishCall(),
-    );
-    return run;
+  private async runStep(job: ScheduledCall): Promise<void> {
+    try {
+      throwIfAborted(job.signal);
+      const state = await this.ensureReady();
+      if (job.settled) return;
+      throwIfAborted(job.signal);
+      const result = await job.step(state);
+      if (job.settled) return;
+      this.completedWindows += 1;
+      throwIfAborted(job.signal);
+      if (result.done) this.finishJob(job, undefined, result.value);
+      else if (this.closed) this.finishJob(job, new EmbedderWorkerClosedError());
+      else if (!job.settled) {
+        job.queuedAt = performance.now();
+        (job.query ? this.queryQueue : this.backgroundQueue).push(job);
+      }
+    } catch (error) {
+      this.finishJob(job, error);
+    } finally {
+      this.active = null;
+      this.notifyIdle();
+      this.schedule();
+    }
   }
 
   /** 取得（必要時建立）worker，並等它完成初始化。 */
@@ -636,6 +894,7 @@ export class WorkerEmbedder implements Embedder {
       state = this.spawn();
     }
     await state.ready;
+    if (this.closed) throw new EmbedderWorkerClosedError();
     return state;
   }
 
@@ -754,15 +1013,19 @@ export class WorkerEmbedder implements Embedder {
     signal: AbortSignal | undefined,
     transfer?: Transferable[],
   ): Promise<unknown> {
+    if (this.closed && method !== "dispose") throw new EmbedderWorkerClosedError();
+    if (state.dead || state.abandoned) throw new EmbedderWorkerCrashError("embedder worker 已無法接收工作");
     throwIfAborted(signal);
     const id = this.nextId;
     this.nextId += 1;
 
+    const startedAt = performance.now();
     return new Promise<unknown>((resolve, reject) => {
       let settled = false;
       const finish = (settle: (value: unknown) => void, value: unknown): void => {
         if (settled) return;
         settled = true;
+        if (method !== "dispose") this.workerRunMs += performance.now() - startedAt;
         if (pending.onAbort !== undefined) signal?.removeEventListener("abort", pending.onAbort);
         this.pending.delete(id);
         settle(value);
@@ -820,6 +1083,10 @@ export class WorkerEmbedder implements Embedder {
       state.readyReject(crash);
     }
     this.rejectPending(crash);
+    for (const job of [...this.admitted]) {
+      // 初始化錯誤由 ready promise 保留原始名稱；已 ready 的實例崩潰則立即使整個邏輯工作失效。
+      if (job !== this.active || state.readyOk) this.finishJob(job, crash);
+    }
     // 關閉中的 terminate 不算「崩潰連鎖」：不推進重建預算。
     if (!state.closing) this.consecutiveCrashes += 1;
     this.detach(state);

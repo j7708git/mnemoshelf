@@ -22,6 +22,7 @@ import {
   type EmbedderRuntimeStatus,
   type ImageInput,
   type IndexProgress,
+  type IndexTimingEvent,
   type ProbeResult,
   type Root,
   type SqliteDatabase,
@@ -256,6 +257,82 @@ describe("indexRoot", () => {
 
   afterEach(async () => {
     await fs.rm(harness.dir, { recursive: true, force: true });
+  });
+
+  it("影音不送圖片入口，重新索引時清理先前錯誤留下的影音向量", async () => {
+    await fs.writeFile(path.join(harness.dir, "sound.wav"), Buffer.from([1, 2]));
+    await fs.writeFile(path.join(harness.dir, "clip.mp4"), Buffer.from([3, 4]));
+    harness.root.modalities.push("audio", "video");
+    const initial = await indexRoot(harness.root, options(harness));
+    expect(initial.scanSkippedFiles).toEqual([
+      { relPath: "clip.mp4", reason: "unsupported-modality" },
+      { relPath: "sound.wav", reason: "unsupported-modality" },
+    ]);
+    expect(initial.total).toBe(2);
+    expect(initial.processed).toBe(2);
+    expect(harness.embedder.images).toEqual([]);
+    const source = (await harness.store.listChunksByPath(harness.root.id, "a.md"))[0]!;
+    const old = await harness.store.replaceChunks(harness.root.id, "sound.wav", [{
+      ...source, kind: "audio",
+    }]);
+    await harness.vec.upsert(old.map((chunk) => ({
+      key: `c:${chunk.id}`, rootId: harness.root.id, embedderId: harness.embedder.info.id,
+      vec: new Float32Array(harness.embedder.info.dim).fill(1 / Math.sqrt(harness.embedder.info.dim)),
+    })));
+    const result = await indexRoot(harness.root, options(harness));
+    expect(result.removedFiles).toBe(1);
+    expect(await harness.store.listChunksByPath(harness.root.id, "sound.wav")).toEqual([]);
+    expect(await harness.vec.existingKeys(old.map((chunk) => `c:${chunk.id}`))).toEqual(new Set());
+    expect(result.processed + result.skippedUnchanged + result.skippedFiles.length + result.failedFiles.length).toBe(result.total);
+  });
+
+  it("階段計時只帶數字與標籤，觀測者失敗不影響索引", async () => {
+    const events: IndexTimingEvent[] = [];
+    const result = await indexRoot(harness.root, {
+      ...options(harness),
+      onTiming(event) { events.push(event); throw new Error("observer"); },
+    });
+    expect(result.processed).toBe(2);
+    expect(new Set(events.map((event) => event.stage))).toEqual(new Set(["scan", "read", "prepare", "embed", "write"]));
+    for (const event of events) {
+      expect(Object.keys(event).sort()).toEqual(["durationMs", "stage"]);
+      expect(Number.isFinite(event.durationMs)).toBe(true);
+      expect(event.durationMs).toBeGreaterThanOrEqual(0);
+    }
+  });
+
+  it("取消須等所有檔案 worker 收尾，不能在另一個嵌入尚未結束時回傳", async () => {
+    const controller = new AbortController();
+    let releaseSecond!: () => void;
+    let bothStarted!: () => void;
+    const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+    const ready = new Promise<void>((resolve) => { bothStarted = resolve; });
+    let entered = 0;
+    const embedder = new class extends RecordingEmbedder {
+      override async embedDocuments(inputs: readonly DocumentInput[], opts?: EmbedDocumentsOptions) {
+        entered += 1;
+        if (entered === 1) {
+          await new Promise<void>((resolve) => controller.signal.addEventListener("abort", () => resolve(), { once: true }));
+        } else {
+          bothStarted();
+          await secondGate;
+        }
+        opts?.signal?.throwIfAborted();
+        return super.embedDocuments(inputs, opts);
+      }
+    }();
+    let finished = false;
+    const result = indexRoot(harness.root, { ...options(harness), embedder, concurrency: 2, signal: controller.signal })
+      .then(() => { finished = true; return null; }, (error: unknown) => { finished = true; return error; });
+    await ready;
+    controller.abort();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const finishedBeforeSecond = finished;
+    releaseSecond();
+    expect(await result).toMatchObject({ name: "AbortError" });
+    expect(finishedBeforeSecond).toBe(false);
+    expect(await harness.store.listRelPaths(harness.root.id)).toEqual([]);
+    expect(await harness.vec.count()).toBe(0);
   });
 
   it("第一次索引會切塊、嵌入並寫入 store 與 vec", async () => {
