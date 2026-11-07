@@ -1,5 +1,6 @@
 # L3：摘要品質量測（`eval:digest`）與三模型矩陣（`eval:digest:matrix`）
 
+> 原文記憶更新：本文件的摘要評測與 `eval:loop`／`eval:digest`／`eval:digest:matrix` 僅適用原文改版前的歷史版本，相關 package scripts 已移除。請在獨立歷史 checkout 重跑；現行原文流程改用 `packages/server/eval/raw-memory/`。以下保留舊評測方法供追溯。
 用 30 回合的**合成**對話量「摘要寫得好不好」：該記的記到沒有、不該記的有沒有混進來、
 kind 對不對、來得及在逾時內完成嗎、寫進去的東西之後找不找得回來。
 

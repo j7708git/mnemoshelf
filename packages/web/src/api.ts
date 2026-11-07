@@ -52,6 +52,18 @@ export class NetworkError extends Error {
   }
 }
 
+export class MemoryPolicyUnavailableError extends Error {
+  constructor() {
+    super("本機服務需要升級才能使用記憶遮罩設定。");
+    this.name = "MemoryPolicyUnavailableError";
+  }
+}
+
+export interface MemoryPolicy {
+  maskSecrets: boolean;
+  version: number;
+}
+
 /** `GET /roots` 回傳的 root（欄位以 Core 契約為準）。 */
 export interface Root {
   id: number;
@@ -92,6 +104,32 @@ export async function apiFetch(path: string, init: RequestInit = {}): Promise<Re
     throw new UnauthorizedApiError();
   }
   return response;
+}
+
+async function requestMemoryPolicy(init?: RequestInit): Promise<MemoryPolicy> {
+  const headers = new Headers(init?.headers);
+  headers.set("accept", "application/json");
+  const response = await apiFetch("/memory-policy", { ...init, headers, cache: "no-store" });
+  if (response.status === 404) throw new MemoryPolicyUnavailableError();
+  if (!response.ok) throw new Error(`本機服務回應 HTTP ${response.status}。`);
+  const body = (await response.json().catch(() => null)) as Partial<MemoryPolicy> | null;
+  if (body === null || typeof body.maskSecrets !== "boolean" || typeof body.version !== "number" ||
+    !Number.isSafeInteger(body.version) || body.version < 1) {
+    throw new Error("本機服務回傳的記憶遮罩設定格式不正確。");
+  }
+  return { maskSecrets: body.maskSecrets, version: body.version };
+}
+
+export function fetchMemoryPolicy(): Promise<MemoryPolicy> {
+  return requestMemoryPolicy();
+}
+
+export function updateMemoryPolicy(maskSecrets: boolean): Promise<MemoryPolicy> {
+  return requestMemoryPolicy({
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ maskSecrets }),
+  });
 }
 
 /** 讀取 roots 清單。 */
@@ -603,8 +641,24 @@ export type MemoryKind = "fact" | "decision" | "pitfall" | "preference";
 /** 記憶的作用範圍（與 Core 契約一致）。 */
 export type MemoryScope = "global" | "project" | "agent";
 
+export type MemorySourceRole = "user" | "assistant";
+
+interface MemorySourceReference {
+  sourceId?: number | null;
+  messageIndex?: number | null;
+  chunkIndex?: number | null;
+  sourceStart?: number | null;
+  sourceEnd?: number | null;
+  chunkVersion?: string | null;
+  sourceType?: "raw-turn" | "legacy-memory";
+  role?: MemorySourceRole | null;
+  occurredAt?: string | null;
+  sourceTurn?: string | null;
+  hasMore?: boolean;
+}
+
 /** `GET /memories` 回傳的記憶（欄位以 Core 契約為準）。 */
-export interface Memory {
+export interface Memory extends MemorySourceReference {
   id: number;
   content: string;
   kind: MemoryKind;
@@ -643,7 +697,7 @@ export interface ChunkSearchHit {
 }
 
 /** 記憶命中。 */
-export interface MemorySearchHit {
+export interface MemorySearchHit extends MemorySourceReference {
   type: "memory";
   key: string;
   rank: number;
@@ -658,6 +712,88 @@ export interface MemorySearchHit {
 }
 
 export type SearchHit = ChunkSearchHit | MemorySearchHit;
+
+export interface MemorySourceCursor {
+  messageIndex: number;
+  offset: number;
+  policyVersion: number;
+}
+
+export interface MemorySourcePage {
+  source: {
+    id: number;
+    agent: string;
+    scope: MemoryScope;
+    project: string | null;
+    sourceSession: string;
+    sourceTurn: string;
+    createdAt: string;
+    chunkVersion: string;
+    messageCount: number;
+  };
+  messages: Array<{
+    sourceMessage: string;
+    role: MemorySourceRole;
+    content: string;
+    occurredAt: string | null;
+    messageIndex: number;
+    start: number;
+    end: number;
+    totalChars: number;
+    complete: boolean;
+  }>;
+  next: MemorySourceCursor | null;
+  truncated: boolean;
+  policyVersion: number;
+  indexState: MemoryEmbeddingStats;
+  untrusted: true;
+}
+
+export class MemorySourcePolicyChangedError extends Error {
+  constructor() {
+    super("記憶遮罩設定已變更，請從開頭重新讀取。");
+    this.name = "MemorySourcePolicyChangedError";
+  }
+}
+
+export async function fetchMemorySource(
+  id: number,
+  access: { scope: MemoryScope; project: string | null; agent: string },
+  cursor: MemorySourceCursor | null,
+  signal?: AbortSignal,
+): Promise<MemorySourcePage> {
+  const query = new URLSearchParams({ scope: access.scope });
+  if (access.scope === "project" && access.project !== null) query.set("project", access.project);
+  if (access.scope === "agent") query.set("agent", access.agent);
+  if (cursor !== null) {
+    query.set("messageIndex", String(cursor.messageIndex));
+    query.set("offset", String(cursor.offset));
+    query.set("policyVersion", String(cursor.policyVersion));
+  }
+
+  const response = await apiFetch(`/memory-sources/${id}?${query}`, {
+    headers: { accept: "application/json" },
+    cache: "no-store",
+    signal,
+  });
+  if (response.status === 409) {
+    const error = (await response.json().catch(() => null)) as { error?: unknown } | null;
+    if (error?.error === "policy-changed") throw new MemorySourcePolicyChangedError();
+  }
+  if (response.status === 404) throw new Error("來源不存在、已刪除或不在可讀取的範圍。");
+  if (!response.ok) throw new Error(`讀取記憶來源失敗（HTTP ${response.status}）。`);
+
+  const page = (await response.json().catch(() => null)) as MemorySourcePage | null;
+  if (page?.source?.id !== id || !Array.isArray(page.messages) || page.untrusted !== true ||
+    !Number.isSafeInteger(page.policyVersion) || page.policyVersion < 1 ||
+    typeof page.truncated !== "boolean" || (page.next !== null &&
+      (page.next?.policyVersion !== page.policyVersion || !Number.isSafeInteger(page.next.messageIndex) ||
+        !Number.isSafeInteger(page.next.offset)))) {
+    throw new Error("本機服務回傳的記憶來源格式不正確。");
+  }
+  if (cursor !== null && page.policyVersion !== cursor.policyVersion) throw new MemorySourcePolicyChangedError();
+  return page;
+}
 
 /** `POST /search` 的回應。 */
 export interface SearchResult {
@@ -675,6 +811,7 @@ export async function search(input: {
 }): Promise<SearchResult> {
   const response = await apiFetch("/search", {
     method: "POST",
+    cache: "no-store",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
   });
@@ -684,7 +821,7 @@ export async function search(input: {
 
 /** 列出未刪除的記憶（由新到舊；pinned 由呼叫端另行排序）。 */
 export async function listMemories(): Promise<Memory[]> {
-  const response = await apiFetch("/memories");
+  const response = await apiFetch("/memories", { cache: "no-store" });
   if (!response.ok) throw new Error(await readErrorMessage(response, "讀取記憶清單失敗"));
   const body = (await response.json()) as { memories?: unknown };
   if (!Array.isArray(body.memories)) throw new Error("伺服器回應格式不正確");
@@ -851,10 +988,10 @@ function isMemoryImportResult(value: unknown): value is MemoryImportResult {
  * 下載記憶備份（NDJSON）：`fetch` → 文字 → Blob＋`<a download>`（與診斷下載相同模式）。
  *
  * 檔名取自 `content-disposition`；取不到時退回 `memories-YYYYMMDD.ndjson`。
- * 備份檔是**遮罩後**視圖、只含未刪除的記憶（不含向量）；檔案由使用者保管。
+ * 備份檔依服務目前的記憶遮罩設定提供，只含未刪除的記憶（不含向量）。
  */
 export async function downloadMemoriesExport(): Promise<{ filename: string }> {
-  const response = await apiFetch("/memories/export");
+  const response = await apiFetch("/memories/export", { cache: "no-store" });
   if (!response.ok) throw new Error(await readErrorMessage(response, "下載記憶備份失敗"));
   const text = await response.text();
   const filename =
@@ -965,6 +1102,7 @@ export async function searchMemories(input: {
 }): Promise<MemoryRecallResult> {
   const response = await apiFetch("/memories/search", {
     method: "POST",
+    cache: "no-store",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
   });

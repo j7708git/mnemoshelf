@@ -1,13 +1,21 @@
 import {
   DuplicateRootError,
+  MemorySourceConflictError,
+  assertMemoryEmbeddingCursor,
   assertMemoryEmbeddingFailure,
   assertMemoryEmbeddingInput,
   assertMemoryQueryVector,
+  assertMemorySourceChunks,
   memoryContentHash,
+  memorySourceEventHash,
   normalizeMemoryLimit,
   normalizeMemoryPatch,
   normalizeMemorySearchFilter,
   normalizeMemorySearchK,
+  normalizeMemorySourceEventCheck,
+  normalizeMemorySourceScope,
+  readMemoryPolicy,
+  validateMemorySourceWrite,
   type Chunk,
   type ChunkKind,
   type Memory,
@@ -17,13 +25,20 @@ import {
   type MemoryKeywordHit,
   type MemoryKind,
   type MemoryPatch,
+  type MemoryPolicy,
   type MemoryScope,
   type MemorySearchFilter,
+  type MemorySource,
+  type MemorySourceEventCheck,
+  type MemorySourceMessage,
+  type MemorySourceWriteResult,
   type MemoryVectorHit,
   type MetadataStore,
   type Modality,
   type NewChunk,
   type NewMemory,
+  type NewMemorySource,
+  type NewMemorySourceChunk,
   type NewRoot,
   type NormalizedMemorySearchFilter,
   type RankedHit,
@@ -32,7 +47,7 @@ import {
   type RootPatch,
   type SearchFilter,
 } from "@mnemoshelf/core";
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
 import { qualified } from "./schema.js";
 import { segmentText } from "./segment.js";
 import { withTransaction } from "./connection.js";
@@ -48,7 +63,10 @@ const ROOT_COLUMNS =
   "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at";
 const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash";
 const MEMORY_COLUMNS =
-  "id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at";
+  `id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at,
+   source_id, message_index, chunk_index, source_start, source_end, chunk_version`;
+const MEMORY_SOURCE_COLUMNS =
+  "id, agent, scope, project, source_session, source_turn, messages_json, request_hash, chunk_version, created_at, deleted_at";
 
 /** `pg` 的 unique violation 錯誤碼（SQLite 是字串比對，PostgreSQL 是 SQLSTATE）。 */
 const UNIQUE_VIOLATION = "23505";
@@ -101,8 +119,30 @@ function rowToMemory(row: Record<string, unknown>): Memory {
     pinned: row.pinned === true,
     sourceSession: row.source_session === null || row.source_session === undefined ? null : String(row.source_session),
     sourceMessage: row.source_message === null || row.source_message === undefined ? null : String(row.source_message),
+    sourceId: row.source_id == null ? null : Number(row.source_id),
+    messageIndex: row.message_index == null ? null : Number(row.message_index),
+    chunkIndex: row.chunk_index == null ? null : Number(row.chunk_index),
+    sourceStart: row.source_start == null ? null : Number(row.source_start),
+    sourceEnd: row.source_end == null ? null : Number(row.source_end),
+    chunkVersion: row.chunk_version == null ? null : String(row.chunk_version),
     createdAt: String(row.created_at),
     deletedAt: row.deleted_at === null || row.deleted_at === undefined ? null : String(row.deleted_at),
+  };
+}
+
+function rowToMemorySource(row: Record<string, unknown>): MemorySource {
+  return {
+    id: Number(row.id),
+    agent: String(row.agent),
+    scope: String(row.scope) as MemoryScope,
+    project: row.project == null ? null : String(row.project),
+    sourceSession: String(row.source_session),
+    sourceTurn: String(row.source_turn),
+    messages: JSON.parse(String(row.messages_json)) as MemorySourceMessage[],
+    requestHash: String(row.request_hash),
+    chunkVersion: String(row.chunk_version),
+    createdAt: String(row.created_at),
+    deletedAt: row.deleted_at == null ? null : String(row.deleted_at),
   };
 }
 
@@ -175,6 +215,9 @@ function metadataSchemaSql(schema: string): string {
   const roots = qualified(schema, "roots");
   const chunks = qualified(schema, "chunks");
   const memories = qualified(schema, "memories");
+  const sources = qualified(schema, "memory_sources");
+  const deletedSources = qualified(schema, "deleted_memory_sources");
+  const policy = qualified(schema, "memory_policy");
   return `
     create table if not exists ${roots} (
       id integer generated always as identity primary key,
@@ -237,6 +280,37 @@ function metadataSchemaSql(schema: string): string {
     -- D4a：記憶的來源欄位（可空、additive；既有資料列為 NULL）。
     alter table ${memories} add column if not exists source_session text;
     alter table ${memories} add column if not exists source_message text;
+
+    create table if not exists ${policy} (
+      id integer primary key check (id = 1),
+      mask_secrets boolean not null,
+      version integer not null check (version >= 1)
+    );
+    create table if not exists ${sources} (
+      id integer generated always as identity primary key,
+      agent text not null,
+      scope text not null,
+      project text,
+      source_session text not null,
+      source_turn text not null,
+      messages_json text not null,
+      request_hash text not null,
+      chunk_version text not null,
+      created_at text not null,
+      deleted_at text,
+      unique (agent, source_session, source_turn)
+    );
+    create table if not exists ${deletedSources} (
+      event_key_hash text primary key
+    );
+
+    alter table ${memories} add column if not exists source_id integer references ${sources}(id);
+    alter table ${memories} add column if not exists message_index integer;
+    alter table ${memories} add column if not exists chunk_index integer;
+    alter table ${memories} add column if not exists source_start integer;
+    alter table ${memories} add column if not exists source_end integer;
+    alter table ${memories} add column if not exists chunk_version text;
+    create unique index if not exists memories_source_chunk_idx on ${memories}(source_id, chunk_index);
   `;
 }
 
@@ -253,6 +327,9 @@ export class PgMetadataStore implements MetadataStore {
   private readonly roots: string;
   private readonly chunks: string;
   private readonly memories: string;
+  private readonly sources: string;
+  private readonly deletedSources: string;
+  private readonly policy: string;
 
   constructor(pool: Pool, options: PgMetadataStoreOptions = {}) {
     this.pool = pool;
@@ -260,6 +337,9 @@ export class PgMetadataStore implements MetadataStore {
     this.roots = qualified(this.schema, "roots");
     this.chunks = qualified(this.schema, "chunks");
     this.memories = qualified(this.schema, "memories");
+    this.sources = qualified(this.schema, "memory_sources");
+    this.deletedSources = qualified(this.schema, "deleted_memory_sources");
+    this.policy = qualified(this.schema, "memory_policy");
   }
 
   async migrate(): Promise<void> {
@@ -273,6 +353,205 @@ export class PgMetadataStore implements MetadataStore {
     await this.backfillMemoryContentHashes();
   }
 
+  async getMemoryPolicy(): Promise<MemoryPolicy> {
+    const result = await this.pool.query(`select mask_secrets, version from ${this.policy} where id = 1`);
+    return readMemoryPolicy(result.rows[0]);
+  }
+
+  async setMemoryPolicy(maskSecrets: boolean): Promise<MemoryPolicy> {
+    if (typeof maskSecrets !== "boolean") throw new TypeError("maskSecrets 必須是布林值");
+    return await withTransaction(this.pool, async (client) => {
+      await client.query(`
+        insert into ${this.policy} (id, mask_secrets, version) values (1, true, 1)
+        on conflict (id) do nothing`);
+      const locked = await client.query(`select mask_secrets, version from ${this.policy} where id = 1 for update`);
+      const row = locked.rows[0];
+      if (row === undefined) throw new Error("記憶遮罩政策未寫入");
+      const current = readMemoryPolicy(row);
+      if (current.maskSecrets === maskSecrets) return current;
+      const updated = await client.query(`
+        update ${this.policy} set mask_secrets = $1, version = version + 1 where id = 1
+        returning mask_secrets, version`, [maskSecrets]);
+      if (updated.rows[0] === undefined) throw new Error("記憶遮罩政策未更新");
+      return readMemoryPolicy(updated.rows[0]);
+    });
+  }
+
+  async checkMemorySource(input: MemorySourceEventCheck): Promise<"available" | "duplicate"> {
+    const event = normalizeMemorySourceEventCheck(input);
+    const result = await this.pool.query(`
+      select s.deleted_at, s.request_hash,
+             exists(select 1 from ${this.deletedSources} where event_key_hash = $4) as tombstone
+        from (select 1) anchor
+        left join ${this.sources} s on s.agent = $1 and s.source_session = $2 and s.source_turn = $3`,
+    [event.agent, event.sourceSession, event.sourceTurn, memorySourceEventHash(event)]);
+    const row = result.rows[0]!;
+    if (row.tombstone || row.deleted_at !== null) throw new MemorySourceConflictError();
+    if (row.request_hash === null) return "available";
+    if (row.request_hash !== event.requestHash) throw new MemorySourceConflictError();
+    return "duplicate";
+  }
+
+  async addMemorySource(input: NewMemorySource, chunks: NewMemorySourceChunk[]): Promise<MemorySourceWriteResult> {
+    const sourceInput = validateMemorySourceWrite(input, chunks);
+    const { agent, scope, project, sourceSession, sourceTurn, messages, requestHash, chunkVersion } = sourceInput;
+    const snapshot = chunks.map((chunk) => ({ ...chunk }));
+    const keyHash = memorySourceEventHash(sourceInput);
+    return await withTransaction(this.pool, async (client) => {
+      await client.query("set transaction isolation level read committed");
+      await this.assertSourceNotTombstoned(client, keyHash);
+      const inserted = await client.query(`
+        insert into ${this.sources} (agent, scope, project, source_session, source_turn, messages_json, request_hash, chunk_version, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        on conflict (agent, source_session, source_turn) do nothing
+        returning ${MEMORY_SOURCE_COLUMNS}`,
+      [agent, scope, project, sourceSession, sourceTurn, JSON.stringify(messages), requestHash, chunkVersion, new Date().toISOString()]);
+      const row = inserted.rows[0];
+      if (row !== undefined) {
+        // 唯一索引的插入可能等到另一個交易硬刪完成，須用新的 snapshot 重查 tombstone。
+        await this.assertSourceNotTombstoned(client, keyHash);
+        const source = rowToMemorySource(row);
+        return { source, memories: await this.insertSourceChunks(client, source, snapshot, false), duplicate: false };
+      }
+
+      const found = await client.query(`
+        select ${MEMORY_SOURCE_COLUMNS} from ${this.sources}
+         where agent = $1 and source_session = $2 and source_turn = $3 for update`,
+      [agent, sourceSession, sourceTurn]);
+      const existing = found.rows[0];
+      if (existing === undefined || existing.deleted_at !== null || existing.request_hash !== requestHash) {
+        throw new MemorySourceConflictError();
+      }
+      const source = rowToMemorySource(existing);
+      return { source, memories: await this.readSourceChunks(client, source.id), duplicate: true };
+    });
+  }
+
+  async getMemorySource(id: number): Promise<MemorySource | null> {
+    return this.readSource(this.pool, id);
+  }
+
+  async listMemorySourcesForExport(): Promise<MemorySource[]> {
+    const result = await this.pool.query(
+      `select ${MEMORY_SOURCE_COLUMNS} from ${this.sources} where deleted_at is null order by created_at, id`,
+    );
+    return result.rows.map(rowToMemorySource);
+  }
+
+  async listMemorySourceChunks(id: number): Promise<Memory[]> {
+    return this.readSourceChunks(this.pool, id);
+  }
+
+  async memorySourceEmbeddingStats(id: number, embedderId: string): Promise<MemoryEmbeddingStats> {
+    return this.readMemoryEmbeddingStats(embedderId, id);
+  }
+
+  async replaceMemorySourceChunks(id: number, chunkVersion: string, chunks: NewMemorySourceChunk[]): Promise<Memory[]> {
+    return await withTransaction(this.pool, async (client) => {
+      const source = await this.readSource(client, id, true);
+      if (source === null || source.deletedAt !== null) return [];
+      assertMemorySourceChunks(source.messages, chunkVersion, chunks);
+      const snapshot = chunks.map((chunk) => ({ ...chunk }));
+      const result = await client.query(`select 1 from ${this.memories} where source_id = $1 and pinned limit 1`, [id]);
+      await client.query(`delete from ${this.memories} where source_id = $1`, [id]);
+      await client.query(`update ${this.sources} set chunk_version = $2 where id = $1`, [id, chunkVersion]);
+      return this.insertSourceChunks(client, { ...source, chunkVersion }, snapshot, result.rows.length > 0);
+    });
+  }
+
+  async updateMemorySource(id: number, patch: MemoryPatch): Promise<MemorySource | null> {
+    return await withTransaction(this.pool, async (client) => {
+      const source = await this.readSource(client, id, true);
+      return source === null ? null : this.updateSource(client, source, patch);
+    });
+  }
+
+  async deleteMemorySource(id: number, hard = false): Promise<boolean> {
+    return await withTransaction(this.pool, async (client) => {
+      const source = await this.readSource(client, id, true);
+      return source === null ? false : this.deleteSource(client, source, hard);
+    });
+  }
+
+  private async assertSourceNotTombstoned(client: PoolClient, eventKeyHash: string): Promise<void> {
+    const result = await client.query(`select 1 from ${this.deletedSources} where event_key_hash = $1`, [eventKeyHash]);
+    if (result.rows.length > 0) throw new MemorySourceConflictError();
+  }
+
+  private async readSource(connection: Pool | PoolClient, id: number, lock = false): Promise<MemorySource | null> {
+    const result = await connection.query(
+      `select ${MEMORY_SOURCE_COLUMNS} from ${this.sources} where id = $1 ${lock ? "for update" : ""}`, [id],
+    );
+    return result.rows[0] === undefined ? null : rowToMemorySource(result.rows[0]);
+  }
+
+  private async readSourceChunks(connection: Pool | PoolClient, id: number): Promise<Memory[]> {
+    const result = await connection.query(
+      `select ${MEMORY_COLUMNS} from ${this.memories} where source_id = $1 and deleted_at is null order by chunk_index`, [id],
+    );
+    return result.rows.map(rowToMemory);
+  }
+
+  private async insertSourceChunks(
+    client: PoolClient, source: MemorySource, chunks: readonly NewMemorySourceChunk[], pinned: boolean,
+  ): Promise<Memory[]> {
+    const rows = chunks.map(({ content, messageIndex, chunkIndex, start, end }) => ({
+      content,
+      message_index: messageIndex,
+      chunk_index: chunkIndex,
+      source_start: start,
+      source_end: end,
+      source_message: source.messages[messageIndex]!.sourceMessage,
+      seg: segmentOrNull(content),
+    }));
+    const inserted = await client.query(`
+      insert into ${this.memories} (
+        content, kind, scope, project, agent, pinned, source_session, source_message, created_at,
+        source_id, message_index, chunk_index, source_start, source_end, chunk_version, seg
+      )
+      select content, 'fact', $2, $3, $4, $5, $6, source_message, $7,
+             $8, message_index, chunk_index, source_start, source_end, $9, seg
+        from json_to_recordset($1::json) as c(
+          content text, message_index integer, chunk_index integer, source_start integer,
+          source_end integer, source_message text, seg text
+        )
+       order by chunk_index
+      returning ${MEMORY_COLUMNS}`,
+    [JSON.stringify(rows), source.scope, source.project, source.agent, pinned, source.sourceSession,
+      source.createdAt, source.id, source.chunkVersion]);
+    if (inserted.rows.length !== chunks.length) throw new Error("原文切塊未完整寫入");
+    return inserted.rows.map(rowToMemory).sort((a, b) => a.chunkIndex! - b.chunkIndex!);
+  }
+
+  private async updateSource(client: PoolClient, source: MemorySource, patch: MemoryPatch): Promise<MemorySource | null> {
+    if (source.deletedAt !== null) return null;
+    const next = normalizeMemorySourceScope(source, patch);
+    await client.query(`update ${this.sources} set scope = $2, project = $3 where id = $1`, [source.id, next.scope, next.project]);
+    await client.query(`update ${this.memories} set scope = $2, project = $3 where source_id = $1`, [source.id, next.scope, next.project]);
+    return { ...source, ...next };
+  }
+
+  private async deleteSource(client: PoolClient, source: MemorySource, hard: boolean): Promise<boolean> {
+    if (hard) {
+      await client.query(`insert into ${this.deletedSources} (event_key_hash) values ($1) on conflict do nothing`,
+        [memorySourceEventHash(source)]);
+      await client.query(`delete from ${this.memories} where source_id = $1`, [source.id]);
+      await client.query(`delete from ${this.sources} where id = $1`, [source.id]);
+    } else if (source.deletedAt === null) {
+      const deletedAt = new Date().toISOString();
+      await client.query(`update ${this.sources} set deleted_at = $2 where id = $1`, [source.id, deletedAt]);
+      await client.query(`update ${this.memories} set deleted_at = $2 where source_id = $1`, [source.id, deletedAt]);
+    }
+    return true;
+  }
+
+  private async markSuperseded(client: PoolClient, id: number, deletedAt: string): Promise<void> {
+    const result = await client.query(`select source_id from ${this.memories} where id = $1`, [id]);
+    if (result.rows[0]?.source_id != null) throw new MemorySourceConflictError();
+    await client.query(`update ${this.memories} set deleted_at = $2 where id = $1 and deleted_at is null and source_id is null`,
+      [id, deletedAt]);
+  }
+
   /**
    * 回填 `content_hash`（migration 0004 的 PostgreSQL 對應）。
    *
@@ -282,7 +561,7 @@ export class PgMetadataStore implements MetadataStore {
   private async backfillMemoryContentHashes(): Promise<void> {
     await withTransaction(this.pool, async (client) => {
       const pending = await client.query(
-        `select id, content from ${this.memories} where content_hash is null order by id`,
+        `select id, content from ${this.memories} where content_hash is null and source_id is null order by id`,
       );
       for (const row of pending.rows) {
         await client.query(
@@ -431,10 +710,7 @@ export class PgMetadataStore implements MetadataStore {
     const createdAt = new Date().toISOString();
     const memoryId = await withTransaction(this.pool, async (client) => {
       if (m.supersedes !== null) {
-        await client.query(`update ${this.memories} set deleted_at = $1 where id = $2 and deleted_at is null`, [
-          createdAt,
-          m.supersedes,
-        ]);
+        await this.markSuperseded(client, m.supersedes, createdAt);
       }
       const result = await client.query(
         `insert into ${this.memories}(content, kind, scope, project, agent, supersedes, source_session, source_message, created_at, deleted_at, seg, content_hash)
@@ -476,10 +752,7 @@ export class PgMetadataStore implements MetadataStore {
 
     const attempt = await withTransaction(this.pool, async (client) => {
       if (m.supersedes !== null) {
-        await client.query(`update ${this.memories} set deleted_at = $1 where id = $2 and deleted_at is null`, [
-          createdAt,
-          m.supersedes,
-        ]);
+        await this.markSuperseded(client, m.supersedes, createdAt);
       }
 
       const inserted = await client.query(
@@ -492,6 +765,7 @@ export class PgMetadataStore implements MetadataStore {
                and coalesce(project, '') = coalesce($4::text, '')
                and agent = $5
                and deleted_at is null
+               and source_id is null
           )
          returning ${MEMORY_COLUMNS}`,
         [
@@ -518,6 +792,7 @@ export class PgMetadataStore implements MetadataStore {
             and coalesce(project, '') = coalesce($3::text, '')
             and agent = $4
             and deleted_at is null
+            and source_id is null
           order by id
           limit 1`,
         [contentHash, m.scope, m.project, m.agent],
@@ -530,15 +805,42 @@ export class PgMetadataStore implements MetadataStore {
   }
 
   async getMemory(id: number): Promise<Memory | null> {
-    const result = await this.pool.query(`select ${MEMORY_COLUMNS} from ${this.memories} where id = $1`, [id]);
+    return this.readMemory(this.pool, id);
+  }
+
+  private async readMemory(connection: Pool | PoolClient, id: number, lock = false): Promise<Memory | null> {
+    const result = await connection.query(
+      `select ${MEMORY_COLUMNS} from ${this.memories} where id = $1 ${lock ? "for update" : ""}`, [id],
+    );
     return result.rows.length === 0 ? null : rowToMemory(result.rows[0]!);
   }
 
+  private async lockMemoryTarget(
+    client: PoolClient, id: number,
+  ): Promise<{ memory: Memory; source: MemorySource | null } | null> {
+    const initial = await this.readMemory(client, id);
+    if (initial === null) return null;
+    if (initial.sourceId == null) {
+      const memory = await this.readMemory(client, id, true);
+      return memory === null ? null : { memory, source: null };
+    }
+    // 先鎖來源再碰子片段，與直接以 source id 更新／重建的鎖定順序一致。
+    const source = await this.readSource(client, initial.sourceId, true);
+    if (source === null) return null;
+    const memory = await this.readMemory(client, id);
+    return memory === null ? null : { memory, source };
+  }
+
   async forgetMemory(id: number): Promise<void> {
-    await this.pool.query(`update ${this.memories} set deleted_at = $1 where id = $2 and deleted_at is null`, [
-      new Date().toISOString(),
-      id,
-    ]);
+    await withTransaction(this.pool, async (client) => {
+      const target = await this.lockMemoryTarget(client, id);
+      if (target === null || target.memory.deletedAt !== null) return;
+      if (target.source !== null) {
+        await this.deleteSource(client, target.source, false);
+      } else {
+        await client.query(`update ${this.memories} set deleted_at = $2 where id = $1`, [id, new Date().toISOString()]);
+      }
+    });
   }
 
   /**
@@ -551,12 +853,12 @@ export class PgMetadataStore implements MetadataStore {
   async normalizeLegacyMemoryScopes(): Promise<{ updated: number }> {
     return await withTransaction(this.pool, async (client) => {
       const cleared = await client.query(
-        `update ${this.memories} set project = null where scope in ('global', 'agent') and project is not null`,
+        `update ${this.memories} set project = null where scope in ('global', 'agent') and project is not null and source_id is null`,
       );
       const promoted = await client.query(
         `update ${this.memories}
             set scope = 'global', project = null
-          where scope = 'project' and (project is null or btrim(project) = '')`,
+          where scope = 'project' and (project is null or btrim(project) = '') and source_id is null`,
       );
       return { updated: (cleared.rowCount ?? 0) + (promoted.rowCount ?? 0) };
     });
@@ -569,13 +871,27 @@ export class PgMetadataStore implements MetadataStore {
    * 與主列同存亡，不需要另外刪除。向量欄位同樣隨列消失。
    */
   async hardDeleteMemory(id: number): Promise<boolean> {
-    const result = await this.pool.query(`delete from ${this.memories} where id = $1`, [id]);
-    return (result.rowCount ?? 0) > 0;
+    return await withTransaction(this.pool, async (client) => {
+      const target = await this.lockMemoryTarget(client, id);
+      if (target === null) return false;
+      if (target.source !== null) return this.deleteSource(client, target.source, true);
+      const result = await client.query(`delete from ${this.memories} where id = $1`, [id]);
+      return (result.rowCount ?? 0) > 0;
+    });
   }
 
   /** 設定釘選（冪等）；不存在的 id 更新不到任何列，等同無操作。 */
   async setMemoryPinned(id: number, pinned: boolean): Promise<void> {
-    await this.pool.query(`update ${this.memories} set pinned = $1 where id = $2`, [pinned, id]);
+    await withTransaction(this.pool, async (client) => {
+      const target = await this.lockMemoryTarget(client, id);
+      if (target === null) return;
+      if (target.source !== null) {
+        await client.query(`update ${this.memories} set pinned = $2 where source_id = $1 and deleted_at is null`,
+          [target.source.id, pinned]);
+      } else {
+        await client.query(`update ${this.memories} set pinned = $2 where id = $1`, [id, pinned]);
+      }
+    });
   }
 
   /**
@@ -586,18 +902,20 @@ export class PgMetadataStore implements MetadataStore {
    * 的競態也回 `null`（0 列），與 SQLite 端一致。內容沒動，`seg`/`tsv` 不必重算。
    */
   async updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null> {
-    const current = await this.getMemory(id);
-    if (current === null || current.deletedAt !== null) return null;
-
-    const next = normalizeMemoryPatch(current, patch);
-    const result = await this.pool.query(
-      `update ${this.memories}
-          set scope = $2, project = $3
-        where id = $1 and deleted_at is null
-        returning ${MEMORY_COLUMNS}`,
-      [id, next.scope, next.project],
-    );
-    return result.rows.length === 0 ? null : rowToMemory(result.rows[0]!);
+    return await withTransaction(this.pool, async (client) => {
+      const target = await this.lockMemoryTarget(client, id);
+      if (target === null || target.memory.deletedAt !== null) return null;
+      if (target.source !== null) {
+        const source = await this.updateSource(client, target.source, patch);
+        return source === null ? null : { ...target.memory, scope: source.scope, project: source.project };
+      }
+      const next = normalizeMemoryPatch(target.memory, patch);
+      const result = await client.query(
+        `update ${this.memories} set scope = $2, project = $3 where id = $1 returning ${MEMORY_COLUMNS}`,
+        [id, next.scope, next.project],
+      );
+      return result.rows.length === 0 ? null : rowToMemory(result.rows[0]!);
+    });
   }
 
   /**
@@ -626,7 +944,8 @@ export class PgMetadataStore implements MetadataStore {
   }
 
   /** 列出需要（重新）產生向量的未刪除記憶（見 `MetadataStore.listMemoriesNeedingEmbedding`）。 */
-  async listMemoriesNeedingEmbedding(embedderId: string, limit?: number): Promise<Memory[]> {
+  async listMemoriesNeedingEmbedding(embedderId: string, limit?: number, before?: Pick<Memory, "createdAt" | "id">): Promise<Memory[]> {
+    assertMemoryEmbeddingCursor(before);
     const normalized = normalizeMemoryLimit(limit);
     if (normalized === 0) return [];
 
@@ -636,15 +955,20 @@ export class PgMetadataStore implements MetadataStore {
           and (embedding_state in ('pending', 'failed')
                or (embedding_state = 'ready'
                    and (embedding_embedder_id is null or embedding_embedder_id <> $1)))
+          ${before === undefined ? "" : "and (created_at, id) < ($3, $4)"}
         order by created_at desc, id desc
         limit $2`,
-      [embedderId, normalized],
+      before === undefined ? [embedderId, normalized] : [embedderId, normalized, before.createdAt, before.id],
     );
     return result.rows.map(rowToMemory);
   }
 
   /** 統計未刪除記憶的語意化狀態（見 `MetadataStore.memoryEmbeddingStats`；四個狀態數自洽）。 */
   async memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats> {
+    return this.readMemoryEmbeddingStats(embedderId);
+  }
+
+  private async readMemoryEmbeddingStats(embedderId: string, sourceId?: number): Promise<MemoryEmbeddingStats> {
     const result = await this.pool.query(
       `select
          count(*)::int as total,
@@ -656,8 +980,8 @@ export class PgMetadataStore implements MetadataStore {
            where embedding_state = 'ready'
              and (embedding_embedder_id is null or embedding_embedder_id <> $1)
          ))::int as stale
-       from ${this.memories} where deleted_at is null`,
-      [embedderId],
+       from ${this.memories} where deleted_at is null ${sourceId === undefined ? "" : "and source_id = $2"}`,
+      sourceId === undefined ? [embedderId] : [embedderId, sourceId],
     );
     const row = result.rows[0] ?? {};
     const count = (value: unknown): number => Number(value ?? 0);

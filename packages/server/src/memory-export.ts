@@ -1,29 +1,21 @@
-/**
- * 記憶備份（JSON Lines／NDJSON）的純函式：序列化匯出列、解析與驗證匯入列、檔名、dry-run 旗標。
- *
- * 為什麼獨立成一個模組：`app.ts` 只做路由與 IO（讀 body、呼叫 store、組 HTTP 回應），
- * 格式與驗證規則集中在這裡，才能用單元測試釘住、也避免 REST 與其他呼叫端各自解讀契約。
- * 契約見 `docs/storage-ports.md` §記憶的匯出／匯入。
- *
- * 重要語意：
- * - 匯出列是**讀取遮罩後**的視圖：呼叫端（REST）必須先套 `maskMemoryContent` 再把結果交給
- *   `serializeMemoriesExport`；本模組不碰資料庫、不自行遮罩。
- * - 匯入不保留 `id`／`createdAt`／`supersedes`（新 id 與匯入時間、`supersedes` 一律 null）；
- *   `pinned` 保留。`content` 會先在這裡遮罩（`maskSecrets`），回報「遮罩了幾個內容」。
- * - 整批先驗證：`planMemoryImport` 只回計畫，不寫入；有任何一行不合法，呼叫端必須整批拒絕。
- */
+/** 記憶 NDJSON 備份的序列化、整批驗證與匯入計畫。 */
 import {
   MEMORY_SCOPES,
   memoryContentHash,
   type Memory,
   type MemoryKind,
   type MemoryScope,
+  type MemoryPolicy,
+  type MemorySource,
 } from "@mnemoshelf/core";
 import { ValidationError } from "./errors.js";
 import { maskSecrets } from "./secret-masking.js";
+import { memoryContentView } from "./memory-policy.js";
+import { parseSourceWriteRequest, prepareMemorySource, sourceBackupView } from "./memory-source.js";
 
-/** 匯出格式版本；寫入每一列，匯入時可省略或必須等於此值。 */
+/** 舊版扁平記憶備份的格式版本。 */
 export const MEMORY_EXPORT_SCHEMA_VERSION = 1;
+export const RAW_MEMORY_EXPORT_SCHEMA_VERSION = 2;
 /** 匯出回應的 content-type（NDJSON）。 */
 export const MEMORY_EXPORT_CONTENT_TYPE = "application/x-ndjson; charset=utf-8";
 /** 匯入請求主體上限（32 MiB）；超過回 413。 */
@@ -83,6 +75,8 @@ export interface MemoryImportPlan {
   total: number;
   /** 通過驗證的資料列。 */
   entries: MemoryImportEntry[];
+  /** 通過驗證且已依同一政策快照備妥的原文來源。 */
+  sources: ReturnType<typeof prepareMemorySource>[];
   /** 前 `MAX_MEMORY_IMPORT_ERRORS` 筆錯誤。 */
   invalid: MemoryImportLineError[];
   /** 不合法的行數（可能大於 `invalid.length`，用於計算 `valid`）。 */
@@ -145,6 +139,26 @@ export function serializeMemoriesExport(memories: readonly Memory[]): Buffer {
   if (memories.length === 0) return Buffer.alloc(0);
   const text = `${memories.map(serializeMemoryExportLine).join("\n")}\n`;
   return Buffer.from(text, "utf8");
+}
+
+/** 匯出 v2 的記憶與原文來源列，來源片段由匯入端重建。 */
+export function serializeRawMemoriesExport(
+  memories: readonly Memory[], sources: readonly MemorySource[], policy: MemoryPolicy,
+): Buffer {
+  const schemaVersion = RAW_MEMORY_EXPORT_SCHEMA_VERSION;
+  const rows = memories.map((memory) => {
+    const { schemaVersion: _legacyVersion, ...fields } = memoryExportRecord(memory);
+    return JSON.stringify({ schemaVersion, type: "memory", memory: fields });
+  });
+  for (const source of sources) {
+    rows.push(JSON.stringify({
+      schemaVersion,
+      type: "source",
+      source: sourceBackupView(source, policy),
+      createdAt: source.createdAt,
+    }));
+  }
+  return rows.length === 0 ? Buffer.alloc(0) : Buffer.from(`${rows.join("\n")}\n`, "utf8");
 }
 
 /**
@@ -221,7 +235,7 @@ function optionalImportSourceRef(value: unknown, field: "sourceSession" | "sourc
  * - `schemaVersion` 可省略，有提供就必須是 1（來源欄位是 additive，因此**不升版**）；
  * - `id`／`createdAt`／`supersedes` 與未知欄位一律忽略（不保留）。
  */
-function parseImportLine(record: unknown, line: number): MemoryImportEntry {
+function parseImportLine(record: unknown, line: number, policy: MemoryPolicy): MemoryImportEntry {
   if (!isRecord(record)) lineError("每一行必須是 JSON 物件");
 
   if (record.schemaVersion !== undefined && record.schemaVersion !== MEMORY_EXPORT_SCHEMA_VERSION) {
@@ -229,7 +243,7 @@ function parseImportLine(record: unknown, line: number): MemoryImportEntry {
   }
 
   const rawContent = requireImportString(record.content, "content", MAX_MEMORY_CHARS);
-  const masked = maskSecrets(rawContent);
+  const masked = memoryContentView(rawContent, policy);
 
   const kind =
     record.kind === undefined || record.kind === null
@@ -302,10 +316,13 @@ function parseImportLine(record: unknown, line: number): MemoryImportEntry {
  * - `total` 是非空行數；`valid = total - invalidCount`。
  * - 錯誤只保留前 `MAX_MEMORY_IMPORT_ERRORS` 筆，但 `invalidCount` 仍是完整計數。
  */
-export function planMemoryImport(text: string): MemoryImportPlan {
+export function planMemoryImport(
+  text: string, policy: MemoryPolicy = { maskSecrets: true, version: 1 },
+): MemoryImportPlan {
   const normalized = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
   const lines = normalized.split("\n");
   const entries: MemoryImportEntry[] = [];
+  const sources: MemoryImportPlan["sources"] = [];
   const invalid: MemoryImportLineError[] = [];
   let total = 0;
   let invalidCount = 0;
@@ -327,7 +344,20 @@ export function planMemoryImport(text: string): MemoryImportPlan {
       continue;
     }
     try {
-      const entry = parseImportLine(parsed, line);
+      if (isRecord(parsed) && parsed.schemaVersion === RAW_MEMORY_EXPORT_SCHEMA_VERSION) {
+        if (parsed.type === "source") {
+          if (typeof parsed.createdAt !== "string" || !Number.isFinite(Date.parse(parsed.createdAt))) {
+            lineError("createdAt 必須是有效的 ISO 8601 時間");
+          }
+          const source = prepareMemorySource(parseSourceWriteRequest(parsed.source), policy);
+          sources.push(source);
+          if (source.redactedCount > 0) redacted += 1;
+          continue;
+        }
+        if (parsed.type !== "memory") lineError("v2 type 必須是 memory 或 source");
+        parsed = parsed.memory;
+      }
+      const entry = parseImportLine(parsed, line, policy);
       entries.push(entry);
       if (entry.redacted) redacted += 1;
     } catch (error) {
@@ -338,7 +368,7 @@ export function planMemoryImport(text: string): MemoryImportPlan {
     }
   }
 
-  return { total, entries, invalid, invalidCount, redacted };
+  return { total, entries, sources, invalid, invalidCount, redacted };
 }
 
 /** 去重 key（與儲存層 `addMemoryUnlessDuplicate` 相同的四個維度；`project` null-safe）。 */

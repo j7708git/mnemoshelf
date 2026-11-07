@@ -65,12 +65,20 @@ function additionalContext(result: unknown, project: string | null): string | nu
     if (typeof hit.score !== "number" || !Number.isFinite(hit.score) || hit.score < MIN_SCORE || hit.score > 1) continue;
     if (hit.scope !== "global" && (project === null || hit.scope !== "project" || hit.project !== project)) continue;
 
-    const content = maskSecrets(hit.content).text.replace(/\s+/gu, " ").trim()
+    const policyAware = typeof response.policyVersion === "number" &&
+      Number.isSafeInteger(response.policyVersion) && response.policyVersion >= 1;
+    const text = policyAware ? hit.content : maskSecrets(hit.content).text;
+    const content = text.replace(/\s+/gu, " ").trim()
       .replace(/<\s*\/\s*memory-context\s*>|</gi, (tag) => (tag === "<" ? "&lt;" : "<\\/memory-context>"));
     if (content === "") continue;
-    const kind = MEMORY_KINDS.find((value) => value === hit.kind) ?? "fact";
-    const date = typeof hit.createdAt === "string" ? /^\d{4}-\d{2}-\d{2}/.exec(hit.createdAt)?.[0] : undefined;
-    const line = `- [${kind}]${date === undefined ? "" : `[${date}]`}[${hit.score.toFixed(2)}] ${content}`;
+    const isRaw = hit.sourceType === "raw-turn" && typeof hit.sourceId === "number" &&
+      Number.isSafeInteger(hit.sourceId) && hit.sourceId > 0 && (hit.role === "user" || hit.role === "assistant");
+    const label = isRaw
+      ? `${hit.role === "user" ? "使用者" : "助理"}原文片段 #${hit.sourceId}（read_memory_source 續讀）`
+      : MEMORY_KINDS.find((value) => value === hit.kind) ?? "fact";
+    const timestamp = isRaw ? hit.occurredAt : hit.createdAt;
+    const date = typeof timestamp === "string" ? /^\d{4}-\d{2}-\d{2}/.exec(timestamp)?.[0] : undefined;
+    const line = `- [${label}]${date === undefined ? "" : `[${date}]`}[${hit.score.toFixed(2)}] ${content}`;
     const remaining = MAX_BLOCK_CHARS - used - 1;
     if (line.length > remaining) {
       // 第一筆過長時保留其開頭，圍籬仍完整；其餘超出預算的結果捨棄。

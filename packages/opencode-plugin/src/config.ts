@@ -23,13 +23,6 @@ import type {
   Settings,
 } from "./types.js";
 
-/** digest 模型呼叫／模型清單檢查的 timeout：預設值（毫秒）。 */
-export const DEFAULT_DIGEST_TIMEOUT_MS = 45000;
-
-/** `digestTimeoutMs` 的合法範圍（毫秒）。 */
-export const DIGEST_TIMEOUT_MIN_MS = 3000;
-export const DIGEST_TIMEOUT_MAX_MS = 120000;
-
 /** `recentTurns` 的預設值與範圍（0＝關閉回合紀錄召回）。 */
 export const DEFAULT_RECENT_TURNS = 3;
 export const RECENT_TURNS_MAX = 5;
@@ -47,10 +40,8 @@ export const DEFAULT_SETTINGS: Readonly<Settings> = {
   hardChars: 1200,
   dedupeTTL: 8,
   recentTurns: DEFAULT_RECENT_TURNS,
-  digestEnabled: false,
-  digestModel: null,
-  digestOnInterrupted: false,
-  digestTimeoutMs: DEFAULT_DIGEST_TIMEOUT_MS,
+  captureEnabled: false,
+  captureOnInterrupted: false,
 };
 
 /** 驗證 runtime 檔時 `GET /health` 的 timeout。 */
@@ -83,13 +74,16 @@ export interface SettingsWarning {
   /**
    * - `invalid`：型別不符，回退預設。
    * - `out-of-range`：超出範圍，夾在範圍內。
+   * - `migrated`：舊開關已用新擷取功能接替。
    * - `removed`：這個鍵已從產品移除；留著不會生效（不驗證值、不記值）。
    */
-  reason: "invalid" | "out-of-range" | "removed";
+  reason: "invalid" | "out-of-range" | "removed" | "migrated";
 }
 
 /** 已移除的設定鍵：只警告、不生效（不驗證值，也不帶值進 log）。 */
 const REMOVED_SETTINGS_KEYS = [
+  "digestModel",
+  "digestTimeoutMs",
   "digestMaxPerTurn",
   "digestMaxPerSession",
   "digestMaxPerDay",
@@ -97,22 +91,7 @@ const REMOVED_SETTINGS_KEYS = [
 
 export type SettingsWarnFn = (warning: SettingsWarning) => void;
 
-/** 解析 `digestModel`（`<providerID>/<modelID>`）；格式不符回 `null`（呼叫端跳過 digest）。 */
-export function parseDigestModel(
-  value: string | null | undefined,
-): { providerID: string; id: string } | null {
-  if (typeof value !== "string") return null;
-  const trimmed = value.trim();
-  // 只在**第一個** `/` 切：model id 本身可能含 `/`（例如某些 provider 的 `vendor/model`）。
-  const slash = trimmed.indexOf("/");
-  if (slash <= 0 || slash === trimmed.length - 1) return null;
-  const providerID = trimmed.slice(0, slash).trim();
-  const id = trimmed.slice(slash + 1).trim();
-  if (providerID === "" || id === "" || /\s/.test(providerID)) return null;
-  return { providerID, id };
-}
-
-function readDigestBoolean(
+function readBoolean(
   value: unknown,
   fallback: boolean,
   key: string,
@@ -124,7 +103,7 @@ function readDigestBoolean(
   return fallback;
 }
 
-function readDigestInt(
+function readBoundedInt(
   value: unknown,
   fallback: number,
   min: number,
@@ -145,22 +124,21 @@ function readDigestInt(
 /**
  * 解析 plugin options；非法值回退預設並夾在可用範圍。
  *
- * `warn` 只收到鍵名與原因（不含值）：digest 相關鍵若填錯，呼叫端會記一行 warning。
+ * `warn` 只收到鍵名與原因（不含值）：設定鍵若填錯，呼叫端會記一行 warning。
  */
 export function readSettings(options: unknown, warn?: SettingsWarnFn): Settings {
   const raw = (options ?? {}) as Record<string, unknown>;
   const trigger = raw.trigger === "every-turn" ? "every-turn" : "first-turn+explicit";
   const softChars = clampInt(raw.softChars, DEFAULT_SETTINGS.softChars, 200, 2000);
   const hardChars = clampInt(raw.hardChars, DEFAULT_SETTINGS.hardChars, softChars, 4000);
-  let digestModel: string | null = null;
-  if (raw.digestModel !== undefined && raw.digestModel !== null) {
-    const normalized = readNonEmptyString(raw.digestModel);
-    if (normalized === undefined || parseDigestModel(normalized) === null) {
-      warn?.({ key: "digestModel", reason: "invalid" });
-    } else {
-      digestModel = normalized;
+  const migrated = (key: "captureEnabled" | "captureOnInterrupted", legacy: string): boolean => {
+    if (raw[key] !== undefined) return readBoolean(raw[key], false, key, warn);
+    if (typeof raw[legacy] === "boolean") {
+      warn?.({ key: legacy, reason: "migrated" });
+      return raw[legacy];
     }
-  }
+    return readBoolean(raw[legacy], false, legacy, warn);
+  };
   // 已移除的張數上限鍵：設定檔若還留著，留一筆警告讓使用者知道它不會生效。
   for (const key of REMOVED_SETTINGS_KEYS) {
     if (raw[key] !== undefined) warn?.({ key, reason: "removed" });
@@ -182,7 +160,7 @@ export function readSettings(options: unknown, warn?: SettingsWarnFn): Settings 
     softChars,
     hardChars,
     dedupeTTL: clampInt(raw.dedupeTTL, DEFAULT_SETTINGS.dedupeTTL, 8, 10),
-    recentTurns: readDigestInt(
+    recentTurns: readBoundedInt(
       raw.recentTurns,
       DEFAULT_SETTINGS.recentTurns,
       0,
@@ -190,22 +168,9 @@ export function readSettings(options: unknown, warn?: SettingsWarnFn): Settings 
       "recentTurns",
       warn,
     ),
-    digestEnabled: readDigestBoolean(raw.digestEnabled, DEFAULT_SETTINGS.digestEnabled, "digestEnabled", warn),
-    digestModel,
-    digestOnInterrupted: readDigestBoolean(
-      raw.digestOnInterrupted,
-      DEFAULT_SETTINGS.digestOnInterrupted,
-      "digestOnInterrupted",
-      warn,
-    ),
-    digestTimeoutMs: readDigestInt(
-      raw.digestTimeoutMs,
-      DEFAULT_SETTINGS.digestTimeoutMs,
-      DIGEST_TIMEOUT_MIN_MS,
-      DIGEST_TIMEOUT_MAX_MS,
-      "digestTimeoutMs",
-      warn,
-    ),
+    captureEnabled: migrated("captureEnabled", "digestEnabled"),
+    captureOnInterrupted: migrated("captureOnInterrupted", "digestOnInterrupted"),
+    ...(readNonEmptyString(raw.spoolDir) === undefined ? {} : { spoolDir: readNonEmptyString(raw.spoolDir) }),
   };
 }
 

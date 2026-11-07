@@ -50,7 +50,7 @@ export const MCP_SERVER_NAME = "mnemoshelf";
  */
 export const MCP_SERVER_VERSION = APP_VERSION;
 
-/** 六個工具（原始 JSON Schema；參數的語意驗證由 REST 負責）。 */
+/** 工具的 JSON Schema；參數的語意驗證由 REST 負責。 */
 export const MCP_TOOLS: Tool[] = [
   {
     name: "search",
@@ -79,7 +79,7 @@ export const MCP_TOOLS: Tool[] = [
       `專案優先——要寫成全域共享請明確指定 scope: "global"。` +
       `精確去重：同一範圍（scope／project／agent）已有相同內容時不新增，回應是既有記憶並帶 duplicate: true；` +
       `要強制新增請帶 force: true。內容編輯（產生新版本並取代舊版）仍用 REST 的 supersedes 語意。` +
-      `內容在寫入前會遮蔽可辨識的機密（API key／token／私鑰等），回應帶 redacted／redactedCount。` +
+      `依目前記憶政策遮蔽可辨識的機密（API key／token／私鑰等），回應帶 redacted／redactedCount。` +
       `回應的來源欄位 sourceSession／sourceMessage 一律為 null（MCP 工具沒有 session 資訊；` +
       `自動寫入者走 REST 自行提供）。${UNTRUSTED_DATA_WARNING}`,
     inputSchema: {
@@ -109,7 +109,7 @@ export const MCP_TOOLS: Tool[] = [
     name: "recall",
     description:
       `列出未刪除的記憶（由新到舊），可帶 filter：kind／scope／project／agent／limit` +
-      `（limit 預設 100、上限 500）。內容在讀取時會再遮一次機密。` +
+      `（limit 預設 100、上限 500）。內容依目前記憶政策顯示。` +
       `每筆帶來源欄位：agent（寫入者標記）與 sourceSession／sourceMessage（寫入來源，可為 null）。` +
       `${TRUST_MODEL_WARNING}${UNTRUSTED_DATA_WARNING}`,
     inputSchema: {
@@ -131,7 +131,7 @@ export const MCP_TOOLS: Tool[] = [
       `project 未提供時依 remember 的規則解析（參數 > 環境變數 MNEMOSHELF_PROJECT > 行程 cwd 的資料夾名稱）。` +
       `scope：global／project／agent（agent 只含自己的）；kind 選填；k 預設 10、上限 100；` +
       `minScore 0..1 只過濾語意結果。每筆命中帶 score／rank／source、untrusted 與完整記憶欄位` +
-      `（含來源：agent、sourceSession、sourceMessage）；內容在讀取時會再遮一次機密。` +
+      `（含來源：agent、sourceSession、sourceMessage）；原文片段可用 read_memory_source 續讀。` +
       `${TRUST_MODEL_WARNING}${UNTRUSTED_DATA_WARNING}`,
     inputSchema: {
       type: "object",
@@ -149,6 +149,28 @@ export const MCP_TOOLS: Tool[] = [
         minScore: { type: "number", description: "0..1，只過濾語意結果" },
       },
       required: ["query"],
+    },
+  },
+  {
+    name: "read_memory_source",
+    description:
+      `依來源 ID 讀取一頁原文對話。以 project、scope 或 includeAllProjects 明確指定範圍；` +
+      `scope=agent 須帶 agent。續讀沿用範圍並傳入上頁的 next 欄位；政策版本變更時從頭讀取。` +
+      `${TRUST_MODEL_WARNING}${UNTRUSTED_DATA_WARNING}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "召回結果的 sourceId" },
+        scope: { type: "string", enum: ["global", "project", "agent"] },
+        project: { type: "string", maxLength: 200 },
+        agent: { type: "string", maxLength: 200 },
+        includeAllProjects: { type: "boolean" },
+        messageIndex: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+        offset: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+        maxChars: { type: "integer", minimum: 1, maximum: 32_000 },
+        policyVersion: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+      },
+      required: ["id"],
     },
   },
   {
@@ -282,7 +304,7 @@ export interface McpServerOptions {
 }
 
 interface RestErrorBody {
-  error?: { name?: unknown; message?: unknown };
+  error?: { name?: unknown; message?: unknown } | string;
 }
 
 /** 打 REST 並解析 JSON；非 2xx 轉成 `RestCallError`。 */
@@ -314,8 +336,11 @@ export async function callRest(
 
   if (!response.ok) {
     const errorBody = (parsed ?? {}) as RestErrorBody;
-    const name = typeof errorBody.error?.name === "string" ? errorBody.error.name : "HttpError";
-    const message = typeof errorBody.error?.message === "string" ? errorBody.error.message : `HTTP ${response.status}`;
+    const error = errorBody.error;
+    const name = typeof error === "string" ? error : typeof error?.name === "string" ? error.name : "HttpError";
+    const message = typeof error !== "string" && typeof error?.message === "string"
+      ? error.message
+      : `HTTP ${response.status}`;
     throw new RestCallError(response.status, name, message);
   }
 
@@ -439,7 +464,7 @@ export function createMcpServer(options: McpServerOptions): Server {
       capabilities: { tools: {} },
       instructions:
         `Mnemoshelf 的本機知識庫入口（只讀使用者選定的 roots）。` +
-        `記憶內容在寫入前會遮蔽可辨識的機密（API key／token／私鑰等），讀取時仍可能含有一般文字。` +
+        `記憶依目前記憶政策遮蔽可辨識的機密（API key／token／私鑰等），讀取時仍可能含有一般文字。` +
         `${TRUST_MODEL_WARNING}${UNTRUSTED_DATA_WARNING}`,
     },
   );
@@ -595,6 +620,31 @@ export function createMcpServer(options: McpServerOptions): Server {
               2,
             ),
           );
+        }
+
+        case "read_memory_source": {
+          const { id } = args;
+          if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) {
+            throw new ValidationError("id", "必須是正整數");
+          }
+          const query = queryString({
+            scope: args.scope,
+            project: args.project,
+            agent: args.agent,
+            includeAllProjects: args.includeAllProjects,
+            messageIndex: args.messageIndex,
+            offset: args.offset,
+            maxChars: args.maxChars,
+            policyVersion: args.policyVersion,
+          });
+          const data = await callRestWithReconnect("GET", `/memory-sources/${id}${query}`, "retry");
+          if (!isRecord(data) || !isRecord(data.source) || data.source.id !== id ||
+              data.untrusted !== true || !Array.isArray(data.messages) ||
+              typeof data.policyVersion !== "number" || !Number.isSafeInteger(data.policyVersion) ||
+              data.policyVersion < 1) {
+            throw new ValidationError("source", "服務回應不支援原文來源介面");
+          }
+          return toolText(JSON.stringify(data, null, 2));
         }
 
         case "forget": {

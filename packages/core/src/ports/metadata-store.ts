@@ -1,4 +1,12 @@
 import type {
+  MemoryPolicy,
+  MemorySource,
+  MemorySourceEventCheck,
+  MemorySourceWriteResult,
+  NewMemorySource,
+  NewMemorySourceChunk,
+} from "../memory/source.js";
+import type {
   Chunk,
   Memory,
   MemoryEmbeddingState,
@@ -52,6 +60,21 @@ export function normalizeMemoryLimit(limit: number | undefined): number {
   if (limit === undefined) return MEMORY_LIST_DEFAULT_LIMIT;
   if (!Number.isInteger(limit) || limit <= 0) return 0;
   return Math.min(limit, MEMORY_LIST_MAX_LIMIT);
+}
+
+/** 嵌入回填游標採用上一頁最後一列的建立時間及 id。 */
+export function assertMemoryEmbeddingCursor(before: Pick<Memory, "createdAt" | "id"> | undefined): void {
+  if (before === undefined) return;
+  if (
+    before === null || typeof before.createdAt !== "string" ||
+    !Number.isSafeInteger(before.id) || before.id <= 0
+  ) {
+    throw new TypeError("記憶嵌入游標不合法");
+  }
+  const date = new Date(before.createdAt);
+  if (!Number.isFinite(date.getTime()) || date.toISOString() !== before.createdAt) {
+    throw new TypeError("記憶嵌入游標時間不合法");
+  }
 }
 
 /**
@@ -311,6 +334,18 @@ export function assertMemoryEmbeddingFailure(reason: MemoryEmbeddingFailure): vo
  * 全文檢索的斷詞方式屬於實作細節，不得洩漏到介面。
  */
 export interface MetadataStore {
+  getMemoryPolicy(): Promise<MemoryPolicy>;
+  setMemoryPolicy(maskSecrets: boolean): Promise<MemoryPolicy>;
+  /** 匯入預檢，實際寫入時會在交易內重新驗證。 */
+  checkMemorySource(input: MemorySourceEventCheck): Promise<"available" | "duplicate">;
+  addMemorySource(input: NewMemorySource, chunks: NewMemorySourceChunk[]): Promise<MemorySourceWriteResult>;
+  getMemorySource(id: number): Promise<MemorySource | null>;
+  listMemorySourcesForExport(): Promise<MemorySource[]>;
+  listMemorySourceChunks(id: number): Promise<Memory[]>;
+  memorySourceEmbeddingStats(id: number, embedderId: string): Promise<MemoryEmbeddingStats>;
+  replaceMemorySourceChunks(id: number, chunkVersion: string, chunks: NewMemorySourceChunk[]): Promise<Memory[]>;
+  updateMemorySource(id: number, patch: MemoryPatch): Promise<MemorySource | null>;
+  deleteMemorySource(id: number, hard?: boolean): Promise<boolean>;
   /** 套用遷移。必須可重複呼叫（冪等）。 */
   migrate(): Promise<void>;
 
@@ -454,8 +489,13 @@ export interface MetadataStore {
    * 條件＝`state in ('pending','failed')` 或（`state='ready'` 但 embedder 不相符）；
    * **排除 `too-long`**。排序與 `listMemories` 相同（`createdAt` 由新到舊、同毫秒以 `id` 決序）；
    * `limit` 的邊界語意沿用 `normalizeMemoryLimit`（預設 100、上限 500、<= 0 回傳空清單）。
+   * 指定 `before` 時只列比該筆更舊的結果（同毫秒時 id 更小），以便繼續回填後續批次。
    */
-  listMemoriesNeedingEmbedding(embedderId: string, limit?: number): Promise<Memory[]>;
+  listMemoriesNeedingEmbedding(
+    embedderId: string,
+    limit?: number,
+    before?: Pick<Memory, "createdAt" | "id">,
+  ): Promise<Memory[]>;
 
   /** 統計未刪除記憶的語意化狀態（見 `MemoryEmbeddingStats`）。 */
   memoryEmbeddingStats(embedderId: string): Promise<MemoryEmbeddingStats>;

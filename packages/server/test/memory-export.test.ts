@@ -51,13 +51,13 @@ async function listMemoryRows(instance: MnemoshelfServer): Promise<Memory[]> {
 }
 
 /** 下載匯出檔（原始 bytes 解碼成文字，才能驗證結尾換行與位元組格式）。 */
-async function exportMemories(instance: MnemoshelfServer): Promise<{
+async function exportMemories(instance: MnemoshelfServer, version = "?schemaVersion=1"): Promise<{
   status: number;
   text: string;
   contentType: string | null;
   contentDisposition: string | null;
 }> {
-  const response = await fetch(`${instance.url}/memories/export`, {
+  const response = await fetch(`${instance.url}/memories/export${version}`, {
     headers: { authorization: `Bearer ${TEST_TOKEN}` },
   });
   return {

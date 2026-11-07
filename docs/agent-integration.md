@@ -7,21 +7,20 @@ Mnemoshelf 的服務只綁 `127.0.0.1`，而且所有 REST 端點都需要 Beare
 
 > 這份檔案是公開文件；內容以程式碼與 `docs/roots-and-privacy.md` 的契約為準。
 
-## 版本與相容性（0.5.x）
+## 版本與相容性
 
 | 版本 | harness 整合狀態 |
 |---|---|
 | **0.5.0** | 本文的三層接入契約與三個入口同日釋出：MCP 入口、OpenCode／OpenChamber 外掛、`@mnemoshelf/dsh-plugin`（dsh bundle）。MCP／REST 契約與 0.4.x 相同；dsh 外掛新增回合前召回與回合卡寫入（含 spool）。 |
 | **0.5.1** | App 內更新證明版：功能與 0.5.0 相同（除版本號）。MCP／REST／外掛契約與行為未變。 |
 
-- `runtime.json` 的 `schemaVersion` 仍是 `1`；MCP 工具仍是六個（`search`、`remember`、`recall`、
-  `forget`、`list_roots`、`search_memories`）。
-- harness 版本需求：OpenCode 見 [opencode-plugin.md](opencode-plugin.md) §1、dsh 見
+- 原文記憶更新：`runtime.json` 的 `schemaVersion` 仍是 `1`；MCP 現有七個工具（`search`、`remember`、`recall`、`forget`、`list_roots`、`search_memories`、`read_memory_source`）。上表是歷史釋出狀態，不代表本輪已發版。
+- harness 版本需求：OpenCode 見 [OpenCode 外掛需求](opencode-plugin.md)、dsh 見
   `packages/dsh-plugin/README.md`、codex-cli 的實測版本見下文「MCP-only 快速上手」。
 - **實測範圍（2026-10-28，Linux x64）**：OpenCode 2.2.0（外掛型別 `@opencode/plugin@2.1.1`）、
-  dsh `0.2.1-rc.2`、codex-cli `0.147.0`。Windows／macOS 未實機。
-- 既有差異照實保留：OpenCode 外掛在 `degraded: true` 時仍注入關鍵字補位結果；dsh 依契約
-  不注入（見下文「與 OpenCode 外掛現況的差異」）。
+  dsh `0.2.1-rc.2`、codex-cli `0.147.0`。該輪 Windows／macOS 未實機。
+- 新原文流程：OpenCode 保留關鍵字補位；dsh 在降級時只採政策有效的原文命中。上列歷史宿主驗證不等於新流程實機驗證。
+- **原文串接補驗（2026-11-06，macOS arm64）**：OpenCode 2.2.5 CLI 與 dsh 0.2.1-rc.5 隨附 runtime，在隔離 profile、SQLite 與合成模型回應下完成兩輪原文保存／下一輪召回。長助理文字逐字保存；實際 GUI、其他平台與回答模型品質另計。
 
 ## 這個檔案是什麼
 
@@ -307,175 +306,30 @@ client 端。
 - token 會隨 `runtime.json` 變動；不要把它寫進 repo 內的設定檔。設定請放在使用者層級
   （例如 `~/.config/opencode/opencode.jsonc`）。
 
-## 與 OpenCode 外掛的關係（MCP vs 自動召回）
+## MCP、外掛與直接接入
 
-兩者都連同一台本機服務、用同一組 `url` + `token`，但分工不同：
+MCP 是 Agent 主動呼叫的工具；外掛在宿主生命週期自動召回及選用擷取；兩者都使用同一個本機 REST 服務與有效遮罩政策。
 
-| | MCP 入口（本文上節） | `@mnemoshelf/opencode-plugin`（自動召回） |
-|---|---|---|
-| 誰發動 | **agent 主動呼叫工具**（`remember`／`search_memories`／`recall` 等） | 外掛在**每次模型請求前**自動查一次 |
-| 能做什麼 | 查詢、寫入、釘選、遺忘（六個工具） | **召回**（注入當次請求）＋**可選**的每回合摘要寫入（`digestEnabled`＋`digestModel`，預設關閉） |
-| 連線來源 | 環境變數 → **自動讀 `runtime.json`**（讀檔後先驗服務身分） | options → 環境變數 → **自動讀 `runtime.json`** |
-| 設定方式 | 使用者在 MCP client 設定（見上節）；桌面版設定頁可直接複製片段 | 使用者手動加進 `opencode.jsonc` 的 `plugins`（v1 不自動改設定） |
+| 接入 | 寫入 | 讀取 |
+| --- | --- | --- |
+| MCP | `remember` 保存主動提供的短記憶 | search／recall／search_memories／read_memory_source 等七個工具 |
+| OpenCode／OpenChamber | captureEnabled 預設關閉；舊 digestEnabled 可遷移，不需要 digestModel | 符合觸發條件時自動召回 |
+| dsh | 預設在完成回合擷取原文，可用 captureEnabled 關閉 | 每個回合第一步自動召回 |
+| REST 程式 | 短記憶 POST /memories；完整回合 POST /memory-sources | 搜尋與按來源續讀 |
 
-- **兩者都會自動讀 `runtime.json`**：MCP 入口在環境變數缺漏時讀檔，並先做身分驗證
-  （見「MCP 設定片段」）；外掛則是 options → 環境變數 → 自動讀檔。使用者因此不必手動複製
-  token 貼進設定檔。
-- **外掛的寫入是可選的**：召回一直是開啟的；寫入只有在你設定 `digestEnabled: true` 並指定
-  `digestModel` 後才會發生——每個成功結束的回合會把 1 張回合紀錄＋最多 2 則原子記憶寫回
-  mnemoshelf（見 [opencode-plugin.md](opencode-plugin.md) §7）。沒有開啟時外掛不呼叫模型、
-  也不寫入；要主動留下記憶，請用 MCP 工具或 REST（見 README 的功能說明與
-  `docs/operations.md` §REST 端點速查）。
-- **職責邊界**：外掛負責「每回合自動摘要寫入＋需要時自動召回」，MCP 負責「agent 想查、想寫、
-  想釘選或想遺忘時自己動手」；兩者共用同一台本機服務與同一組 `url` + `token`。
-- 兩者可以同時開：外掛負責「不用問就帶進背景」，MCP 負責「agent 想查或想寫時自己動手」。
-- 詳細安裝、參數與疑難排解見 [opencode-plugin.md](opencode-plugin.md)。
+安裝參數見 [OpenCode 外掛](opencode-plugin.md) 與 [dsh 外掛](../packages/dsh-plugin/README.md)。原文 schema、完整性、角色／時間、遮罩開關、分頁與備份的權威定義在 [原文記憶](raw-memory.md)，不在各宿主複製另一份資料契約。
 
-> **本節為 v1 接入契約（2026-10-28）。** 前面的 `runtime.json`、MCP 設定與安全說明不變；
-> 本節定義「任何 harness 如何接入」：三層接入模型、寫入與回合卡、確定性、召回、注入與剝除。
-> 契約的權威仍是程式碼；程式碼與本節不符時以程式碼為準，各小節附上對應檔案。
->
-> **dsh 的範圍**：本節提到的 dsh 行為（`agent/pre-step`、`user/message`、`form:'recall'`、
-> `turn/end`、900 字上限）是 v1 契約的結論，**已實作於 `packages/dsh-plugin`**
-> 並隨 0.5.0 釋出；實作與本節如有出入，以 `packages/dsh-plugin/README.md` 與程式碼為準。
+### 寫入與來源識別
 
-## 三層接入模型
+原文回合使用穩定的 agent／sourceSession／sourceTurn 作為事件 key，有序 messages 保留 sourceMessage、role、content、occurredAt。agent 為來源標記，不是身分驗證；未知時間為 null。相同事件重送去重，不同事件的相同文字仍各自保留，內容衝突明確拒絕。
 
-Mnemoshelf 對外只有**本機 REST** 與**建在 REST 上的 MCP 入口**；「外掛」不是第三套 API，而是
-harness 內用 REST 實作自動召回／寫入的整合層。三層的差別在**誰發動**與**誰決定內容**。
+新原文入口不沿用舊卡片 2,000／4,000 字元截斷，也不產生額外原子摘要。舊卡片與摘要保留為舊版記憶；手動短記憶的 8,000 字元上限與內容去重維持相容。單一回合建議只由一個自動寫入者擷取，避免不同來源名稱把同回合記兩次。
 
-| 層 | 誰發動 | 責任 | 召回 | 寫入 |
-|---|---|---|---|---|
-| MCP 工具 | 模型或 agent 主動呼叫工具 | 六個工具（`search`／`remember`／`recall`／`forget`／`list_roots`／`search_memories`）；stdio 入口只轉發 REST，不直接開資料庫 | 只有明確呼叫 `recall`／`search_memories` 才查 | 只有明確呼叫 `remember` 才寫 |
-| 外掛（自動） | 宿主生命週期事件（請求前／回合結束） | 在 harness 內自動召回；可選或固定的自動寫入 | 每次符合條件的模型請求前 | OpenCode 只在啟用時（`digestEnabled`＋`digestModel`，預設關閉）；dsh 每個成功完成的回合寫一張回合卡 |
-| REST 直接呼叫 | harness 自己的程式碼 | 自行決定時機、內容、錯誤與重試 | `POST /memories/search` | `POST /memories` |
+只擷取宿主提供的可見使用者與助理文字；排除工具、system、隱藏推理、附件與注入的記憶。剝除後保留原文，不用生成模型、不將擷取範圍以外的歷史冒稱已保存。取得可見文字與事件 ID 的宿主限制需由各外掛明示。
 
-- **三者共用同一台服務與同一組 `url` + `token`**（來源都是 `runtime.json`，見上文）。同一時間建議
-  只跑一個服務實例；兩個實例會寫進不同資料庫。
-- **MCP 沒有 session 資訊**：`remember` 寫出的 `sourceSession`／`sourceMessage` 是 `null`
-  （見 [storage-ports.md](storage-ports.md) §寫入與讀取）。要留下回合來源，必須走 REST 自己帶欄位。
-- **外掛的自動召回不需要模型同意**；MCP 的召回則由模型（或使用者下的指令）決定何時查。
-  兩者可以並存（見上一節）。
-- **同一個 harness 只留一個回合卡寫入者**：外掛與自寫 REST 同時寫同一回合，會因內容不同而
-  留下兩張；本契約不禁止，但預設不要這樣做。
-- MCP client 的設定形狀（通用 `mcpServers` 與 OpenCode V2）見上文「MCP 設定片段」；本節不重複。
+### 補送與政策
 
-要選哪一層：
-
-- 想讓模型自己查、自己寫、自己釘選或遺忘 → **MCP 工具**。
-- 想每回合自動帶背景、不想依賴模型記得呼叫 → **外掛或自寫 hook**（REST）。
-- 只想在特定時機寫入（例如 CI、腳本、回合結束）→ **REST 直接呼叫**。
-
-## 寫入路徑與回合卡
-
-一般記憶與回合卡都走 `POST /memories`；差別只在 `agent` 與內容規則。請求主體：
-
-```json
-{
-  "content": "User: 這次要記住的事\nAssistant: 好的，記下了",
-  "kind": "fact",
-  "scope": "project",
-  "project": "<project-name>",
-  "agent": "<harness>/turn",
-  "sourceSession": "<session-id>",
-  "sourceMessage": "<turn-id>"
-}
-```
-
-| 欄位 | 必填 | 說明 |
-|---|---|---|
-| `content` | 是 | 記憶文字，上限 8000 字元（`MAX_MEMORY_CHARS`）；伺服器寫入前先遮罩機密 |
-| `agent` | 是 | 來源標記，上限 200 字元；命名規則見下 |
-| `kind` | 否 | `fact`（預設）／`decision`／`pitfall`／`preference` |
-| `scope` | 否 | `global`／`project`／`agent`；省略時有 `project` 視為 `project`，否則 `global` |
-| `project` | 否 | `scope: "project"` 時必填；其他 scope 帶非 null 的 `project` → `400` |
-| `sourceSession` | 否 | 寫入端的 session 識別，上限 200 字元 |
-| `sourceMessage` | 否 | 寫入端的訊息／回合識別，上限 200 字元 |
-| `force` | 否 | `true` 時跳過精確去重；非 boolean → `400` |
-| `supersedes` | 否 | 被取代的記憶 id（編輯用）；帶了也會跳過去重 |
-
-驗證與錯誤邊界以 `packages/server/src/http/app.ts` 的 `addMemory` 為準。
-
-### 去重與回應
-
-- 去重 key＝（**遮罩後內容**的正規化 hash、`scope`、`project`、`agent`）。正規化是 NFC → 去前後
-  空白 → 連續空白（含換行）收斂為一個空格；**不轉大小寫**。已軟刪除的記憶不計入。
-- 新增成功 → `201`＋完整記憶＋`duplicate: false`。
-- 已有相同 key 的未刪除記憶 → `200`＋既有記憶＋`duplicate: true`；**不新增、不排入嵌入**。
-  對 harness 而言 `200 duplicate` 與 `201` 一樣是成功（spool 補送也應視為成功）。
-- `force: true` 跳過去重（重送可能多一張）；`supersedes` 走編輯路徑、同樣跳過去重。
-- `sourceSession`／`sourceMessage` **不在去重 key 內**：同內容、同 `agent`／`scope`／`project`
-  但來源不同，仍算重複。
-- 寫入只把 id 交給背景嵌入 worker，**不等待**；`201` 不代表立刻搜得到。搜尋當下可能因向量
-  尚未就緒而 `degraded`（見下節）。
-
-### `agent` 命名
-
-| 用途 | 值 | 例 |
-|---|---|---|
-| 回合卡 | `<harness>/turn` | `dsh/turn`、`opencode-plugin/turn` |
-| 非回合（原子記憶、腳本寫入） | `<harness>` | `dsh`、`opencode-plugin` |
-
-- `<harness>` 用**小寫**、以 `-` 分隔、不含空白；其他 harness 照這個規則取名字
-  （例如 `<my-harness>` 與 `<my-harness>/turn`）。
-- **必須穩定**：`agent` 在去重 key 內，改名會讓同內容變成新卡。不要把回合 id、時間、模型名、
-  session id 放進 `agent`。
-- 伺服器只檢查「非空字串、≤200 字元、不含 token-like 機密」，**不驗證命名格式**
-  （`packages/server/src/http/app.ts`）。因此上述格式是本契約的要求，不是伺服器保證。
-- `agent` 只是來源標記，**不是身分驗證**；讀取路徑會再遮罩一次。
-- Web 的「只看自動寫入」目前只認 `opencode-plugin` 前綴（`docs/storage-ports.md` §UI），
-  其他 harness 的卡片只會出現在「全部」；這是顯示輔助，不是安全邊界。
-
-### `sourceSession`／`sourceMessage`
-
-- 不透明字串；儲存 `trim` 後的值。空白 → `400`；超過 **200 字元** → `400`，**不截斷**
-  （`optionalSourceRef`，`packages/server/src/http/app.ts`）。
-- 含 token-like 機密 → `400`（識別值不改寫、不遮罩）。
-- 不是安全邊界、不參與權限或去重；寫入後不可經 `PATCH` 變更。
-- `sourceSession` 放 harness 的 session id；`sourceMessage` 放**回合 id**（或 assistant message id）。
-  **回合 id 只放這裡，不進 `content`**。
-- 回合 id 超過 200 字元時，請在 harness 端先做確定性縮短（例如 SHA-256 hex 前 32 碼）；
-  伺服器不會替你截斷，直接送會 `400`。
-- 格式沒有硬性規定；重點是同一回合重送時值相同，且可回溯到來源。
-
-### 回合卡
-
-- 每個**成功結束**的回合最多一張回合卡：`kind: "fact"`、`agent: "<harness>/turn"`。
-- dsh v1 契約在 `turn/end` 取最後一則 user 與最後一則 assistant 文字後產生；使用者文字剝除後
-  < 40 字元或空白 → **不寫**、不報錯（已實作於 `packages/dsh-plugin`，細節見該套件 README）。
-- 內容是抽取式的（見下節），不是模型摘要。OpenCode 的 digest 回合卡是**模型摘要**、
-  且帶 `force: true`（[opencode-plugin.md](opencode-plugin.md) §7.2），屬於既有實作；
-  本契約不要求它變更，但其他 harness 不要把它當成確定性卡片的範本。
-
-## 確定性卡片內容
-
-回合卡要能「重送不多寫、內容可重現」。規則如下：
-
-1. **同回合重送逐字相同**：同一個回合重送同一份 `content`（連同 `agent`／`scope`／`project`）
-   會得到 `200 duplicate: true`，資料庫筆數不變。這是本契約的冪等機制；v1 沒有另外的
-   idempotency key。
-2. **不得含**：時間戳或日期、回合 id／message id／session id、**長度會變的尾段**
-   （「共 N 字」「已截斷 N 字」、計數器、延遲毫秒）、隨機排序（`Set`／`Map` 迭代順序、
-   未排序陣列、隨機 tie-break）、模型名或版本、執行環境值（hostname、cwd、pid）。
-3. **抽取式、不呼叫模型**：從 user／assistant 的**文字**取用；不摘要、不改寫、不翻譯、
-   不呼叫任何模型。抽取與正規化必須是純函式：同輸入、同規則 → 同輸出。
-4. **固定格式與固定截斷**：欄位順序、分隔字元、換行、截斷長度都是程式常數，不從環境讀。
-   建議格式（本契約建議，非伺服器強制）：
-
-   ```text
-   User: <本次 user 文字>
-   Assistant: <本次 assistant 最終文字>
-   ```
-
-   整張卡上限是伺服器的 8000 字元；各自長度上限由 harness 自訂，但一經採用不得依執行環境變動。
-   截斷請用固定規則（例如固定長度＋固定省略符號），不要附加會變動的統計。
-5. **不取**工具輸出、附件、system-reminder、`<memory-context>` 等內容（見「不送什麼」）。
-6. **內容變了就是新卡（同內容才 duplicate）**：使用者改字、或新回合產生不同文字 → 新 `content` → 新卡；
-   只有逐字相同才是 `duplicate`。若兩個不同回合真的產生逐字相同的文字，伺服器會把它們視為
-   重複（只留一張）；本契約偏好這個取捨（寧可少一張，也不要重送多一張）。需要「同文多張」
-   只能帶 `force: true`，代價是重送可能重複——只有在你自行保證每回合只送一次時才這樣做。
-7. 自我檢查：同一回合算兩次內容並 `diff`，必須完全相同；或送兩次確認第二次是
-   `200 duplicate: true`。
+spool 固定保存第一次準備的事件 payload，成功與明確 duplicate 才視為完成。來源 API 不支援、內容衝突或超限必須有可診斷狀態，不靜默截短或丟棄。政策開啟或未知時，完整訊息先遮罩再落地；服務接收時仍套當下有效政策。已保存的 spool 不因切換批次改寫。
 
 ## 召回契約
 
@@ -485,7 +339,7 @@ harness 內用 REST 實作自動召回／寫入的整合層。三層的差別在
 {
   "query": "<本次 user 文字，已剝除附件、system-reminder 與注入塊>",
   "project": "<project-name>",
-  "k": 4,
+  "k": 8,
   "minScore": 0.65
 }
 ```
@@ -495,7 +349,7 @@ harness 內用 REST 實作自動召回／寫入的整合層。三層的差別在
 | `query` | 必填、非空，上限 2000 字元（`MAX_MEMORY_QUERY_CHARS`） |
 | `project` | 本專案名稱；未指定 `scope` 時，範圍＝**本專案＋global** |
 | `scope` | 明確範圍：`global`／`project`／`agent`。沒有專案脈絡時送 `scope: "global"` |
-| `k` | 回傳筆數；本契約要求 **`k` ≤ 4**（新 harness 一律送 `4`） |
+| `k` | 回傳候選片段數；dsh 及 OpenCode 預設取 `8`，注入來源數與呈現預算另行限制 |
 | `minScore` | 只過濾**語意**命中，`0..1`；本契約用 **`minScore` 0.65** |
 | `includeAllProjects` | 只在明確的跨專案查詢使用，**不要**用在自動召回 |
 | `agent`／`kind` | 選配；自動召回**不要**送 `agent`（否則會把 `scope:"agent"` 納入） |
@@ -512,39 +366,33 @@ harness 內用 REST 實作自動召回／寫入的整合層。三層的差別在
 
 ### 回應與降級
 
-- 成功回 `200`＋`{query, k, degraded, degradedReason, memoryEmbedding, hits}`；`hits` 是完整記憶
-  欄位＋`rank`／`score`／`source`（`semantic`／`keyword`）／`untrusted: true`。
+- 成功回 `200`，包含 `policyVersion`、查詢資訊與 `hits`。舊記憶維持既有欄位；原文命中是節錄，附 `sourceId`、角色、時間與來源座標。`rank`／`score`／`source`（`semantic`／`keyword`）／`untrusted: true` 仍保留。完整原文使用 `read_memory_source` 續讀。
 - `degraded: true` 代表語意路徑不可用：
   - `degradedReason: "no-embeddings"`：沒有可用的就緒向量（含換 embedder 後全部 stale）。
   - `degradedReason: "embedder-unavailable"`：查詢嵌入失敗（含查詢過長）。
   此時伺服器改用關鍵字結果，仍回 `200`，`hits` 可能有值。
-- **dsh v1 契約要求：`degraded: true` → 不注入**，只記錄原因代碼（`degradedReason`），不記錄
-  query 或記憶內容。**OpenCode 外掛的既有行為（仍注入關鍵字補位）在 v1 保留**，見下節差異；
-  這是刻意的例外，不是本契約的通用要求。
+- **降級召回**：dsh 接受當下政策版本有效的原文關鍵字命中；僅有舊記憶的降級結果仍不注入。OpenCode 保留關鍵字補位。兩者都先驗證政策版本，政策失效時不注入；診斷不記錄 query 或記憶內容。
 - **空召回 → 不注入**（`hits` 為空，或過濾後沒有可注入項目）。
 - 逾時、連線失敗、HTTP 錯誤、格式不符 → fail-open：不注入、不影響回覆、不重試。
 - **timeout 800ms**：用 `AbortController` 包住請求。dsh v1 契約固定 800ms（已實作於
   `packages/dsh-plugin`）；
   OpenCode 外掛的 `timeoutMs` 程式預設 150（範圍 100–2000，見
-  `packages/opencode-plugin/src/config.ts`），本機現況設定為 800；本契約維持 800，不要求改動。
+  `packages/opencode-plugin/src/config.ts`），使用者可依本機延遲調整。
 - 召回失敗的 log 只放狀態與原因代碼，**不放** query 原文、記憶內容、token。
 
 ### 注入預算
 
-- 單次注入最多 **4 筆**；超過就從尾端（最低 rank）丟。
-- dsh v1 契約的注入區塊（含標記）總長 ≤ **900 字元**（`packages/dsh-plugin`）；超預算從最後一筆開始丟，
-  不留半截圍籬。
-- OpenCode 外掛的既有預算是 soft 900／hard 1200 字元（[opencode-plugin.md](opencode-plugin.md) §6.3）。
+- 原文單次預設最多 **4 個來源**、每來源最多 **2 個不同片段**，按角色與位置去重。OpenCode 可用 maxItems 調整來源數。來源以片段倒數名次總和選擇，選定後保留首次命中順序；剩餘預算先保留短片段，再分配給較長片段。舊記憶仍最多 4 筆。
+- dsh 注入區塊（含標記）總長 ≤ **900 Unicode 碼點**（`packages/dsh-plugin`），不留半截圍籬。每個來源標記 ID，片段保留 user／assistant 角色，整塊明示原文節錄、不受信任及 read_memory_source 續讀方式。
+- OpenCode 外掛預算是 soft 900／hard 1200 字元，見 [外掛設定](opencode-plugin.md)。
 - 要不要另外注入「最近回合卡」由 harness 決定；本契約只要求 `POST /memories/search` 這條路徑。
   OpenCode 的 `recentTurns` 是既有行為，不是本契約的必要條件。
 
 ### 與 OpenCode 外掛現況的差異（照實列出）
 
-- **`k`**：本契約要求新 harness 送 `k: 4`；OpenCode 外掛現行送 `kMax: 8` 取候選、最多注入
-  4 筆（`maxItems: 4`）。這是外掛自己的預算策略，不要求改動。
-- **`degraded`**：dsh v1 契約要求不注入；OpenCode 外掛現行會記錄 `degraded`，但仍注入關鍵字補位
-  結果（`packages/opencode-plugin/src/recall.ts`）。**這是 v1 保留的既有行為，不是契約要求**。
-- **timeout**：OpenCode 的 `timeoutMs` 是可設定值：程式預設 150、本機現況 800（已拍板值）；
+- **`k`**：dsh 固定 8；OpenCode 預設 kMax=8、maxItems=4，可設定。maxItems 對原文代表來源組數，對舊記憶代表筆數。
+- **`degraded`**：dsh 只採有效的原文關鍵字命中；OpenCode 同時保留舊記憶的關鍵字補位。
+- **timeout**：OpenCode 的 `timeoutMs` 是可設定值：程式預設 150；
   dsh v1 契約固定 800（`packages/dsh-plugin`）。
 
 ## 注入標記與剝除
@@ -584,7 +432,7 @@ harness 內用 REST 實作自動召回／寫入的整合層。三層的差別在
   （`packages/opencode-plugin/src` 也沒有送出它），所以**不能只靠 `form`** 判斷一則訊息是不是注入。
 - 兩個條件都認不到時，寧可跳過該段，不要把它當成使用者文字寫進記憶。
 
-### 寫卡前剝除
+### 原文擷取前剝除
 
 ```js
 // 移除所有 <memory-context ...>…</memory-context>；沒有結尾標籤時丟到字串尾端。
@@ -607,7 +455,7 @@ const stripMemoryContext = (text) => text.replace(MEMORY_CONTEXT, "").trim();
 | 附件與檔案內容（圖片、PDF、貼上的檔案位元組） | 不讀取、不送出；附件的中繼資料也不要用來填充內容 |
 | system prompt 與 system-reminder（例如 `<system-reminder>`） | 宿主指令，不是使用者說的話 |
 | synthetic／狀態訊息（例如 `[[mnemoshelf-status]]`、slash command 輸出） | 外掛或宿主產生，不是這一回合的實質對話 |
-| `<memory-context>` 整個區塊 | 召回內容再寫回去會自我放大；寫卡前剝除 |
+| `<memory-context>` 整個區塊 | 召回內容再寫回去會自我放大；原文擷取前剝除 |
 | 其他 harness 的私有標記（未知的 XML／tag／包裝） | 認不得就整段丟；必要時整個回合不寫 |
 | reasoning／thinking | 只取最終文字，不取推理過程 |
 | token、金鑰、密碼、私人憑證 | 伺服器會遮罩，但不要依賴它；根本不要送 |
@@ -652,7 +500,7 @@ async function call(path, init = {}) {
   return { status: response.status, body };
 }
 
-// 1) remember：一張確定性的回合卡（同內容重送會是 200 duplicate）
+// 1) remember：一筆手動短記憶（不是自動原文擷取；完整回合請用 /memory-sources）
 const content = [
   "User: 我們把召回 timeout 定在 800ms，k 上限 4。",
   "Assistant: 收到；minScore 0.65，只過濾語意命中。",
@@ -816,7 +664,7 @@ MNEMOSHELF_RUNTIME_FILE="$HOME/.local/share/mnemoshelf/runtime.json" node rememb
    完整關閉再啟動 client（不是只開新視窗），讓它啟動 MCP 入口。多數 client 會列出工具；
    也可以看 client 的 MCP log／MCP 入口的 stderr。
 
-   **成功長什麼樣**：工具清單出現 `mnemoshelf` 的六個工具：`search`、`remember`、`recall`、
+   **成功長什麼樣**：工具清單出現 `mnemoshelf` 的七個工具：`search`、`remember`、`recall`、
    `forget`、`list_roots`、`search_memories`；MCP 入口 stderr 有一行
    `[mnemoshelf-mcp] 連線來源：連線資訊檔（runtime.json）（127.0.0.1:<port>）`。
 
@@ -910,7 +758,7 @@ MNEMOSHELF_RUNTIME_FILE="$HOME/.local/share/mnemoshelf/runtime.json" node rememb
 ### 驗收清單
 
 - [ ] `runtime.json` 存在，`GET /health` 的 `service` 是 `mnemoshelf`。
-- [ ] client 的 `tools/list` 有六個工具。
+- [ ] client 的 `tools/list` 有七個工具。
 - [ ] `remember` 回 `201` 或 `200 duplicate: true`。
 - [ ] `recall`／`search_memories` 找得回同一筆。
 - [ ] 文件與設定片段沒有 token；`runtime.json` 不在 repo 內。

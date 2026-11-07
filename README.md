@@ -34,10 +34,10 @@ pnpm --filter @mnemoshelf/desktop dist
 | 檔案總管 | 自己挑選要納入的資料夾（root）；加入後先乾跑預覽統計（會納入什麼、會跳過什麼），確認後才開始索引。提供目錄樹、檔案預覽與圖片縮圖。 |
 | 語意搜尋 | 文字與圖片落在同一個向量空間，可以用文字搜圖片；三種模式 `vector`（預設）、`keyword`、`hybrid`。 |
 | 共用記憶 | 每則記憶有 `content`、`kind`（fact／decision／pitfall／preference）、`scope`（global／project／agent）、`project`、`agent`、`pinned`；支援 NDJSON 備份匯出／匯入。 |
-| Agent 整合 | MCP 六個工具 `search`、`remember`、`recall`、`forget`、`list_roots`、`search_memories`（[docs/operations.md](docs/operations.md)）；OpenCode／OpenChamber 外掛在模型請求前檢查，於 session 的第一則 prompt 或訊息含明示線索時召回（預設 `first-turn+explicit`；[docs/opencode-plugin.md](docs/opencode-plugin.md)）；dsh 外掛在每個回合第一步召回，回合結束寫入一張回合卡（[docs/agent-integration.md](docs/agent-integration.md)）。 |
+| Agent 整合 | MCP 七個工具 `search`、`remember`、`recall`、`forget`、`list_roots`、`search_memories`、`read_memory_source`（[docs/operations.md](docs/operations.md)）；OpenCode／OpenChamber 外掛在模型請求前檢查，於 session 的第一則 prompt 或訊息含明示線索時召回（預設 `first-turn+explicit`；[docs/opencode-plugin.md](docs/opencode-plugin.md)）；dsh 外掛在每個回合第一步召回，回合結束保存原文來源（[docs/agent-integration.md](docs/agent-integration.md)）。 |
 | 連接 Agent | 四種 harness 的接入指引、狀態偵測與可複製片段；只讀使用者層設定，不寫入、不執行安裝（[docs/agent-integration.md](docs/agent-integration.md)、[docs/opencode-plugin.md](docs/opencode-plugin.md)）。 |
-| 回合摘要（選用） | 外掛可把「使用者訊息＋助理最終回覆」交給指定模型，整理成回合紀錄與原子記憶寫回本機；**預設關閉**。怎麼選摘要模型見 [docs/opencode-plugin.md](docs/opencode-plugin.md) §13.1。 |
-| 隱私與信任模型 | 預設不掃任何目錄；服務只綁 `127.0.0.1` 並以 token 保護；寫入與讀取都會遮蔽可辨識的機密。現行是**本機單一 owner 全權**：`agent` 只是來源標記、不是身分驗證，`scope=agent` 不是安全邊界（[docs/roots-and-privacy.md](docs/roots-and-privacy.md)）。 |
+| 原文記憶 | 保存宿主提供的可見使用者／助理文字，以程式切塊及既有 embedding 召回；不需要摘要模型。App 可選擇記憶遮罩，預設開啟；來源可分頁續讀，見 [docs/raw-memory.md](docs/raw-memory.md)。 |
+| 隱私與信任模型 | 預設不掃任何目錄；服務只綁 `127.0.0.1` 並以 token 保護；記憶預設在寫入與讀取時遮罩，使用者可在 App 關閉；檔案索引仍遮罩。現行是**本機單一 owner 全權**：`agent` 只是來源標記、不是身分驗證，`scope=agent` 不是安全邊界（[docs/roots-and-privacy.md](docs/roots-and-privacy.md)）。 |
 
 <!-- 截圖位置：語意搜尋結果（文字查圖片） -->
 
@@ -55,8 +55,8 @@ TypeScript／Node.js／pnpm；桌面殼是 Electron＋React，Web UI 用 Vite＋
 | `packages/storage-pg` | PostgreSQL＋pgvector 儲存後端 |
 | `packages/web` | Web UI（Vite＋React＋Tailwind） |
 | `packages/desktop` | Electron 桌面殼與打包 |
-| `packages/opencode-plugin` | OpenCode／OpenChamber 自動召回與回合摘要外掛 |
-| `packages/dsh-plugin` | dsh 自動召回與回合卡外掛（服務不可用時 spool 補送） |
+| `packages/opencode-plugin` | OpenCode／OpenChamber 自動召回與原文擷取外掛 |
+| `packages/dsh-plugin` | dsh 自動召回與原文擷取外掛（服務不可用時 spool 補送） |
 
 ## 設計原則
 
@@ -72,11 +72,12 @@ TypeScript／Node.js／pnpm；桌面殼是 Electron＋React，Web UI 用 Vite＋
 |---|---|
 | [docs/building.md](docs/building.md) | 從原始碼建置、各平台產物、簽章與公證警告、LGPL 合規 |
 | [docs/operations.md](docs/operations.md) | REST 端點速查、MCP 工具、環境變數總表、索引排隊與取消 |
-| [docs/opencode-plugin.md](docs/opencode-plugin.md) | OpenCode／OpenChamber 外掛：安裝（連接 Agent 頁提供可複製片段）、召回行為、回合摘要 |
+| [docs/opencode-plugin.md](docs/opencode-plugin.md) | OpenCode／OpenChamber 外掛：安裝（連接 Agent 頁提供可複製片段）、召回行為、原文擷取 |
 | [docs/agent-integration.md](docs/agent-integration.md) | 連接 Agent 頁面的接入指引、`runtime.json` 連線資訊檔與 MCP 設定片段（入口會自動讀檔，不必手動貼 token）、各 harness 召回契約 |
 | [docs/codex-recall.md](docs/codex-recall.md) | 從原始碼啟用 Codex 自動召回、查詢範圍與排查方式 |
 | [docs/updates.md](docs/updates.md) | App 內更新：支援矩陣、更新前備份、還原與手動回滾、平台限制 |
 | [docs/roots-and-privacy.md](docs/roots-and-privacy.md) | root 規則、路徑安全、機密遮罩、信任模型、資料刪除 |
+| [docs/raw-memory.md](docs/raw-memory.md) | 原文寫入、來源續讀、遮罩開關、生命週期與 v2 備份 |
 | [docs/storage-ports.md](docs/storage-ports.md) | 搜尋模式、記憶欄位與檢索、匯出／匯入、PostgreSQL 後端 |
 | [docs/embedder-contract.md](docs/embedder-contract.md) | embedder 能力宣告、執行裝置與退回、CoreML 風險 |
 | [docs/architecture.html](docs/architecture.html) | 架構圖（以瀏覽器開啟） |

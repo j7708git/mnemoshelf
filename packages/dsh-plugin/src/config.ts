@@ -23,7 +23,7 @@ import type {
 import { asRecord } from "./strip.js";
 
 /** 召回搜尋的固定契約值（T1／T3 卡）：不從環境或設定覆寫。 */
-export const RECALL_K = 4;
+export const RECALL_K = 8;
 export const RECALL_MIN_SCORE = 0.65;
 export const RECALL_TIMEOUT_MS = 800;
 
@@ -33,29 +33,11 @@ export const MAX_BLOCK_CHARS = 900;
 /** `POST /memories/search` 的 query 上限（與 server `MAX_MEMORY_QUERY_CHARS` 一致）。 */
 export const MAX_QUERY_CHARS = 2000;
 
-/** 卡片門檻：使用者文字（剝除後）低於這個字元數就不寫。 */
-export const MIN_USER_CHARS = 40;
-
-/** 卡片各段固定上限（程式常數；不隨環境變動）。 */
-export const MAX_CARD_USER_CHARS = 2000;
-export const MAX_CARD_ASSISTANT_CHARS = 4000;
-
-/** server 的單張記憶上限；用來做最後一道保險。 */
-export const MAX_MEMORY_CHARS = 8000;
-
-/** `sourceSession`／`sourceMessage` 的上限（server 超長直接 400，不截斷）。 */
-export const MAX_SOURCE_REF_CHARS = 200;
-
-/** 回合卡固定使用 `fact`（v1 契約）。 */
+/** 原文來源的宿主識別。 */
 export const TURN_AGENT = "dsh/turn";
 
-/** 寫入 `POST /memories` 的 timeout（毫秒）。 */
-export const WRITE_TIMEOUT_MS = 5000;
-
-/** spool 上限與補送間隔。 */
-export const SPOOL_LIMIT = 200;
+/** 補送間隔。 */
 export const SPOOL_FLUSH_INTERVAL_MS = 5 * 60 * 1000;
-export const SPOOL_FLUSH_BATCH = 20;
 
 /** `GET /health` 的 timeout。 */
 export const HEALTH_TIMEOUT_MS = 300;
@@ -69,6 +51,7 @@ export interface Settings {
   token?: string;
   runtimeFile?: string;
   spoolDir?: string;
+  captureEnabled?: boolean;
 }
 
 function readNonEmptyString(value: unknown): string | undefined {
@@ -81,6 +64,7 @@ function readNonEmptyString(value: unknown): string | undefined {
 export function readSettings(raw: unknown): Settings {
   const record = asRecord(raw) ?? {};
   const settings: Settings = {};
+  if (typeof record.captureEnabled === "boolean") settings.captureEnabled = record.captureEnabled;
   const project = readNonEmptyString(record.project);
   if (project !== undefined) settings.project = project;
   const baseUrl = readNonEmptyString(record.baseUrl);

@@ -18,6 +18,8 @@ import {
   type ChunkKind,
   type Embedder,
   type MemoryKind,
+  type Memory,
+  type MemorySourceMessage,
   type MemoryScope,
   type MetadataStore,
   type RankedHit,
@@ -25,7 +27,7 @@ import {
   type VectorIndex,
 } from "@mnemoshelf/core";
 import { ValidationError } from "./errors.js";
-import { maskSecrets } from "./secret-masking.js";
+import { createMemoryPresenter, loadCurrentMemoryPresentations, type PrepareMemoryPresentation } from "./memory-policy.js";
 
 /** 支援的搜尋模式。 */
 export const SEARCH_MODES = ["keyword", "vector", "hybrid"] as const;
@@ -75,6 +77,23 @@ export interface MemorySearchHit {
   /** 記憶內容片段，長度上限 `TEXT_SNIPPET_MAX_CHARS`。 */
   text: string;
   textTruncated: boolean;
+  sourceType: "raw-turn" | "legacy-memory";
+  sourceId?: number | null;
+  messageIndex?: number | null;
+  chunkIndex?: number | null;
+  sourceStart?: number | null;
+  sourceEnd?: number | null;
+  chunkVersion?: string | null;
+  role?: MemorySourceMessage["role"];
+  occurredAt?: string | null;
+  sourceTurn?: string;
+  sourceSession?: string | null;
+  sourceMessage?: string | null;
+  hasMore?: true;
+  snippetStart?: number;
+  snippetEnd?: number;
+  snippetAnchor?: number;
+  untrusted: true;
 }
 
 export type SearchHit = ChunkSearchHit | MemorySearchHit;
@@ -101,6 +120,7 @@ export interface UnifiedSearchResult {
   /** 實際生效的 `k`（夾住上限後）。 */
   k: number;
   hits: SearchHit[];
+  policyVersion: number;
 }
 
 /** 合併後的一項：名次、分數與鍵。 */
@@ -198,41 +218,45 @@ export function normalizeSearchOptions(options: UnifiedSearchOptions): {
  * 需要搜尋記憶時明確帶 `mode: "keyword"` 或 `"hybrid"`。`rootIds` 有指定時記憶一律不納入
  * （storage-ports.md 對 `searchKeyword` 的既有規則）。
  */
-export async function unifiedSearch(
+export async function prepareUnifiedSearch(
   deps: UnifiedSearchDeps,
   options: UnifiedSearchOptions,
-): Promise<UnifiedSearchResult> {
+): Promise<PrepareMemoryPresentation<UnifiedSearchResult>> {
   const { query, mode, rootIds, k } = normalizeSearchOptions(options);
   const filter: SearchFilter = rootIds === undefined ? {} : { rootIds };
 
-  const lists = await rankLists(deps, query, mode, filter, k);
-  const fused = fuseRanked(lists).slice(0, k);
-
-  const chunkIds: number[] = [];
+  const candidateLimit = mode === "keyword" && rootIds === undefined ? Math.min(k * 4, 500) : k;
+  const lists = await rankLists(deps, query, mode, filter, candidateLimit);
+  const fused = fuseRanked(lists);
   const chunkRanks = new Map<number, FusedHit>();
-  const memoryIds: number[] = [];
   const memoryRanks = new Map<number, FusedHit>();
+  const memories: Memory[] = [];
+  const sourceCounts = new Map<number, number>();
 
   for (const hit of fused) {
-    const [prefix, rawId] = [hit.key.slice(0, 2), Number(hit.key.slice(2))];
-    if (!Number.isInteger(rawId)) continue;
-    if (prefix === "c:") {
-      chunkIds.push(rawId);
-      chunkRanks.set(rawId, hit);
-    } else if (prefix === "m:") {
-      memoryIds.push(rawId);
-      memoryRanks.set(rawId, hit);
+    if (chunkRanks.size + memories.length >= k) break;
+    const id = Number(hit.key.slice(2));
+    if (!Number.isInteger(id)) continue;
+    if (hit.key.startsWith("c:")) {
+      chunkRanks.set(id, hit);
+    } else if (hit.key.startsWith("m:")) {
+      const memory = await deps.store.getMemory(id);
+      if (memory === null || memory.deletedAt !== null) continue;
+      if (memory.sourceId != null) {
+        const count = sourceCounts.get(memory.sourceId) ?? 0;
+        if (count >= 2) continue;
+        sourceCounts.set(memory.sourceId, count + 1);
+      }
+      memories.push(memory);
+      memoryRanks.set(id, hit);
     }
   }
 
   const hits: SearchHit[] = [];
-
-  if (chunkIds.length > 0) {
-    // getChunks 依傳入 ids 的順序回傳（缺漏者略過），因此這裡另外用 fused 的名次排序。
-    const chunks = await deps.store.getChunks(chunkIds);
+  if (chunkRanks.size > 0) {
+    const chunks = await deps.store.getChunks([...chunkRanks.keys()]);
     for (const chunk of chunks) {
-      const fusedHit = chunkRanks.get(chunk.id);
-      if (fusedHit === undefined) continue;
+      const fusedHit = chunkRanks.get(chunk.id)!;
       const text = chunk.text === null ? null : snippet(chunk.text);
       hits.push({
         type: "chunk",
@@ -249,32 +273,62 @@ export async function unifiedSearch(
     }
   }
 
-  for (const memoryId of memoryIds) {
-    const memory = await deps.store.getMemory(memoryId);
-    if (memory === null || memory.deletedAt !== null) continue;
-    const fusedHit = memoryRanks.get(memoryId);
-    if (fusedHit === undefined) continue;
-    // 讀取路徑再遮一次：既有 DB 可能存著未遮罩的內容；先遮全文再切片段，
-    // 避免片段邊界剛好切在機密中間而漏掉。metadata（agent／project）也一併保護。
-    const text = snippet(maskSecrets(memory.content).text);
-    const maskedAgent = maskSecrets(memory.agent).text;
-    const maskedProject = memory.project === null ? null : maskSecrets(memory.project).text;
-    hits.push({
-      type: "memory",
-      key: fusedHit.key,
-      rank: fusedHit.rank,
-      score: fusedHit.score,
-      id: memory.id,
-      kind: memory.kind,
-      scope: memory.scope,
-      project: maskedProject,
-      agent: maskedAgent,
-      text: text.text,
-      textTruncated: text.textTruncated,
-    });
-  }
+  return async () => {
+    const presentations = await loadCurrentMemoryPresentations(deps.store, [...memoryRanks.keys()]);
+    return (policy) => {
+      const rendered = [...hits];
+      const present = createMemoryPresenter(policy);
+      for (const entry of presentations) {
+        const memory = present(entry, { query, maxChars: TEXT_SNIPPET_MAX_CHARS });
+        if (memory === null) continue;
+        const hit = memoryRanks.get(memory.id)!;
+        const text = memory.sourceType === "raw-turn"
+          ? { text: memory.content, textTruncated: memory.truncated }
+          : snippet(memory.content);
+        rendered.push({
+          type: "memory",
+          key: hit.key,
+          rank: hit.rank,
+          score: hit.score,
+          id: memory.id,
+          kind: memory.kind,
+          scope: memory.scope,
+          project: memory.project,
+          agent: memory.agent,
+          sourceSession: memory.sourceSession,
+          sourceMessage: memory.sourceMessage,
+          sourceType: memory.sourceType,
+          ...(memory.sourceType === "raw-turn" && {
+            sourceId: memory.sourceId,
+            messageIndex: memory.messageIndex,
+            chunkIndex: memory.chunkIndex,
+            sourceStart: memory.sourceStart,
+            sourceEnd: memory.sourceEnd,
+            chunkVersion: memory.chunkVersion,
+            role: memory.role,
+            occurredAt: memory.occurredAt,
+            sourceTurn: memory.sourceTurn,
+            hasMore: memory.hasMore,
+            snippetStart: memory.snippetStart,
+            snippetEnd: memory.snippetEnd,
+            snippetAnchor: memory.snippetAnchor,
+          }),
+          untrusted: true,
+          ...text,
+        });
+      }
 
-  // 名次依 fused 的順序（chunk 與記憶交錯），且重新編號成連續的 1..n。
-  hits.sort((a, b) => a.rank - b.rank);
-  return { mode, k, hits: hits.map((hit, index) => ({ ...hit, rank: index + 1 })) };
+      rendered.sort((a, b) => a.rank - b.rank);
+      return { mode, k, hits: rendered.map((hit, index) => ({ ...hit, rank: index + 1 })), policyVersion: policy.version };
+    };
+  };
+}
+
+export async function unifiedSearch(
+  deps: UnifiedSearchDeps,
+  options: UnifiedSearchOptions,
+): Promise<UnifiedSearchResult> {
+  const prepare = await prepareUnifiedSearch(deps, options);
+  const render = await prepare();
+  return render(await deps.store.getMemoryPolicy());
 }

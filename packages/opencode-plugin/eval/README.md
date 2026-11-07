@@ -1,5 +1,6 @@
 # 記憶召回離線評估（D3）
 
+> 原文記憶更新：本文件的摘要評測與 `eval:loop`／`eval:digest`／`eval:digest:matrix` 僅適用原文改版前的歷史版本，相關 package scripts 已移除。請在獨立歷史 checkout 重跑；現行原文流程改用 `packages/server/eval/raw-memory/`。以下保留舊評測方法供追溯。
 這個目錄是一套**可重跑**的召回評估：用合成記憶卡與標註題目，量 v1 外掛（`src/recall.ts`）
 的召回率、誤注入、abstention、注入量與延遲。它**不改 server 的搜尋演算法**，也不改外掛行為；
 唯一重用方式是 import 已建置的純函式（`dist/recall.js` 的 `planRecall`、`isDuplicate`，

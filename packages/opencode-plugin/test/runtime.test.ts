@@ -105,6 +105,7 @@ async function setup(
   env: Record<string, string> = ENV,
   /** 覆寫 runtime 依賴（例如提供真的讀檔／pid 檢查）；未提供的沿用測試預設。 */
   extraDeps: Partial<RuntimeDeps> = {},
+  policyFetch: () => Response = () => jsonResponse({ maskSecrets: true, version: 1 }),
 ): Promise<Harness> {
   let handler: ((event: ContextEventLike) => Promise<void>) | undefined;
   const commands = new Map<string, CapturedCommand>();
@@ -119,8 +120,12 @@ async function setup(
       // 召回請求才帶 Authorization；`/health` 身分檢查一律不帶。
       authorization: new Headers(init?.headers).get("authorization"),
     });
-    if (fetchImpl !== undefined) return fetchImpl(input, init);
-    return jsonResponse(memoryHits());
+    if (String(input).endsWith("/memory-policy")) return policyFetch();
+    const response = fetchImpl === undefined ? jsonResponse(memoryHits()) : await fetchImpl(input, init);
+    if (!response.ok) return response;
+    const body = (await response.clone().json().catch(() => null)) as { hits?: unknown; memories?: unknown; policyVersion?: number } | null;
+    if (!body || (!Array.isArray(body.hits) && !Array.isArray(body.memories))) return response;
+    return jsonResponse({ policyVersion: 1, ...body }, response.status);
   };
 
   const ctx: PluginContextLike = {
@@ -1111,5 +1116,101 @@ describe("指令", () => {
     await harness.commands.get("memory-all")?.execute({ sessionID: "session-1", prompt: { text: "  " } });
     expect(harness.searchCalls()).toHaveLength(0);
     expect(harness.synthetic.at(-1)?.text).toContain("需要查詢文字");
+  });
+});
+
+describe("原文片段與政策確認", () => {
+  it("同一回合重注入查政策；OFF→ON 或讀取失敗後不沿用舊片段與來源去重", async () => {
+    let version = 1;
+    let available = true;
+    const needle = "合成敏感片段";
+    const harness = await setup({ recentTurns: 0 }, async () => jsonResponse({
+      policyVersion: version,
+      hits: [{
+        id: 11, sourceId: 4, sourceType: "raw-turn", role: "assistant", truncated: true,
+        kind: "fact", source: "keyword", score: 1, content: version === 1 ? needle : "[REDACTED:assignment]",
+      }],
+    }), undefined, ENV, {}, () => available
+      ? jsonResponse({ maskSecrets: version > 1, version })
+      : jsonResponse({}, 503));
+    const run = async (): Promise<string> => {
+      const event = userEvent(FIRST_QUERY, "same-message");
+      await harness.handler(event);
+      return latestText(event);
+    };
+    expect(await run()).toContain(needle);
+    expect(await run()).toContain(needle);
+    expect(harness.searchCalls()).toHaveLength(1);
+    expect(harness.fetchCalls.filter(({ url }) => url.endsWith("/memory-policy"))).toHaveLength(3);
+
+    version += 1;
+    const masked = await run();
+    expect(masked).not.toContain(needle);
+    expect(masked).toContain("[REDACTED:assignment]");
+    expect(masked).toContain("[source id=4]\n  assistant:");
+    expect(harness.searchCalls()).toHaveLength(2);
+
+    available = false;
+    expect(await run()).toBe(FIRST_QUERY);
+    expect(harness.searchCalls()).toHaveLength(2);
+    available = true;
+    expect(await run()).toContain("[REDACTED:assignment]");
+    expect(harness.searchCalls()).toHaveLength(3);
+    await harness.cleanup();
+  });
+
+  it("舊服務無可靠政策時不注入；搜尋期間切換則重新查詢，不混用舊 recent 內容", async () => {
+    let version = 1;
+    const harness = await setup({}, async (input) => {
+      if (String(input).includes("/memories?")) {
+        return jsonResponse({ policyVersion: 1, memories: [{ id: 90, content: "不混用舊回合", createdAt: "2026-01-01" }] });
+      }
+      const resultVersion = version;
+      if (version === 1) version = 2;
+      return jsonResponse({
+        policyVersion: resultVersion,
+        hits: [{ id: 9, sourceId: 7, sourceType: "raw-turn", role: "user", source: "keyword",
+          content: resultVersion === 1 ? "不應再出現的原文" : "重新查到的安全內容" }],
+      });
+    }, undefined, ENV, {}, () => jsonResponse({ maskSecrets: version === 2, version }));
+    const event = userEvent(FIRST_QUERY);
+    await harness.handler(event);
+    expect(latestText(event)).toContain("重新查到的安全內容");
+    expect(latestText(event)).not.toContain("不應再出現的原文");
+    expect(latestText(event)).not.toContain("不混用舊回合");
+    expect(harness.searchCalls()).toHaveLength(2);
+    await harness.cleanup();
+
+    const legacy = await setup({}, undefined, undefined, ENV, {}, () => new Response("<html>fallback</html>"));
+    const old = userEvent(FIRST_QUERY);
+    await legacy.handler(old);
+    expect(latestText(old)).toBe(FIRST_QUERY);
+    expect(legacy.logs.join("\n")).toContain("upgrade-required");
+    expect(legacy.searchCalls()).toHaveLength(0);
+    await legacy.cleanup();
+  });
+
+  it("原文排除同一位置的重疊候選，保留超過舊 fact 預算的內容並優先於舊回合", async () => {
+    const anchor = "這裡是服務定位的精確答案";
+    const context = "前置字元".repeat(20) + anchor + "文脈😀".repeat(50);
+    const harness = await setup({ softChars: 580, maxFactChars: 40 }, async (input) =>
+      String(input).includes("/memories?")
+        ? jsonResponse({ memories: [{ id: 91, content: "舊回合".repeat(200), createdAt: "2026-01-01" }] })
+        : jsonResponse({
+          hits: [
+            { id: 1, sourceId: 7, sourceType: "raw-turn", role: "assistant", source: "keyword", content: context },
+            { id: 2, sourceId: 7, sourceType: "raw-turn", role: "assistant", source: "keyword", content: "相鄰片段不重覆" },
+            { id: 3, sourceId: 8, sourceType: "raw-turn", role: "user", source: "keyword", content: "第二個來源" },
+          ],
+        }));
+    const event = userEvent(FIRST_QUERY);
+    await harness.handler(event);
+    const output = latestText(event);
+    expect(output).toContain(context);
+    expect(output).toContain("第二個來源");
+    expect(output).not.toContain("相鄰片段不重覆");
+    expect(output).toContain("[source id=7]\n  assistant:");
+    expect(output).toContain("[source id=8]\n  user:");
+    await harness.cleanup();
   });
 });

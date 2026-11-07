@@ -42,6 +42,7 @@ export interface AgentLike {
 export interface SessionEventLike {
   type: string;
   seq?: number;
+  time?: number;
   data?: Record<string, unknown>;
 }
 
@@ -74,6 +75,14 @@ export interface RecallHitLike {
   score?: unknown;
   source?: unknown;
   pinned?: unknown;
+  sourceType?: unknown;
+  sourceId?: unknown;
+  role?: unknown;
+  messageIndex?: unknown;
+  snippetStart?: unknown;
+  snippetEnd?: unknown;
+  snippetAnchor?: unknown;
+  truncated?: unknown;
 }
 
 /** 解析完成的 Mnemoshelf 連線（含全權 token；不得寫進 log／spool）。 */
@@ -94,24 +103,6 @@ export interface RuntimeFileRecord {
   pid: number;
   startedAt: string;
   appVersion: string;
-}
-
-/** `POST /memories` 的請求主體（只放卡片需要的欄位）。 */
-export interface MemoryWritePayload {
-  content: string;
-  kind: "fact";
-  scope: "project" | "global";
-  project?: string;
-  agent: "dsh/turn";
-  sourceSession: string;
-  sourceMessage: string;
-}
-
-/** spool 檔案的內容；**不含** token、url 或任何連線資訊。 */
-export interface SpoolRecord {
-  schemaVersion: 1;
-  createdAt: number;
-  payload: MemoryWritePayload;
 }
 
 /** 結構化 log：只接受事件名與純量／計數欄位，避免把內容或憑證帶出去。 */

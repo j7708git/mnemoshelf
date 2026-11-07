@@ -139,6 +139,33 @@ describe("Codex 自動召回", () => {
     expect(context).not.toContain(globalHit.content);
   });
 
+  it("原文命中標記角色、原對話日期及續讀來源，沿用伺服器的政策視圖", async () => {
+    const synthetic = "fixture-value-" + "z".repeat(30);
+    const fetchImpl = fakeService({
+      degraded: false,
+      policyVersion: 2,
+      hits: [{
+        ...globalHit,
+        sourceType: "raw-turn",
+        sourceId: 23,
+        role: "assistant",
+        kind: "fact",
+        occurredAt: "2026-02-15T03:04:05Z",
+        createdAt: "2026-04-01T03:04:05Z",
+        content: `節錄證據 ${["password", synthetic].join("=")}`,
+      }],
+    });
+    const output = await runCodexRecall(Readable.from([JSON.stringify(hookEvent)]), {
+      env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, homeDir, fetchImpl,
+    });
+    const context = output?.hookSpecificOutput.additionalContext ?? "";
+    expect(context).toContain("助理原文片段 #23（read_memory_source 續讀）");
+    expect(context).toContain("2026-02-15");
+    expect(context).not.toContain("2026-04-01");
+    expect(context).not.toContain("[fact]");
+    expect(context).toContain(synthetic);
+  });
+
   it.each([
     "無法解析的 JSON",
     JSON.stringify({ ...hookEvent, hook_event_name: "Stop" }),

@@ -1,8 +1,9 @@
-import { mkdir, mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createRuntime } from "../src/index.js";
+import type { SourceWriteRequest } from "../src/raw-memory.js";
 import type {
   MessageLike,
   PluginContextLike,
@@ -11,8 +12,6 @@ import type {
   RuntimeDeps,
 } from "../src/types.js";
 
-const USER_TEXT = "使用者這次明確要求把召回 timeout 固定成八百毫秒，並且把 k 上限設為四。";
-const ASSISTANT_TEXT = "收到，會照這個契約實作，召回失敗時 fail-open 不影響回覆。";
 const SESSION_ID = "session-abc";
 
 interface RecordedCall {
@@ -109,18 +108,11 @@ function hasLog(event: string, reason?: string): boolean {
   );
 }
 
-async function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
-  const started = Date.now();
-  while (!predicate()) {
-    if (Date.now() - started > timeoutMs) throw new Error("waitFor timeout");
-    await new Promise((resolve) => setTimeout(resolve, 5));
-  }
-}
-
 describe("召回注入", () => {
   it("pre-step 追加一則 user/message，帶 source kind／form 與區塊", async () => {
     const calls: RecordedCall[] = [];
     const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).endsWith("/memory-policy")) return jsonResponse({ maskSecrets: true, version: 1 });
       calls.push({
         url: String(url),
         body: init?.body === undefined ? null : JSON.parse(String(init.body)),
@@ -128,6 +120,7 @@ describe("召回注入", () => {
       return jsonResponse({
         hits: [{ id: 1, content: "使用者偏好深色模式", kind: "fact", createdAt: "2026-10-20" }],
         degraded: false,
+        policyVersion: 1,
       });
     }) as typeof fetch;
 
@@ -153,11 +146,13 @@ describe("召回注入", () => {
     expect(text).toContain("使用者偏好深色模式");
     expect([...text].length).toBeLessThanOrEqual(900);
     expect(calls).toHaveLength(1);
-    expect(calls[0]?.body).toMatchObject({ project: "mnemoshelf", k: 4, minScore: 0.65 });
+    expect(calls[0]?.body).toMatchObject({ project: "mnemoshelf", k: 8, minScore: 0.65 });
   });
 
   it("空召回不注入，decision 原樣回傳", async () => {
-    const fetchImpl = (async () => jsonResponse({ hits: [], degraded: false })) as typeof fetch;
+    const fetchImpl: typeof fetch = async (url) => String(url).endsWith("/memory-policy")
+      ? jsonResponse({ maskSecrets: true, version: 1 })
+      : jsonResponse({ hits: [], degraded: false, policyVersion: 1 });
     const { ctx, invoke } = createCtx();
     createRuntime(ctx, {}, deps({ fetchImpl }));
 
@@ -170,11 +165,13 @@ describe("召回注入", () => {
   });
 
   it("degraded 不注入", async () => {
-    const fetchImpl = (async () =>
-      jsonResponse({
+    const fetchImpl: typeof fetch = async (url) => String(url).endsWith("/memory-policy")
+      ? jsonResponse({ maskSecrets: true, version: 1 })
+      : jsonResponse({
         hits: [{ id: 1, content: "關鍵字補位", kind: "fact", createdAt: "2026-10-20" }],
         degraded: true,
-      })) as typeof fetch;
+        policyVersion: 1,
+      });
     const { ctx, invoke } = createCtx();
     createRuntime(ctx, {}, deps({ fetchImpl }));
 
@@ -231,188 +228,134 @@ describe("召回注入", () => {
       messages: MessageLike[];
     };
     expect(result.messages).toHaveLength(1);
-    expect(hasLog("recall-skip", "network")).toBe(true);
+    expect(hasLog("recall-skip", "policy-unavailable")).toBe(true);
   });
 });
 
-describe("回合寫入", () => {
-  function writeFetch(calls: RecordedCall[], response: () => Response = () => jsonResponse({ id: 1 }, 201)) {
-    return (async (url: string | URL | Request, init?: RequestInit) => {
-      calls.push({
-        url: String(url),
-        body: init?.body === undefined ? null : JSON.parse(String(init.body)),
-      });
-      return response();
-    }) as typeof fetch;
+describe("原文回合寫入", () => {
+  function writeStub(posts: SourceWriteRequest[]) {
+    const urls: string[] = [];
+    let state: "old" | "failed" | "ready" = "ready";
+    const fetchImpl: typeof fetch = async (url, init) => {
+      const route = new URL(String(url)).pathname;
+      urls.push(route);
+      if (route === "/memory-policy") return state === "old"
+        ? new Response("not supported", { status: 404 })
+        : jsonResponse({ maskSecrets: true, version: 1 });
+      if (route !== "/memory-sources") throw new Error("unexpected route");
+      const payload = JSON.parse(String(init?.body)) as SourceWriteRequest;
+      posts.push(payload);
+      if (state === "failed") return jsonResponse({}, 503);
+      const duplicate = posts.slice(0, -1).some((previous) => JSON.stringify(previous) === JSON.stringify(payload));
+      return jsonResponse({
+        source: { ...payload, id: 1, createdAt: "2026-01-01T00:00:00.000Z", chunkVersion: "raw-v1", messageCount: payload.messages.length },
+        saved: true, duplicate, policyVersion: 1, memoryIds: [1], redacted: false, redactedCount: 0,
+      }, duplicate ? 200 : 201);
+    };
+    return { urls, fetchImpl, setState: (next: typeof state) => { state = next; } };
   }
 
-  async function endTurn(
-    invoke: (event: string, ...args: unknown[]) => Promise<unknown>,
-    input: { user: string; assistant: string; turn?: number },
-  ): Promise<void> {
-    await invoke("agent/created", { agent: { session: { id: SESSION_ID } } });
-    await invoke("session/event", { id: SESSION_ID }, { type: "turn/start", data: { turn: input.turn ?? 1 } });
-    await invoke(
-      "session/event",
-      { id: SESSION_ID },
-      {
-        type: "user/message",
-        data: { id: "u1", content: [{ type: "text", text: input.user }], source: { kind: "user" } },
-      },
-    );
-    await invoke(
-      "session/event",
-      { id: SESSION_ID },
-      {
-        type: "assistant/message",
-        data: { turn: input.turn ?? 1, step: 1, message: { content: [{ type: "text", text: input.assistant }] } },
-      },
-    );
-    await invoke("session/event", { id: SESSION_ID }, { type: "turn/end", data: { turn: input.turn ?? 1, reason: { kind: "completed" } } });
-  }
-
-  it("寫一張 dsh/turn 卡，欄位與內容正確、不含注入塊", async () => {
-    const calls: RecordedCall[] = [];
-    const { ctx, invoke } = createCtx();
-    createRuntime(ctx, { project: "mnemoshelf" }, deps({ fetchImpl: writeFetch(calls) }));
-    await endTurn(invoke, { user: USER_TEXT, assistant: ASSISTANT_TEXT });
-
-    await waitFor(() => calls.some((call) => call.url.endsWith("/memories")));
-    await waitFor(() => hasLog("write-ok"));
-    const write = calls.find((call) => call.url.endsWith("/memories"));
-    expect(write?.body).toMatchObject({
-      kind: "fact",
-      scope: "project",
-      project: "mnemoshelf",
-      agent: "dsh/turn",
-      sourceSession: SESSION_ID,
-      sourceMessage: "1",
+  async function sendTurn(
+    invoke: ReturnType<typeof createCtx>["invoke"],
+    assistant: string,
+    { reason = "completed", session = SESSION_ID, turn = 1 } = {},
+  ) {
+    const event = (type: string, data: Record<string, unknown>, time?: number) =>
+      invoke("session/event", { id: session }, { type, time, data });
+    await event("turn/start", { turn });
+    await event("user/message", {
+      id: "u1", content: [{ type: "text", text: " 不行\r\n" }], source: { kind: "user" },
+    }, 2000);
+    await event("user/message", {
+      id: "recall", content: [{ type: "text", text: "不擷取的注入內容" }], source: { kind: "mnemoshelf-recall" },
     });
-    const content = String(write?.body?.content);
-    expect(content).toBe(`User: ${USER_TEXT}\nAssistant: ${ASSISTANT_TEXT}`);
-    expect(content).not.toContain("memory-context");
-    expect(hasLog("write-ok")).toBe(true);
-  });
+    await event("assistant/message", {
+      turn, step: 1, message: { id: "a1", content: [
+        { type: "text", text: "第一個可見步驟。" },
+        { type: "tool", text: "工具結果不擷取" },
+        { type: "reasoning", text: "隱藏推理" },
+      ] },
+    }, 3000);
+    await event("user/message", { id: "u2", content: [{ type: "text", text: "再看中段" }], source: { kind: "user" } });
+    await event("assistant/message", { turn: turn + 1, message: { id: "wrong-turn", content: "不擷取的異輪內容" } });
+    await event("assistant/message", { turn, step: 2, message: {
+      content: [{ type: "text", text: assistant + "<memory-context>回顯內容</memory-context>" }],
+    } });
+    await event("turn/end", { turn, reason: { kind: reason } });
+  }
 
-  it("注入塊不進卡片：長注入塊＋短真人輸入 → 不寫", async () => {
-    const calls: RecordedCall[] = [];
+  it("完整有序保留短輸入、長中尾、程式碼、空白與原始時間；重播同一事件保持同 key", async () => {
+    const posts: SourceWriteRequest[] = [];
+    const { fetchImpl, urls } = writeStub(posts);
     const { ctx, invoke } = createCtx();
-    createRuntime(ctx, {}, deps({ fetchImpl: writeFetch(calls) }));
-    const dirtyUser = `好\n<memory-context source="mnemoshelf" trust="untrusted">\n${"舊記憶。".repeat(100)}\n</memory-context>`;
-    await endTurn(invoke, { user: dirtyUser, assistant: ASSISTANT_TEXT });
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    expect(calls.filter((call) => call.url.endsWith("/memories"))).toHaveLength(0);
-    expect(hasLog("turn-skip", "short")).toBe(true);
-  });
-
-  it("短回合（<40 字元）不寫、不報錯", async () => {
-    const calls: RecordedCall[] = [];
-    const { ctx, invoke } = createCtx();
-    createRuntime(ctx, {}, deps({ fetchImpl: writeFetch(calls) }));
-    await endTurn(invoke, { user: "太短了", assistant: ASSISTANT_TEXT });
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    expect(calls.filter((call) => call.url.endsWith("/memories"))).toHaveLength(0);
-    expect(hasLog("turn-skip", "short")).toBe(true);
-  });
-
-  it("沒有助手的空白回覆不寫", async () => {
-    const calls: RecordedCall[] = [];
-    const { ctx, invoke } = createCtx();
-    createRuntime(ctx, {}, deps({ fetchImpl: writeFetch(calls) }));
-    await endTurn(invoke, { user: USER_TEXT, assistant: "" });
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    expect(calls.filter((call) => call.url.endsWith("/memories"))).toHaveLength(0);
-    expect(hasLog("turn-skip", "no-assistant")).toBe(true);
-  });
-
-  it("別人的 session 事件不進緩衝、不寫卡", async () => {
-    const calls: RecordedCall[] = [];
-    const { ctx, invoke } = createCtx();
-    createRuntime(ctx, {}, deps({ fetchImpl: writeFetch(calls) }));
+    const runtime = createRuntime(ctx, { project: "fixture" }, deps({ fetchImpl }));
+    const content = "  開頭🏷️\r\n" + "`中段程式碼`\r\n".repeat(3000) + "\t尾段  ";
     await invoke("agent/created", { agent: { session: { id: SESSION_ID } } });
-    await invoke("session/event", { id: "foreign" }, { type: "turn/start", data: { turn: 1 } });
-    await invoke(
-      "session/event",
-      { id: "foreign" },
-      {
-        type: "user/message",
-        data: { content: [{ type: "text", text: "FOREIGN" }], source: { kind: "user" } },
-      },
-    );
-    await invoke("session/event", { id: "foreign" }, { type: "turn/end", data: { turn: 1, reason: { kind: "completed" } } });
-    await new Promise((resolve) => setTimeout(resolve, 60));
-    expect(calls).toHaveLength(0);
-  });
-
-  it("duplicate 回應視為成功，不進 spool", async () => {
-    const calls: RecordedCall[] = [];
-    const { ctx, invoke } = createCtx();
-    createRuntime(
-      ctx,
-      {},
-      deps({ fetchImpl: writeFetch(calls, () => jsonResponse({ duplicate: true }, 200)) }),
-    );
-    await endTurn(invoke, { user: USER_TEXT, assistant: ASSISTANT_TEXT });
-    await waitFor(() => calls.length > 0);
-    await new Promise((resolve) => setTimeout(resolve, 40));
-    expect(await readdir(path.join(dir, "spool")).catch(() => [])).toEqual([]);
-    expect(hasLog("write-ok")).toBe(true);
-  });
-
-  it("寫入失敗進 spool；恢復後 flush 補送並刪除", async () => {
-    const calls: RecordedCall[] = [];
-    let failing = true;
-    const fetchImpl = (async (url: string | URL | Request, init?: RequestInit) => {
-      calls.push({
-        url: String(url),
-        body: init?.body === undefined ? null : JSON.parse(String(init.body)),
-      });
-      return failing ? jsonResponse({}, 503) : jsonResponse({ id: 1, duplicate: false }, 201);
-    }) as typeof fetch;
-
-    const { ctx, invoke } = createCtx();
-    const runtime = createRuntime(ctx, { project: "mnemoshelf" }, deps({ fetchImpl }));
-    await endTurn(invoke, { user: USER_TEXT, assistant: ASSISTANT_TEXT });
-    await waitFor(() => hasLog("write-spooled"));
-
-    const files = await readdir(path.join(dir, "spool"));
-    expect(files).toHaveLength(1);
-    expect(hasLog("spool-write")).toBe(true);
-
-    failing = false;
-    await runtime.flush();
+    await sendTurn(invoke, content);
+    await runtime.awaitIdle();
+    await sendTurn(invoke, content);
+    await runtime.awaitIdle();
+    expect(posts).toHaveLength(2);
+    expect(posts[1]).toEqual(posts[0]);
+    expect(posts[0]).toMatchObject({
+      agent: "dsh/turn", scope: "project", project: "fixture", sourceSession: SESSION_ID, sourceTurn: "1",
+      messages: [
+        { sourceMessage: "u1", role: "user", content: " 不行\r\n", occurredAt: new Date(2000).toISOString() },
+        { sourceMessage: "a1", role: "assistant", content: "第一個可見步驟。", occurredAt: new Date(3000).toISOString() },
+        { sourceMessage: "u2", role: "user", content: "再看中段", occurredAt: null },
+        { sourceMessage: "visible:assistant:3", role: "assistant", content, occurredAt: null },
+      ],
+    });
+    expect(urls).toEqual(["/memory-policy", "/memory-sources", "/memory-policy", "/memory-sources"]);
     expect(await readdir(path.join(dir, "spool"))).toEqual([]);
-    expect(hasLog("spool-flush")).toBe(true);
+    runtime.dispose();
   });
 
-  it("服務停止（pid-dead／連線失敗）時不讓回合失敗，spool 留檔", async () => {
-    const fetchImpl = (async () => {
-      throw new Error("ECONNREFUSED");
-    }) as typeof fetch;
+  it("舊服務先保留並提示升級；服務恢復補送原文", async () => {
+    const posts: SourceWriteRequest[] = [];
+    const stub = writeStub(posts);
     const { ctx, invoke } = createCtx();
-    createRuntime(ctx, {}, deps({ fetchImpl }));
-    await endTurn(invoke, { user: USER_TEXT, assistant: ASSISTANT_TEXT });
-    await waitFor(() => hasLog("write-spooled"));
+    const runtime = createRuntime(ctx, {}, deps({ fetchImpl: stub.fetchImpl }));
+    stub.setState("old");
+    await invoke("agent/created", { agent: { session: { id: SESSION_ID } } });
+    await sendTurn(invoke, "原文尾巴");
+    await runtime.awaitIdle();
+    expect(posts).toEqual([]);
+    expect(hasLog("spool-deferred", "upgrade-required")).toBe(true);
     expect(await readdir(path.join(dir, "spool"))).toHaveLength(1);
+    stub.setState("ready");
+    await runtime.flush();
+    expect(posts[0]?.messages.at(-1)?.content).toBe("原文尾巴");
+    expect(await readdir(path.join(dir, "spool"))).toEqual([]);
+    runtime.dispose();
   });
 
-  it("runtime.json 被正常關閉刪除、但資料目錄還在 → 仍進 spool", async () => {
-    const home = path.join(dir, "home");
-    await mkdir(path.join(home, ".config", "Mnemoshelf", "data"), { recursive: true });
+  it("其他 session、不完整／失敗回合、關閉及未設定服務都不擷取", async () => {
+    const posts: SourceWriteRequest[] = [];
+    const { fetchImpl, urls } = writeStub(posts);
     const { ctx, invoke } = createCtx();
-    createRuntime(
-      ctx,
-      { project: "mnemoshelf" },
-      deps({
-        env: {},
-        home,
-        fetchImpl: (async () => {
-          throw new Error("should not call");
-        }) as typeof fetch,
-      }),
-    );
-    await endTurn(invoke, { user: USER_TEXT, assistant: ASSISTANT_TEXT });
-    await waitFor(() => hasLog("write-spooled"));
-    expect(await readdir(path.join(dir, "spool"))).toHaveLength(1);
+    const runtime = createRuntime(ctx, {}, deps({ fetchImpl }));
+    await invoke("agent/created", { agent: { session: { id: SESSION_ID } } });
+    await sendTurn(invoke, "不應送", { session: "foreign" });
+    await sendTurn(invoke, "不應送", { reason: "error" });
+    await invoke("session/event", { id: SESSION_ID }, { type: "turn/end", data: { turn: 5, reason: { kind: "completed" } } });
+    await runtime.awaitIdle();
+    expect(hasLog("turn-skip", "incomplete-turn")).toBe(true);
+    expect(hasLog("turn-skip", "not-completed")).toBe(true);
+    expect(urls).toEqual([]);
+    runtime.dispose();
+
+    for (const [config, env] of [[{ captureEnabled: false }, undefined], [{}, {}]] as const) {
+      const disabled = createCtx();
+      const result = createRuntime(disabled.ctx, config, deps({ fetchImpl, ...(env ? { env } : {}) }));
+      await disabled.invoke("agent/created", { agent: { session: { id: SESSION_ID } } });
+      await sendTurn(disabled.invoke, "不應送");
+      await result.awaitIdle();
+      await result.flush();
+      expect(urls).toEqual([]);
+      result.dispose();
+    }
+    expect(hasLog("write-disabled", "no-config")).toBe(true);
+    await expect(readdir(path.join(dir, "spool"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

@@ -103,6 +103,13 @@ export interface Memory {
   sourceSession: string | null;
   /** 寫入這筆記憶的訊息識別（來源；D4a 擴充）。未提供或舊資料一律 `null`；不可變更。 */
   sourceMessage: string | null;
+  /** 原文來源與保存文字的 UTF-16 位置。舊記憶的欄位為 null。 */
+  sourceId?: number | null;
+  messageIndex?: number | null;
+  chunkIndex?: number | null;
+  sourceStart?: number | null;
+  sourceEnd?: number | null;
+  chunkVersion?: string | null;
   /** ISO 8601 時間字串。 */
   createdAt: string;
   /** ISO 8601 時間字串；未刪除時為 null。 */
@@ -120,7 +127,8 @@ export interface Memory {
  */
 export type NewMemory = Omit<
   Memory,
-  "id" | "createdAt" | "deletedAt" | "pinned" | "sourceSession" | "sourceMessage"
+  "id" | "createdAt" | "deletedAt" | "pinned" | "sourceSession" | "sourceMessage" |
+    "sourceId" | "messageIndex" | "chunkIndex" | "sourceStart" | "sourceEnd" | "chunkVersion"
 > & {
   sourceSession?: string | null;
   sourceMessage?: string | null;

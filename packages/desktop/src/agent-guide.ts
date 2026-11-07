@@ -1163,7 +1163,7 @@ export function buildInstallCard(harness: AgentGuideHarnessTab, input: AgentGuid
       lines.push(
         "# 把 Mnemoshelf 接到 dsh（給 agent 的安裝卡）",
         "",
-        "你是協助使用者安裝 Mnemoshelf 的 agent。照下面做完，dsh 會在回合前自動召回記憶、回合結束寫入回合卡。",
+        "你是協助使用者安裝 Mnemoshelf 的 agent。照下面做完，dsh 會在回合前自動召回記憶，並在回合結束後依外掛設定保存對話原文。",
         "",
         ...runtimeStep(input),
         "## 2. 用 `dsh plugin` 指令安裝（優先做法）",
