@@ -25,6 +25,8 @@ import {
   type RootPreview,
 } from "./api";
 import { formatBytes } from "./format";
+import { toggleModality } from "./audio";
+import { AudioModelStatus } from "./AudioModelStatus";
 
 export interface AddRootFlowProps {
   /** 使用者取消（尚未加入或加入後反悔）。 */
@@ -56,13 +58,16 @@ const SKIP_REASON_LABEL: Record<string, string> = {
   excluded: "排除規則",
   "modality-off": "未開啟的模態",
   "unsupported-modality": "尚未支援的媒體類型",
+  "unsupported-audio-format": "音訊格式未支援（目前支援 WAV）",
+  "invalid-audio": "音訊內容損毀或無法解碼",
+  "audio-limit-exceeded": "音訊超出時長或解碼上限",
   "too-large": "超過大小上限",
   "unsupported-type": "不支援的型別",
   "unresolved-symlink": "無法解析的連結",
   "symlink-dir": "符號連結目錄",
   "not-a-file": "非一般檔案",
   "binary-content": "內容像二進位檔",
-  undecodable: "無法解碼（不支援的圖片格式）",
+  undecodable: "無法解碼或超出媒體限制",
 };
 
 /** 模態 → 中文標籤。 */
@@ -78,7 +83,7 @@ const MODALITY_LABEL: Record<string, string> = {
  * 由「是否含圖片」組出要寫入 root 的模態清單。
  *
  * 勾了圖片＝`text`／`code`／`image`；沒勾則維持 v0.1.2 的預設（不加圖片）。
- * 只有這三個模態有 UI 入口（音訊／影片尚未支援）。
+ * 音訊開關另外疊加，不因切換照片清除其他模態。
  */
 export function modalitiesForImages(enabled: boolean): string[] {
   return enabled ? ["text", "code", "image"] : ["text", "code"];
@@ -98,6 +103,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
    * 加入時就決定第一次 `POST /roots` 的模態；加入後在預覽頁改成 PATCH（見 `setImagesEnabled`）。
    */
   const [includeImages, setIncludeImages] = useState(false);
+  const [includeAudio, setIncludeAudio] = useState(false);
   const [step, setStep] = useState<Step>("input");
   const [root, setRoot] = useState<Root | null>(null);
   const [preview, setPreview] = useState<RootPreview | null>(null);
@@ -180,7 +186,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
     setBusy(true);
     let updated: Root | null = null;
     try {
-      updated = await updateRootModalities(root.id, modalitiesForImages(enabled));
+      updated = await updateRootModalities(root.id, toggleModality(root.modalities, "image", enabled));
     } catch (patchError) {
       setIncludeImages(!enabled);
       setError(patchError instanceof Error ? patchError.message : "更新資料夾設定失敗");
@@ -193,6 +199,23 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
     await loadPreview(updated);
   };
 
+  const setAudioEnabled = async (enabled: boolean): Promise<void> => {
+    if (root === null || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const updated = await updateRootModalities(root.id, toggleModality(root.modalities, "audio", enabled));
+      setRoot(updated);
+      setIncludeAudio(enabled);
+      onRootChangedRef.current?.(updated);
+      await loadPreview(updated);
+    } catch (patchError) {
+      setError(patchError instanceof Error ? patchError.message : "更新音訊設定失敗");
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const submitPath = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     const target = pathInput.trim();
@@ -202,7 +225,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
     let created: Root | null = null;
     try {
       // 勾了「含圖片」才帶 image 模態；沒勾與 v0.1.2 完全相同（服務端預設 text／code）。
-      created = await addRoot({ path: target, modalities: modalitiesForImages(includeImages) });
+      created = await addRoot({ path: target, modalities: toggleModality(modalitiesForImages(includeImages), "audio", includeAudio) });
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "加入資料夾失敗");
     }
@@ -399,6 +422,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
             服務只會讀取這個資料夾；家目錄本身與檔案系統根目錄會被拒絕。加入後會先顯示統計，確認才開始索引。
           </p>
           <ImagesToggle checked={includeImages} onChange={setIncludeImages} />
+          <AudioToggle checked={includeAudio} disabled={busy} onChange={setIncludeAudio} />
           {error !== null && (
             <p role="alert" className="text-sm text-red-600">
               {error}
@@ -423,6 +447,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
             disabled={busy}
             onChange={(next) => void setImagesEnabled(next)}
           />
+          <AudioToggle checked={includeAudio} disabled={busy} onChange={(next) => void setAudioEnabled(next)} />
 
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <Stat label="檔案數" value={String(preview.totalFiles)} />
@@ -436,6 +461,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
               時間組成（粗估）：文字 {preview.estimated.textSeconds} 秒、圖片 {preview.estimated.imageSeconds} 秒
               {preview.estimated.otherSeconds > 0 ? `、其他媒體 ${preview.estimated.otherSeconds} 秒` : ""}。
               單張照片約數秒；沒勾「含照片」時圖片會列在下面的「未開啟的模態」被跳過。
+              {includeAudio && " 音訊依檔案大小估算片段上界，尚未讀取實際時長；不含首次模型下載時間。"}
             </p>
           )}
 
@@ -521,6 +547,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
       {step === "indexing" && (
         <div className="space-y-3">
           <p className="text-sm text-ink">正在建立索引…（可以放著，完成後會自動顯示）</p>
+          {includeAudio && <AudioModelStatus active />}
           <ProgressBar status={status} />
           {error !== null && (
             <p role="alert" className="text-sm text-red-600">
@@ -564,7 +591,10 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
       )}
 
       {step === "done" && (
-        <p className="text-sm text-ink">索引完成，目錄樹已可使用。</p>
+        <div className="space-y-2">
+          <p className="text-sm text-ink">索引完成，目錄樹已可使用。</p>
+          {includeAudio && <AudioModelStatus />}
+        </div>
       )}
 
       {step === "failed" && (
@@ -608,6 +638,19 @@ function Stat({ label, value }: { label: string; value: string }) {
  *
  * 標籤刻意用白話（不寫「image 模態」），並在同一行說明代價與「改完要重新索引才生效」。
  */
+function AudioToggle({ checked, disabled, onChange }: {
+  checked: boolean; disabled?: boolean; onChange: (next: boolean) => void;
+}) {
+  return (
+    <label className="flex items-start gap-2 text-sm text-ink">
+      <input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} className="mt-0.5" />
+      <span>這個資料夾含音訊，一起索引
+        <span className="mt-0.5 block text-xs text-muted">支援 WAV（PCM16／float32、單／雙聲道），預設單檔最多 10 MiB、最長 10 分鐘。首次索引需下載音訊模型；檔案內容只在本機處理。預覽依檔名與大小統計，格式與時長於索引時確認。</span>
+      </span>
+    </label>
+  );
+}
+
 function ImagesToggle({
   checked,
   disabled,

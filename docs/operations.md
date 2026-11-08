@@ -9,6 +9,14 @@
 
 ## REST 端點速查
 
+音訊索引先以 `PATCH /roots/:id` 的 `modalities` 明確加入 `audio`，再預覽並索引。
+本版只支援受限 WAV；格式與上限見 [音訊契約](roots-and-privacy.md#音訊索引與來源定位)。
+`POST /search` 與 MCP `search` 的音訊命中有 `media.startSeconds`／`endSeconds`、
+`track`、`preprocessVersion`、`embedderId`、`embeddingDim`，沒有逐字稿；以 vector／hybrid 查詢。
+`GET /roots/:id/file?path=...` 對支援 WAV 回 `audio/wav`，仍需 token 與 root 守衛，最多 10 MiB。
+`GET /diagnostics` 的 `embedderRuntime.audioState` 區分未載入／準備中／就緒／失敗；
+失敗且 `audioRetryable=false` 時需重啟後再試，否則可修正下載問題後重跑索引。
+
 | 端點 | 說明 |
 |---|---|
 | `GET /health` | 免 token；服務身分、版本與 build（建置 commit） |

@@ -34,7 +34,7 @@ describe("previewRoot", () => {
     try {
       await fs.writeFile(path.join(dir, "sound.wav"), Buffer.from([1]));
       await fs.writeFile(path.join(dir, "clip.mp4"), Buffer.from([2]));
-      const preview = await previewRoot({ path: dir, modalities: ["audio", "video"] });
+      const preview = await previewRoot({ path: dir, modalities: ["audio", "video"] }, { supportedModalities: ["text", "code", "image"] });
       expect(preview.totalFiles).toBe(0);
       expect(preview.estimatedSeconds).toBe(0);
       expect(preview.skipped).toEqual([

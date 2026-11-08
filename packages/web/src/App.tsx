@@ -18,7 +18,8 @@ import {
   type MemoryPolicy,
   type Root,
 } from "./api";
-import { AddRootFlow, modalitiesForImages } from "./AddRootFlow";
+import { AddRootFlow } from "./AddRootFlow";
+import { toggleModality } from "./audio";
 import { AgentGuidePanel } from "./AgentGuidePanel";
 import { COPY_BLOCKED_TEXT } from "./agentGuideText";
 import { BootstrapScreen } from "./BootstrapScreen";
@@ -464,11 +465,11 @@ export function App() {
    * 不偷偷幫使用者觸發一輪可能跑好幾小時的索引。
    * 失敗時不切換整個畫面（那只是一個開關），改在側欄顯示一行錯誤並把清單刷新回真實狀態。
    */
-  const onToggleImages = async (root: Root, enabled: boolean): Promise<void> => {
+  const onToggleImages = async (root: Root, enabled: boolean, modality = "image"): Promise<void> => {
     setImagesBusyRootId(root.id);
     setRootsError(null);
     try {
-      await updateRootModalities(root.id, modalitiesForImages(enabled));
+      await updateRootModalities(root.id, toggleModality(root.modalities, modality, enabled));
       await refreshRoots();
     } catch (error) {
       setRootsError(error instanceof Error ? error.message : "更新資料夾設定失敗");
@@ -643,6 +644,7 @@ export function App() {
                   }}
                   onRemove={(root) => void onRemoveRoot(root)}
                   onToggleImages={(root, enabled) => void onToggleImages(root, enabled)}
+                  onToggleAudio={(root, enabled) => void onToggleImages(root, enabled, "audio")}
                   imagesBusyRootId={imagesBusyRootId}
                 />
                 {rootsError !== null && (

@@ -9,6 +9,7 @@ import {
   memoryContentHash,
   memorySourceEventHash,
   normalizeMemoryLimit,
+  normalizeChunkMedia,
   normalizeMemoryPatch,
   normalizeMemorySearchFilter,
   normalizeMemorySearchK,
@@ -61,7 +62,7 @@ export interface PgMetadataStoreOptions {
 
 const ROOT_COLUMNS =
   "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at";
-const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash";
+const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash, media_json";
 const MEMORY_COLUMNS =
   `id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at,
    source_id, message_index, chunk_index, source_start, source_end, chunk_version`;
@@ -96,6 +97,7 @@ function rowToRoot(row: Record<string, unknown>): Root {
 }
 
 function rowToChunk(row: Record<string, unknown>): Chunk {
+  const media = normalizeChunkMedia(row.media_json == null ? undefined : JSON.parse(String(row.media_json)));
   return {
     id: Number(row.id),
     rootId: Number(row.root_id),
@@ -104,6 +106,7 @@ function rowToChunk(row: Record<string, unknown>): Chunk {
     kind: String(row.kind) as ChunkKind,
     text: row.text === null || row.text === undefined ? null : String(row.text),
     contentHash: String(row.content_hash),
+    ...(media === undefined ? {} : { media }),
   };
 }
 
@@ -242,6 +245,7 @@ function metadataSchemaSql(schema: string): string {
       seg text,
       tsv tsvector generated always as (to_tsvector('simple', seg)) stored
     );
+    alter table ${chunks} add column if not exists media_json text;
     create index if not exists chunks_root_path_idx on ${chunks}(root_id, rel_path);
     create index if not exists chunks_tsv_gin on ${chunks} using gin (tsv);
 
@@ -648,16 +652,18 @@ export class PgMetadataStore implements MetadataStore {
     relPath: string,
     chunks: Omit<NewChunk, "rootId" | "relPath">[],
   ): Promise<Chunk[]> {
+    const normalized = chunks.map((item) => ({ ...item, media: normalizeChunkMedia(item.media) }));
     return await withTransaction(this.pool, async (client) => {
       await client.query(`delete from ${this.chunks} where root_id = $1 and rel_path = $2`, [rootId, relPath]);
 
       const created: Chunk[] = [];
-      for (const item of chunks) {
+      for (const item of normalized) {
         const result = await client.query(
-          `insert into ${this.chunks}(root_id, rel_path, seq, kind, text, content_hash, seg)
-           values ($1, $2, $3, $4, $5, $6, $7)
+          `insert into ${this.chunks}(root_id, rel_path, seq, kind, text, content_hash, seg, media_json)
+           values ($1, $2, $3, $4, $5, $6, $7, $8)
            returning ${CHUNK_COLUMNS}`,
-          [rootId, relPath, item.seq, item.kind, item.text, item.contentHash, segmentOrNull(item.text)],
+          [rootId, relPath, item.seq, item.kind, item.text, item.contentHash, segmentOrNull(item.text),
+            item.media === undefined ? null : JSON.stringify(item.media)],
         );
         created.push(rowToChunk(result.rows[0]!));
       }

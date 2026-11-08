@@ -34,6 +34,94 @@ const STATUS: EmbedderRuntimeStatus = {
   dmlDeviceId: 0,
 };
 
+describe("音訊片段排程", () => {
+  const audio = () => ({ samples: Float32Array.of(0.1, -0.1), sampleRate: 16000 as const });
+
+  it("PCM計入准入位元組且排隊時已快照，不修改或detach呼叫端", async () => {
+    const { embedder, requests, release } = controlledEmbedder();
+    const source = audio();
+    const pending = embedder.embedAudio(source);
+    source.samples[0] = 0.8;
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(8);
+    await waitFor(() => requests.length === 1);
+    const params = requests[0]!.message.params as { samples: Float32Array; sampleRate: number };
+    expect(params.samples[0]).toBeCloseTo(0.1);
+    expect(params.samples).not.toBe(source.samples);
+    expect(source.samples.byteLength).toBe(8);
+    expect(params.sampleRate).toBe(16000);
+    await release(0);
+    await pending;
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+    await embedder.dispose();
+  });
+
+  it("超限拒絕且不啟動worker；非法PCM與預先取消同樣不執行", async () => {
+    const { embedder, workers } = controlledEmbedder({ scheduling: { maxInputBytes: 4 } });
+    await expect(embedder.embedAudio(audio())).rejects.toBeInstanceOf(EmbedderQueueFullError);
+    await expect(embedder.embedAudio({ samples: Float32Array.of(NaN), sampleRate: 16000 }))
+      .rejects.toMatchObject({ name: "EmbedderInputError" });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(embedder.embedAudio(audio(), { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(workers).toHaveLength(0);
+    await embedder.dispose();
+  });
+
+  it("音訊間查詢優先，背景音訊仍會前進", async () => {
+    const { embedder, requests, release } = controlledEmbedder();
+    const first = embedder.embedAudio(audio());
+    await waitFor(() => requests.length === 1);
+    const second = embedder.embedAudio(audio());
+    const query = embedder.embedQuery("查詢");
+    await release(0);
+    await release(1);
+    await release(2);
+    await Promise.all([first, second, query]);
+    expect(requests.map(({ message }) => message.method)).toEqual(["embedAudio", "embedQuery", "embedAudio"]);
+    await embedder.dispose();
+  });
+
+  it("排隊音訊立即取消；在途音訊取消與dispose必須等native回應", async () => {
+    const { embedder, requests, release, workers } = controlledEmbedder();
+    const activeController = new AbortController();
+    const active = embedder.embedAudio(audio(), { signal: activeController.signal });
+    const rejected = expect(active).rejects.toMatchObject({ name: "AbortError" });
+    await waitFor(() => requests.length === 1);
+    const queuedController = new AbortController();
+    const queued = embedder.embedAudio(audio(), { signal: queuedController.signal });
+    const queuedRejected = expect(queued).rejects.toMatchObject({ name: "AbortError" });
+    queuedController.abort();
+    await queuedRejected;
+    activeController.abort();
+    let disposed = false;
+    const disposal = embedder.dispose().then(() => { disposed = true; });
+    await flushPromises();
+    expect(disposed).toBe(false);
+    expect(workers[0]!.terminated).toBe(false);
+    await release(0);
+    await Promise.all([rejected, disposal]);
+    expect(requests).toHaveLength(1);
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+  });
+
+  it("worker準備期狀態會傳回proxy，失敗後仍可觀察", async () => {
+    const { embedder, requests, workers } = controlledEmbedder();
+    const pending = embedder.embedAudio(audio());
+    const rejected = expect(pending).rejects.toMatchObject({ name: "ModelLoadError" });
+    await waitFor(() => requests.length === 1);
+    workers[0]!.emit("message", { type: "status", runtimeStatus: { ...STATUS, audioState: "loading" } });
+    expect(embedder.runtimeStatus?.audioState).toBe("loading");
+    workers[0]!.emit("message", {
+      type: "response", id: requests[0]!.message.id, ok: false,
+      error: { name: "ModelLoadError", message: "音訊資產準備失敗" },
+      runtimeStatus: { ...STATUS, audioState: "failed" },
+    });
+    await rejected;
+    expect(embedder.runtimeStatus?.audioState).toBe("failed");
+    await embedder.dispose();
+  });
+});
+
 type FakeMessage = Record<string, unknown>;
 type FakeHandler = (message: FakeMessage, worker: FakeEmbedderWorker) => void;
 

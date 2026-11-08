@@ -631,6 +631,16 @@ export async function fetchImageBlobUrl(
   return URL.createObjectURL(await response.blob());
 }
 
+/** 音訊經授權端點取得；呼叫端負責釋放 blob URL。 */
+export async function fetchAudioBlobUrl(rootId: number, filePath: string): Promise<string> {
+  const response = await apiFetch(`/roots/${rootId}/file?path=${encodeURIComponent(filePath)}`);
+  if (!response.ok) throw new Error(await readErrorMessage(response, "讀取音訊失敗"));
+  if (!(response.headers.get("content-type") ?? "").startsWith("audio/wav")) {
+    throw new Error("此檔案不是支援的 WAV 音訊。");
+  }
+  return URL.createObjectURL(await response.blob());
+}
+
 // ---------------------------------------------------------------------------
 // M3 收尾：統一搜尋、記憶管理（列表／釘選／編輯／刪除／來源）
 // ---------------------------------------------------------------------------
@@ -694,6 +704,14 @@ export interface ChunkSearchHit {
   kind: EntryKind;
   text: string | null;
   textTruncated: boolean;
+  media?: {
+    startSeconds: number;
+    endSeconds: number;
+    track: "audio";
+    preprocessVersion: string;
+    embedderId: string;
+    embeddingDim: number;
+  };
 }
 
 /** 記憶命中。 */
@@ -1191,6 +1209,8 @@ export interface DiagnosticsEmbedderSelfTest {
  * 未提供時 `embedderRuntime` 為 `null`；`fallbackReason` 有值代表曾經從 GPU 退回 CPU。
  */
 export interface DiagnosticsEmbedderRuntime {
+  audioState?: "not-loaded" | "loading" | "ready" | "failed";
+  audioRetryable?: boolean;
   /** 要求／設定的裝置選項（`auto`／`cpu`／`dml`／`coreml`）。 */
   requestedDevice: string;
   /** 目前使用的裝置（`cpu`／`dml`／`coreml`）；模型尚未載入時為計畫值。 */

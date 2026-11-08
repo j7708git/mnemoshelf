@@ -486,6 +486,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
     // 載入前：計畫裝置即可讀取。
     const before: EmbedderRuntimeStatus = embedder.runtimeStatus;
     expect(before).toEqual({
+      audioState: "not-loaded",
       requestedDevice: "auto",
       device: "dml",
       loaded: false,

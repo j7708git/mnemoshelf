@@ -19,7 +19,7 @@
  */
 import { parentPort } from "node:worker_threads";
 import type { Transferable } from "node:worker_threads";
-import type { DocumentInput, EmbedderRuntimeStatus, ImageInput } from "@mnemoshelf/core";
+import type { AudioInput, DocumentInput, EmbedderRuntimeStatus, ImageInput } from "@mnemoshelf/core";
 import { TransformersEmbedder, type TransformersEmbedderOptions } from "@mnemoshelf/embedder-transformers";
 import type {
   EmbedderWorkerCancelMessage,
@@ -73,6 +73,15 @@ function readImage(params: unknown): ImageInput {
   return typeof record.mimeType === "string"
     ? { bytes: record.bytes, mimeType: record.mimeType }
     : { bytes: record.bytes };
+}
+
+/** proxy 只傳已解碼、已限制大小的 PCM，worker 不讀來源檔案。 */
+function readAudio(params: unknown): AudioInput {
+  const record = params as { samples?: unknown; sampleRate?: unknown } | null;
+  if (!(record?.samples instanceof Float32Array) || record.sampleRate !== 16000) {
+    throw new Error("embedAudio 缺少 16 kHz PCM");
+  }
+  return { samples: record.samples, sampleRate: 16000 };
 }
 
 /** 蒐集要 transfer 的 buffer（去重；只有真正的 `ArrayBuffer` 可以轉移）。 */
@@ -149,7 +158,8 @@ export function startEmbedderWorker(port: WorkerPort): void {
       replyError(id, new Error("embedder worker 尚未初始化"));
       return;
     }
-    const controller = method === "embedDocuments" || method === "embedImage" ? new AbortController() : null;
+    const controller = method === "embedDocuments" || method === "embedImage" || method === "embedAudio"
+      ? new AbortController() : null;
     if (controller !== null) controllers.set(id, controller);
     try {
       switch (method) {
@@ -185,6 +195,17 @@ export function startEmbedderWorker(port: WorkerPort): void {
         }
         case "probe": {
           reply(id, await embedder.probe());
+          return;
+        }
+        case "embedAudio": {
+          const status = embedder.runtimeStatus;
+          if (status.audioState !== "ready") {
+            post({ type: "status", runtimeStatus: { ...status, audioState: "loading" } });
+          }
+          const vector = await embedder.embedAudio(readAudio(message.params), {
+            ...(controller === null ? {} : { signal: controller.signal }),
+          });
+          reply(id, vector, buffersOf([vector]));
           return;
         }
         case "dispose": {

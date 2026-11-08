@@ -8,6 +8,7 @@
 export type {
   Chunk,
   ChunkKind,
+  ChunkMedia,
   Memory,
   MemoryEmbeddingState,
   MemoryKind,
@@ -59,6 +60,7 @@ export {
   MEMORY_SCOPES,
   MEMORY_SEARCH_MAX_K,
   normalizeMemoryLimit,
+  normalizeChunkMedia,
   normalizeMemoryPatch,
   normalizeMemorySearchFilter,
   normalizeMemorySearchK,
@@ -75,7 +77,10 @@ export type {
   NormalizedMemorySearchFilter,
 } from "./ports/metadata-store.js";
 export type { VectorIndex, VectorItem } from "./ports/vector-index.js";
+export { inspectWav, decodeWavSegments, WAV_PREPROCESSING_VERSION } from "./audio/wav.js";
+export type { WavInfo, WavSegment } from "./audio/wav.js";
 export type {
+  AudioInput,
   DocumentInput,
   Embedder,
   EmbedderFallbackReason,

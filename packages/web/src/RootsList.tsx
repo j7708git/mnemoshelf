@@ -11,6 +11,7 @@ export interface RootsListProps {
    * 省略時不顯示這個開關（讓沒有這個能力的呼叫端維持原樣）。
    */
   onToggleImages?: (root: Root, enabled: boolean) => void;
+  onToggleAudio?: (root: Root, enabled: boolean) => void;
   /** 正在更新設定的 root id（避免重複送出）。 */
   imagesBusyRootId?: number | null;
 }
@@ -52,6 +53,7 @@ export function RootsList({
   onSelect,
   onRemove,
   onToggleImages,
+  onToggleAudio,
   imagesBusyRootId,
 }: RootsListProps) {
   if (roots.length === 0) {
@@ -111,6 +113,14 @@ export function RootsList({
                   <span className="text-muted" title="改變設定後要重新索引才會生效">
                     （重新索引後生效）
                   </span>
+                </label>
+              )}
+              {onToggleAudio !== undefined && root.mode === "index" && (
+                <label className="mt-1 flex items-center gap-1.5 text-xs text-ink">
+                  <input type="checkbox" checked={root.modalities.includes("audio")}
+                    disabled={imagesBusyRootId === root.id}
+                    onChange={(event) => onToggleAudio(root, event.target.checked)} />
+                  含音訊 WAV（重新索引後生效）
                 </label>
               )}
               <p className="text-xs text-muted">加入時間：{formatDate(root.createdAt)}</p>

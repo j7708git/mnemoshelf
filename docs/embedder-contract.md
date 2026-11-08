@@ -39,6 +39,8 @@ interface Embedder {
   embedDocuments(inputs: readonly DocumentInput[], opts?: EmbedDocumentsOptions): Promise<Float32Array[]>;
   /** 圖片。輸入為已解碼的像素或檔案位元組，由實作決定，但必須明確定義。 */
   embedImage(image: ImageInput, opts?: EmbedDocumentsOptions): Promise<Float32Array>;
+  /** 已解碼的單聲道音訊片段；選配，audio=true 時必須提供。 */
+  embedAudio?(audio: AudioInput, opts?: EmbedDocumentsOptions): Promise<Float32Array>;
   /** 啟動探測，見「啟動探測」一節。 */
   probe(): Promise<ProbeResult>;
   dispose(): Promise<void>;
@@ -46,6 +48,43 @@ interface Embedder {
 ```
 
 所有回傳的向量：長度為 `info.dim`、**已 L2 正規化**（模長 1，容差 1e-3）。
+
+## 音訊片段與模型就緒
+
+```ts
+interface AudioInput {
+  samples: Float32Array;
+  sampleRate: 16000;
+}
+```
+
+- 輸入是已解碼、已混音的 16 kHz 單聲道 PCM，1 至 480,000 個有限樣本，每個值在 [-1, 1]。
+  最大 30 秒，超出必須拒絕，不能讓上游 processor 靜默截短；檔案解碼與時間切段由索引器處理。
+- 少於 160 個樣本的非空尾段補零至 160（10 ms），避免上游產生零個音訊 frame；原始樣本保留，
+  補零不延長來源起訖時間。增量索引的前處理身分包含 `audio-pad160-v1`。
+- `embedAudio` 不加文字 prefix；與文字、圖片使用相同模型的共同向量空間，同樣截斷到 `info.dim`
+  並重新 L2 正規化。每段檢查實際 `input_ids` token 數，不超過 8,192；缺有效形狀時拒絕。
+- 空、非有限值、錯誤取樣率、超限 PCM 為 `EmbedderInputError`，不載模型；取消優先於輸入驗證。
+  前處理錯誤不觸發裝置退回。已開始的 native Run 不強制中斷，完成後若已取消則丟棄結果。
+- `capabilities.audio=true` 表示有音訊處理入口，不代表權重已下載。選配的
+  `runtimeStatus.audioState` 值為 `disabled`／`not-loaded`／`loading`／`ready`／`failed`。
+  本實作起始為 `not-loaded`；首次音訊要求才透過既有模型快取下載／載入 audio encoder，下載失敗可重試。
+  q4 音訊權重約 189 MB，純文字／圖片使用不會觸發此下載。
+- 首次音訊在共享模型鎖內，先等既有推論與下述資產預檢完成、釋放舊 session，再載入三個 encoder；不常駐第二份文字模型。
+  音訊升級失敗時恢復原裝置設定，下一個文字／圖片要求仍可重載原 backend。
+- 升級前先以公開 `model_file_name` 選項建立**單一音訊 session**，取得並驗證音訊權重後立即釋放；
+  這個階段失敗會保留既有文字／圖片模型，`audioRetryable=true`，可重跑索引。三 encoder 的正式升級
+  僅讀本機快取。上游多 session 建置使用 `Promise.all`，一般原生建置失敗沒有公開的部分 session
+  清理入口，因此仍可能保留部分資源直到行程結束；這類失敗以 `EAUDIORESTART`、`audioState=failed`、
+  `audioRetryable=false` 回報，**需重新啟動後再試**。同一實例停止音訊重試，避免逐檔累積資源；文字／圖片仍可恢復。
+- 直接使用 adapter 時，音訊升級／推論中呼叫 `dispose()` 也會等安全邊界再釋放，並行 dispose 冪等；
+  後續明確 `embed*` 呼叫可重新載入，但不解除上述本實例音訊 terminal 失敗狀態。
+- **首版音訊使用 CPU**。DML／CoreML 的文字與圖片自我測試不代表音訊 encoder 已驗收。
+  原先使用加速器的實例在首次音訊成功後，文字與圖片也共用 CPU backend；診斷保留 `requestedDevice`，
+  `fallbackReason.code=audio-cpu`。這是本次執行的政策，不把既有加速器決定快取覆寫成失敗。
+  首次音訊後該實例所有模型操作序列執行，`serializedInference=true`；未使用音訊的既有路徑維持原行為。
+- 服務 worker 將一個音訊片段視為一個背景排程視窗，PCM 位元組計入全域准入上限；准入後複製並 transfer，
+  不 detach 呼叫端 buffer。查詢可在片段邊界穿插，取消與安全關閉沿用同一個 drain 契約。
 
 ## 執行裝置狀態（`runtimeStatus`，選配）
 
@@ -58,6 +97,10 @@ interface Embedder {
 ```ts
 /** embedder 的執行裝置狀態（選配能力，供診斷與排程參考）。 */
 interface EmbedderRuntimeStatus {
+  /** 音訊資產狀態（選配），與能力宣告分開。 */
+  audioState?: "disabled" | "not-loaded" | "loading" | "ready" | "failed";
+  /** failed 時提供；false 表示需重新啟動後再試。 */
+  audioRetryable?: boolean;
   /** 要求／設定的裝置選項（`auto` 表示依平台自動決定）；值由實作定義。 */
   requestedDevice: string;
   /**

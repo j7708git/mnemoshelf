@@ -39,6 +39,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
 import type { Transferable } from "node:worker_threads";
 import type {
+  AudioInput,
   DocumentInput,
   Embedder,
   EmbedderInfo,
@@ -60,6 +61,7 @@ export type EmbedderWorkerMethod =
   | "embedQuery"
   | "embedDocument"
   | "embedImage"
+  | "embedAudio"
   | "probe"
   | "dispose";
 
@@ -111,7 +113,8 @@ export interface EmbedderWorkerResponseMessage {
   runtimeStatus?: EmbedderRuntimeStatus;
 }
 
-export type EmbedderWorkerOutboundMessage = EmbedderWorkerReadyMessage | EmbedderWorkerResponseMessage;
+export type EmbedderWorkerOutboundMessage = EmbedderWorkerReadyMessage | EmbedderWorkerResponseMessage
+  | { type: "status"; runtimeStatus: EmbedderRuntimeStatus };
 
 /**
  * 測試可注入的 worker 介面（只涵蓋 proxy 用到的部分）。
@@ -584,6 +587,28 @@ export class WorkerEmbedder implements Embedder {
     return await this.call<ProbeResult>("probe", {}, undefined);
   }
 
+  async embedAudio(audio: AudioInput, opts?: EmbedDocumentsOptions): Promise<Float32Array> {
+    const signal = opts?.signal;
+    throwIfAborted(signal);
+    if (!(audio.samples instanceof Float32Array) || audio.sampleRate !== 16000 ||
+        audio.samples.length === 0 || audio.samples.length > 480_000 ||
+        audio.samples.some((sample) => !Number.isFinite(sample) || Math.abs(sample) > 1)) {
+      throw Object.assign(new Error("音訊必須為 16 kHz、最多 30 秒的有限單聲道 PCM"), {
+        name: "EmbedderInputError", code: "undecodable",
+      });
+    }
+    return await this.enqueue<Float32Array>(false, 1, audio.samples.byteLength, signal, () => {
+      // 准入後才複製，不 detach 呼叫端的 PCM；一次片段即一個公平排程視窗。
+      const samples = new Float32Array(audio.samples);
+      return async (state) => {
+        throwIfAborted(signal);
+        const value = await this.send(state, "embedAudio", { samples, sampleRate: 16000 }, signal, [samples.buffer]);
+        throwIfAborted(signal);
+        return { done: true, value };
+      };
+    });
+  }
+
   /**
    * 等目前所有在途／已排隊的嵌入呼叫結束（**不關閉** worker）。
    *
@@ -985,6 +1010,11 @@ export class WorkerEmbedder implements Embedder {
       return;
     }
 
+    if (message.type === "status") {
+      const status = (raw as { runtimeStatus?: EmbedderRuntimeStatus }).runtimeStatus;
+      if (status !== undefined) this.setStatus(status);
+      return;
+    }
     if (message.type !== "response" || typeof message.id !== "number") return;
     const pending = this.pending.get(message.id);
     if (pending === undefined) {

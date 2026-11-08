@@ -23,6 +23,7 @@ import {
   assertMemoryQueryVector,
   cosineSimilarity,
   normalizeMemoryLimit,
+  normalizeChunkMedia,
   normalizeMemoryPatch,
   normalizeMemorySearchFilter,
   normalizeMemorySearchK,
@@ -57,7 +58,7 @@ import { runMigrations } from "./db.js";
 import { buildMatchExpression, segmentText } from "./segment.js";
 
 const ROOT_COLUMNS = "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at";
-const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash";
+const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash, media_json";
 const MEMORY_COLUMNS =
   `id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at,
    source_id, message_index, chunk_index, source_start, source_end, chunk_version`;
@@ -85,6 +86,7 @@ function rowToRoot(row: Record<string, unknown>): Root {
 }
 
 function rowToChunk(row: Record<string, unknown>): Chunk {
+  const media = normalizeChunkMedia(row.media_json == null ? undefined : JSON.parse(String(row.media_json)));
   return {
     id: Number(row.id),
     rootId: Number(row.root_id),
@@ -93,6 +95,7 @@ function rowToChunk(row: Record<string, unknown>): Chunk {
     kind: String(row.kind) as ChunkKind,
     text: row.text === null || row.text === undefined ? null : String(row.text),
     contentHash: String(row.content_hash),
+    ...(media === undefined ? {} : { media }),
   };
 }
 
@@ -473,6 +476,7 @@ export class SqliteMetadataStore implements MetadataStore {
     relPath: string,
     chunks: Omit<NewChunk, "rootId" | "relPath">[],
   ): Promise<Chunk[]> {
+    const normalized = chunks.map((item) => ({ ...item, media: normalizeChunkMedia(item.media) }));
     const replace = this.db.transaction((items: Omit<NewChunk, "rootId" | "relPath">[]): number[] => {
       const existing = selectRows(
         this.db,
@@ -489,13 +493,14 @@ export class SqliteMetadataStore implements MetadataStore {
       }
 
       const insert = this.db.prepare(
-        "insert into chunks(root_id, rel_path, seq, kind, text, content_hash) values (?, ?, ?, ?, ?, ?)",
+        "insert into chunks(root_id, rel_path, seq, kind, text, content_hash, media_json) values (?, ?, ?, ?, ?, ?, ?)",
       );
       const insertFts = this.db.prepare("insert into chunks_fts(rowid, seg) values (?, ?)");
 
       const created: number[] = [];
       for (const item of items) {
-        const info = insert.run(rootId, relPath, item.seq, item.kind, item.text, item.contentHash);
+        const info = insert.run(rootId, relPath, item.seq, item.kind, item.text, item.contentHash,
+          item.media === undefined ? null : JSON.stringify(item.media));
         const chunkId = Number(info.lastInsertRowid);
         created.push(chunkId);
         if (item.text !== null && item.text.trim().length > 0) {
@@ -505,7 +510,7 @@ export class SqliteMetadataStore implements MetadataStore {
       return created;
     });
 
-    return this.getChunks(replace(chunks));
+    return this.getChunks(replace(normalized));
   }
 
   async deleteChunksByPath(rootId: number, relPath: string): Promise<number[]> {

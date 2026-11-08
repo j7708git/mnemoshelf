@@ -9,6 +9,7 @@
 import { useCallback, useState } from "react";
 import { search, SEARCH_MODES, type ChunkSearchHit, type DirEntry, type Root, type SearchHit, type SearchMode } from "./api";
 import { FilePreview } from "./FilePreview";
+import { formatMediaTime } from "./audio";
 import { RawMemorySourceDisclosure } from "./RawMemorySourcePanel";
 import { basename, formatDateTime, MEMORY_KIND_LABEL, MEMORY_SCOPE_LABEL, memoryOriginLabel, memorySourceRoleLabel } from "./format";
 
@@ -48,7 +49,7 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
   const [mode, setMode] = useState<SearchMode>("hybrid");
   const [query, setQuery] = useState("");
   const [state, setState] = useState<SearchState>({ kind: "idle" });
-  const [selected, setSelected] = useState<{ entry: DirEntry; rootId: number } | null>(null);
+  const [selected, setSelected] = useState<{ entry: DirEntry; rootId: number; key: string; media?: ChunkSearchHit["media"] } | null>(null);
 
   const rootPath = (rootId: number): string => roots.find((root) => root.id === rootId)?.path ?? `root ${rootId}`;
 
@@ -149,10 +150,10 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
                     {hit.type === "chunk" ? (
                       <button
                         type="button"
-                        onClick={() => setSelected({ entry: entryForChunk(hit), rootId: hit.rootId })}
-                        aria-current={selected?.entry.path === hit.relPath ? "true" : undefined}
+                        onClick={() => setSelected({ entry: entryForChunk(hit), rootId: hit.rootId, key: hit.key, media: hit.media })}
+                        aria-current={selected?.key === hit.key ? "true" : undefined}
                         className={`w-full rounded-lg border px-3 py-2 text-left ${
-                          selected?.entry.path === hit.relPath ? "border-ink bg-white" : "border-line bg-white/70"
+                          selected?.key === hit.key ? "border-ink bg-white" : "border-line bg-white/70"
                         }`}
                       >
                         <div className="flex items-center justify-between gap-2">
@@ -172,6 +173,7 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
                             {hit.textTruncated ? "…" : ""}
                           </p>
                         )}
+                        {hit.media !== undefined && <p className="mt-1 text-xs text-ink">音訊片段 {formatMediaTime(hit.media.startSeconds)}–{formatMediaTime(hit.media.endSeconds)}</p>}
                         <p className="mt-1 text-[11px] text-muted">點擊在右側預覽這個檔案</p>
                       </button>
                     ) : (
@@ -219,13 +221,14 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
           <div className="h-[60vh] min-h-0 overflow-auto">
             {selected === null ? (
               <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center text-sm text-muted">
-                點選左側的檔案結果即可在這裡預覽（支援文字與圖片）。
+                點選左側的檔案結果即可在這裡預覽（支援文字、圖片與 WAV 音訊）。
               </div>
             ) : (
               <FilePreview
-                key={`${selected.rootId}:${selected.entry.path}`}
+                key={selected.key}
                 rootId={selected.rootId}
                 entry={selected.entry}
+                media={selected.media}
               />
             )}
           </div>

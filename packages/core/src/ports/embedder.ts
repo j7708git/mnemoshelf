@@ -11,6 +11,13 @@ export interface ImageInput {
   mimeType?: string;
 }
 
+/** 已解碼的單聲道音訊片段；不接受檔案位元組或路徑。 */
+export interface AudioInput {
+  /** 16 kHz PCM，值有限且介於 -1 與 1；1 至 480,000 個樣本（最多 30 秒）。 */
+  samples: Float32Array;
+  sampleRate: 16000;
+}
+
 /** embedder 的能力宣告。 */
 export interface EmbedderInfo {
   /** 穩定識別，含模型與執行環境，例如 "embeddinggemma-2@onnx-q8"。換模型或量化版就要換 id。 */
@@ -75,6 +82,10 @@ export interface EmbedderSelfTestStatus {
  * 「欄位不存在」處理。`serializedInference` 為 true 時，索引器會把檔案間併發限制為 1。
  */
 export interface EmbedderRuntimeStatus {
+  /** 音訊模型資產的就緒狀態；選配能力不等於資產已載入。 */
+  audioState?: "disabled" | "not-loaded" | "loading" | "ready" | "failed";
+  /** 音訊失敗後是否可在同一行程重試；false 表示需重新啟動，避免重複原生載入失敗。 */
+  audioRetryable?: boolean;
   /** 要求／設定的裝置選項（`auto` 表示依平台自動決定）；值由實作定義。 */
   requestedDevice: string;
   /**
@@ -156,6 +167,8 @@ export interface Embedder {
   embedDocuments(inputs: readonly DocumentInput[], opts?: EmbedDocumentsOptions): Promise<Float32Array[]>;
   /** 圖片。 */
   embedImage(image: ImageInput, opts?: EmbedDocumentsOptions): Promise<Float32Array>;
+  /** 音訊片段（選配）；audio 能力為 true 時必須提供，取消語意與圖片相同。 */
+  embedAudio?(audio: AudioInput, opts?: EmbedDocumentsOptions): Promise<Float32Array>;
   /** 啟動探測。 */
   probe(): Promise<ProbeResult>;
   dispose(): Promise<void>;

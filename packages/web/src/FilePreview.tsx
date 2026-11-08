@@ -1,25 +1,27 @@
 /**
- * 檔案預覽：文字（`GET /roots/:id/file` 的 JSON）與圖片（fetch＋blob URL）。
+ * 檔案預覽：文字 JSON、圖片與音訊（fetch＋blob URL），音訊可定位來源時間。
  *
  * 圖片一律 `fetch`＋`URL.createObjectURL`（`<img src>` 帶不了 `Authorization`），
  * 且在不再使用時 `URL.revokeObjectURL`（否則 blob 會累積）。預設顯示縮圖端點的結果，
  * 需要時可切換成原始位元組。
  */
-import { useEffect, useState } from "react";
-import { fetchImageBlobUrl, readTextPreview, type DirEntry, type TextPreviewBody } from "./api";
+import { useEffect, useState, useRef } from "react";
+import { fetchAudioBlobUrl, fetchImageBlobUrl, readTextPreview, type DirEntry, type TextPreviewBody, type ChunkSearchHit } from "./api";
 import { formatBytes } from "./format";
+import { formatMediaTime } from "./audio";
 
 /** 計算 UTF-8 位元組數用；模組層共用一個即可。 */
 const utf8Encoder = new TextEncoder();
 
 /** 檔案預覽的容器：依型別分派。`key` 由呼叫端以路徑設定，切換檔案時整個重掛載。 */
-export function FilePreview({ rootId, entry }: { rootId: number; entry: DirEntry }) {
+export function FilePreview({ rootId, entry, media }: { rootId: number; entry: DirEntry; media?: ChunkSearchHit["media"] }) {
   if (entry.kind === "text" || entry.kind === "code") {
     return <TextFilePreview rootId={rootId} entry={entry} />;
   }
   if (entry.kind === "image") {
     return <ImageFilePreview rootId={rootId} entry={entry} />;
   }
+  if (entry.kind === "audio") return <AudioFilePreview rootId={rootId} entry={entry} media={media} />;
   return (
     <div className="rounded-lg border border-line bg-white px-4 py-6 text-sm text-muted">
       <p className="font-medium text-ink">{entry.name}</p>
@@ -27,6 +29,41 @@ export function FilePreview({ rootId, entry }: { rootId: number; entry: DirEntry
       {entry.size !== null && <p className="mt-1">大小：{formatBytes(entry.size)}</p>}
     </div>
   );
+}
+
+function AudioFilePreview({ rootId, entry, media }: { rootId: number; entry: DirEntry; media?: ChunkSearchHit["media"] }) {
+  const [url, setUrl] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const player = useRef<HTMLAudioElement>(null);
+  useEffect(() => {
+    let cancelled = false;
+    let created: string | null = null;
+    setUrl(null);
+    setError(null);
+    void fetchAudioBlobUrl(rootId, entry.path).then((value) => {
+      if (cancelled) URL.revokeObjectURL(value);
+      else { created = value; setUrl(value); }
+    }).catch((reason: unknown) => {
+      if (!cancelled) setError(reason instanceof Error ? reason.message : "讀取音訊失敗");
+    });
+    return () => { cancelled = true; if (created !== null) URL.revokeObjectURL(created); };
+  }, [rootId, entry.path]);
+  const seek = (): void => {
+    if (player.current !== null && media !== undefined) player.current.currentTime = media.startSeconds;
+  };
+  return <div className="space-y-3 rounded-lg border border-line bg-white p-4">
+    <p className="break-all font-medium text-ink">{entry.path}</p>
+    {media !== undefined && <p className="text-sm text-muted">命中片段：{formatMediaTime(media.startSeconds)}–{formatMediaTime(media.endSeconds)}</p>}
+    {error !== null && <p role="alert" className="text-sm text-red-600">{error}</p>}
+    {url === null && error === null && <p className="text-sm text-muted">正在載入音訊…</p>}
+    {url !== null && <>
+      <audio ref={player} controls preload="metadata" src={url} onLoadedMetadata={seek}
+        onError={() => setError("瀏覽器無法播放這個音訊檔案。")}
+        className="w-full" aria-label={entry.name} />
+      {media !== undefined && <button type="button" onClick={seek} className="rounded border border-line px-3 py-1 text-sm">定位到命中片段</button>}
+    </>}
+    <p className="text-xs text-muted">音訊語意索引不產生逐字稿；播放的是來源檔案目前的內容。</p>
+  </div>;
 }
 
 type TextState = { kind: "loading" } | { kind: "ready"; body: TextPreviewBody } | { kind: "error"; message: string };

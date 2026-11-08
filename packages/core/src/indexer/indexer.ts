@@ -1,5 +1,8 @@
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
+import {
+  decodeWavSegments, inspectWav, DEFAULT_AUDIO_SEGMENT_SECONDS, MAX_WAV_BYTES, WAV_PREPROCESSING_VERSION, type WavInfo,
+} from "../audio/wav.js";
 import { PathBlockedError, PathOutsideRootError } from "../errors.js";
 import type { DocumentInput, Embedder, ImageInput } from "../ports/embedder.js";
 import type { MetadataStore } from "../ports/metadata-store.js";
@@ -9,10 +12,62 @@ import { maskSecrets } from "../privacy/secret-masking.js";
 import { resolveInsideRoot } from "../roots/path-guard.js";
 import { chunkCode, chunkText } from "./chunk-text.js";
 import { RootNotIndexableError } from "./errors.js";
-import { walkRoot, type ScanEntry, type ScanOptions, type SkipReason, type SkippedEntry } from "./scan.js";
+import { DEFAULT_MAX_FILE_BYTES, walkRoot, type ScanEntry, type ScanOptions, type SkipReason, type SkippedEntry } from "./scan.js";
 
 /** 每個 chunk 的輸入（rootId 與 relPath 由 replaceChunks 補上）。 */
 type ChunkInput = Omit<NewChunk, "rootId" | "relPath">;
+
+/** 把分段政策納入版本，避免只改片長卻沿用舊索引。 */
+const AUDIO_INDEX_VERSION = `${WAV_PREPROCESSING_VERSION}:${DEFAULT_AUDIO_SEGMENT_SECONDS}s:audio-pad160-v1`;
+
+interface AudioPermitWaiter {
+  grant: () => void;
+  cancel: () => void;
+}
+interface AudioPermitPool {
+  active: number;
+  waiting: AudioPermitWaiter[];
+}
+/** 共用 embedder 的所有 root 共用讀取名額；等待者尚未持有 WAV 或 PCM。 */
+const audioPermitPools = new WeakMap<Embedder, AudioPermitPool>();
+
+async function acquireAudioPermit(embedder: Embedder, signal: AbortSignal | undefined): Promise<() => void> {
+  throwIfAborted(signal);
+  let pool = audioPermitPools.get(embedder);
+  if (pool === undefined) {
+    pool = { active: 0, waiting: [] };
+    audioPermitPools.set(embedder, pool);
+  }
+  const state = pool;
+  const release = (): void => {
+    state.active--;
+    state.waiting.shift()?.grant();
+  };
+  if (state.active < 2) {
+    state.active++;
+    return release;
+  }
+  return new Promise((resolve, reject) => {
+    const waiter: AudioPermitWaiter = {
+      grant(): void {
+        signal?.removeEventListener("abort", waiter.cancel);
+        state.active++;
+        resolve(release);
+      },
+      cancel(): void {
+        const index = state.waiting.indexOf(waiter);
+        if (index < 0) return;
+        state.waiting.splice(index, 1);
+        signal?.removeEventListener("abort", waiter.cancel);
+        try { throwIfAborted(signal); }
+        catch (error) { reject(error); }
+      },
+    };
+    state.waiting.push(waiter);
+    signal?.addEventListener("abort", waiter.cancel, { once: true });
+    if (signal?.aborted) waiter.cancel();
+  });
+}
 
 /** 每次索引的進度回報。 */
 export interface IndexProgress {
@@ -204,7 +259,7 @@ export function hashBytes(bytes: Uint8Array): string {
 /**
  * 這個檔案是不是「整檔交給 embedder 解碼」的媒體檔（非文字／程式碼）？
  *
- * 媒體檔每檔固定一個 chunk，嵌入前不切塊、也不做內容層二進位偵測
+ * 媒體不做文字的內容層二進位偵測；圖片每檔一個 chunk，音訊另以時間切段
  * （圖片本來就是二進位；`looksBinary` 只服務 text／code）。
  */
 function isMediaKind(kind: ChunkKind): boolean {
@@ -373,7 +428,7 @@ function buildChunkInputs(file: ScanEntry, contentHash: string, content = ""): C
  * 對切塊結果產生向量（尚未寫入任何儲存）。
  *
  * 文字／程式碼：**每檔一次批次呼叫** `embedDocuments`（檔案內不再逐塊 await）。
- * 媒體檔每檔固定一塊，批次化沒有換到任何東西，維持單筆 `embedImage`。
+ * 圖片維持單筆 `embedImage`；音訊由 processFile 的時間片段路徑處理，不會進此圖片分支。
  * `signal` 在批次前檢查，並一路傳給 embedder（沿用 `throwIfAborted` 慣例）：
  * 中止時直接拋出，呼叫端因此不會動到 DB。
  */
@@ -405,6 +460,35 @@ interface ProcessDeps {
   embedder: Embedder;
   store: MetadataStore;
   vec: VectorIndex;
+  maxFileBytes: number;
+}
+
+/** 音訊只讀有限大小；檔案掃描後變大也不得繞過讀取上限。 */
+async function readAudioFile(abs: string, limit: number, signal: AbortSignal | undefined): Promise<Buffer> {
+  const handle = await fs.open(abs, "r");
+  try {
+    const stat = await handle.stat();
+    // 公開 core 呼叫端也可能傳 NaN；非法通用上限不能使音訊硬限制失效。
+    const maxBytes = Number.isFinite(limit) && limit > 0 ? Math.min(limit, MAX_WAV_BYTES) : DEFAULT_MAX_FILE_BYTES;
+    if (!stat.isFile() || stat.size > maxBytes) throw Object.assign(new Error("音訊超過讀取限制"), { code: "audio-limit-exceeded" });
+    const result = Buffer.alloc(stat.size + 1);
+    let offset = 0;
+    while (offset < result.length) {
+      throwIfAborted(signal);
+      const { bytesRead } = await handle.read(result, offset, Math.min(64 * 1024, result.length - offset), null);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > stat.size) throw Object.assign(new Error("讀取期間音訊大小改變"), { code: "audio-limit-exceeded" });
+    return result.subarray(0, offset);
+  } finally {
+    await handle.close();
+  }
+}
+
+function audioSkipReason(error: unknown): SkipReason | undefined {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === "unsupported-audio-format" || code === "invalid-audio" || code === "audio-limit-exceeded" ? code : undefined;
 }
 
 type FileOutcome =
@@ -498,13 +582,52 @@ async function processFile(
   hooks: ProcessHooks = {},
   onTiming?: IndexRootOptions["onTiming"],
 ): Promise<FileOutcome> {
+  const release = file.kind === "audio" ? await acquireAudioPermit(deps.embedder, signal) : undefined;
+  try {
+    throwIfAborted(signal);
+    return await processFileInSlot(root, file, deps, signal, hooks, onTiming);
+  } finally { release?.(); }
+}
+
+async function processFileInSlot(
+  root: Root,
+  file: ScanEntry,
+  deps: ProcessDeps,
+  signal: AbortSignal | undefined,
+  hooks: ProcessHooks = {},
+  onTiming?: IndexRootOptions["onTiming"],
+): Promise<FileOutcome> {
   const target = await revalidateReadPath(root, file);
-  if (!target.ok) return { status: "skipped", reason: target.reason };
+  if (!target.ok) {
+    await purgeChunks(root.id, file.relPath, deps);
+    return { status: "skipped", reason: target.reason };
+  }
 
   const readStart = performance.now();
-  const bytes = await fs.readFile(target.abs);
+  let bytes: Buffer;
+  try {
+    bytes = file.kind === "audio"
+      ? await readAudioFile(target.abs, deps.maxFileBytes, signal)
+      : await fs.readFile(target.abs);
+  } catch (error) {
+    throwIfAborted(signal);
+    const reason = audioSkipReason(error);
+    if (file.kind !== "audio" || reason === undefined) throw error;
+    await purgeChunks(root.id, file.relPath, deps);
+    return { status: "skipped", reason };
+  }
   reportTiming(onTiming, "read", readStart);
   const prepareStart = performance.now();
+  let audioInfo: WavInfo | undefined;
+  if (file.kind === "audio") {
+    try { audioInfo = inspectWav(bytes); }
+    catch (error) {
+      const reason = audioSkipReason(error);
+      if (reason === undefined) throw error;
+      await purgeChunks(root.id, file.relPath, deps);
+      return { status: "skipped", reason };
+    }
+  }
 
   // 內容層防線放在增量判斷**之前**：hash 未變的舊資料也必須被清掉。
   if (
@@ -537,7 +660,18 @@ async function processFile(
   }
 
   const existing = await deps.store.listChunksByPath(root.id, file.relPath);
-  if (existing.length > 0 && existing.every((chunk) => chunk.contentHash === contentHash)) {
+  const audioComplete = audioInfo === undefined || (
+    existing.length === Math.ceil(audioInfo.durationSeconds / DEFAULT_AUDIO_SEGMENT_SECONDS) &&
+    existing.every((chunk, index) => chunk.seq === index &&
+      chunk.media?.startSeconds === index * DEFAULT_AUDIO_SEGMENT_SECONDS &&
+      chunk.media?.endSeconds === Math.min((index + 1) * DEFAULT_AUDIO_SEGMENT_SECONDS, audioInfo!.durationSeconds))
+  );
+  if (audioComplete && existing.length > 0 && existing.every((chunk) => chunk.contentHash === contentHash && (
+    file.kind !== "audio" || (
+      chunk.kind === "audio" && chunk.media?.preprocessVersion === AUDIO_INDEX_VERSION &&
+      chunk.media.embedderId === deps.embedder.info.id && chunk.media.embeddingDim === deps.embedder.info.dim
+    )
+  ))) {
     const keys = existing.map((chunk) => `c:${chunk.id}`);
     const present = await deps.vec.existingKeys(keys);
     if (keys.every((key) => present.has(key))) {
@@ -546,16 +680,40 @@ async function processFile(
     }
   }
 
-  const inputs = buildChunkInputs(file, contentHash, content);
+  const inputs = file.kind === "audio" ? [] : buildChunkInputs(file, contentHash, content);
   reportTiming(onTiming, "prepare", prepareStart);
   hooks.onChunked?.(inputs.length);
   let vectors: Float32Array[];
   const embedStart = performance.now();
   try {
-    vectors = await embedInputs(inputs, file, bytes, deps.embedder, signal);
+    if (file.kind === "audio") {
+      hooks.onChunked?.(Math.ceil(audioInfo!.durationSeconds / DEFAULT_AUDIO_SEGMENT_SECONDS));
+      vectors = [];
+      if (!deps.embedder.info.capabilities.audio || deps.embedder.embedAudio === undefined) {
+        throw new Error("音訊嵌入能力尚未就緒");
+      }
+      for await (const segment of decodeWavSegments(bytes, { signal })) {
+        throwIfAborted(signal);
+        vectors.push(await deps.embedder.embedAudio({ samples: segment.samples, sampleRate: 16000 }, { signal }));
+        inputs.push({
+          seq: inputs.length, kind: "audio", text: null, contentHash,
+          media: {
+            startSeconds: segment.startSeconds, endSeconds: segment.endSeconds, track: "audio",
+            preprocessVersion: AUDIO_INDEX_VERSION, embedderId: deps.embedder.info.id, embeddingDim: deps.embedder.info.dim,
+          },
+        });
+      }
+    } else {
+      vectors = await embedInputs(inputs, file, bytes, deps.embedder, signal);
+    }
   } catch (error) {
     // 取消不是「檔案壞掉」：原樣拋出，讓整輪以 AbortError 結束（見 throwIfAborted）。
     throwIfAborted(signal);
+    const audioReason = file.kind === "audio" ? audioSkipReason(error) : undefined;
+    if (audioReason !== undefined) {
+      await purgeChunks(root.id, file.relPath, deps);
+      return { status: "skipped", reason: audioReason };
+    }
     if (!isMediaKind(file.kind) || !isMediaDecodeError(error)) throw error;
     // 解不開的媒體檔（HEIC／BMP／ICO、2 通道圖、0 byte 佔位檔…）**不是**處理失敗：
     // 它這輩子都索引不了，記 failed 只會讓照片庫一開就滿是失敗，而且重跑結果相同。
@@ -626,11 +784,15 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
   // 序列推論的裝置（例如 DirectML）不允許同一 session 並發 `Run`：一律單一檔案 worker。
   // 這裡是唯一的下限來源，呼叫端傳進來的 concurrency 也不得超過它。
   const serialized = embedder.runtimeStatus?.serializedInference === true;
-  const concurrency = serialized ? 1 : Math.max(1, Math.floor(options.concurrency ?? 2));
+  const requestedConcurrency = Math.max(1, Math.floor(options.concurrency ?? 2));
+  const concurrency = serialized ? 1 : root.modalities.includes("audio") ? Math.min(2, requestedConcurrency) : requestedConcurrency;
   // 限速（預設 0＝不限速、不建立 timer）：夾成非負整數，負值／NaN 一律視為 0。
   const betweenFilesMs = Math.max(0, Math.floor(options.throttle?.betweenFilesMs ?? 0));
-  // capability 宣告仍須配合真正的處理入口；尚未有 audio/video port，不能送 embedImage。
+  // 能力宣告與實際入口必須同時存在；影片尚未接通。
   const scanOptions: ScanOptions = { supportedModalities: ["text", "code", "image"] };
+  if (embedder.info.capabilities.audio && embedder.embedAudio !== undefined) {
+    scanOptions.supportedModalities = ["text", "code", "image", "audio"];
+  }
   if (options.maxFileBytes !== undefined) scanOptions.maxFileBytes = options.maxFileBytes;
   // 把 signal 一路帶進掃描層：大目錄下取消不必等整輪走訪結束（見 ScanOptions.signal）。
   if (signal !== undefined) scanOptions.signal = signal;
@@ -690,7 +852,7 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
       const file = files[index]!;
       let outcome: FileOutcome;
       try {
-        outcome = await processFile(root, file, { embedder, store, vec }, signal, {
+        outcome = await processFile(root, file, { embedder, store, vec, maxFileBytes: options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES }, signal, {
           onChunked: (chunkCount) => {
             estimatedChunks += chunkCount;
             report();

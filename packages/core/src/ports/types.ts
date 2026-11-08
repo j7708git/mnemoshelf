@@ -43,6 +43,16 @@ export interface RootPatch {
   modalities?: Modality[];
 }
 
+/** 音訊片段的來源位置與可重現的嵌入身分；時間單位為秒。 */
+export interface ChunkMedia {
+  startSeconds: number;
+  endSeconds: number;
+  track: "audio";
+  preprocessVersion: string;
+  embedderId: string;
+  embeddingDim: number;
+}
+
 /** 檔案切塊後的內容單位。 */
 export interface Chunk {
   id: number;
@@ -55,6 +65,8 @@ export interface Chunk {
   /** 非文字模態（例如圖片）為 null。 */
   text: string | null;
   contentHash: string;
+  /** 音訊片段才提供；既有文字／圖片與舊資料省略此欄。 */
+  media?: ChunkMedia;
 }
 
 /** 新增 chunk 時的輸入（id 由儲存層產生）。 */

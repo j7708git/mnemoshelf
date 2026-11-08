@@ -14,7 +14,8 @@ describe("TransformersEmbedder 建構子（不下載模型）", () => {
     const embedder = new TransformersEmbedder();
     expect(embedder.info.id).toBe("embeddinggemma-2@onnx-q4");
     expect(embedder.info.dim).toBe(DEFAULT_DIM);
-    expect(embedder.info.capabilities).toEqual({ text: true, image: true, audio: false, video: false });
+    expect(embedder.info.capabilities).toEqual({ text: true, image: true, audio: true, video: false });
+    expect(embedder.runtimeStatus.audioState).toBe("not-loaded");
   });
 
   it("dtype 會進 info.id（換量化即換 id）", () => {

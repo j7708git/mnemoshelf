@@ -178,6 +178,7 @@ export const STATIC_CSP = [
   "script-src 'self'",
   "style-src 'self'",
   "img-src 'self' blob: data:",
+  "media-src 'self' blob:",
   "connect-src 'self'",
   "base-uri 'none'",
   "form-action 'self'",
@@ -1228,6 +1229,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       exclude: root.exclude,
       respectGitignore: root.respectGitignore,
       ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
+    }, {
+      supportedModalities: ["text", "code", "image", ...(deps.embedder.info.capabilities.audio && typeof deps.embedder.embedAudio === "function" ? ["audio" as const] : [])],
     });
     // 記住這次 preview 的統計：`GET /diagnostics` 會回報「上次量到的數字」（不重新掃描磁碟）。
     lastPreviewByRoot.set(id, preview);
@@ -1336,7 +1339,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   /**
    * `GET /roots/:id/file?path=`：文字預覽（JSON）或圖片原始位元組（帶 Content-Type）。
    *
-   * 二進位與媒體檔 → 415；超過大小上限 → 413。
+   * 支援 WAV 回傳 audio/wav；其他二進位與媒體檔 → 415；超過大小上限 → 413。
    */
   const readFile = async (id: number, url: URL): Promise<RouteResult> => {
     const root = await getRootOr404(id);

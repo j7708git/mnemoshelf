@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import type {
+  AudioInput,
   DocumentInput,
   Embedder,
   EmbedderInfo,
@@ -74,6 +75,23 @@ export class FakeEmbedder implements Embedder {
     dim: FAKE_EMBEDDER_DIM,
     capabilities: { text: true, image: true, audio: false, video: false },
   };
+
+  constructor(options: { audio?: boolean } = {}) {
+    this.info.capabilities.audio = options.audio ?? false;
+  }
+
+  async embedAudio(audio: AudioInput, opts?: EmbedDocumentsOptions): Promise<Float32Array> {
+    throwIfAborted(opts?.signal);
+    if (!(audio.samples instanceof Float32Array) || audio.sampleRate !== 16000 ||
+        audio.samples.length === 0 || audio.samples.length > 480_000 ||
+        audio.samples.some((sample) => !Number.isFinite(sample) || Math.abs(sample) > 1)) {
+      throw Object.assign(new Error("音訊必須為 16 kHz、最多 30 秒的有限單聲道 PCM"), {
+        name: "EmbedderInputError", code: "undecodable",
+      });
+    }
+    const bytes = new Uint8Array(audio.samples.buffer, audio.samples.byteOffset, audio.samples.byteLength);
+    return hashToVector(createHash("sha256").update("audio:").update(bytes).digest());
+  }
 
   async embedQuery(text: string): Promise<Float32Array> {
     assertFakeInputLimit(text);

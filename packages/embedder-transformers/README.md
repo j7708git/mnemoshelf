@@ -28,7 +28,12 @@ OS 使用者資料目錄下的 `mnemoshelf/models`。
   在沒有對應 prebuild 的平台／架構上，**圖片嵌入能力會失效**。`probe()` 的圖片子項會抓到這個
   失敗（probe 回傳 `{ok:false}`）。部署前請在目標平台跑一次 `probe()` 確認。
 - 模型下載約 300 MB（q4 文字＋視覺＋tokenizer），首次使用時下載到快取目錄。
-- 音訊／影片未支援（`audio_config=null`，`capabilities` 如實宣告）。
+- `embedAudio({samples, sampleRate:16000}, {signal})` 接受已解碼 mono Float32 PCM（最多30秒），
+  回傳相同維度與向量空間。WAV解碼／切段由core處理；本套件不讀音訊檔案。影片尚未接通。
+- 音訊encoder在首次音訊呼叫才下載／載入（q4約189 MB）；`runtimeStatus.audioState`分別回報
+  尚未載入、準備中、就緒或失敗。首版音訊使用CPU，安全升級後文字／圖片共用同一CPU backend。
+  若原本使用加速器，診斷以`audio-cpu`標示政策，既有加速器決定快取不改寫。完整契約見
+  [embedder-contract](../../docs/embedder-contract.md)。
 - `dispose()` 在模型載入進行中被呼叫時，載入完成後才會實際釋放（競態視窗已知，
   單一寫入者架構下無實際影響；見 `embedder.ts` 的 doc comment）。
 

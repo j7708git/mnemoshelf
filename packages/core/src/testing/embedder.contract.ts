@@ -74,6 +74,45 @@ export function runEmbedderContract(name: string, factory: EmbedderFactory): voi
       expect(embedder.info.dim).toBe(embedder.info.dim);
     });
 
+    it("音訊能力必須有入口；片段輸出維度、有限值、正規化與確定性一致", async () => {
+      if (!embedder.info.capabilities.audio) return;
+      expect(typeof embedder.embedAudio).toBe("function");
+      const samples = Float32Array.from({ length: 16000 }, (_, i) => Math.sin(i * 0.1) * 0.25);
+      const input = { samples, sampleRate: 16000 as const };
+      const a = await embedder.embedAudio!(input);
+      const b = await embedder.embedAudio!(input);
+      expect(a.length).toBe(embedder.info.dim);
+      expect(isFiniteVector(a)).toBe(true);
+      expect(Math.abs(norm(a) - 1)).toBeLessThan(1e-3);
+      expect(cosine(a, b)).toBeGreaterThanOrEqual(0.999);
+    });
+
+    it("音訊拒絕空輸入、非有限值、錯誤取樣率與超過30秒；不靜默截短", async () => {
+      if (!embedder.info.capabilities.audio) return;
+      for (const samples of [new Float32Array(0), Float32Array.of(NaN), Float32Array.of(Infinity), new Float32Array(480001)]) {
+        await expect(embedder.embedAudio!({ samples, sampleRate: 16000 }))
+          .rejects.toMatchObject({ name: "EmbedderInputError" });
+      }
+      await expect(embedder.embedAudio!({ samples: new Float32Array(100), sampleRate: 8000 as never }))
+        .rejects.toMatchObject({ name: "EmbedderInputError" });
+    });
+
+    it("已取消音訊不回傳向量", async () => {
+      if (!embedder.info.capabilities.audio) return;
+      const controller = new AbortController();
+      controller.abort();
+      await expect(embedder.embedAudio!({ samples: new Float32Array(16000), sampleRate: 16000 }, { signal: controller.signal }))
+        .rejects.toMatchObject({ name: "AbortError" });
+    });
+
+    it("非空極短音訊尾段不得丟棄，仍產生合法向量", async () => {
+      if (!embedder.info.capabilities.audio) return;
+      const vector = await embedder.embedAudio!({ samples: Float32Array.of(0.25), sampleRate: 16000 });
+      expect(vector.length).toBe(embedder.info.dim);
+      expect(isFiniteVector(vector)).toBe(true);
+      expect(Math.abs(norm(vector) - 1)).toBeLessThan(1e-3);
+    });
+
     it("同一輸入必得同一向量（query、document、image 各自確定性）", async () => {
       const query = await embedder.embedQuery("契約測試的查詢文字");
       expect(Array.from(await embedder.embedQuery("契約測試的查詢文字"))).toEqual(Array.from(query));

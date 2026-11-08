@@ -46,10 +46,21 @@ root 記錄建立後、索引開始前先做一次乾跑（dry run），回報�
   而跳過**：索引階段會對文字／程式碼套用遮罩（見 §機密遮罩），原檔案仍會被納入、只讀不寫。
 
 使用者確認後才開始索引。索引可取消，也可限速，避免占滿 CPU。
-目前產品索引入口只接通文字、程式碼與圖片；即使 root 設定包含 `audio` 或 `video`，
-預覽與索引仍以 `unsupported-modality` 跳過，不會送進圖片模型。索引結果的 `scanSkippedFiles`
+產品索引支援文字、程式碼、圖片與受限 WAV 音訊；`audio` 需使用者手動開啟。
+影片或沒有音訊能力的 embedder 仍以 `unsupported-modality` 跳過，不會送進圖片模型。索引結果的 `scanSkippedFiles`
 記錄掃描階段跳過原因，不計入 `total`；處理階段的 `skippedFiles` 仍計入 `total`，既有對帳語意不變。
 重新索引會依既有清理規則移除未支援模態的舊索引，來源檔案保持不變。
+
+### 音訊索引與來源定位
+
+- 首版只接受 RIFF/WAVE PCM16 或 IEEE float32，單／雙聲道、8–192 kHz；MP3／FLAC、RF64、WAVE extensible 等回報未支援。副檔名符合仍須在索引時驗證內容。
+- 預設單檔 10 MiB 限制保留；音訊另有 64 MiB 解碼硬上限、600 秒時長上限與 RIFF 結構數上限，不能用提高 root 位元組設定繞過。
+- 解碼僅處理已通過 root 守衛的位元組，不啟動外部解碼程序、不追蹤外部檔案或網路參照。逐段轉成 16 kHz mono PCM，每段 10 秒，完整保留最後不足一段的音訊。模型入口每段最多 30 秒。
+- 預覽依副檔名與大小估算可納入數與片段上界，**不讀音訊內容、不保證 codec／時長有效**，也不含首次模型下載時間。處理時另回報 `unsupported-audio-format`、`invalid-audio`、`audio-limit-exceeded`。
+- 首次索引音訊才下載／載入額外音訊 encoder；檔案與解碼 PCM 不上傳。音訊模型狀態為 `not-loaded`／`loading`／`ready`／`failed`；下載預檢失敗可在重跑時重試。若本機多 session 初始化失敗，會停止本行程的音訊重試並提示重新啟動，避免上游部分 session 資源反覆累積；文字與圖片仍可重新載入使用。
+- 本版音訊使用 CPU；第一次啟用後文字／圖片也共用該 CPU backend，不把既有加速器的文字／圖片自測當成音訊加速驗證。
+- 音訊不套文字機密遮罩、不產生逐字稿。搜尋命中包含來源與時間範圍；WAV 預覽經同一授權檔案端點取得，固定上限 10 MiB，可跳到片段起點。播放使用來源檔案當下內容，檔案變更後應重新索引。
+- 取消會停止下一片段，等待當前 native 推論收尾；未完成的整個檔案留待重跑。每檔全部片段成功才進入既有寫入流程，不將部分片段標成完成。
   <!-- 2026-10-19 更新：`POST /roots/:id/index/cancel` 已實作；限速 `MNEMOSHELF_INDEX_RATE=off|normal|low`
        也已實作（`normal` 50ms、`low` 250ms，`off` 為預設），只作用於「檔案與檔案之間」，
        大檔內部的讓渡由 WorkerEmbedder 視窗排程負責。預設值與完整行為以 `docs/operations.md` 與
@@ -185,8 +196,8 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
   - `POST /roots/:id/index` 的回應（`IndexRootResult`）新增 additive `maskedFiles`：只計「內容」
     至少遮一處的檔案（媒體檔、跳過與未變更的檔案不計）。**title-only 遮罩不計入**：既有索引
     若內容未變會跳過，title 的遮罩只對本輪重新嵌入的檔案生效。
-  - 媒體檔（`image`／`audio`／`video`）**不套**文字遮罩，仍以原始位元組嵌入；`contentHash` 仍為
-    原始位元組的 sha256。
+  - 媒體檔**不套**文字遮罩；圖片送已編碼位元組，音訊送解碼後的時間片段。`contentHash` 仍為
+    原始檔案位元組的 sha256；音訊另以片段／前處理版本與 embedding 身分驗證增量完整性。
   - **既有索引需重跑該 root 的索引才會套用**；未重跑前，舊 chunk 仍可能含未遮罩內容
     （本版不自動清除舊索引，避免升級即全庫重嵌）。對受影響的 root 重跑一次索引即可。
 - **限制（誠實標示）**：這是 curated、盡力而為的防護，**不是完整 DLP**；無法保證所有憑證格式

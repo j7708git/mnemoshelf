@@ -19,6 +19,7 @@ import {
 } from "./api";
 import { DirectoryTree } from "./DirectoryTree";
 import { FilePreview } from "./FilePreview";
+import { AudioModelStatus } from "./AudioModelStatus";
 import { formatBytes } from "./format";
 
 export interface ExplorerPanelProps {
@@ -281,6 +282,8 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
           無法確認本輪索引是否啟動（上方顯示的可能是上一輪結果），請稍後再試或再按「重新索引」。
         </p>
       )}
+
+      {root.modalities.includes("audio") && <AudioModelStatus active={running} />}
 
       <div className="grid min-h-0 gap-4 lg:grid-cols-2">
         <div className="h-[60vh] min-h-0">

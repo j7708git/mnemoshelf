@@ -3,6 +3,7 @@ import { DuplicateRootError } from "../errors.js";
 import {
   MEMORY_LIST_DEFAULT_LIMIT,
   MEMORY_LIST_MAX_LIMIT,
+  normalizeChunkMedia,
   type MemoryFilter,
   type MemorySearchFilter,
   type MetadataStore,
@@ -172,6 +173,48 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       expect(removed).toEqual(chunks.map((c) => c.id));
       expect(await store.searchKeyword("鰻魚飯", {}, 5)).toHaveLength(0);
       expect(await store.getChunks(removed)).toEqual([]);
+    });
+
+    it("時間片段的媒體位置與嵌入身分會往返，舊 chunk 省略 media", async () => {
+      const root = await store.addRoot(rootInput());
+      const media = {
+        startSeconds: 10, endSeconds: 20.125, track: "audio" as const,
+        preprocessVersion: "wav-v1:10s", embedderId: "audio-test", embeddingDim: 512,
+      };
+      const chunks = await store.replaceChunks(root.id, "sample.wav", [
+        { seq: 0, kind: "audio", text: null, contentHash: "audio-hash", media },
+      ]);
+      expect(chunks[0]?.media).toEqual(media);
+      expect((await store.getChunks(chunks.map((chunk) => chunk.id)))[0]?.media).toEqual(media);
+      expect((await store.listChunksByPath(root.id, "sample.wav"))[0]?.media).toEqual(media);
+      const legacy = await store.replaceChunks(root.id, "note.txt", [
+        { seq: 0, kind: "text", text: "舊呼叫端", contentHash: "text-hash" },
+      ]);
+      expect(legacy[0]).not.toHaveProperty("media");
+      expect(normalizeChunkMedia(undefined)).toBeUndefined();
+      expect(normalizeChunkMedia(null)).toBeUndefined();
+      expect(normalizeChunkMedia(media)).toEqual(media);
+      expect(normalizeChunkMedia(media)).not.toBe(media);
+    });
+
+    it("非法媒體位置拒絕寫入且不刪除既有 chunk", async () => {
+      const root = await store.addRoot(rootInput());
+      const media = {
+        startSeconds: 0, endSeconds: 10, track: "audio" as const,
+        preprocessVersion: "wav-v1", embedderId: "audio-test", embeddingDim: 512,
+      };
+      const old = await store.replaceChunks(root.id, "sample.wav", [
+        { seq: 0, kind: "audio", text: null, contentHash: "old", media },
+      ]);
+      for (const change of [{ startSeconds: -1 }, { endSeconds: 0 }, { endSeconds: Infinity },
+        { startSeconds: NaN }, { preprocessVersion: "" }, { embedderId: "" }, { embeddingDim: 0 }]) {
+        await expect(store.replaceChunks(root.id, "sample.wav", [
+          { seq: 0, kind: "audio", text: null, contentHash: "new", media: { ...media, ...change } },
+        ])).rejects.toThrow(TypeError);
+        expect(await store.listChunksByPath(root.id, "sample.wav")).toEqual(old);
+      }
+      expect(() => normalizeChunkMedia("audio")).toThrow(TypeError);
+      expect(() => normalizeChunkMedia({ ...media, track: "video" })).toThrow(TypeError);
     });
 
     it("getChunks 依傳入順序回傳，缺漏者略過", async () => {

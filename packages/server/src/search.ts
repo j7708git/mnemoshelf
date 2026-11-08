@@ -16,6 +16,7 @@ import {
   rrfMerge,
   RRF_DEFAULT_K,
   type ChunkKind,
+  type ChunkMedia,
   type Embedder,
   type MemoryKind,
   type Memory,
@@ -58,6 +59,8 @@ export interface ChunkSearchHit {
   /** 文字片段（媒體檔為 null）；長度上限 `TEXT_SNIPPET_MAX_CHARS`。 */
   text: string | null;
   textTruncated: boolean;
+  /** 音訊片段的來源時間與產生版本；舊 chunk 省略。 */
+  media?: ChunkMedia;
 }
 
 /** 記憶命中。 */
@@ -267,6 +270,7 @@ export async function prepareUnifiedSearch(
         relPath: chunk.relPath,
         seq: chunk.seq,
         kind: chunk.kind,
+        ...(chunk.media === undefined ? {} : { media: chunk.media }),
         text: text === null ? null : text.text,
         textTruncated: text === null ? false : text.textTruncated,
       });

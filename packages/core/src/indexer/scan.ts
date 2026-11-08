@@ -26,6 +26,9 @@ export type SkipReason =
   | "excluded"
   | "modality-off"
   | "unsupported-modality"
+  | "unsupported-audio-format"
+  | "invalid-audio"
+  | "audio-limit-exceeded"
   | "too-large"
   | "unresolved-symlink"
   | "symlink-dir"
@@ -446,6 +449,11 @@ export async function walkRoot(root: ScanRoot, options: ScanOptions = {}): Promi
     }
     if (options.supportedModalities !== undefined && !options.supportedModalities.includes(kind)) {
       skipped.push({ relPath: rel, reason: "unsupported-modality" });
+      return;
+    }
+    // 音訊處理入口目前只接受 WAV；副檔名僅為第一道篩選，實際 codec 由解碼器檢查。
+    if (options.supportedModalities !== undefined && kind === "audio" && path.extname(rel).toLowerCase() !== ".wav") {
+      skipped.push({ relPath: rel, reason: "unsupported-audio-format" });
       return;
     }
     if (size > maxFileBytes) {

@@ -28,7 +28,7 @@ export interface PreviewEstimate {
   textSeconds: number;
   /** 圖片（每張一個固定成本；模型不細分像素數與檔案大小）。 */
   imageSeconds: number;
-  /** 其他媒體（音訊／影片；embedder 尚未支援，見常數註解）。 */
+  /** 音訊（依檔案大小推估的片段上界）；不是讀取音訊標頭取得的精確時長。 */
   otherSeconds: number;
   /** 三者相加，等於 `RootPreview.estimatedSeconds`。 */
   seconds: number;
@@ -75,9 +75,9 @@ const TEXT_CHUNK_SECONDS = 0.4;
  */
 const IMAGE_SECONDS = 5;
 /**
- * 其他媒體（音訊／影片）：目前的 embedder 宣告不支援（`capabilities.audio／video` 為 false），
- * 預設能力守衛會將它們列為 unsupported-modality，不計入成本。這個保守估值僅供呼叫端
- * 明確傳入 supportedModalities 的未來實作使用；取與圖片同級，不代表影音已驗收。
+ * 音訊每個十秒片段的保守估值；預覽不讀內容，不能得知精確 codec、取樣率或時長。
+ * 以首批支援的最小每秒位元組數（8kHz／PCM16／mono）估計片段數上界。
+ * 這是規模提示而非裝置效能保證；實際時長／片段數在索引解碼後才可確定。
  */
 const OTHER_MEDIA_SECONDS = IMAGE_SECONDS;
 
@@ -105,9 +105,9 @@ export async function previewRoot(input: PreviewRootInput, options: ScanOptions 
     respectGitignore: input.respectGitignore ?? true,
   };
 
-  // 目前索引器只有文字／程式碼與圖片入口；型別有影音不代表已能處理。
+  // 服務端可依實際 embedder 就緒狀態縮小集合；單獨預覽使用產品格式能力。
   const scanOptions: ScanOptions = {
-    supportedModalities: options.supportedModalities ?? ["text", "code", "image"],
+    supportedModalities: options.supportedModalities ?? ["text", "code", "image", "audio"],
     ...(options.signal === undefined ? {} : { signal: options.signal }),
   };
   if (input.maxFileBytes !== undefined) scanOptions.maxFileBytes = input.maxFileBytes;
@@ -130,6 +130,10 @@ export async function previewRoot(input: PreviewRootInput, options: ScanOptions 
       const chunks = Math.max(1, Math.ceil(file.size / ESTIMATED_BYTES_PER_CHUNK));
       estimatedChunks += chunks;
       textChunks += chunks;
+    } else if (file.kind === "audio") {
+      const segments = Math.max(1, Math.ceil(Math.min(600, file.size / 16000) / 10));
+      estimatedChunks += segments;
+      otherMediaFiles += segments;
     } else {
       estimatedChunks += 1; // 媒體檔每檔一塊
       if (file.kind === "image") imageFiles += 1;

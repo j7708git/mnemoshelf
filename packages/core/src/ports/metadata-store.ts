@@ -8,6 +8,7 @@ import type {
 } from "../memory/source.js";
 import type {
   Chunk,
+  ChunkMedia,
   Memory,
   MemoryEmbeddingState,
   MemoryKind,
@@ -21,6 +22,25 @@ import type {
   RootPatch,
   SearchFilter,
 } from "./types.js";
+
+/** 驗證並複製媒體定位資料；不存在代表舊版或非時間型 chunk。 */
+export function normalizeChunkMedia(value: unknown): ChunkMedia | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) throw new TypeError("媒體定位資料必須是物件");
+  const item = value as Record<string, unknown>;
+  if (
+    typeof item.startSeconds !== "number" || !Number.isFinite(item.startSeconds) || item.startSeconds < 0 ||
+    typeof item.endSeconds !== "number" || !Number.isFinite(item.endSeconds) || item.endSeconds <= item.startSeconds ||
+    item.track !== "audio" ||
+    typeof item.preprocessVersion !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(item.preprocessVersion) ||
+    typeof item.embedderId !== "string" || item.embedderId.trim().length === 0 || item.embedderId.length > 512 ||
+    typeof item.embeddingDim !== "number" || !Number.isInteger(item.embeddingDim) || item.embeddingDim <= 0
+  ) throw new TypeError("媒體定位資料不合法");
+  return {
+    startSeconds: item.startSeconds, endSeconds: item.endSeconds, track: "audio",
+    preprocessVersion: item.preprocessVersion, embedderId: item.embedderId, embeddingDim: item.embeddingDim,
+  };
+}
 
 /** `listMemories` 未指定 `limit` 時的預設筆數。 */
 export const MEMORY_LIST_DEFAULT_LIMIT = 100;

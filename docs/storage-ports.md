@@ -97,6 +97,48 @@ keyword 路把 vector 路原本正確的命中壓了下去（RRF 讓兩路等權
 （見 §設計規則 1）。需要固定行為的呼叫端請一律明確帶 `mode`。**記憶只進 keyword 那一路**，因此預設
 `vector` 不含記憶命中；要搜尋記憶請帶 `mode: "keyword"` 或 `"hybrid"`。
 
+## 音訊片段與增量索引
+
+`Chunk.media` 是選填的時間片段資料；既有文字、程式碼、圖片與舊版資料**省略**此欄，不補 `null`。
+目前時間片段限音訊，`Chunk.text` 為 `null`，不產生或冒充語音轉錄：
+
+```ts
+interface ChunkMedia {
+  startSeconds: number;
+  endSeconds: number;
+  track: "audio";
+  preprocessVersion: string;
+  embedderId: string;
+  embeddingDim: number;
+}
+```
+
+- 時間使用原始來源的秒數，區間為 `[startSeconds, endSeconds)`；起點必須有限且非負，終點必須有限且大於起點。
+- `preprocessVersion` 包含解碼／混音／重採樣、分段與極短輸入補零政策；目前為
+  `wav-pcm-mono16k-sinc-v1:10s:audio-pad160-v1`。模型前處理不足 160 樣本時補零到 160 樣本，
+  來源起訖時間不因補零延長，避免極短尾段被模型前處理丟失。
+  `embedderId`／`embeddingDim` 記錄向量身分。欄位在寫入前共用驗證，非法資料拒絕且不刪除既有片段。
+- SQLite 遷移 `0007_chunk_media` 新增 nullable `chunks.media_json text`；PostgreSQL 以
+  `add column if not exists` 補同欄。遷移不重建原表、不刪除舊 chunk 或向量，並可重複執行。
+- `replaceChunks`、`getChunks`、`listChunksByPath` 完整保存並回傳定位資料；向量搜尋命中的 chunk id
+  可藉此定位回來源音訊。沒有將檔名或定位資訊混入音訊內容向量。
+- 音訊的 `contentHash` 仍是原始檔案位元組 SHA-256。只有 hash、片段數／順序／完整時間覆蓋、
+  前處理版本、模型身分與維度全相同，且每個向量 key 都存在時才跳過重算。少尾段或缺向量時整檔重建。
+- 每檔所有片段嵌入成功才替換其 chunk 與向量；取消或推論失敗不發布半份索引。
+  替換仍沿用先刪舊向量、再替換 chunk、再寫新向量的自癒順序。壞格式／無效音訊／超限檔
+  則列為具名跳過並回收其舊索引；未支援的副檔名在掃描時記 `unsupported-audio-format`。
+- WAV 預設每段 10 秒；每次只準備一段 PCM，最後不足 10 秒仍保存。共用 embedder 的多個 root
+  合計最多持有 2 個音訊檔的讀取／處理名額（在讀 WAV 前取得，完整處理後釋放，等待可取消）；
+  含音訊 root 的檔案併發也最多 2；
+  序列推論裝置仍為 1。既有 10 MiB 單檔預設上限保留，解碼另限制 64 MiB 原始輸入、600 秒時長，
+  不會因調大通用檔案大小選項就移除音訊護欄。
+- 預覽只列舉而不讀內容，因此 WAV 是候選格式，實際 codec 與時長在確認索引後驗證。
+  音訊片段估值以最低支援位元率（8 kHz、PCM16、mono）推估上界、最多 60 段；
+  每段 5 秒的成本是保守規模提示，不是裝置效能保證。服務端依實際嵌入能力限制預覽模態。
+
+SQLite 與 PostgreSQL 共用兩項新增契約測試（往返與非法輸入不損資料）。SQLite 遷移已另有
+舊資料庫升級測試；PostgreSQL 必須在啟用 `MNEMOSHELF_PG=1` 的環境實跑，未啟用時不能宣稱驗收通過。
+
 ## 記憶的釘選（M3 擴充）
 
 管理面的標記：`Memory.pinned: boolean`（型別見 `ports/types.ts`）。既有資料與新增的記憶一律

@@ -17,6 +17,7 @@ import path from "node:path";
 import sharp from "sharp";
 import {
   classifyFile,
+  inspectWav,
   mimeTypeFor,
   resolveInsideRoot,
   type ChunkKind,
@@ -28,6 +29,8 @@ import { FileTooLargeError, NotFoundError, UnsupportedFileTypeError, ValidationE
 export const MAX_TEXT_PREVIEW_BYTES = 256 * 1024;
 /** 原始圖片位元組的上限（超過回 413）。 */
 export const MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+/** 音訊預覽固定上限，與預設索引大小一致。 */
+export const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
 /** 縮圖輸入檔的上限（超過回 413；避免對巨大檔解碼）。 */
 export const MAX_THUMBNAIL_INPUT_BYTES = 25 * 1024 * 1024;
 /** 縮圖的寬度上限（像素）；較小的圖不放大。 */
@@ -71,7 +74,15 @@ export interface ImageBytes {
   bytes: Buffer;
 }
 
-export type FilePreview = TextPreview | ImageBytes;
+export interface AudioBytes {
+  kind: "audio";
+  path: string;
+  size: number;
+  contentType: "audio/wav";
+  bytes: Buffer;
+}
+
+export type FilePreview = TextPreview | ImageBytes | AudioBytes;
 
 /** 縮圖結果。 */
 export interface ThumbnailResult {
@@ -241,7 +252,7 @@ async function readPrefix(abs: string, limit: number): Promise<Buffer> {
  *
  * - 圖片 → 原始位元組＋正確 Content-Type（上限 `MAX_IMAGE_BYTES`）；
  * - 文字／程式碼 → JSON（上限 `MAX_TEXT_PREVIEW_BYTES`，超過截斷並標明）；
- * - 二進位與媒體（audio／video）→ `UnsupportedFileTypeError`（415），不回傳亂碼。
+ * - 支援的 WAV → 有界原始音訊；其他二進位／媒體 → 415，不回傳亂碼。
  */
 export async function readFilePreview(root: Root, relPath: string): Promise<FilePreview> {
   const { abs, rel } = await resolveTarget(root, relPath);
@@ -249,6 +260,20 @@ export async function readFilePreview(root: Root, relPath: string): Promise<File
   if (!stats.isFile()) throw new ValidationError("path", "不是檔案");
 
   const kind = classifyFile(path.basename(abs));
+
+  if (kind === "audio" && path.extname(abs).toLowerCase() === ".wav") {
+    if (stats.size > MAX_AUDIO_BYTES) throw new FileTooLargeError(rel, MAX_AUDIO_BYTES);
+    // 讀取前重新守衛，並限制實際讀取量，避免 stat 後檔案增長。
+    const guarded = await resolveTarget(root, relPath);
+    const bytes = await readPrefix(guarded.abs, MAX_AUDIO_BYTES + 1);
+    if (bytes.length > MAX_AUDIO_BYTES) throw new FileTooLargeError(rel, MAX_AUDIO_BYTES);
+    try {
+      inspectWav(bytes);
+    } catch {
+      throw new UnsupportedFileTypeError(rel, "音訊預覽只支援有效的 PCM16／float32 WAV（單／雙聲道、最長 10 分鐘）");
+    }
+    return { kind: "audio", path: rel, size: bytes.length, contentType: "audio/wav", bytes };
+  }
 
   if (kind === "image") {
     if (stats.size > MAX_IMAGE_BYTES) throw new FileTooLargeError(rel, MAX_IMAGE_BYTES);
