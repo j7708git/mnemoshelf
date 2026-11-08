@@ -18,6 +18,35 @@ export interface AudioInput {
   sampleRate: 16000;
 }
 
+/** 已解碼的單一影格；RGB（3 通道）或 RGBA（4 通道）像素，row-major、不做 alpha 預乘。 */
+export interface VideoFrameInput {
+  /** 已解碼像素；長度必須等於 width × height × channels。 */
+  pixels: Uint8Array;
+  /** 影格寬度（像素整數）；1 至 MAX_VIDEO_FRAME_EDGE。 */
+  width: number;
+  /** 影格高度（像素整數）；1 至 MAX_VIDEO_FRAME_EDGE。 */
+  height: number;
+  /** 通道數：3＝RGB、4＝RGBA。 */
+  channels: 3 | 4;
+  /** 來源時間（秒）；有限、非負，同一片段內非遞減。模型不編碼時間，但應用要保存與驗證。 */
+  timestampSeconds: number;
+}
+
+/** 一段影片片段的已解碼影格序列（同段內所有影格的寬、高、通道數必須一致）。 */
+export interface VideoInput {
+  /** 1 至 MAX_VIDEO_FRAMES 幀；超過上限必須拒絕，不得默默抽樣。 */
+  frames: readonly VideoFrameInput[];
+}
+
+/** 每段影片的影格數上限（對齊預設模型 video_processor 的 max_frames；超過不得默默抽樣）。 */
+export const MAX_VIDEO_FRAMES = 32;
+
+/** 單一影格的邊長上限（像素）；保護前處理與記憶體，正常輸入縮放後遠小於此值。 */
+export const MAX_VIDEO_FRAME_EDGE = 2048;
+
+/** 一段影片所有影格的像素總數上限（8,388,608；RGBA 最壞 32 MiB）。 */
+export const MAX_VIDEO_PIXELS = 8_388_608;
+
 /** embedder 的能力宣告。 */
 export interface EmbedderInfo {
   /** 穩定識別，含模型與執行環境，例如 "embeddinggemma-2@onnx-q8"。換模型或量化版就要換 id。 */
@@ -86,6 +115,10 @@ export interface EmbedderRuntimeStatus {
   audioState?: "disabled" | "not-loaded" | "loading" | "ready" | "failed";
   /** 音訊失敗後是否可在同一行程重試；false 表示需重新啟動，避免重複原生載入失敗。 */
   audioRetryable?: boolean;
+  /** 影片模型資產的就緒狀態；選配能力不等於資產已載入（decoder 是否可用由解碼／索引層另行回報）。 */
+  videoState?: "disabled" | "not-loaded" | "loading" | "ready" | "failed";
+  /** 影片失敗後是否可在同一行程重試；false 表示需重新啟動後再試。 */
+  videoRetryable?: boolean;
   /** 要求／設定的裝置選項（`auto` 表示依平台自動決定）；值由實作定義。 */
   requestedDevice: string;
   /**
@@ -169,6 +202,11 @@ export interface Embedder {
   embedImage(image: ImageInput, opts?: EmbedDocumentsOptions): Promise<Float32Array>;
   /** 音訊片段（選配）；audio 能力為 true 時必須提供，取消語意與圖片相同。 */
   embedAudio?(audio: AudioInput, opts?: EmbedDocumentsOptions): Promise<Float32Array>;
+  /**
+   * 影片幀序列（選配）；video 能力為 true 時必須提供，取消語意與圖片相同。
+   * 輸入是**已解碼**的幀，不接受檔案位元組、路徑或影片容器；不加文字 prefix。
+   */
+  embedVideo?(video: VideoInput, opts?: EmbedDocumentsOptions): Promise<Float32Array>;
   /** 啟動探測。 */
   probe(): Promise<ProbeResult>;
   dispose(): Promise<void>;

@@ -23,10 +23,28 @@ import {
   type PollTrack,
   type Root,
   type RootPreview,
+  type VideoCapability,
+  type VideoPreviewEstimate,
 } from "./api";
 import { formatBytes } from "./format";
 import { toggleModality } from "./audio";
 import { AudioModelStatus } from "./AudioModelStatus";
+import {
+  DEFAULT_VIDEO_MAX_FILE_BYTES,
+  describeVideoEntries,
+  effectiveVideoMaxFileBytes,
+  formatVideoLimitBytes,
+  formatVideoLimitSeconds,
+  isVideoReason,
+  parseVideoLimitMiB,
+  videoLimitMiBDefault,
+  videoReasonLabel,
+  VIDEO_LIMIT_MAX_MIB,
+  VIDEO_LIMIT_MIN_MIB,
+  VIDEO_MAX_DURATION_SECONDS,
+  VIDEO_SEGMENT_SECONDS,
+  videoToggleState,
+} from "./media";
 
 export interface AddRootFlowProps {
   /** 使用者取消（尚未加入或加入後反悔）。 */
@@ -45,6 +63,13 @@ export interface AddRootFlowProps {
    * 用途與 `onRootCreated` 相同：讓側欄的 roots 清單（模態標示）不要顯示過期狀態。
    */
   onRootChanged?: (root: Root) => void;
+  /**
+   * 服務層影片能力（`GET /roots` 的 `video`）。
+   *
+   * 非 `available` 時「含影片」開關停用並顯示原因（不讓使用者開了才在索引時全數失敗）；
+   * `null`＝服務未回報（舊版服務），同樣停用並說明。
+   */
+  videoCapability?: VideoCapability | null;
 }
 
 type Step = "input" | "preview" | "preview-failed" | "indexing" | "cancelled" | "done" | "failed";
@@ -95,7 +120,8 @@ function skipSummary(skipped: RootPreview["skipped"]): { reason: string; count: 
   return [...counts.entries()].map(([reason, count]) => ({ reason, count }));
 }
 
-export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: AddRootFlowProps) {
+export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, videoCapability }: AddRootFlowProps) {
+  const videoToggle = videoToggleState(videoCapability ?? null);
   const [pathInput, setPathInput] = useState("");
   /**
    * 這個資料夾含照片嗎？（**預設關**：文字／程式碼照舊，照片索引較慢不要嚇到人）
@@ -104,6 +130,17 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
    */
   const [includeImages, setIncludeImages] = useState(false);
   const [includeAudio, setIncludeAudio] = useState(false);
+  /** 影片模態（**預設關**；非 `available` 時整段停用，見 `videoToggle`）。 */
+  const [includeVideo, setIncludeVideo] = useState(false);
+  /**
+   * 影片單檔大小上限（UI 輸入單位：整數 MiB；送出時換算成 bytes）。
+   *
+   * 預設沿用服務層預設（正常是 512 MiB）；**與影片模態無關**——影片未開啟也可以先設定，
+   * 值會在 root 建立時一併寫入（契約：POST /roots 的 additive `videoMaxFileBytes`）。
+   */
+  const [videoLimitMiB, setVideoLimitMiB] = useState<string>(() => videoLimitMiBDefault(videoCapability?.maxFileBytes));
+  /** 目前輸入的解析結果；不合法時阻擋送出並顯示原因（不默默截斷）。 */
+  const videoLimit = parseVideoLimitMiB(videoLimitMiB);
   const [step, setStep] = useState<Step>("input");
   const [root, setRoot] = useState<Root | null>(null);
   const [preview, setPreview] = useState<RootPreview | null>(null);
@@ -216,16 +253,52 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
     }
   };
 
+  /**
+   * 切換已加入 root 的影片模態（`PATCH /roots/:id`），成功後重跑預覽。
+   *
+   * 只在 capability 可用時才會被呼叫（開關本身已停用）；失敗時顯示錯誤並重跑預覽還原。
+   */
+  const setVideoEnabled = async (enabled: boolean): Promise<void> => {
+    if (root === null || busy || !videoToggle.enabled) return;
+    setIncludeVideo(enabled);
+    setBusy(true);
+    setError(null);
+    try {
+      const updated = await updateRootModalities(root.id, toggleModality(root.modalities, "video", enabled));
+      setRoot(updated);
+      onRootChangedRef.current?.(updated);
+      await loadPreview(updated);
+    } catch (patchError) {
+      setIncludeVideo(!enabled);
+      setError(patchError instanceof Error ? patchError.message : "更新影片設定失敗");
+      setBusy(false);
+    }
+  };
+
   const submitPath = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     const target = pathInput.trim();
     if (target === "") return;
+    // 影片上限是合法的正整數 MiB 才送出；錯誤在欄位下方顯示，不默默改成預設值。
+    if (!videoLimit.ok) {
+      setError(videoLimit.message);
+      return;
+    }
     setError(null);
     setBusy(true);
     let created: Root | null = null;
     try {
       // 勾了「含圖片」才帶 image 模態；沒勾與 v0.1.2 完全相同（服務端預設 text／code）。
-      created = await addRoot({ path: target, modalities: toggleModality(modalitiesForImages(includeImages), "audio", includeAudio) });
+      created = await addRoot({
+        path: target,
+        modalities: toggleModality(
+          toggleModality(modalitiesForImages(includeImages), "audio", includeAudio),
+          "video",
+          includeVideo && videoToggle.enabled,
+        ),
+        // 一律明帶這個 root 的上限（bytes）；範圍與換算已在 UI 端驗證。
+        videoMaxFileBytes: videoLimit.bytes,
+      });
     } catch (submitError) {
       setError(submitError instanceof Error ? submitError.message : "加入資料夾失敗");
     }
@@ -423,6 +496,43 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
           </p>
           <ImagesToggle checked={includeImages} onChange={setIncludeImages} />
           <AudioToggle checked={includeAudio} disabled={busy} onChange={setIncludeAudio} />
+          <VideoToggle
+            checked={includeVideo}
+            disabled={busy || !videoToggle.enabled}
+            state={videoToggle}
+            onChange={setIncludeVideo}
+          />
+          <div className="space-y-1">
+            <label htmlFor="add-root-video-limit" className="block text-sm font-medium text-ink">
+              影片單檔大小上限（MiB）
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                id="add-root-video-limit"
+                type="number"
+                min={VIDEO_LIMIT_MIN_MIB}
+                max={VIDEO_LIMIT_MAX_MIB}
+                step={1}
+                inputMode="numeric"
+                value={videoLimitMiB}
+                disabled={busy}
+                aria-invalid={!videoLimit.ok}
+                aria-describedby="add-root-video-limit-hint"
+                onChange={(event) => setVideoLimitMiB(event.target.value)}
+                className="w-32 rounded-md border border-line bg-white px-3 py-2 text-sm text-ink outline-none focus:border-ink disabled:opacity-40"
+              />
+              <span className="text-sm text-muted">MiB</span>
+            </div>
+            <p id="add-root-video-limit-hint" className="text-xs text-muted">
+              預設 512 MiB（目前服務預設：{formatVideoLimitBytes(videoCapability?.maxFileBytes ?? DEFAULT_VIDEO_MAX_FILE_BYTES)}）。
+              只套用影片；影片未開啟也可以先設定，上限 16 GiB。超過這個大小的影片會具名跳過。
+            </p>
+            {!videoLimit.ok && (
+              <p role="alert" className="text-xs text-red-600">
+                {videoLimit.message}
+              </p>
+            )}
+          </div>
           {error !== null && (
             <p role="alert" className="text-sm text-red-600">
               {error}
@@ -448,6 +558,17 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
             onChange={(next) => void setImagesEnabled(next)}
           />
           <AudioToggle checked={includeAudio} disabled={busy} onChange={(next) => void setAudioEnabled(next)} />
+          <VideoToggle
+            checked={includeVideo}
+            disabled={busy || !videoToggle.enabled}
+            state={videoToggle}
+            onChange={(next) => void setVideoEnabled(next)}
+          />
+          <p className="text-xs text-muted">
+            影片單檔上限：{formatVideoLimitBytes(effectiveVideoMaxFileBytes(root, videoCapability?.maxFileBytes))}
+            {root.videoMaxFileBytes == null ? "（服務預設）" : ""}
+            ；加入後可在左側資料夾清單修改（只套用影片，不需要重新索引既有文字／圖片）。
+          </p>
 
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
             <Stat label="檔案數" value={String(preview.totalFiles)} />
@@ -462,6 +583,23 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
               {preview.estimated.otherSeconds > 0 ? `、其他媒體 ${preview.estimated.otherSeconds} 秒` : ""}。
               單張照片約數秒；沒勾「含照片」時圖片會列在下面的「未開啟的模態」被跳過。
               {includeAudio && " 音訊依檔案大小估算片段上界，尚未讀取實際時長；不含首次模型下載時間。"}
+              {preview.video !== null && preview.video !== undefined && preview.video.files > 0 &&
+                " 影片的時長與段數在預覽階段未知，不計入上面的估時（見下方影片區塊）。"}
+            </p>
+          )}
+
+          {preview.video !== null && preview.video !== undefined && preview.video.files > 0 && (
+            <VideoCandidates
+              video={preview.video}
+              skipped={preview.skipped}
+              durationLimitSeconds={videoCapability?.durationLimitSeconds ?? VIDEO_MAX_DURATION_SECONDS}
+              maxFileBytes={effectiveVideoMaxFileBytes(root, videoCapability?.maxFileBytes)}
+            />
+          )}
+
+          {!includeVideo && preview.skipped.some((item) => item.reason === "modality-off") && (
+            <p className="text-xs text-muted">
+              影片（與其他未開啟的模態）目前不列入候選；若這個資料夾含 .mp4，勾選「含影片」後會重新預覽候選數。
             </p>
           )}
 
@@ -485,7 +623,9 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
               <ul className="mt-1 space-y-1 text-sm text-muted">
                 {skipSummary(preview.skipped).map((item) => (
                   <li key={item.reason}>
-                    {SKIP_REASON_LABEL[item.reason] ?? item.reason}：{item.count} 個
+                    {isVideoReason(item.reason)
+                      ? videoReasonLabel(item.reason)
+                      : (SKIP_REASON_LABEL[item.reason] ?? item.reason)}：{item.count} 個
                   </li>
                 ))}
               </ul>
@@ -594,6 +734,11 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged }: 
         <div className="space-y-2">
           <p className="text-sm text-ink">索引完成，目錄樹已可使用。</p>
           {includeAudio && <AudioModelStatus />}
+          {status?.state === "completed" && status.result !== null && describeVideoEntries(status.result.failedFiles) !== "" && (
+            <p className="text-xs text-amber-700">
+              部分影片處理失敗（其餘檔案已完成）：{describeVideoEntries(status.result.failedFiles)}。
+            </p>
+          )}
         </div>
       )}
 
@@ -648,6 +793,83 @@ function AudioToggle({ checked, disabled, onChange }: {
         <span className="mt-0.5 block text-xs text-muted">支援 WAV（PCM16／float32、單／雙聲道），預設單檔最多 10 MiB、最長 10 分鐘。首次索引需下載音訊模型；檔案內容只在本機處理。預覽依檔名與大小統計，格式與時長於索引時確認。</span>
       </span>
     </label>
+  );
+}
+
+/**
+ * 「這個資料夾含影片，一起索引」開關（加入前與預覽頁共用）。
+ *
+ * 服務層影片能力不可用時停用並顯示原因（decoder 缺失／損毀／embedder 不支援），
+ * 不讓使用者開了之後才發現索引時全數失敗。預設關閉。
+ */
+function VideoToggle({ checked, disabled, state, onChange }: {
+  checked: boolean;
+  disabled?: boolean;
+  state: { enabled: boolean; reason: string | null; summary: string };
+  onChange: (next: boolean) => void;
+}) {
+  return (
+    <label className="flex items-start gap-2 text-sm text-ink">
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled ?? !state.enabled}
+        onChange={(event) => onChange(event.target.checked)}
+        className="mt-0.5"
+      />
+      <span>
+        這個資料夾含影片（.mp4），一起索引
+        <span className="mt-0.5 block text-xs text-muted">
+          每 {VIDEO_SEGMENT_SECONDS} 秒抽 1 幀（短暫畫面可能被略過）；預覽不讀媒體，時長與段數待確認。
+          同時開啟「含音訊」才會索引影片的選定 AAC 音軌。{state.summary}
+          {state.reason !== null ? `（${state.reason}）` : ""}
+        </span>
+      </span>
+    </label>
+  );
+}
+
+/**
+ * 預覽頁的影片候選區塊：候選檔數、時長待確認、抽樣限制、上限與上界段數、影片 skip 原因。
+ *
+ * 所有數字都標明是**上界**；不把「壓縮大小 ÷ 位元率」之類的推算畫成時長。
+ */
+function VideoCandidates({ video, skipped, durationLimitSeconds, maxFileBytes }: {
+  video: VideoPreviewEstimate;
+  skipped: RootPreview["skipped"];
+  durationLimitSeconds: number;
+  maxFileBytes: number;
+}) {
+  const videoSkipped = skipSummary(skipped.filter((item) => isVideoReason(item.reason)));
+  return (
+    <div className="space-y-1 rounded-md border border-line bg-surface px-3 py-2 text-xs text-muted">
+      <p className="text-sm font-medium text-ink">影片候選：{video.files} 支</p>
+      <p>時長待確認：預覽只列舉與估算，不讀取媒體、不啟動 probe，也不由壓縮大小換算秒數。</p>
+      <p>
+        抽樣限制：每 {VIDEO_SEGMENT_SECONDS} 秒一段、每段 1 幀（約 0.25 fps）；短暫事件可能被抽樣略過，
+        命中時間代表片段時間。
+      </p>
+      <p>
+        上限：時長 {formatVideoLimitSeconds(durationLimitSeconds)} 秒、單檔 {formatVideoLimitBytes(maxFileBytes)}；
+        超過的檔案會具名跳過，不會索引部分內容。
+      </p>
+      <p>
+        索引段數上界：{video.estimatedSegmentCountMax} 段（每檔畫面最多 {video.visualSegmentsPerFileMax} 段
+        {video.includesAudioTrack ? `、音軌最多 ${video.audioSegmentsPerFileMax} 段` : ""}）；
+        索引時間上界約 {video.estimatedSecondsMax} 秒。這些都是上界，不是實際值。
+      </p>
+      <p>
+        音軌：{video.includesAudioTrack
+          ? "已計入影片的選定 AAC 音軌（每 10 秒一段）；只有選定音軌缺失或不支援時整檔具名跳過。"
+          : "未計入影片音軌（需同時勾選「含音訊」；只有音訊開關不會讀取影片）。"}
+      </p>
+      {videoSkipped.length > 0 && (
+        <p>
+          因影片限制被跳過：
+          {videoSkipped.map((item) => `${videoReasonLabel(item.reason)} ${item.count} 個`).join("、")}。
+        </p>
+      )}
+    </div>
   );
 }
 

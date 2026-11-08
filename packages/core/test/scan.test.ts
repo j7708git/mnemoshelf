@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { classifyFile, isJunkFile, matchesAnyGlob, matchesGlob, mimeTypeFor, walkRoot, type ScanRoot } from "../src/index.js";
+// 新增的影片常數／helper 尚未從公開入口 export（本輪禁改 index.ts，PM 之後統一 export）。
+import { isSupportedVideoFileName } from "../src/indexer/scan.js";
 
 function baseRoot(overrides: Partial<ScanRoot> = {}): ScanRoot {
   return {
@@ -281,5 +283,77 @@ describe("walkRoot", () => {
     });
     // 取消不會有副作用：再跑一次完整走訪仍得到全部檔案。
     expect((await walkRoot(baseRoot({ path: big }))).files).toHaveLength(50);
+  });
+});
+
+describe("walkRoot：影片 v1（mp4 白名單與大小上限）", () => {
+  let base = "";
+  let videoRoot = "";
+
+  beforeAll(async () => {
+    base = await fs.mkdtemp(path.join(os.tmpdir(), "mnemoshelf-scan-video-"));
+    videoRoot = path.join(base, "root");
+    await fs.mkdir(videoRoot, { recursive: true });
+    await fs.writeFile(path.join(videoRoot, "clip.mp4"), Buffer.alloc(100, 1));
+    await fs.writeFile(path.join(videoRoot, "movie.mov"), Buffer.alloc(100, 2));
+    await fs.writeFile(path.join(videoRoot, "big.mp4"), Buffer.alloc(2000, 3));
+    await fs.writeFile(path.join(videoRoot, "notes.md"), "# 一般文字");
+  });
+
+  afterAll(async () => {
+    await fs.rm(base, { recursive: true, force: true });
+  });
+
+  it("呼叫端未宣告支援 video 時，沿用既有 unsupported-modality（產品行為不變）", async () => {
+    const result = await walkRoot(
+      baseRoot({ path: videoRoot, modalities: ["text", "video"] }),
+      { supportedModalities: ["text", "code", "image", "audio"] },
+    );
+    expect(rels(result.files)).toEqual(["notes.md"]);
+    expect(result.skipped).toContainEqual({ relPath: "clip.mp4", reason: "unsupported-modality" });
+    expect(result.skipped).toContainEqual({ relPath: "movie.mov", reason: "unsupported-modality" });
+  });
+
+  it("宣告支援 video 後，只納入 v1 白名單 `.mp4`；其他容器記 unsupported-video-format", async () => {
+    const result = await walkRoot(
+      baseRoot({ path: videoRoot, modalities: ["text", "video"] }),
+      { supportedModalities: ["text", "code", "image", "audio", "video"], videoMaxFileBytes: 1_000_000 },
+    );
+    // `.mp4` 大小寫不敏感（副檔名一律小寫比對）。
+    expect(rels(result.files)).toEqual(["big.mp4", "clip.mp4", "notes.md"]);
+    expect(result.files.find((file) => file.relPath === "clip.mp4")?.kind).toBe("video");
+    expect(result.skipped).toContainEqual({ relPath: "movie.mov", reason: "unsupported-video-format" });
+  });
+
+  it("影片套用 videoMaxFileBytes；通用 maxFileBytes 不套用影片", async () => {
+    // 通用上限調到很小：只影響非影片檔案，100 bytes 的 mp4 仍納入。
+    const genericTiny = await walkRoot(
+      baseRoot({ path: videoRoot, modalities: ["text", "video"] }),
+      { supportedModalities: ["text", "video"], maxFileBytes: 10, videoMaxFileBytes: 1_000_000 },
+    );
+    expect(rels(genericTiny.files)).toEqual(["big.mp4", "clip.mp4"]);
+    expect(genericTiny.skipped).toContainEqual({ relPath: "notes.md", reason: "too-large" });
+
+    // 影片專屬上限：超過者記 video-too-large（預覽看得到，才能提示調整上限）。
+    const limited = await walkRoot(
+      baseRoot({ path: videoRoot, modalities: ["text", "video"] }),
+      { supportedModalities: ["text", "video"], videoMaxFileBytes: 1000 },
+    );
+    expect(rels(limited.files)).toEqual(["clip.mp4", "notes.md"]);
+    expect(limited.skipped).toContainEqual({ relPath: "big.mp4", reason: "video-too-large" });
+  });
+
+  it("未提供 supportedModalities 的純列舉：影片仍套 videoMaxFileBytes、不做容器白名單", async () => {
+    const result = await walkRoot(baseRoot({ path: videoRoot, modalities: ["text", "video"] }), { videoMaxFileBytes: 1000 });
+    expect(rels(result.files)).toEqual(["clip.mp4", "movie.mov", "notes.md"]);
+    expect(result.skipped).toContainEqual({ relPath: "big.mp4", reason: "video-too-large" });
+  });
+
+  it("isSupportedVideoFileName 只認 v1 容器副檔名（大小寫不敏感）", () => {
+    expect(isSupportedVideoFileName("clip.mp4")).toBe(true);
+    expect(isSupportedVideoFileName("CLIP.MP4")).toBe(true);
+    expect(isSupportedVideoFileName("movie.mov")).toBe(false);
+    expect(isSupportedVideoFileName("clip.mp4.txt")).toBe(false);
+    expect(isSupportedVideoFileName("noext")).toBe(false);
   });
 });

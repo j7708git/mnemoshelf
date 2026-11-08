@@ -14,8 +14,17 @@ describe("TransformersEmbedder 建構子（不下載模型）", () => {
     const embedder = new TransformersEmbedder();
     expect(embedder.info.id).toBe("embeddinggemma-2@onnx-q4");
     expect(embedder.info.dim).toBe(DEFAULT_DIM);
-    expect(embedder.info.capabilities).toEqual({ text: true, image: true, audio: true, video: false });
+    // video 只對已知模型白名單宣告 true（保守宣告；見 VIDEO_CAPABLE_MODEL_IDS）。
+    expect(embedder.info.capabilities).toEqual({ text: true, image: true, audio: true, video: true });
     expect(embedder.runtimeStatus.audioState).toBe("not-loaded");
+    expect(embedder.runtimeStatus.videoState).toBe("not-loaded");
+  });
+
+  it("自訂 modelId 保守宣告 video=false、videoState=disabled（可呼叫但具名失敗）", () => {
+    const embedder = new TransformersEmbedder({ modelId: "org/some-other-model" });
+    expect(embedder.info.capabilities.video).toBe(false);
+    expect(embedder.runtimeStatus.videoState).toBe("disabled");
+    expect(embedder.runtimeStatus.videoRetryable).toBeUndefined();
   });
 
   it("dtype 會進 info.id（換量化即換 id）", () => {

@@ -29,3 +29,7 @@ mac_report/
 
 # 一次性探測殘檔（例如端點探測回來的錯誤回應本體），不進版控
 probe-model.json
+
+# staging 原子替換的暫存／備份目錄（強殺或斷電時可能殘留；內含 FFmpeg binary，禁止進版控）
+packages/desktop/media-bin.staging-*/
+packages/desktop/media-bin.old-*/

@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "description": "FFmpeg／ffprobe staging 的凍結候選（C3 打包管線）。只放版本、大小與 SHA256，不含本機路徑；由 scripts/stage-media-bin.mjs 讀取比對。配送版本（static／shared／最小自建）與授權仍待使用者決定，變更此檔的雜湊等於變更配送候選，須經 PM 決定。",
+  "license": {
+    "spdx": "LGPL-3.0-or-later",
+    "fileNames": [
+      "LICENSE.txt",
+      "LICENSE",
+      "COPYING.LGPLv3",
+      "COPYING.LESSER"
+    ],
+    "licenseTextMarkers": [
+      "GNU LESSER GENERAL PUBLIC LICENSE",
+      "Version 3, 29 June 2007"
+    ]
+  },
+  "source": {
+    "kind": "third-party-prebuilt",
+    "provider": "BtbN FFmpeg-Builds",
+    "releaseTag": "autobuild-2026-11-07-12-47",
+    "asset": "ffmpeg-n9.0.2-48-gd4070a14ce-win64-lgpl-9.0.zip",
+    "assetSha256": "7a347fb3220968b63fc7e025ed78370588726e0d0bf2bd0445d3f8f2387c36db",
+    "build": "static、LGPL-only（--enable-version3；無 --enable-gpl／--enable-nonfree；libx264／libx265／libxvid／fdk-aac 皆 disabled）",
+    "verifiedBy": "A1 spike：project-notes projects/mnemoshelf/research/2026-11-08-video-decoder.md §2.2–2.4；raw manifest 在 code .tmp/video-a/decoder/manifest.json"
+  },
+  "targets": {
+    "win32-x64": {
+      "binaries": {
+        "ffmpeg": {
+          "fileName": "ffmpeg.exe",
+          "bytes": 132290560,
+          "sha256": "71ac0a64a4e3e0caaf7a8c25c7e73d161ac1b269cca930d207e89e1b23959dfb",
+          "versionLinePrefix": "ffmpeg version n9.0.2-48-gd4070a14ce-20261107"
+        },
+        "ffprobe": {
+          "fileName": "ffprobe.exe",
+          "bytes": 132089856,
+          "sha256": "88abaa76c626db34a48795dc42f987e991df426913720ef15a7053063b3c22b4",
+          "versionLinePrefix": "ffprobe version n9.0.2-48-gd4070a14ce-20261107"
+        }
+      }
+    }
+  }
+}

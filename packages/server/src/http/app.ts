@@ -11,8 +11,10 @@
  * - `POST /roots/:id/preview`、`POST /roots/:id/index`、`POST /roots/:id/index/cancel`
  * - `GET  /roots/:id/entries?path=`（目錄子項）、`GET /roots/:id/file?path=`（文字預覽／圖片位元組）、
  *   `GET /roots/:id/thumb?path=`（縮圖）、`GET /roots/:id/index/status`（索引进度輪詢）
+ * - `GET|HEAD /roots/:id/media?path=`（影片播放：受 token／root 守衛的單一 Range；206／416、
+ *   單次上限 4 MiB、串流不快取；見 `media.ts`）
  * - `GET  /diagnostics`（除錯資訊匯出：版本、平台、embedder（含執行裝置與退回原因）、每 root 統計、
- *   記憶語意化狀態與背景 worker 統計；家目錄前綴遮罩成 `~`）
+ *   影片能力與解碼器狀態、記憶語意化狀態與背景 worker 統計；家目錄前綴遮罩成 `~`）
  * - `POST /search`（`query` 超過模型單筆輸入上限時 → `400 InputTooLongError`，見 `toHttpError`）
  * - `POST /memories`（精確去重：重複回 200＋`duplicate: true`，新增回 201 並 enqueue 背景嵌入）、
  *   `GET /memories`、`PATCH /memories/:id`、`POST /memories/:id/pin`、
@@ -44,6 +46,8 @@ import {
   assertRootAllowed,
   blockedReason,
   DEFAULT_PREVIEW_MODALITIES,
+  DEFAULT_VIDEO_MAX_FILE_BYTES,
+  type DecoderAvailability,
   DuplicateRootError,
   indexRoot,
   isBlocked,
@@ -57,6 +61,7 @@ import {
   type MemoryPolicy,
   MemorySourceConflictError,
   memorySourceEventHash,
+  type MediaDecoder,
   type MemoryScope,
   type MetadataStore,
   type Modality,
@@ -67,6 +72,7 @@ import {
   previewRoot,
   type Root,
   RootNotIndexableError,
+  type RootPatch,
   RootTooBroadError,
   type Embedder,
   type EmbedderInfo,
@@ -74,6 +80,7 @@ import {
   type VectorIndex,
   type RootMode,
   type RootPreview,
+  VIDEO_MAX_DURATION_SECONDS,
 } from "@mnemoshelf/core";
 import { LOOPBACK_HOST } from "../config.js";
 import type { EmbedderSchedulingStatus } from "../worker-embedder.js";
@@ -103,6 +110,7 @@ import {
   type TextPreview,
 } from "./explorer.js";
 import { requireLocalHost, requireLoopback, requireToken } from "./auth.js";
+import { buildMediaResponse, sendStreamResult, type StreamRouteResult } from "./media.js";
 import { prepareUnifiedSearch, type SearchMode } from "../search.js";
 import type { MemoryEmbeddingWorker } from "../memory-embedder.js";
 import { maskSecrets } from "../secret-masking.js";
@@ -165,6 +173,38 @@ export { MAX_MEMORY_CHARS, MAX_MEMORY_METADATA_CHARS } from "../memory-export.js
 const MODALITIES: readonly Modality[] = ["text", "code", "image", "audio", "video"];
 
 /**
+ * 與影片有關的 skip／failed 原因（診斷只計這些，不把文字／音訊的原因混進影片統計）。
+ *
+ * 清單對齊 core：掃描階段兩個（`unsupported-video-format`／`video-too-large`）、
+ * 處理階段六個（時長／解析度／無影像流／壞檔／codec／音軌），以及 decoder 環境錯誤。
+ */
+/**
+ * per-root 影片單檔大小上限的值域（bytes）；與 core `ports/metadata-store.ts` 的
+ * `normalizeRootVideoMaxFileBytes` 同值。
+ *
+ * 為什麼這裡也有一份：core 的驗證器目前還沒從 `@mnemoshelf/core` 公開 export（PM 統一
+ * export）；server 先擋是為了讓非法值回 `400 ValidationError` 而不是 store 的 `TypeError`
+ * 變成 500。PM export 後應改 import 單一來源（見 notes 遺留項）。
+ */
+const VIDEO_MAX_FILE_BYTES_MIN = 1;
+const VIDEO_MAX_FILE_BYTES_MAX = 16 * 1024 * 1024 * 1024;
+
+const VIDEO_INDEX_REASONS: ReadonlySet<string> = new Set([
+  "unsupported-video-format",
+  "video-too-large",
+  "video-duration-exceeded",
+  "video-resolution-exceeded",
+  "video-no-stream",
+  "invalid-video",
+  "unsupported-video-codec",
+  "unsupported-video-audio-track",
+  "video-decoder-unavailable",
+  "video-decode-timeout",
+  "video-decode-cancelled",
+  "video-not-found",
+]);
+
+/**
  * API 的第一段路徑前綴。
  *
  * 只有這些前綴會進 API 路由（要 token）；其餘路徑才可能由靜態檔／SPA fallback 服務。
@@ -223,11 +263,24 @@ export interface AddRootRequest {
   respectGitignore?: boolean;
   /** 單檔大小上限；`Root` 契約沒有此欄位，因此只存在行程內，重啟後回退預設 10 MB（見 docs/operations.md）。 */
   maxFileBytes?: number;
+  /**
+   * 影片單檔大小上限（bytes；**per-root 持久化**，寫入 `Root.videoMaxFileBytes`）。
+   *
+   * - 未提供或 `null`＝未設定（沿用行程層 `MNEMOSHELF_VIDEO_MAX_FILE_BYTES`，再退回 512 MiB）；
+   * - 有值必須是 1–16 GiB 的整數，否則 `400 ValidationError`。
+   */
+  videoMaxFileBytes?: number | null;
 }
 
-/** `PATCH /roots/:id` 的請求主體（目前只有 `modalities` 可改；見 `RootPatch`）。 */
+/**
+ * `PATCH /roots/:id` 的請求主體（見 `RootPatch`）。
+ *
+ * `modalities` 與 `videoMaxFileBytes` 至少要提供一項；未提供的欄位＝不變。
+ */
 export interface PatchRootRequest {
   modalities?: Modality[];
+  /** 影片單檔大小上限（bytes）；`null`＝清除設定（回行程層預設）、未提供＝不改。 */
+  videoMaxFileBytes?: number | null;
 }
 
 /** `DELETE /roots/:id` 的回應。 */
@@ -366,6 +419,83 @@ export interface DiagnosticsIndexSummary {
   failedByReason: Record<string, number>;
 }
 
+/**
+ * 影片能力不可用的固定原因碼。
+ *
+ * - `missing-ffmpeg`／`missing-ffprobe`：binary 不存在（decoder 已設定但檔案不在）；
+ * - `ffmpeg-failed`／`ffprobe-failed`：binary 損毀、不可執行或 `-version` 失敗；
+ * - `embedder-video-unsupported`：解碼器可用，但 embedder 沒有宣告／提供影片入口。
+ *
+ * 刻意不含路徑與 stderr：這是給 UI 顯示「為什麼影片不能用」的穩定標籤。
+ */
+export type VideoCapabilityReason =
+  | "missing-ffmpeg"
+  | "missing-ffprobe"
+  | "ffmpeg-failed"
+  | "ffprobe-failed"
+  | "embedder-video-unsupported";
+
+/**
+ * 影片能力的對外摘要（additive；`GET /roots`、preview 與 `/diagnostics` 共用同一個形狀）。
+ *
+ * 為什麼要三態：`supportedModalities` 只是掃描層的內部選項，客戶端看不到；若只憑
+ * 「preview 沒有列出影片候選」無法區分「使用者沒開／伺服器沒裝 decoder」與「裝了但壞掉」。
+ * UI（C2）可據此先停用影片開關並顯示原因，而不是讓使用者開了才在索引時失敗。
+ */
+export interface VideoCapability {
+  /** 服務是否已把影片接進預覽／索引（decoder 已設定＋可用＋embedder 具備影片入口）。 */
+  available: boolean;
+  /**
+   * 三態：
+   * - `disabled`：沒有設定 decoder（產品預設；影片模態會以 `unsupported-modality` 跳過）；
+   * - `unavailable`：decoder 已設定但不可用（或 embedder 不支援影片）；索引時影片檔會以
+   *   `video-decoder-unavailable` 等具名原因失敗，不是靜默跳過；
+   * - `available`：可預覽、索引與播放。
+   */
+  state: "disabled" | "unavailable" | "available";
+  /** `unavailable` 時的固定原因碼；`available`／`disabled` 為 `null`。 */
+  reason: VideoCapabilityReason | null;
+  /** embedder 是否宣告並提供影片入口（模型能力；與 decoder 可用性分開）。 */
+  embedderVideo: boolean;
+  /**
+   * 影片單檔大小上限的**服務層預設**（bytes）；個別 root 可用 `Root.videoMaxFileBytes`
+   * 覆寫。實際生效值＝`root.videoMaxFileBytes ?? maxFileBytes`。
+   */
+  maxFileBytes: number;
+  /** 影片時長上限（秒；由解碼器強制，固定 600）。 */
+  durationLimitSeconds: number;
+  /** decoder 版本（可用時；不含路徑）。 */
+  ffmpegVersion: string | null;
+  ffprobeVersion: string | null;
+}
+
+/**
+ * 本行程的影片索引統計（不含任何路徑／檔名）。
+ *
+ * 來源是**最近一輪**索引結果與最近一次 preview（行程內記憶體；重啟歸零）；
+ * 與 `roots[].stats` 的通用統計分開，因為影片的原因碼需要單獨對帳
+ * （例如 `video-too-large` 是掃描階段、`video-decoder-unavailable` 是處理階段）。
+ */
+export interface DiagnosticsVideoIndexing {
+  /** 本行程「root 宣告 video 且服務已接通」並跑完的索引輪數。 */
+  runs: number;
+  /** 最近一輪完成的時間（ISO 8601）；從未跑過為 `null`。 */
+  lastFinishedAt: string | null;
+  /** 最近一輪掃描階段跳過的影片原因（例如 `video-too-large`）。 */
+  scanSkippedByReason: Record<string, number>;
+  /** 最近一輪處理階段跳過的影片原因（例如 `invalid-video`）。 */
+  skippedByReason: Record<string, number>;
+  /** 最近一輪失敗的影片原因（例如 `video-decoder-unavailable`）。 */
+  failedByReason: Record<string, number>;
+  /** 最近一次 preview 看到的影片候選檔數（跨 root 加總）；從未 preview 過為 `null`。 */
+  previewCandidateFiles: number | null;
+}
+
+/** `GET /diagnostics` 的影片區塊：能力摘要＋解碼器狀態＋索引統計。 */
+export interface DiagnosticsVideo extends VideoCapability {
+  indexing: DiagnosticsVideoIndexing;
+}
+
 /** 一個 root 的診斷資訊（路徑等字串的家目錄前綴已遮罩成 `~`）。 */
 export interface DiagnosticsRoot {
   id: number;
@@ -377,6 +507,13 @@ export interface DiagnosticsRoot {
   exclude: string[];
   respectGitignore: boolean;
   createdAt: string;
+  /**
+   * 這個 root **實際生效**的影片單檔大小上限（bytes）：
+   * `root.videoMaxFileBytes` → 行程層預設（`MNEMOSHELF_VIDEO_MAX_FILE_BYTES`／512 MiB）。
+   *
+   * 與 `video.maxFileBytes`（服務層預設）搭配看：前者是這個 root 的值，後者是未設定時的預設。
+   */
+  videoMaxFileBytes: number;
   /** 上次 preview 或索引的統計；從未量測過為 `null`。 */
   stats: DiagnosticsFileStats | null;
   /** 統計來源；從未 preview／索引過為 `null`。 */
@@ -408,6 +545,8 @@ export interface DiagnosticsResponse {
   indexing: { rootId: number; startedAt: string | null }[];
   /** 記憶語意化的狀態與背景 worker 統計（卡 B1；additive 欄位）。 */
   memories: DiagnosticsMemoryEmbedding;
+  /** 影片能力、解碼器狀態與本行程影片索引統計（additive；不含路徑）。 */
+  video: DiagnosticsVideo;
 }
 
 /**
@@ -460,11 +599,20 @@ type PolicyRouteResult = { renderWithPolicy: PolicyRenderer };
 type DeferredPolicyRouteResult = { preparePolicyResponse: PrepareMemoryPresentation<ImmediateRouteResult> };
 
 /** 記憶內容在 HTTP 送出前依目前政策呈現。 */
-export type RouteResult = ImmediateRouteResult | PolicyRouteResult | DeferredPolicyRouteResult;
+export type RouteResult =
+  | ImmediateRouteResult
+  | StreamRouteResult
+  | PolicyRouteResult
+  | DeferredPolicyRouteResult;
 
 /** 判斷路由結果是否為位元組回應。 */
 function isBytesResult(result: ImmediateRouteResult): result is BytesRouteResult {
   return "bytes" in result;
+}
+
+/** 判斷路由結果是否為串流回應（影片播放）。 */
+function isStreamResult(result: ImmediateRouteResult | StreamRouteResult): result is StreamRouteResult {
+  return "stream" in result;
 }
 
 /** `GET /roots/:id/entries` 的回應。 */
@@ -495,6 +643,25 @@ export interface RestAppDeps {
    * 未提供時完全沿用既有行為（檔案之間不休眠）。詳見 core 的 `IndexRootOptions.throttle`。
    */
   indexThrottle?: NonNullable<IndexRootOptions["throttle"]>;
+  /**
+   * 影片解碼器（選填；B1 `MediaDecoder`）。
+   *
+   * - 未提供：影片不納入預覽／索引（既有行為，`.mp4` 以 `unsupported-modality` 跳過）。
+   * - 提供且可用：預覽與索引都宣告 video，索引時傳給 `indexRoot`。
+   * - 提供但不可用：**索引仍傳給 `indexRoot`**，讓影片檔逐檔以
+   *   `video-decoder-unavailable` 具名失敗（不是靜默跳過）；預覽不宣告 video
+   *   （候選數會是 0），原因由 `videoCapability` 回報給 UI。
+   */
+  decoder?: MediaDecoder;
+  /** 啟動時 decoder 可用性檢查結果（由 `createServer` 注入；未提供 decoder 時省略）。 */
+  decoderAvailability?: DecoderAvailability | null;
+  /**
+   * 影片單檔大小上限的**行程層預設**（bytes）；預設 `DEFAULT_VIDEO_MAX_FILE_BYTES`（512 MiB）。
+   *
+   * 個別 root 可用持久化的 `Root.videoMaxFileBytes` 覆寫；生效值＝
+   * `root.videoMaxFileBytes ?? 這個預設`，preview、indexer 有界快照與播放端點都用生效值。
+   */
+  videoMaxFileBytes?: number;
 }
 
 export interface RestApp {
@@ -510,6 +677,12 @@ export interface RestApp {
    * 唯讀、僅供診斷／測試核對「設定有接到索引器」；呼叫端不應修改它。
    */
   readonly indexThrottle: NonNullable<IndexRootOptions["throttle"]> | undefined;
+  /** 啟動時 decoder 可用性檢查結果（未設定 decoder 為 `null`；測試與診斷核對用）。 */
+  readonly decoderAvailability: DecoderAvailability | null;
+  /** 影片單檔大小上限的行程層預設（bytes）；各 root 的生效值見 `Root.videoMaxFileBytes`。 */
+  readonly videoMaxFileBytes: number;
+  /** 影片能力摘要（`GET /roots`、preview 與 `/diagnostics` 共用同一個形狀）。 */
+  readonly videoCapability: VideoCapability;
   /**
    * 中止所有進行中的索引（**關閉流程用**；additive）。
    *
@@ -840,6 +1013,28 @@ function optionalStringArray(value: unknown, field: string): string[] | undefine
 }
 
 /**
+ * 解析 root 的影片單檔大小上限欄位（`POST /roots`／`PATCH /roots/:id` 共用）。
+ *
+ * - `undefined` → `undefined`：未提供（POST＝未設定；PATCH＝不改）；
+ * - `null` → `null`：清除／未設定（回行程層預設）；
+ * - 1–16 GiB 的整數 → 原值；
+ * - 其他（0／負數／小數／非數字／超過上限）→ `400 ValidationError`。
+ */
+function parseRootVideoMaxFileBytes(value: unknown, field: string): number | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < VIDEO_MAX_FILE_BYTES_MIN ||
+    value > VIDEO_MAX_FILE_BYTES_MAX
+  ) {
+    throw new ValidationError(field, "必須是 1–16 GiB 的整數（bytes），或 null 表示未設定");
+  }
+  return value;
+}
+
+/**
  * 寫入路徑的 metadata 檢查：`agent`／`project` 若含 token-like 機密 → 拒絕（400）。
  *
  * 為什麼不遮而要拒絕：agent／project 是**查詢鍵**（過濾、召回 bucket 都用它精確比對）；
@@ -1043,6 +1238,73 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   });
 
   const homeDir = deps.homeDir ?? homedir();
+
+  // ---------------------------------------------------------------------------
+  // 影片能力（decoder＋embedder）：三種狀態一次算清楚，供 preview／index／diagnostics 共用。
+  // ---------------------------------------------------------------------------
+  const videoMaxFileBytes = deps.videoMaxFileBytes ?? DEFAULT_VIDEO_MAX_FILE_BYTES;
+  const decoderAvailability: DecoderAvailability | null = deps.decoderAvailability ?? null;
+  /** decoder 是否已設定（設定但不可用時仍要讓索引具名失敗，不可靜默跳過）。 */
+  const decoderConfigured = deps.decoder !== undefined;
+  /** embedder 是否真的具備影片入口（模型能力；與 decoder 可用性分開）。 */
+  const embedderVideoReady =
+    deps.embedder.info.capabilities.video === true && typeof deps.embedder.embedVideo === "function";
+
+  let videoCapabilityReason: VideoCapabilityReason | null = null;
+  if (decoderConfigured) {
+    if (!embedderVideoReady) videoCapabilityReason = "embedder-video-unsupported";
+    else if (decoderAvailability?.available !== true) videoCapabilityReason = decoderAvailability?.reason ?? "ffmpeg-failed";
+  }
+  const videoAvailable = decoderConfigured && videoCapabilityReason === null;
+  /**
+   * 預覽用的 supportedModalities：**只在可用時**宣告 video。
+   * 不可用時預覽不列影片候選（避免讓使用者以為能索引），原因由 `videoCapability` 回報。
+   */
+  const videoSupportedForScan = videoAvailable;
+  /**
+   * 索引時是否把 decoder 傳給 `indexRoot`：只要 decoder 已設定且 embedder 有影片入口就傳。
+   * 不可用時 indexer 會逐檔 failed（reason `video-decoder-unavailable`），不是靜默跳過。
+   */
+  const videoSupportedForIndex = decoderConfigured && embedderVideoReady;
+  /**
+   * root 實際生效的影片單檔上限：per-root 設定 → 行程層（env／512 MiB）預設。
+   * preview、index（有界快照）與播放端點都必須用這一個值。
+   */
+  const effectiveVideoMaxFileBytes = (root: Root): number => root.videoMaxFileBytes ?? videoMaxFileBytes;
+  const videoCapability: VideoCapability = {
+    available: videoAvailable,
+    state: !decoderConfigured ? "disabled" : videoAvailable ? "available" : "unavailable",
+    reason: videoCapabilityReason,
+    embedderVideo: embedderVideoReady,
+    // 服務層**預設**；個別 root 的實際值見 `GET /roots` 的 `videoMaxFileBytes`。
+    maxFileBytes: videoMaxFileBytes,
+    durationLimitSeconds: VIDEO_MAX_DURATION_SECONDS,
+    ffmpegVersion: videoAvailable ? (decoderAvailability?.ffmpegVersion ?? null) : null,
+    ffprobeVersion: videoAvailable ? (decoderAvailability?.ffprobeVersion ?? null) : null,
+  };
+  /** 本行程的影片索引統計（最近一輪；不含路徑；preview 候選數在每次診斷時才彙總）。 */
+  const videoIndexing: Omit<DiagnosticsVideoIndexing, "previewCandidateFiles"> = {
+    runs: 0,
+    lastFinishedAt: null,
+    scanSkippedByReason: {},
+    skippedByReason: {},
+    failedByReason: {},
+  };
+  /** 記錄一輪影片索引的結果（只計與影片有關的原因；不含任何路徑）。 */
+  const recordVideoIndexRun = (result: IndexRootResult): void => {
+    videoIndexing.runs += 1;
+    videoIndexing.lastFinishedAt = new Date().toISOString();
+    videoIndexing.scanSkippedByReason = countByReason(
+      (result.scanSkippedFiles ?? []).filter((entry) => VIDEO_INDEX_REASONS.has(entry.reason)),
+    );
+    videoIndexing.skippedByReason = countByReason(
+      result.skippedFiles.filter((entry) => VIDEO_INDEX_REASONS.has(entry.reason)),
+    );
+    videoIndexing.failedByReason = countByReason(
+      result.failedFiles.filter((entry) => VIDEO_INDEX_REASONS.has(entry.reason)),
+    );
+  };
+
   /**
    * 行程內的每 root 單檔大小上限（`Root` 契約無此欄位，重啟即失、回退 indexer 預設 10 MB）。
    * 這是刻意的取捨（PM 裁示：文件化，不持久化）；要持久化需 migration 與契約變更。
@@ -1182,6 +1444,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       }
       maxFileBytes = body.maxFileBytes;
     }
+    // 影片上限是 per-root 持久化欄位（null／未提供＝未設定，沿用行程層預設）。
+    const videoMaxFileBytesSetting = parseRootVideoMaxFileBytes(body.videoMaxFileBytes, "videoMaxFileBytes");
 
     const root = await deps.store.addRoot({
       path: realPath,
@@ -1191,29 +1455,35 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       exclude,
       respectGitignore: body.respectGitignore ?? true,
       watch: false,
+      ...(typeof videoMaxFileBytesSetting === "number" ? { videoMaxFileBytes: videoMaxFileBytesSetting } : {}),
     });
     if (maxFileBytes !== undefined) maxFileBytesByRoot.set(root.id, maxFileBytes);
     return { status: 201, body: root };
   };
 
   /**
-   * `PATCH /roots/:id`：更新 root 的可變設定（目前只有 `modalities`）。
+   * `PATCH /roots/:id`：更新 root 的可變設定（`modalities` 與 `videoMaxFileBytes`）。
    *
    * 語意：
-   * - `modalities` 必須提供（本端點只改這個欄位）；缺少或非法 → `400`；未知的 root → `404`。
+   * - 兩個欄位**至少提供一項**；未提供＝不變；非法 → `400`；未知的 root → `404`。
+   * - `videoMaxFileBytes`：number＝設定、`null`＝清除（回行程層預設）。
    * - 成功回 `200`＋更新後的 root。
-   * - **不自動觸發重新索引**：改的是設定，掃描層下一次索引才會看到新的模態；
+   * - **不自動觸發重新索引**：改的是設定，掃描層下一次索引才會看到新的模態／上限；
    *   關掉某個模態時既有的 chunk／向量也**不會立刻**釋放，要在下一次索引時由清理迴圈清掉
    *   （與 `DELETE`／模態切換的既有語意一致，見 docs/roots-and-privacy.md 的「改變模態」一節）。
    */
   const patchRoot = async (request: IncomingMessage, id: number): Promise<{ status: number; body: unknown }> => {
     await getRootOr404(id);
     const body = (await readJsonBody(request)) as unknown as PatchRootRequest;
-    if (body.modalities === undefined) {
-      throw new ValidationError("modalities", "必須提供要更新的欄位（目前只支援 modalities）");
+    const patch: RootPatch = {};
+    if (body.modalities !== undefined) patch.modalities = validateModalities(body.modalities);
+    const videoMaxFileBytesSetting = parseRootVideoMaxFileBytes(body.videoMaxFileBytes, "videoMaxFileBytes");
+    // undefined＝不改；null＝清除；number＝設定（RootPatch 的 null 有語意，不能和 undefined 混用）。
+    if (videoMaxFileBytesSetting !== undefined) patch.videoMaxFileBytes = videoMaxFileBytesSetting;
+    if (Object.keys(patch).length === 0) {
+      throw new ValidationError("body", "至少要提供 modalities 或 videoMaxFileBytes");
     }
-    const modalities = validateModalities(body.modalities);
-    const updated = await deps.store.updateRoot(id, { modalities });
+    const updated = await deps.store.updateRoot(id, patch);
     // 先行 getRootOr404 之後理論上不會是 null；並行刪除時仍以 404 回應，不吞掉。
     if (updated === null) throw new NotFoundError("root", id);
     return { status: 200, body: updated };
@@ -1222,19 +1492,26 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   const previewFor = async (id: number): Promise<{ status: number; body: unknown }> => {
     const root = await getRootOr404(id);
     const maxFileBytes = maxFileBytesByRoot.get(id);
+    // 支援的模態：decoder 可用時才宣告 video（不可用時預覽不列影片候選；原因由 videoCapability 回報）。
+    const supportedModalities: Modality[] = ["text", "code", "image"];
+    if (deps.embedder.info.capabilities.audio && typeof deps.embedder.embedAudio === "function") {
+      supportedModalities.push("audio");
+    }
+    if (videoSupportedForScan) supportedModalities.push("video");
     const preview = await previewRoot({
       path: root.path,
       modalities: root.modalities,
       include: root.include,
       exclude: root.exclude,
       respectGitignore: root.respectGitignore,
+      // 影片上限與 indexer／播放端點共用同一個值：per-root 設定 → 行程層預設。
+      videoMaxFileBytes: effectiveVideoMaxFileBytes(root),
       ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
-    }, {
-      supportedModalities: ["text", "code", "image", ...(deps.embedder.info.capabilities.audio && typeof deps.embedder.embedAudio === "function" ? ["audio" as const] : [])],
-    });
+    }, { supportedModalities });
     // 記住這次 preview 的統計：`GET /diagnostics` 會回報「上次量到的數字」（不重新掃描磁碟）。
     lastPreviewByRoot.set(id, preview);
-    return { status: 200, body: preview };
+    // additive：讓 UI 區分「未設定 decoder」與「設定但不可用」，不必只看候選數猜。
+    return { status: 200, body: { ...preview, videoCapability } };
   };
 
   const startIndex = async (id: number): Promise<{ status: number; body: unknown }> => {
@@ -1263,6 +1540,11 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         indexingTimings[stage].durationMs += durationMs;
       },
       ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
+      // 影片：decoder 設定且 embedder 有入口就傳（不可用時 indexer 逐檔具名 failed）。
+      // videoMaxFileBytes 與 preview／播放端點共用同一個值（per-root 設定 → 行程層預設）。
+      ...(videoSupportedForIndex
+        ? { decoder: deps.decoder, videoMaxFileBytes: effectiveVideoMaxFileBytes(root) }
+        : {}),
       ...(deps.indexThrottle === undefined ? {} : { throttle: deps.indexThrottle }),
     });
     indexing.set(id, run);
@@ -1271,6 +1553,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     try {
       const result = await run;
       indexStatus.finish(id, result);
+      // 影片索引統計（只有 root 宣告 video 且服務已接通時才計；不含路徑）。
+      if (videoSupportedForIndex && root.modalities.includes("video")) recordVideoIndexRun(result);
       return { status: 200, body: { rootId: id, durationMs: Date.now() - startedAt, ...result } };
     } catch (error) {
       // 取消是使用者要求（不是錯誤）：標記 `cancelled`，並以 200＋`cancelled` 回應，
@@ -1370,6 +1654,27 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     };
   };
 
+  /**
+   * `GET|HEAD /roots/:id/media?path=`：影片播放（單一 Range、206／416、單次上限 4 MiB）。
+   *
+   * 守衛：`dispatch` 已驗 token／loopback／Host；本函式再過 `buildMediaResponse` 的
+   * realpath＋root 前綴＋黑名單，只服務 root 內的 `.mp4`。串流由 `sendStreamResult` 送出，
+   * client 中止時 destroy 讀取串流（不整檔讀入記憶體、不快取）。
+   */
+  const readMedia = async (id: number, request: IncomingMessage, url: URL): Promise<RouteResult> => {
+    const root = await getRootOr404(id);
+    const method = (request.method ?? "GET").toUpperCase();
+    return await buildMediaResponse(
+      root,
+      {
+        relPath: url.searchParams.get("path"),
+        rangeHeader: request.headers.range,
+        headOnly: method === "HEAD",
+      },
+      { maxFileBytes: effectiveVideoMaxFileBytes(root) },
+    );
+  };
+
   /** `GET /roots/:id/index/status`：輪詢索引进度（行程內記憶體狀態）。 */
   const getIndexStatus = async (id: number): Promise<RouteResult> => {
     await getRootOr404(id);
@@ -1440,6 +1745,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         exclude: root.exclude,
         respectGitignore: root.respectGitignore,
         createdAt: root.createdAt,
+        videoMaxFileBytes: effectiveVideoMaxFileBytes(root),
         stats,
         statsSource,
         statsUnavailable: stats === null,
@@ -1449,6 +1755,11 @@ export function createRestApp(deps: RestAppDeps): RestApp {
 
     const memoryStats = await deps.store.memoryEmbeddingStats(deps.embedder.info.id);
     const memoryWorkerStats = deps.memoryEmbedder.stats();
+    // 影片候選檔數來自「最近一次 preview」（不為了診斷臨時掃描磁碟）；從未 preview 過為 null。
+    const previewCandidateFiles =
+      lastPreviewByRoot.size === 0
+        ? null
+        : [...lastPreviewByRoot.values()].reduce((sum, preview) => sum + preview.byKind.video.count, 0);
 
     const raw: DiagnosticsResponse = {
       generatedAt: new Date().toISOString(),
@@ -1481,6 +1792,11 @@ export function createRestApp(deps: RestAppDeps): RestApp {
           failed: memoryWorkerStats.failed,
           tooLong: memoryWorkerStats.tooLong,
         },
+      },
+      // 影片：能力三態、decoder 狀態與本行程索引統計（不含路徑）。
+      video: {
+        ...videoCapability,
+        indexing: { ...videoIndexing, previewCandidateFiles },
       },
     };
     // 一律遮罩家目錄前綴：不輸出使用者家目錄的絕對路徑（見 repo 隱私規範）。
@@ -1684,7 +2000,11 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     url: URL,
   ): Promise<RouteResult> => {
     if (segments.length === 1) {
-      if (method === "GET") return { status: 200, body: { roots: await deps.store.listRoots() } };
+      // additive：`video` 是服務層能力（三態），與每個 root 自己的 modalities 無關；
+      // UI 可先看它決定影片開關能不能開，不必等 preview／index 才知道 decoder 壞掉。
+      if (method === "GET") {
+        return { status: 200, body: { roots: await deps.store.listRoots(), video: videoCapability } };
+      }
       if (method === "POST") return await createRoot(request);
       throw new MethodNotAllowedError(method, ["GET", "POST"]);
     }
@@ -1718,6 +2038,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       if (segments[2] === "thumb") {
         if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
         return await readThumbnail(id, url);
+      }
+      if (segments[2] === "media") {
+        if (method !== "GET" && method !== "HEAD") throw new MethodNotAllowedError(method, ["GET", "HEAD"]);
+        return await readMedia(id, request, url);
       }
     }
 
@@ -2191,7 +2515,16 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         throw new NotFoundError("路徑");
     }
 
-    const send = (payload: ImmediateRouteResult, headers: Record<string, string> = {}): void => {
+    const send = async (
+      payload: ImmediateRouteResult | StreamRouteResult,
+      headers: Record<string, string> = {},
+    ): Promise<void> => {
+      if (isStreamResult(payload)) {
+        // 影片播放：串流直接寫出；等串流結束（或 client 中止）才回報完成，
+        // 讓 close()／settled() 能看到仍在傳輸的回應。
+        await sendStreamResult(response, payload);
+        return;
+      }
       if (isBytesResult(payload)) {
         sendBytes(response, payload.status, payload.contentType, payload.bytes, { ...payload.headers, ...headers });
       } else {
@@ -2200,7 +2533,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     };
 
     if ("status" in result) {
-      send(result);
+      await send(result);
     } else {
       const deferred = result;
       // 在同一佇列內確認可見性與政策，直到資料送出才允許來源變更。
@@ -2209,7 +2542,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
           ? deferred.renderWithPolicy
           : await deferred.preparePolicyResponse();
         const policy = await deps.store.getMemoryPolicy();
-        send(render(policy), { "X-Mnemoshelf-Policy-Version": String(policy.version), "cache-control": "no-store" });
+        await send(render(policy), { "X-Mnemoshelf-Policy-Version": String(policy.version), "cache-control": "no-store" });
       });
     }
   };
@@ -2258,6 +2591,9 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     handler,
     indexing,
     indexThrottle: deps.indexThrottle,
+    decoderAvailability,
+    videoMaxFileBytes,
+    videoCapability,
     cancelAllIndexing,
     async settled(): Promise<void> {
       // 索引是背景工作（回應會等它），這裡等所有在途請求結束。

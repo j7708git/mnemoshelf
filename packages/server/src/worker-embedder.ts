@@ -47,11 +47,14 @@ import type {
   EmbedDocumentsOptions,
   ImageInput,
   ProbeResult,
+  VideoInput,
 } from "@mnemoshelf/core";
 import {
   EMBED_DEVICE_ENV,
+  assertVideoInput,
   parseEmbedDeviceOption,
   TransformersEmbedder,
+  videoInputBytes,
   type TransformersEmbedderOptions,
 } from "@mnemoshelf/embedder-transformers";
 
@@ -62,6 +65,7 @@ export type EmbedderWorkerMethod =
   | "embedDocument"
   | "embedImage"
   | "embedAudio"
+  | "embedVideo"
   | "probe"
   | "dispose";
 
@@ -603,6 +607,41 @@ export class WorkerEmbedder implements Embedder {
       return async (state) => {
         throwIfAborted(signal);
         const value = await this.send(state, "embedAudio", { samples, sampleRate: 16000 }, signal, [samples.buffer]);
+        throwIfAborted(signal);
+        return { done: true, value };
+      };
+    });
+  }
+
+  /**
+   * 影片片段：一個片段即一個背景排程視窗；所有像素位元組計入全域准入上限。
+   *
+   * 驗證在**送進 worker 前**完成（非法幀序列不建立 worker、不占名額）；
+   * 准入後才複製每一幀的像素，再以 transferable 送出——**不 detach 呼叫端 buffer**，
+   * 呼叫端仍可拿同一份像素去計算來源 hash 或保存。取消與安全關閉沿用既有語意：
+   * 取消在邊界生效，已開始的 native Run 等收尾。
+   */
+  async embedVideo(video: VideoInput, opts?: EmbedDocumentsOptions): Promise<Float32Array> {
+    const signal = opts?.signal;
+    if (this.closed) throw new EmbedderWorkerClosedError();
+    throwIfAborted(signal);
+    assertVideoInput(video);
+    const bytes = videoInputBytes(video);
+    return await this.enqueue<Float32Array>(false, 1, bytes, signal, () => {
+      // 准入後才複製，不 detach 呼叫端的像素；一次片段即一個公平排程視窗。
+      const frames = video.frames.map((frame) => ({
+        pixels: new Uint8Array(frame.pixels),
+        width: frame.width,
+        height: frame.height,
+        channels: frame.channels,
+        timestampSeconds: frame.timestampSeconds,
+      }));
+      const transfer = frames
+        .map((frame) => frame.pixels.buffer)
+        .filter((buffer): buffer is ArrayBuffer => buffer instanceof ArrayBuffer);
+      return async (state) => {
+        throwIfAborted(signal);
+        const value = await this.send(state, "embedVideo", { frames }, signal, transfer);
         throwIfAborted(signal);
         return { done: true, value };
       };

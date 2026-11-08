@@ -487,6 +487,8 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
     const before: EmbedderRuntimeStatus = embedder.runtimeStatus;
     expect(before).toEqual({
       audioState: "not-loaded",
+      // 影片能力與音訊對稱：白名單模型在載入前為 not-loaded（不會假造 ready）。
+      videoState: "not-loaded",
       requestedDevice: "auto",
       device: "dml",
       loaded: false,

@@ -21,7 +21,7 @@
 import { BrowserWindow, Menu, Tray, app, clipboard, ipcMain, net, safeStorage, session, shell, type IpcMainInvokeEvent } from "electron";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -59,6 +59,7 @@ import { ModelBootstrap, type BootstrapState } from "./model-bootstrap.js";
 import { downloadModelFiles } from "./model-download.js";
 import { MODEL_PROFILE } from "./model-profile.js";
 import { formatProbe, probeNativeModules } from "./native-probe.js";
+import { hasConfiguredMediaDecoderEnv, resolveMediaDecoder } from "./media-binaries.js";
 import { buildServerEnv, parseCliArgs, resolveDesktopPaths, type DesktopPaths } from "./paths.js";
 import { resolveMcpEntryPath } from "./mcp-entry.js";
 import { loadOrCreateToken, toTokenInfo, type TokenInfo } from "./token-store.js";
@@ -167,6 +168,29 @@ async function resolveWebDir(candidate: string, appPath: string): Promise<string
   }
   log(`警告：找不到 Web UI（嘗試過：${candidates.join("、")}）；靜態路徑會回 404。`);
   return candidate;
+}
+
+/**
+ * 開發模式的影片解碼器候選目錄（**.tmp** 內；只在檔案存在時採用）。
+ *
+ * 不寫死版本或本機路徑：`.tmp/video-a/decoder/bin` 與 `bin-shared` 底下的一層子目錄
+ * （BtbN 解壓後的 `ffmpeg-<version>/bin`）。打包版不用這裡（走 `resources/bin`）。
+ * 讀不到目錄就回空清單，不讓開發環境的缺檔影響啟動。
+ */
+async function devMediaDecoderCandidateDirs(appPath: string): Promise<string[]> {
+  const decoderRoots = [
+    path.resolve(appPath, "..", "..", ".tmp", "video-a", "decoder", "bin"),
+    path.resolve(appPath, "..", "..", ".tmp", "video-a", "decoder", "bin-shared"),
+  ];
+  const candidates: string[] = [];
+  for (const root of decoderRoots) {
+    candidates.push(root);
+    const entries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (entry.isDirectory()) candidates.push(path.join(root, entry.name, "bin"));
+    }
+  }
+  return candidates;
 }
 
 function escapeHtml(value: string): string {
@@ -715,6 +739,19 @@ async function main(): Promise<void> {
   log(`Agent 連線發現設定：${agentSettings.agentDiscovery ? "on" : "off"}（${paths.settingsFile}）`);
   const webDir = await resolveWebDir(paths.webDir, appPath);
 
+  /**
+   * 影片解碼器（ffmpeg／ffprobe）：打包版放 `resources/bin`（asar 之外）；開發版接受
+   * `.tmp/video-a/decoder` 的候選目錄（**檔案存在才用**）。環境變數已設定時一律不覆寫。
+   * 只把目錄以 `MNEMOSHELF_FFMPEG_DIR` 交給 Core 服務——不改 packaging／發版流程（配送屬 C3）。
+   */
+  const mediaDecoder = resolveMediaDecoder({
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    env: process.env,
+    exists: (file) => existsSync(file),
+    devCandidates: app.isPackaged ? [] : await devMediaDecoderCandidateDirs(appPath),
+  });
+
   // macOS 的自啟走 SMAppService，`path`／`args` 是 Windows-only，登入時收不到 `--hidden`：
   // 改由 `wasOpenedAtLogin` 推導「這次是登入時啟動」，視同 `--hidden`（不彈視窗）並隱藏 Dock 圖示。
   if (openedAtLogin(autostartOptions())) {
@@ -728,6 +765,13 @@ async function main(): Promise<void> {
   log(`isPackaged=${String(app.isPackaged)}；appPath=${appPath}；resourcesPath=${process.resourcesPath}`);
   log(`userData=${paths.userData}`);
   log(`dataDir=${paths.dataDir}；modelDir=${paths.modelDir}；webDir=${webDir}`);
+  log(
+    mediaDecoder === null
+      ? hasConfiguredMediaDecoderEnv(process.env)
+        ? "影片解碼器：沿用環境變數設定（desktop 不覆寫）"
+        : "影片解碼器：未設定（影片能力 disabled；可用環境變數或 resources/bin 提供）"
+      : `影片解碼器：${mediaDecoder.source}（目錄 ${mediaDecoder.directory}）`,
+  );
 
   log("原生模組探測：");
   const moduleProbes = probeNativeModules();
@@ -767,6 +811,7 @@ async function main(): Promise<void> {
         // 桌面設定優先：這裡一律覆寫 shell 環境變數（含 runtime 檔路徑，設定頁才能刪同一個檔）。
         agentDiscovery: startupAgentDiscovery,
         runtimeFile: paths.runtimeFile,
+        ...(mediaDecoder === null ? {} : { mediaDecoderDirectory: mediaDecoder.directory }),
       }),
     });
   } catch (error) {

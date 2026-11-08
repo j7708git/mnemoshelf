@@ -90,6 +90,27 @@ export class EmbedderInputError extends Error {
   }
 }
 
+/**
+ * 目前載入的模型／processor 不支援影片幀序列入口（例如自訂 modelId 沒有 video_processor）。
+ *
+ * **不是**輸入類錯誤（不是某一幀壞掉），也不是裝置類錯誤（換 CPU 不會變好）：
+ * 是模型能力與宣告不一致。`capabilities.video` 以白名單保守宣告；真的被呼叫時
+ * 仍以這個具名錯誤回報，`runtimeStatus.videoState` 轉為 `disabled`，
+ * 而不是假裝 ready 或把整件事降級成一般錯誤。
+ */
+export class VideoUnsupportedError extends Error {
+  /** 穩定錯誤碼（測試／上層可程式比對）。 */
+  readonly code = "video-unsupported";
+  /** 模型 id。 */
+  readonly modelId: string;
+
+  constructor(modelId: string, message = "這個模型的 processor 沒有影片支援（video_processor）") {
+    super(`模型「${modelId}」無法處理影片幀序列：${message}`);
+    this.name = "VideoUnsupportedError";
+    this.modelId = modelId;
+  }
+}
+
 /** 推論失敗（模型輸出缺少可用的 sentence_embedding，或形狀不符）。 */
 export class ModelInferenceError extends Error {
   /** 模型 id。 */

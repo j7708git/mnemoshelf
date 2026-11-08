@@ -7,7 +7,15 @@ import { promises as fs } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
-import { type DocumentInput, type Embedder, type EmbedderInfo, type EmbedDocumentsOptions, type ImageInput, type ProbeResult } from "@mnemoshelf/core";
+import {
+  type DocumentInput,
+  type Embedder,
+  type EmbedderInfo,
+  type EmbedDocumentsOptions,
+  type ImageInput,
+  type MediaDecoder,
+  type ProbeResult,
+} from "@mnemoshelf/core";
 import { FakeEmbedder } from "@mnemoshelf/core/testing";
 import { createServer, type MnemoshelfServer, type MemoryEmbeddingWorkerOptions } from "../src/index.js";
 
@@ -136,7 +144,7 @@ export class FailingEmbedder implements Embedder {
 export interface TestServer {
   instance: MnemoshelfServer;
   dataDir: string;
-  /** 關閉服務並刪除暫存資料目錄。 */
+  /** 關閉服務；**自己建立的**暫存資料目錄會一併刪除（沿用外部 `dataDir` 時不刪）。 */
   close(): Promise<void>;
 }
 
@@ -146,18 +154,26 @@ export async function startTestServer(
     embedder?: Embedder;
     homeDir?: string;
     webDir?: string;
+    /** 額外的環境變數（例如影片上限 `MNEMOSHELF_VIDEO_MAX_FILE_BYTES`）；預設空物件。 */
+    env?: NodeJS.ProcessEnv;
+    /** 測試注入的影片解碼器（正式路徑由環境變數建立 ffmpeg decoder）。 */
+    decoder?: MediaDecoder;
     /** 記憶嵌入 worker 的調校（卡 B1；測試通常把重試延遲設 0）。 */
     memoryEmbedding?: Pick<MemoryEmbeddingWorkerOptions, "batchSize" | "retryAttempts" | "retryDelayMs">;
+    /** 沿用既有資料目錄（重啟情境測試）；省略時建立新的暫存目錄。 */
+    dataDir?: string;
   } = {},
 ): Promise<TestServer> {
-  const dataDir = await makeTempDir("mnemoshelf-data-");
+  const ownsDataDir = options.dataDir === undefined;
+  const dataDir = options.dataDir ?? (await makeTempDir("mnemoshelf-data-"));
   const instance = await createServer({
-    env: {},
+    env: options.env ?? {},
     token: TEST_TOKEN,
     dataDir,
     port: 0,
     embedder: options.embedder ?? new FakeEmbedder(),
     homeDir: options.homeDir ?? os.homedir(),
+    ...(options.decoder === undefined ? {} : { decoder: options.decoder }),
     ...(options.webDir === undefined ? {} : { webDir: options.webDir }),
     ...(options.memoryEmbedding === undefined ? {} : { memoryEmbedding: options.memoryEmbedding }),
   });
@@ -166,7 +182,7 @@ export async function startTestServer(
     dataDir,
     async close(): Promise<void> {
       await instance.close();
-      await removeTempDir(dataDir);
+      if (ownsDataDir) await removeTempDir(dataDir);
     },
   };
 }

@@ -25,6 +25,15 @@ export interface Root {
   watch: boolean;
   /** ISO 8601 時間字串。 */
   createdAt: string;
+  /**
+   * 影片單檔大小上限（bytes）；**選填**，未設定時由呼叫端沿用行程層預設
+   * （`MNEMOSHELF_VIDEO_MAX_FILE_BYTES`，再退回 512 MiB）。
+   *
+   * - 只套用影片（`video` 模態）；通用 `maxFileBytes` 的 10 MiB 不套用影片。
+   * - 值域是整數 1–16 GiB（由 `normalizeRootVideoMaxFileBytes` 驗證）。
+   * - 舊資料列為 NULL 時**不出現**這個鍵（不得補 512 MiB：預設值屬呼叫端語意）。
+   */
+  videoMaxFileBytes?: number;
 }
 
 /** 新增 root 時的輸入（id 與 createdAt 由儲存層產生）。 */
@@ -33,21 +42,55 @@ export type NewRoot = Omit<Root, "id" | "createdAt">;
 /**
  * 更新既有 root 時**可變更**的欄位（`MetadataStore.updateRoot`）。
  *
- * 為什麼只有 `modalities`：`path`／`mode` 改變等同換一個 root（索引內容、清理語意都會變），
- * 應以「移除再加入」處理；`include`／`exclude`／`respectGitignore` 目前沒有 UI／REST 入口，
- * 尚未定義變更語意。欄位未提供（`undefined`）＝該欄位不變。
+ * 為什麼只有 `modalities` 與 `videoMaxFileBytes`：`path`／`mode` 改變等同換一個 root
+ * （索引內容、清理語意都會變），應以「移除再加入」處理；`include`／`exclude`／
+ * `respectGitignore` 目前沒有 UI／REST 入口，尚未定義變更語意。欄位未提供（`undefined`）
+ * ＝該欄位不變。
  *
- * 變更模態**不會**動任何既有 chunk／向量：要重新索引才會生效（見 `indexRoot` 的清理語意）。
+ * - 變更模態**不會**動任何既有 chunk／向量：要重新索引才會生效（見 `indexRoot` 的清理語意）。
+ * - `videoMaxFileBytes`：`number`＝設定新上限；`null`＝清除設定（回到行程層預設）；
+ *   `undefined`＝不改。變更只影響下一次 preview／index 與播放端點，不動既有索引。
  */
 export interface RootPatch {
   modalities?: Modality[];
+  /** 影片單檔大小上限（bytes）；`null` 表示清除設定。值域見 `normalizeRootVideoMaxFileBytes`。 */
+  videoMaxFileBytes?: number | null;
 }
 
-/** 音訊片段的來源位置與可重現的嵌入身分；時間單位為秒。 */
+/** 時間片段的來源軌道（`ChunkMedia.track`）。 */
+export type ChunkMediaTrack = "audio" | "video" | "video-audio";
+
+/**
+ * 媒體片段可記錄的來源容器（v1 白名單）。
+ *
+ * `wav` 是既有音訊片段；`mp4` 是影片 v1 唯一支援的容器（見影片里程碑）。
+ * 舊資料沒有這個欄位，讀取端不得補值。
+ */
+export type ChunkMediaContainer = "wav" | "mp4";
+
+/**
+ * 媒體片段的來源位置與可重現的嵌入身分；時間單位為秒。
+ *
+ * 這是 additive 擴充：音訊里程碑的舊資料只有 `startSeconds`／`endSeconds`／`track:"audio"`
+ * 與三個嵌入身分欄位，因此新增欄位一律**選填**（舊列不得被補 `null` 或空陣列）。
+ * 欄位語意、合法範圍與 `seq` 規則見 `docs/storage-ports.md`。
+ */
 export interface ChunkMedia {
   startSeconds: number;
   endSeconds: number;
-  track: "audio";
+  /**
+   * 來源軌道：
+   * - `video`：影片**畫面**片段（`kind:"video"`），保留 `frameTimesSeconds`；
+   * - `video-audio`：影片**所選音軌**片段（`kind:"audio"`），保留 `streamIndex`；
+   * - `audio`：舊資料與獨立 WAV 音訊片段。
+   */
+  track: ChunkMediaTrack;
+  /** 來源容器；舊資料省略。 */
+  container?: ChunkMediaContainer;
+  /** 來源 stream index（影片所選音軌**必填**；畫面片段可省略）。 */
+  streamIndex?: number;
+  /** 畫面片段實際採用的幀時間（秒；`track:"video"` 必填，落在片段區間內）。 */
+  frameTimesSeconds?: number[];
   preprocessVersion: string;
   embedderId: string;
   embeddingDim: number;
@@ -65,7 +108,7 @@ export interface Chunk {
   /** 非文字模態（例如圖片）為 null。 */
   text: string | null;
   contentHash: string;
-  /** 音訊片段才提供；既有文字／圖片與舊資料省略此欄。 */
+  /** 時間型片段（音訊／影片）才提供；既有文字／圖片與舊資料省略此欄。 */
   media?: ChunkMedia;
 }
 

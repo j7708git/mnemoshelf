@@ -4,15 +4,44 @@ import {
   decodeWavSegments, inspectWav, DEFAULT_AUDIO_SEGMENT_SECONDS, MAX_WAV_BYTES, WAV_PREPROCESSING_VERSION, type WavInfo,
 } from "../audio/wav.js";
 import { PathBlockedError, PathOutsideRootError } from "../errors.js";
+import { MediaDecoderError } from "../media/index.js";
+import type { DecoderAvailability, MediaDecoder, VideoProbe, VisualFrame, VisualSegment } from "../media/index.js";
 import type { DocumentInput, Embedder, ImageInput } from "../ports/embedder.js";
+import { assignChunkMediaSeq } from "../ports/metadata-store.js";
 import type { MetadataStore } from "../ports/metadata-store.js";
-import type { ChunkKind, NewChunk, Root } from "../ports/types.js";
+import type { ChunkKind, ChunkMedia, Modality, NewChunk, Root } from "../ports/types.js";
 import type { VectorIndex, VectorItem } from "../ports/vector-index.js";
 import { maskSecrets } from "../privacy/secret-masking.js";
 import { resolveInsideRoot } from "../roots/path-guard.js";
 import { chunkCode, chunkText } from "./chunk-text.js";
 import { RootNotIndexableError } from "./errors.js";
-import { DEFAULT_MAX_FILE_BYTES, walkRoot, type ScanEntry, type ScanOptions, type SkipReason, type SkippedEntry } from "./scan.js";
+import {
+  DEFAULT_MAX_FILE_BYTES,
+  DEFAULT_VIDEO_MAX_FILE_BYTES,
+  walkRoot,
+  type ScanEntry,
+  type ScanOptions,
+  type SkipReason,
+  type SkippedEntry,
+} from "./scan.js";
+import {
+  VIDEO_CONTAINER,
+  assertVideoVisualCoverage,
+  buildVideoChunkLayout,
+  checkVideoProbePolicy,
+  decoderSkipReason,
+  isVideoIndexUnchanged,
+  assertSameFileIdentity,
+  removeVideoSnapshot,
+  sameVerifiedPath,
+  snapshotVideoSource,
+  videoAudioPreprocessVersion,
+  videoAudioSelection,
+  videoFramesForSegment,
+  videoVisualPreprocessVersion,
+  type VideoIndexIdentity,
+  type VideoSnapshot,
+} from "./video.js";
 
 /** 每個 chunk 的輸入（rootId 與 relPath 由 replaceChunks 補上）。 */
 type ChunkInput = Omit<NewChunk, "rootId" | "relPath">;
@@ -20,35 +49,53 @@ type ChunkInput = Omit<NewChunk, "rootId" | "relPath">;
 /** 把分段政策納入版本，避免只改片長卻沿用舊索引。 */
 const AUDIO_INDEX_VERSION = `${WAV_PREPROCESSING_VERSION}:${DEFAULT_AUDIO_SEGMENT_SECONDS}s:audio-pad160-v1`;
 
-interface AudioPermitWaiter {
+interface MediaPermitWaiter {
   grant: () => void;
   cancel: () => void;
 }
-interface AudioPermitPool {
+interface MediaPermitPool {
   active: number;
-  waiting: AudioPermitWaiter[];
+  waiting: MediaPermitWaiter[];
 }
 /** 共用 embedder 的所有 root 共用讀取名額；等待者尚未持有 WAV 或 PCM。 */
-const audioPermitPools = new WeakMap<Embedder, AudioPermitPool>();
+const audioPermitPools = new WeakMap<Embedder, MediaPermitPool>();
+/**
+ * 影片「片段排程」名額（每個 embedder 同時最多 1 個）。
+ *
+ * 這是 indexer 的第二層名額，與 decoder 內部的「程序生命週期」名額（D4 補修，
+ * FfmpegMediaDecoder.decodeBudget 容量 1）是兩個獨立名額，互相搭配：
+ * - 這裡以「每次 decoder next()」為單位取放：取得一個 segment 後、送入 embed 前立刻釋放，
+ *   讓長片在嵌入期間其他 root 可以排到片段（片段級公平、不恢復整檔鎖）。
+ * - decoder 的程序名額持有到 ffmpeg close；其他 root 需要時 decoder 會於段界讓出程序，
+ *   下一次 next() 從段起點以 -ss 恢復。因此同時存活的解碼程序也 ≤1。
+ * - 兩者無死鎖：等待者一定在「持有者的程序已 park 或已讓出」時才取得片段名額；decoder 的
+ *   讓出由程序名額的等待通知觸發，不需要持有片段名額的 root 先呼叫 next()。
+ */
+const videoPermitPools = new WeakMap<Embedder, MediaPermitPool>();
 
-async function acquireAudioPermit(embedder: Embedder, signal: AbortSignal | undefined): Promise<() => void> {
+async function acquireMediaPermit(
+  pools: WeakMap<Embedder, MediaPermitPool>,
+  capacity: number,
+  embedder: Embedder,
+  signal: AbortSignal | undefined,
+): Promise<() => void> {
   throwIfAborted(signal);
-  let pool = audioPermitPools.get(embedder);
+  let pool = pools.get(embedder);
   if (pool === undefined) {
     pool = { active: 0, waiting: [] };
-    audioPermitPools.set(embedder, pool);
+    pools.set(embedder, pool);
   }
   const state = pool;
   const release = (): void => {
     state.active--;
     state.waiting.shift()?.grant();
   };
-  if (state.active < 2) {
+  if (state.active < capacity) {
     state.active++;
     return release;
   }
   return new Promise((resolve, reject) => {
-    const waiter: AudioPermitWaiter = {
+    const waiter: MediaPermitWaiter = {
       grant(): void {
         signal?.removeEventListener("abort", waiter.cancel);
         state.active++;
@@ -67,6 +114,16 @@ async function acquireAudioPermit(embedder: Embedder, signal: AbortSignal | unde
     signal?.addEventListener("abort", waiter.cancel, { once: true });
     if (signal?.aborted) waiter.cancel();
   });
+}
+
+/** 音訊讀取／處理名額：每個 embedder 同時最多 2 個檔案（既有政策不變）。 */
+function acquireAudioPermit(embedder: Embedder, signal: AbortSignal | undefined): Promise<() => void> {
+  return acquireMediaPermit(audioPermitPools, 2, embedder, signal);
+}
+
+/** 影片解碼名額：每個 embedder 同時最多 1 個影片檔在解碼。 */
+function acquireVideoDecodePermit(embedder: Embedder, signal: AbortSignal | undefined): Promise<() => void> {
+  return acquireMediaPermit(videoPermitPools, 1, embedder, signal);
 }
 
 /** 每次索引的進度回報。 */
@@ -137,8 +194,27 @@ export interface IndexRootOptions {
   onProgress?: (progress: IndexProgress) => void;
   /** 各階段耗時，不含路徑／內容；併發階段加總不等於牆鐘時間。觀測失敗不影響索引。 */
   onTiming?: (event: IndexTimingEvent) => void;
-  /** 單檔大小上限，預設 10 MB（見 scan.walkRoot）。 */
+  /** 單檔大小上限，預設 10 MB（見 scan.walkRoot）；**不套用影片**。 */
   maxFileBytes?: number;
+  /**
+   * 影片解碼器（選配；B1 `MediaDecoder`）。
+   *
+   * 只有同時滿足下列條件時，影片才會納入掃描並走影片索引流程：
+   * root 的 `modalities` 含 `video`、提供本欄位、`embedder.info.capabilities.video` 為 true
+   * 且 `embedder.embedVideo` 存在。任一條件不成立時，影片檔沿用舊行為以
+   * `unsupported-modality` 跳過（不猜、不靜默降級）。
+   *
+   * 提供的 decoder 若 `checkAvailability()` 回不可用，影片檔會逐檔記 failed
+   * （`reason:"video-decoder-unavailable"`，可重試），服務與其他模態照常完成。
+   */
+  decoder?: MediaDecoder;
+  /**
+   * 影片單檔大小上限（bytes），預設 `DEFAULT_VIDEO_MAX_FILE_BYTES`（512 MiB）。
+   *
+   * 只套用影片（掃描與有界快照都用它）；通用 `maxFileBytes` 的 10 MiB 不套用影片。
+   * per-root 持久化與 UI 入口屬 C 階段，索引器只接受呼叫端明確給的值。
+   */
+  videoMaxFileBytes?: number;
   /**
    * **索引限速**（額外、預設不啟用）：每個檔案處理完、換下一個檔案之前休眠指定毫秒，
    * 把 CPU 讓給同一台機器上的其他工作（使用者感受與常駐服務的回應性）。
@@ -456,11 +532,24 @@ async function embedInputs(
   return embedder.embedDocuments(documents, { signal });
 }
 
+/** 影片索引的執行期上下文（root 有 video、decoder 提供且 embedder 支援時才存在）。 */
+interface ProcessVideoContext {
+  decoder: MediaDecoder;
+  /** decoder 回報的 ffmpeg 版本（進 `preprocessVersion` 的增量身分；不含路徑）。 */
+  decoderVersion: string | undefined;
+  /** `checkAvailability()` 的結果；false 時影片檔逐檔 failed（可重試），不嘗試解碼。 */
+  available: boolean;
+  /** 影片單檔上限（掃描與快照共用）。 */
+  maxFileBytes: number;
+}
+
 interface ProcessDeps {
   embedder: Embedder;
   store: MetadataStore;
   vec: VectorIndex;
   maxFileBytes: number;
+  /** 影片上下文；沒有時影片檔不會出現在掃描結果（呼叫端未接通）。 */
+  video?: ProcessVideoContext;
 }
 
 /** 音訊只讀有限大小；檔案掃描後變大也不得繞過讀取上限。 */
@@ -513,6 +602,16 @@ interface ProcessHooks {
  * 不用 `error.message`：`fs` 的訊息（例如 `ENOENT: no such file or directory, open '<絕對路徑>'`）
  * 含本機絕對路徑。這裡只取結構化的 `code` 或錯誤名稱，並限制字元集與長度。
  */
+/**
+ * 快照／root 驗證錯誤 → skip 原因（D6）。root 邊界被換掉是 deterministic 跳過，
+ * 與 revalidateReadPath 的既有語意一致；MediaDecoderError 走 decoderSkipReason。
+ */
+function snapshotSkipReason(error: unknown): SkipReason | undefined {
+  if (error instanceof PathOutsideRootError) return "unresolved-symlink";
+  if (error instanceof PathBlockedError) return "blocked";
+  return decoderSkipReason(error);
+}
+
 function failureReason(error: unknown): string {
   const code = (error as { code?: unknown } | null)?.code;
   if (typeof code === "string" && /^[A-Za-z][A-Za-z0-9_-]{0,31}$/.test(code)) return code;
@@ -573,6 +672,10 @@ async function purgeChunks(rootId: number, relPath: string, deps: ProcessDeps): 
  * 若在刪除與寫入之間失敗，DB 仍是舊 hash 但向量已缺，下輪的增量判斷（第 4 步）會發現
  * 「hash 未變但向量不齊」而重做；若反過來「寫入後才刪」，在 `replaceChunks`→`upsert`
  * 之間失敗會讓舊向量成為永遠不會再被回收的孤兒（下輪只看到新 hash 的新向量齊全而跳過）。
+ *
+ * **影片**不進上面這條通用流程：它由 `processVideoFile` 處理（有界快照、probe、逐段解碼後
+ * 才嵌入，且不做「圖片每檔一塊」的假設）。共用的是 worker 的計數／failed 語意與
+ * 「先嵌入成功才動 DB」的原則。
  */
 async function processFile(
   root: Root,
@@ -582,7 +685,11 @@ async function processFile(
   hooks: ProcessHooks = {},
   onTiming?: IndexRootOptions["onTiming"],
 ): Promise<FileOutcome> {
-  const release = file.kind === "audio" ? await acquireAudioPermit(deps.embedder, signal) : undefined;
+  // 音訊檔持有 audio 名額；影片檔的 decoder 名額改在 processVideoFile 內以「每次 next()」
+  // 為單位取得／釋放（D4），不再整檔持有。
+  const release = file.kind === "audio"
+    ? await acquireAudioPermit(deps.embedder, signal)
+    : undefined;
   try {
     throwIfAborted(signal);
     return await processFileInSlot(root, file, deps, signal, hooks, onTiming);
@@ -601,6 +708,13 @@ async function processFileInSlot(
   if (!target.ok) {
     await purgeChunks(root.id, file.relPath, deps);
     return { status: "skipped", reason: target.reason };
+  }
+
+  // 影片走自己的流程：有界快照 → probe → 政策／選軌 → lazy 解碼＋嵌入 → 整檔替換。
+  // 不把整個檔案讀進 Node heap（512 MiB 上限的檔案不是 Buffer 物件該承擔的）。
+  if (file.kind === "video") {
+    if (deps.video === undefined) throw new Error("影片索引尚未接通（缺少 decoder 或 embedVideo）");
+    return processVideoFile(root, file, target.abs, deps, signal, hooks, onTiming);
   }
 
   const readStart = performance.now();
@@ -748,6 +862,252 @@ async function processFileInSlot(
 }
 
 /**
+ * 處理一個影片檔（B3b 主流程）。
+ *
+ * 順序（資料完整性優先，與文字／音訊共用「先嵌入、成功才動 DB」的原則）：
+ * 1. 建立**有界快照**（複製到本輪專屬暫存目錄、同時算原始位元組 sha256）；
+ * 2. `probe()`，檢查 hasVideo／H.264／解析度／時長／大小；
+ * 3. 選軌政策：`audio` 模態關→不讀音軌；有音軌但選定軌非 AAC→整檔具名跳過；
+ * 4. 增量：hash＋前處理版本＋embedder 身分＋音軌選擇＋片段佈局全同且向量齊全才跳過；
+ * 5. lazy 逐段解碼＋嵌入：視覺每 4 秒 1 幀走 `embedVideo`，音軌每 10 秒走 `embedAudio`
+ *    （音軌每段向共用的音訊名額取／放，不長期佔用其他模態預算）；
+ * 6. `assignChunkMediaSeq` 定序後**整檔替換**：先刪舊向量，再寫 chunk，最後寫新向量
+ *    （沿用既有自癒順序）；取消或失敗不發布部分索引。
+ *
+ * 錯誤語意：decoder 的 deterministic 媒體問題（壞檔／不支援 codec 或音軌／超限）記
+ * skipped 並清除舊索引；環境或可重試問題（decoder 不可用、逾時、來源消失）拋出，由
+ * worker 記 failed（保留舊索引，下一輪重試）；取消沿用 AbortError 語意（不寫任何資料）。
+ */
+async function processVideoFile(
+  root: Root,
+  file: ScanEntry,
+  absPath: string,
+  deps: ProcessDeps,
+  signal: AbortSignal | undefined,
+  hooks: ProcessHooks,
+  onTiming?: IndexRootOptions["onTiming"],
+): Promise<FileOutcome> {
+  const video = deps.video!;
+  const embedder = deps.embedder;
+  // 必須 bind：WorkerEmbedder／TransformersEmbedder 的 embed* 是 class method，內部依賴 this；
+  // 直接取出再呼叫會讓 this 變成 undefined（D1 產品鏈抓到的 TypeError）。
+  const embedVideo = embedder.embedVideo?.bind(embedder);
+  if (embedVideo === undefined) throw new Error("影片嵌入能力尚未就緒");
+  // decoder 不可用是環境／可重試問題：逐檔 failed（reason=video-decoder-unavailable），
+  // 不影響其他模態；不能因為 binary 暫時缺失就把舊索引當成「已無效」清掉。
+  if (!video.available) throw new MediaDecoderError("video-decoder-unavailable");
+
+  const existing = await deps.store.listChunksByPath(root.id, file.relPath);
+
+  const readStart = performance.now();
+  let snapshot: VideoSnapshot;
+  try {
+    // D6：先 open handle、handle.stat()，再由 verifier 重走 root 邊界並比對身分；
+    // 通過才從同一 handle 複製。驗證失敗一律不把內容交給 decoder。
+    snapshot = await snapshotVideoSource(absPath, video.maxFileBytes, signal, async ({ handleStat, expectedPath }) => {
+      // D6：重新走 root 邊界；解析後路徑必須與 caller 已驗證的路徑相同（大小寫依平台），
+      // 否則 fail closed——只比 dev／ino 擋不住父目錄被換成 root 內另一個目錄。
+      const resolved = await resolveInsideRoot([root], expectedPath);
+      if (!sameVerifiedPath(resolved.abs, expectedPath)) throw new MediaDecoderError("invalid-video");
+      const pathStat = await fs.stat(resolved.abs, { bigint: true });
+      assertSameFileIdentity(handleStat, pathStat);
+    });
+  } catch (error) {
+    throwIfAborted(signal);
+    const reason = snapshotSkipReason(error);
+    if (reason === undefined) throw error;
+    await purgeChunks(root.id, file.relPath, deps);
+    return { status: "skipped", reason };
+  }
+  reportTiming(onTiming, "read", readStart);
+
+  try {
+    const prepareStart = performance.now();
+
+    let probe: VideoProbe;
+    try {
+      probe = await video.decoder.probe({ path: snapshot.path }, { signal });
+    } catch (error) {
+      throwIfAborted(signal);
+      const reason = decoderSkipReason(error);
+      if (reason === undefined) throw error;
+      await purgeChunks(root.id, file.relPath, deps);
+      return { status: "skipped", reason };
+    }
+
+    const policyReason = checkVideoProbePolicy(probe);
+    if (policyReason !== undefined) {
+      await purgeChunks(root.id, file.relPath, deps);
+      return { status: "skipped", reason: policyReason };
+    }
+
+    // 音軌只在 audio 模態開啟、且 embedder 實際具備音訊入口時才處理；否則連 probe 的音軌都不用讀。
+    const audioRequested = root.modalities.includes("audio")
+      && embedder.info.capabilities.audio
+      && embedder.embedAudio !== undefined;
+    const selection = videoAudioSelection(probe, audioRequested);
+    if (selection.status === "unsupported") {
+      // 使用者要求音軌但所選軌不是 AAC（例如 AC-3／DTS）：整檔具名跳過，不做部分成功。
+      await purgeChunks(root.id, file.relPath, deps);
+      return { status: "skipped", reason: "unsupported-video-audio-track" };
+    }
+    const streamIndex = selection.status === "ready" ? selection.streamIndex : null;
+    const layout = buildVideoChunkLayout(probe, selection.status === "ready");
+
+    const visualVersion = videoVisualPreprocessVersion(video.decoderVersion);
+    const audioVersion = videoAudioPreprocessVersion(video.decoderVersion);
+    const identity: VideoIndexIdentity = {
+      contentHash: snapshot.contentHash,
+      visualPreprocessVersion: visualVersion,
+      audioPreprocessVersion: audioVersion,
+      embedderId: embedder.info.id,
+      embeddingDim: embedder.info.dim,
+    };
+    reportTiming(onTiming, "prepare", prepareStart);
+
+    // 增量：先比對資料形狀與身分，再確認每個既有 chunk 的向量都還在（缺一即整檔重做）。
+    if (isVideoIndexUnchanged(existing, identity, layout)) {
+      const keys = existing.map((chunk) => `c:${chunk.id}`);
+      const present = await deps.vec.existingKeys(keys);
+      if (keys.every((key) => present.has(key))) return { status: "unchanged" };
+    }
+
+    hooks.onChunked?.(layout.visualCount + (layout.audio?.count ?? 0));
+
+    type VideoChunkInput = ChunkInput & { media: ChunkMedia; vectorIndex: number };
+    const inputs: VideoChunkInput[] = [];
+    const vectors: Float32Array[] = [];
+    const embedStart = performance.now();
+    try {
+      let visualCount = 0;
+      // deadline 涵蓋 lazy 解碼期間的嵌入等待；decoder 另有程序生命週期名額（容量 1），
+      // 會在有其他 root 等待時於段界讓出程序，下一次 next() 以 -ss 恢復。
+      const visualTimeoutMs = Math.min(30 * 60_000, Math.max(60_000, layout.visualCount * 8_000 + probe.durationSeconds * 200));
+      // D4：片段名額以「每次 next()」為單位；取得 segment 後、送入 embed 前立刻釋放，
+      // 讓長片在嵌入期間其他 root 可以排到片段。任何錯誤／取消都先 iterator.return()；
+      // decoder 會 kill→等 close→release 程序名額（被主動讓出的 kill 不算失敗）。
+      const iterator = video.decoder.decodeVisualSegments({ path: snapshot.path }, { signal, probe, timeoutMs: visualTimeoutMs });
+      let iteratorDone = false;
+      try {
+        for (;;) {
+          throwIfAborted(signal);
+          const releaseVideo = await acquireVideoDecodePermit(embedder, signal);
+          let next: IteratorResult<VisualSegment>;
+          try {
+            next = await iterator.next();
+          } finally {
+            releaseVideo();
+          }
+          if (next.done) {
+            iteratorDone = true;
+            break;
+          }
+          const segment = next.value;
+          throwIfAborted(signal);
+          const vector = await embedVideo({ frames: videoFramesForSegment(segment) }, { signal });
+          throwIfAborted(signal);
+          vectors.push(vector);
+          inputs.push({
+            seq: 0,
+            kind: "video",
+            text: null,
+            contentHash: snapshot.contentHash,
+            vectorIndex: vectors.length - 1,
+            media: {
+              startSeconds: segment.startSeconds,
+              endSeconds: segment.endSeconds,
+              track: "video",
+              container: VIDEO_CONTAINER,
+              frameTimesSeconds: segment.frames.map((frame: VisualFrame) => frame.timestampSeconds),
+              preprocessVersion: visualVersion,
+              embedderId: embedder.info.id,
+              embeddingDim: embedder.info.dim,
+            },
+          });
+          visualCount += 1;
+        }
+      } finally {
+        if (!iteratorDone) await iterator.return(undefined);
+      }
+      // 片段數量必須等於 probe 推得的完整覆蓋；少一段代表時間軸不完整，不寫部分索引。
+      assertVideoVisualCoverage(visualCount, layout.visualCount);
+
+      if (layout.audio !== null) {
+        // 同上：保留 this；不可把 class method 脫鉤呼叫。
+        const embedAudio = embedder.embedAudio?.bind(embedder);
+        if (embedAudio === undefined) throw new Error("音訊嵌入能力尚未就緒");
+        let audioCount = 0;
+        const audioTimeoutMs = Math.min(30 * 60_000, Math.max(60_000, layout.audio.count * 3_000 + probe.durationSeconds * 200));
+        for await (const segment of video.decoder.decodeAudioSegments({ path: snapshot.path }, { signal, probe, timeoutMs: audioTimeoutMs })) {
+          throwIfAborted(signal);
+          // 理論上不會有 0 樣本片段；跳過比送進 embedder 被拒更安全（不延長來源時間）。
+          if (segment.samples.length === 0) continue;
+          // 與 WAV 共用音訊名額：每段取得、嵌入後立刻釋放，不持有一整檔。
+          const releaseAudio = await acquireAudioPermit(embedder, signal);
+          try {
+            throwIfAborted(signal);
+            vectors.push(await embedAudio({ samples: segment.samples, sampleRate: 16000 }, { signal }));
+            inputs.push({
+              seq: 0,
+              kind: "audio",
+              text: null,
+              contentHash: snapshot.contentHash,
+              vectorIndex: vectors.length - 1,
+              media: {
+                startSeconds: segment.startSeconds,
+                endSeconds: segment.endSeconds,
+                track: "video-audio",
+                container: VIDEO_CONTAINER,
+                streamIndex: layout.audio.streamIndex,
+                preprocessVersion: audioVersion,
+                embedderId: embedder.info.id,
+                embeddingDim: embedder.info.dim,
+              },
+            });
+          } finally {
+            releaseAudio();
+          }
+          audioCount += 1;
+        }
+        if (audioCount === 0) throw new MediaDecoderError("invalid-video");
+      }
+    } catch (error) {
+      // 取消不是「檔案壞掉」：原樣拋出，讓整輪以 AbortError 結束。
+      throwIfAborted(signal);
+      const reason = decoderSkipReason(error);
+      if (reason === undefined) throw error;
+      await purgeChunks(root.id, file.relPath, deps);
+      return { status: "skipped", reason };
+    } finally {
+      reportTiming(onTiming, "embed", embedStart);
+    }
+    throwIfAborted(signal);
+
+    // 整檔成功才替換：先刪舊向量，再 replaceChunks，最後寫新向量。
+    // 沿用索引器的自癒順序：任一中途失敗點都會在下一輪因「hash 相符但向量不齊」而重做。
+    const writeStart = performance.now();
+    const ordered = assignChunkMediaSeq(inputs);
+    if (existing.length > 0) {
+      await deps.vec.deleteByKeys(existing.map((chunk) => `c:${chunk.id}`));
+    }
+    const written = await deps.store.replaceChunks(root.id, file.relPath, ordered);
+    const items: VectorItem[] = written.map((chunk, index) => ({
+      key: `c:${chunk.id}`,
+      rootId: chunk.rootId,
+      embedderId: embedder.info.id,
+      vec: vectors[ordered[index]!.vectorIndex]!,
+    }));
+    await deps.vec.upsert(items);
+    reportTiming(onTiming, "write", writeStart);
+    // 影片 chunk 沒有文字內容，不計入 maskedFiles。
+    return { status: "processed", chunks: ordered.length, masked: false };
+  } finally {
+    // 快照只屬於本輪；成功、失敗、取消都要刪除（不把使用者媒體留在暫存）。
+    await removeVideoSnapshot(snapshot.dir);
+  }
+}
+
+/**
  * 掃描並索引一個 `mode:'index'` 的 root。
  *
  * - 增量：文字／程式碼以**遮罩後內容**的 sha256、媒體檔以原始位元組的 sha256，與 DB 內既有
@@ -763,6 +1123,12 @@ async function processFileInSlot(
  *   內容層跳過（`binary-content`）與解碼失敗跳過（`undecodable`）的檔案仍在 `files` 內
  *   （掃描不讀內容，無法事先知道），因此由 `processFile` 自己清除（見 `purgeChunks`），
  *   結果同樣不保留索引。
+ * - **影片（B3b）**：只有 root 有 `video` 模態、呼叫端提供 `decoder`、且 embedder 有
+ *   `capabilities.video`＋`embedVideo` 時才納入掃描；每檔走「有界快照 → probe → 選軌政策 →
+ *   lazy 逐段解碼＋嵌入 → 整檔替換」。deterministic 媒體問題（壞檔／不支援 codec／音軌／
+ *   超限）記 skipped 並清除舊索引；decoder 不可用／逾時／來源消失記 failed（保留舊索引、
+ *   可重試）；取消不寫任何資料。影片解碼名額以每次 decoder next() 為單位（D4）；音軌片段
+ *   只借用既有的音訊名額（每段取放），不長期佔用其他模態的預算。
  * - 可取消（`signal`：掃描期間於每個目錄／檔案迭代前檢查，worker 池於每個檔案開始前與嵌入前檢查）。
  *   限併發（`concurrency`，預設 2；embedder 宣告 `runtimeStatus.serializedInference` 時固定為 1）。
  * - **單檔失敗不中斷整輪**：`processFile` 的錯誤被記入 `failedFiles`（原因只留短標籤），
@@ -785,17 +1151,51 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
   // 這裡是唯一的下限來源，呼叫端傳進來的 concurrency 也不得超過它。
   const serialized = embedder.runtimeStatus?.serializedInference === true;
   const requestedConcurrency = Math.max(1, Math.floor(options.concurrency ?? 2));
-  const concurrency = serialized ? 1 : root.modalities.includes("audio") ? Math.min(2, requestedConcurrency) : requestedConcurrency;
   // 限速（預設 0＝不限速、不建立 timer）：夾成非負整數，負值／NaN 一律視為 0。
   const betweenFilesMs = Math.max(0, Math.floor(options.throttle?.betweenFilesMs ?? 0));
-  // 能力宣告與實際入口必須同時存在；影片尚未接通。
-  const scanOptions: ScanOptions = { supportedModalities: ["text", "code", "image"] };
+  const supportedModalities: Modality[] = ["text", "code", "image"];
   if (embedder.info.capabilities.audio && embedder.embedAudio !== undefined) {
-    scanOptions.supportedModalities = ["text", "code", "image", "audio"];
+    supportedModalities.push("audio");
   }
+  // 影片接通條件（缺一不可）：root 開啟 video 模態、呼叫端提供 decoder、embedder 宣告能力
+  // 且實際有 embedVideo 入口。任一不成立時影片檔照舊以 unsupported-modality 跳過，
+  // 不猜、也不靜默降級成圖片路徑。
+  let video: ProcessVideoContext | undefined;
+  if (root.modalities.includes("video")
+    && options.decoder !== undefined
+    && embedder.info.capabilities.video
+    && embedder.embedVideo !== undefined) {
+    // availability 只在整輪開始查一次（會 spawn 兩個短命程序）；不可用不讓整輪失敗，
+    // 由影片檔逐檔 failed（可重試），文字／圖片／音訊照常索引。
+    let availability: DecoderAvailability = { available: false };
+    try {
+      availability = await options.decoder.checkAvailability();
+    } catch {
+      availability = { available: false };
+    }
+    video = {
+      decoder: options.decoder,
+      decoderVersion: availability.ffmpegVersion,
+      available: availability.available,
+      maxFileBytes: options.videoMaxFileBytes ?? DEFAULT_VIDEO_MAX_FILE_BYTES,
+    };
+    supportedModalities.push("video");
+  }
+  // 含音訊或影片的 root：檔案間併發上限 2（媒體解碼一次只做一個檔案，避免長片餓死其他檔）。
+  const mediaRoot = root.modalities.includes("audio") || video !== undefined;
+  const concurrency = serialized ? 1 : mediaRoot ? Math.min(2, requestedConcurrency) : requestedConcurrency;
+  const scanOptions: ScanOptions = { supportedModalities };
+  if (video !== undefined) scanOptions.videoMaxFileBytes = video.maxFileBytes;
   if (options.maxFileBytes !== undefined) scanOptions.maxFileBytes = options.maxFileBytes;
   // 把 signal 一路帶進掃描層：大目錄下取消不必等整輪走訪結束（見 ScanOptions.signal）。
   if (signal !== undefined) scanOptions.signal = signal;
+  const processDeps: ProcessDeps = {
+    embedder,
+    store,
+    vec,
+    maxFileBytes: options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES,
+    ...(video === undefined ? {} : { video }),
+  };
 
   const scanStart = performance.now();
   const scan = await walkRoot(root, scanOptions);
@@ -852,7 +1252,7 @@ export async function indexRoot(root: Root, options: IndexRootOptions): Promise<
       const file = files[index]!;
       let outcome: FileOutcome;
       try {
-        outcome = await processFile(root, file, { embedder, store, vec, maxFileBytes: options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES }, signal, {
+        outcome = await processFile(root, file, processDeps, signal, {
           onChunked: (chunkCount) => {
             estimatedChunks += chunkCount;
             report();

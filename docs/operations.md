@@ -17,13 +17,19 @@
 `GET /diagnostics` 的 `embedderRuntime.audioState` 區分未載入／準備中／就緒／失敗；
 失敗且 `audioRetryable=false` 時需重啟後再試，否則可修正下載問題後重跑索引。
 
+影片索引以 `PATCH /roots/:id` 的 `modalities` 明確加入 `video`；同時有 `audio` 才會索引影片選定音軌（只有 `audio` 不會讀取影片）。格式與限制見 [影片契約](roots-and-privacy.md)。
+`POST /search` 與 MCP `search` 的影片命中有 `media.track`（`video`／`video-audio`）、`startSeconds`／`endSeconds`、`frameTimesSeconds`、`streamIndex`、`container`；沒有逐字稿。
+`GET|HEAD /roots/:id/media?path=...` 提供影片播放：單一 `Range`、206／416、單次上限 4 MiB、`Accept-Ranges`、token 與 root 守衛；`GET /roots/:id/file` 仍不服務影片。
+`GET /diagnostics.video` 回 decoder 能力三態（`disabled`／`unavailable`／`available`）、版本、per-root 生效上限與本行程影片索引統計；`GET /roots` 另回 additive `video`，preview 回 `videoCapability`。
+桌面版由 Electron Chromium 播放同源 Range；瀏覽器 standalone 目前不支援影片播放（需桌面版）。
+
 | 端點 | 說明 |
 |---|---|
 | `GET /health` | 免 token；服務身分、版本與 build（建置 commit） |
-| `GET /diagnostics` | 診斷資訊（版本、平台、embedder 裝置與退回原因、每 root 統計、記憶向量狀態） |
-| `GET /roots` / `POST /roots` | 列出／加入 root（`POST` 可帶 `maxFileBytes` 指定**單檔大小上限**，預設 10 MB） |
+| `GET /diagnostics` | 診斷資訊（版本、平台、embedder 裝置與退回原因、每 root 統計、記憶向量狀態、影片能力／decoder 狀態與索引統計） |
+| `GET /roots` / `POST /roots` | 列出／加入 root（`POST` 可帶 `maxFileBytes` 指定通用單檔上限，預設 10 MB；可帶 `videoMaxFileBytes` 指定 per-root 影片上限，bytes、1–16 GiB；`GET` 另回 additive `video` 能力摘要） |
 | `GET /roots/:id` | 單一 root |
-| `PATCH /roots/:id` | 改模態（`modalities`） |
+| `PATCH /roots/:id` | 改模態與 per-root 影片上限（`modalities`／`videoMaxFileBytes`；後者 `null` 清除、值域 1–16 GiB） |
 | `DELETE /roots/:id?deleteData=1` | 移除 root；`deleteData` 決定是否連帶刪已索引資料。接受 `1`／`0`／`true`／`false`／`yes`／`no` |
 | `POST /roots/:id/preview` | 索引前預覽（乾跑，不寫入；root 需已加入） |
 | `POST /roots/:id/index` | 開始索引；同一 root 已在索引中會回 `409` |
@@ -31,6 +37,7 @@
 | `GET /roots/:id/entries` | 條目（`?path=` 相對路徑；省略＝root 根目錄） |
 | `GET /roots/:id/file` | 讀檔（`?path=`；文字回 JSON 預覽，圖片回原始位元組） |
 | `GET /roots/:id/thumb` | 縮圖（`?path=`） |
+| `GET`／`HEAD /roots/:id/media` | 影片播放（`?path=`；只服務 `.mp4`；單一 Range、206／416、單次 4 MiB、`Accept-Ranges`、token 與 root 守衛；不整檔入記憶體） |
 | `POST /search` | 檔案語意搜尋（`mode`：`vector` 預設／`keyword`／`hybrid`；`k` 上限 100） |
 | `GET /memory-policy` / `PATCH /memory-policy` | 讀取／保存記憶遮罩開關與政策版本 |
 | `POST /memory-sources` | 完整原文回合寫入；8 MiB 上限，事件重送去重 |
@@ -107,6 +114,9 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
 | `MNEMOSHELF_EMBED_ORT_LOG` | embedder | 未設定（不覆寫 ORT 預設） | ONNX Runtime log 等級 `0`–`4`（`0`＝verbose），僅診斷用。 |
 | `MNEMOSHELF_MEMORY_BACKFILL` | 服務端 | `on` | 啟動時是否回填既有記憶向量；只接受 `on`／`off`（大小寫不拘），非法值直接拒絕啟動。`off` 只停啟動回填，**新寫入的記憶仍會嵌入**。 |
 | `MNEMOSHELF_INDEX_RATE` | 服務端 | `off` | 索引限速：`normal` 每檔之間休眠 50ms、`low` 250ms，`off` 不休眠。**只作用於檔案與檔案之間**；大檔內的讓渡由下述視窗排程負責。非法值直接拒絕啟動。 |
+| `MNEMOSHELF_FFMPEG_PATH` / `MNEMOSHELF_FFPROBE_PATH` | 服務端、桌面版（打包版由桌面注入） | 未設定 | 影片解碼器 ffmpeg／ffprobe 絕對路徑；**必須成對**。未設定＝影片能力 `disabled`。 |
+| `MNEMOSHELF_FFMPEG_DIR` | 服務端、桌面版 | 未設定 | 影片解碼器目錄（內含平台檔名 ffmpeg／ffprobe）；與成對 PATH 變數二選一，PATH 優先。打包版為 `<resources>/bin`。 |
+| `MNEMOSHELF_VIDEO_MAX_FILE_BYTES` | 服務端 | `512 MiB` | 影片單檔大小上限（bytes）；per-root `videoMaxFileBytes` 優先，未設定時用本值。 |
 | `MNEMOSHELF_BUILD_COMMIT` | 建置腳本（server）；服務端僅在讀不到 build-info 時後備 | `unknown` | **build 時 fallback**：`git rev-parse HEAD` 不可用時（例如從 tarball build）寫入的 commit；不用於執行期設定。 |
 
 測試專用的變數（`MNEMOSHELF_E2E`、`MNEMOSHELF_AUTOTEST_*`、`MNEMOSHELF_SMOKE_NO_SANDBOX`、

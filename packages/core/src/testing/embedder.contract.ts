@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import type { Embedder, ImageInput } from "../ports/embedder.js";
+import { MAX_VIDEO_FRAME_EDGE, MAX_VIDEO_FRAMES } from "../ports/embedder.js";
+import type { Embedder, ImageInput, VideoFrameInput, VideoInput } from "../ports/embedder.js";
 
 /** 每個測試都要拿到全新、獨立的實例（真實 embedder 會重新載入模型）。 */
 export type EmbedderFactory = () => Embedder | Promise<Embedder>;
@@ -40,6 +41,28 @@ const TINY_PNG_BLUE =
 function distinctImage(which: "a" | "b"): ImageInput {
   const base64 = which === "a" ? TINY_PNG_RED : TINY_PNG_BLUE;
   return { bytes: new Uint8Array(Buffer.from(base64, "base64")), mimeType: "image/png" };
+}
+
+/** 一張合成的影片影格（確定性圖樣；不放任何私人影像）。 */
+function videoFrame(
+  which: "a" | "b",
+  index: number,
+  options: { width?: number; height?: number; channels?: 3 | 4; timestampSeconds?: number } = {},
+): VideoFrameInput {
+  const width = options.width ?? 8;
+  const height = options.height ?? 8;
+  const channels = options.channels ?? 3;
+  const pixels = new Uint8Array(width * height * channels);
+  const base = which === "a" ? 7 : 191;
+  for (let i = 0; i < pixels.length; i += 1) {
+    pixels[i] = (base + index * 37 + i * 31) % 256;
+  }
+  return { pixels, width, height, channels, timestampSeconds: options.timestampSeconds ?? index * 0.25 };
+}
+
+/** 一段合法的合成影片（1–4 幀）。 */
+function videoClip(which: "a" | "b", frames = 4): VideoInput {
+  return { frames: Array.from({ length: frames }, (_, index) => videoFrame(which, index)) };
 }
 
 /**
@@ -233,6 +256,76 @@ export function runEmbedderContract(name: string, factory: EmbedderFactory): voi
         // 讓失敗訊息直接出現在測試輸出中。
         throw new Error(`probe 失敗：${result.message ?? "(無訊息)"}`);
       }
+    });
+
+    it("影片能力必須有入口；1 幀與 4 幀（含 RGBA）輸出維度、有限值、正規化與確定性一致", async () => {
+      // capabilities.video=false 時不要求入口（音訊同理）。
+      if (!embedder.info.capabilities.video) return;
+      expect(typeof embedder.embedVideo).toBe("function");
+
+      const single = await embedder.embedVideo!(videoClip("a", 1));
+      const four = await embedder.embedVideo!(videoClip("a", 4));
+      const rgba = await embedder.embedVideo!({ frames: [videoFrame("a", 0, { channels: 4 })] });
+      for (const vector of [single, four, rgba]) {
+        expect(vector).toBeInstanceOf(Float32Array);
+        expect(vector.length).toBe(embedder.info.dim);
+        expect(isFiniteVector(vector)).toBe(true);
+        expect(Math.abs(norm(vector) - 1)).toBeLessThan(1e-3);
+      }
+
+      // 同一輸入重複呼叫必得（近似）同一向量；不同內容得不同向量。
+      const repeated = await embedder.embedVideo!(videoClip("a", 4));
+      expect(cosine(four, repeated)).toBeGreaterThanOrEqual(0.999);
+      const other = await embedder.embedVideo!(videoClip("b", 4));
+      expect(cosine(four, other)).toBeLessThan(0.999);
+    });
+
+    it("影片拒絕空幀、超過 32 幀、非法通道／像素長度／尺寸／時間戳；不靜默抽樣", async () => {
+      if (!embedder.info.capabilities.video) return;
+      const invalid: VideoInput[] = [
+        // 空片段：不得回傳空向量或默默補幀。
+        { frames: [] },
+        // 超過 32 幀：必須拒絕，不得由上游默默抽樣成 32 幀。
+        {
+          frames: Array.from({ length: MAX_VIDEO_FRAMES + 1 }, (_, index) =>
+            videoFrame("a", index, { width: 1, height: 1 })),
+        },
+        // 通道數不是 3／4。
+        { frames: [{ ...videoFrame("a", 0), channels: 2 as never }] },
+        // 像素長度與 width×height×channels 不符。
+        { frames: [{ ...videoFrame("a", 0), pixels: new Uint8Array(1) }] },
+        // 邊長 0 與超過上限。
+        { frames: [{ ...videoFrame("a", 0), width: 0 }] },
+        {
+          frames: [{
+            ...videoFrame("a", 0),
+            width: MAX_VIDEO_FRAME_EDGE + 1,
+            pixels: new Uint8Array((MAX_VIDEO_FRAME_EDGE + 1) * 8 * 3),
+          }],
+        },
+        // 時間戳非有限、負值、遞減。
+        { frames: [{ ...videoFrame("a", 0), timestampSeconds: Number.NaN }] },
+        { frames: [{ ...videoFrame("a", 0), timestampSeconds: -1 }] },
+        {
+          frames: [
+            videoFrame("a", 0, { timestampSeconds: 1 }),
+            videoFrame("a", 1, { timestampSeconds: 0.5 }),
+          ],
+        },
+        // 同一片段內幀尺寸不一致。
+        { frames: [videoFrame("a", 0), videoFrame("a", 1, { width: 9 })] },
+      ];
+      for (const video of invalid) {
+        await expect(embedder.embedVideo!(video)).rejects.toMatchObject({ name: "EmbedderInputError" });
+      }
+    });
+
+    it("已取消的影片不回傳向量", async () => {
+      if (!embedder.info.capabilities.video) return;
+      const controller = new AbortController();
+      controller.abort();
+      await expect(embedder.embedVideo!(videoClip("a", 1), { signal: controller.signal }))
+        .rejects.toMatchObject({ name: "AbortError" });
     });
 
     it("已取消的文字批次與圖片必須拒絕，不回傳成功向量", async () => {

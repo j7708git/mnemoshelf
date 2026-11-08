@@ -8,7 +8,7 @@
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Worker } from "node:worker_threads";
+import { Worker, type Transferable } from "node:worker_threads";
 import { describe, expect, it, vi } from "vitest";
 import type { EmbedderInfo, EmbedderRuntimeStatus } from "@mnemoshelf/core";
 import { FakeEmbedder } from "@mnemoshelf/core/testing";
@@ -128,6 +128,8 @@ type FakeHandler = (message: FakeMessage, worker: FakeEmbedderWorker) => void;
 /** 行程內的假 worker：`postMessage` 以 microtask 非同步回呼，事件介面與真的 Worker 相同。 */
 class FakeEmbedderWorker implements EmbedderWorkerLike {
   readonly posted: FakeMessage[] = [];
+  /** 每次 `postMessage` 的 transfer 清單（與 `posted` 同索引）；用於驗證 buffer 真的被轉移。 */
+  readonly postedTransfers: (readonly Transferable[] | undefined)[] = [];
   terminated = false;
   private readonly listeners: Record<EmbedderWorkerEvent, Set<(...args: unknown[]) => void>> = {
     message: new Set(),
@@ -137,9 +139,10 @@ class FakeEmbedderWorker implements EmbedderWorkerLike {
 
   constructor(private readonly handler: FakeHandler) {}
 
-  postMessage(message: unknown): void {
+  postMessage(message: unknown, transferList?: readonly Transferable[]): void {
     const typed = message as FakeMessage;
     this.posted.push(typed);
+    this.postedTransfers.push(transferList);
     queueMicrotask(() => {
       if (!this.terminated) this.handler(typed, this);
     });
@@ -899,6 +902,170 @@ describe("WorkerEmbedder：有界公平排程", () => {
     await release(0);
     await Promise.all([run, first, second]);
     expect(workers[0]!.terminated).toBe(true);
+  });
+
+  /** 4×4 RGB 合成影格（確定性圖樣；不放任何私人影像）。 */
+  function videoFrame(
+    index: number,
+    overrides: Partial<{
+      pixels: Uint8Array;
+      width: number;
+      height: number;
+      channels: 3 | 4;
+      timestampSeconds: number;
+    }> = {},
+  ): { pixels: Uint8Array; width: number; height: number; channels: 3 | 4; timestampSeconds: number } {
+    const pixels = new Uint8Array(4 * 4 * 3);
+    for (let i = 0; i < pixels.length; i += 1) pixels[i] = (index * 11 + i) % 256;
+    return { pixels, width: 4, height: 4, channels: 3, timestampSeconds: index * 0.25, ...overrides };
+  }
+
+  /** 一段合成影片（預設 2 幀）。 */
+  function videoClip(count = 2) {
+    return { frames: Array.from({ length: count }, (_, index) => videoFrame(index)) };
+  }
+
+  /**
+   * 影片排程用假 worker：init 自動 ready、dispose 自動回應、cancel 以 AbortError 收尾；
+   * 其餘 request 交給 handler（測試自己決定何時／如何回應）。
+   */
+  function videoHarness(
+    handler: (message: FakeMessage, worker: FakeEmbedderWorker) => void,
+    overrides: Partial<WorkerEmbedderOptions> = {},
+  ) {
+    return makeEmbedder((message, worker) => {
+      if (message.type === "init") {
+        worker.ready();
+        return;
+      }
+      if (message.type === "request" && message.method === "dispose") {
+        worker.respond(message.id as number, null);
+        return;
+      }
+      if (message.type === "cancel") {
+        worker.fail(message.id as number, { name: "AbortError", message: "嵌入已取消" });
+        return;
+      }
+      if (message.type === "request") handler(message, worker);
+    }, overrides);
+  }
+
+  it("影片排程：像素 byte 計入准入、准入後才複製、transfer 出去且不 detach 呼叫端", async () => {
+    const { embedder, workers } = videoHarness(() => undefined);
+    const source = videoClip(2);
+    const callerPixels = source.frames.map((entry) => entry.pixels);
+    const pending = embedder.embedVideo(source);
+
+    // 准入在呼叫當下完成：4×4×3×2 幀＝96 bytes（只計像素，不含 metadata）。
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(2 * 4 * 4 * 3);
+    await waitFor(() => workers[0]?.posted.some((message) => message.type === "request") === true);
+    const requestIndex = workers[0]!.posted.findIndex((message) => message.type === "request");
+    const request = workers[0]!.posted[requestIndex]!;
+    expect(request.method).toBe("embedVideo");
+
+    type WireFrame = {
+      pixels: Uint8Array;
+      width: number;
+      height: number;
+      channels: number;
+      timestampSeconds: number;
+    };
+    const params = request.params as { frames: WireFrame[] };
+    expect(params.frames).toHaveLength(2);
+    expect(params.frames[0]).toMatchObject({ width: 4, height: 4, channels: 3, timestampSeconds: 0 });
+    expect(params.frames[1]).toMatchObject({ timestampSeconds: 0.25 });
+    // 准入後才複製：送出的像素是另一個 buffer，呼叫端 buffer 沒有被 detach、仍可續用。
+    expect(params.frames[0]!.pixels).not.toBe(callerPixels[0]);
+    callerPixels[0]![0] = 123;
+    expect(source.frames[0]!.pixels.byteLength).toBe(48);
+    expect(params.frames[0]!.pixels[0]).not.toBe(123);
+    // transfer 清單就是送出的兩份像素 buffer（不是呼叫端的 buffer）。
+    const transfer = workers[0]!.postedTransfers[requestIndex]!;
+    expect(transfer).toHaveLength(2);
+    expect(transfer![0]).toBe(params.frames[0]!.pixels.buffer);
+    expect(transfer!.includes(callerPixels[0]!.buffer as never)).toBe(false);
+
+    workers[0]!.respond(request.id as number, Float32Array.of(1, 0));
+    expect(Array.from(await pending)).toEqual([1, 0]);
+    await embedder.drain();
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+    await embedder.dispose();
+  });
+
+  it("影片排程：非法幀序列在建立 worker 前拒絕；預先取消同樣不執行", async () => {
+    const { embedder, workers } = videoHarness(() => undefined);
+    const invalid: unknown[] = [
+      { frames: [] },
+      {
+        frames: Array.from({ length: 33 }, (_, index) =>
+          videoFrame(index, { width: 1, height: 1, pixels: new Uint8Array(3) })),
+      },
+      { frames: [videoFrame(0, { channels: 2 as never })] },
+      { frames: [videoFrame(0, { timestampSeconds: Number.NaN })] },
+    ];
+    for (const video of invalid) {
+      await expect(embedder.embedVideo(video as never)).rejects.toMatchObject({
+        name: "EmbedderInputError",
+        code: "invalid-video-input",
+      });
+    }
+    expect(workers).toHaveLength(0);
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+
+    const controller = new AbortController();
+    controller.abort();
+    await expect(embedder.embedVideo(videoClip(1), { signal: controller.signal }))
+      .rejects.toMatchObject({ name: "AbortError" });
+    expect(workers).toHaveLength(0);
+    await embedder.dispose();
+  });
+
+  it("影片排程：像素位元組超過准入上限 → EEMBEDDERQUEUEFULL，不建立 worker", async () => {
+    const { embedder, workers } = videoHarness(() => undefined, { scheduling: { maxInputBytes: 10 } });
+    await expect(embedder.embedVideo(videoClip(1))).rejects.toBeInstanceOf(EmbedderQueueFullError);
+    expect(workers).toHaveLength(0);
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+    await embedder.dispose();
+  });
+
+  it("影片排程：在途取消送 cancel、排隊取消立即拒絕，兩者都不採結果", async () => {
+    const controller = new AbortController();
+    const { embedder, workers } = videoHarness(() => undefined);
+    const active = embedder.embedVideo(videoClip(1), { signal: controller.signal });
+    const rejected = expect(active).rejects.toMatchObject({ name: "AbortError" });
+    await waitFor(() => workers[0]?.posted.some((message) => message.type === "request") === true);
+
+    const queuedController = new AbortController();
+    const queued = embedder.embedVideo(videoClip(1), { signal: queuedController.signal });
+    const queuedRejected = expect(queued).rejects.toMatchObject({ name: "AbortError" });
+    queuedController.abort();
+    await queuedRejected;
+
+    controller.abort();
+    await rejected;
+    const requestId = workers[0]!.posted.find((message) => message.type === "request")!.id;
+    expect(workers[0]!.posted.some((message) => message.type === "cancel" && message.id === requestId)).toBe(true);
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+    await embedder.dispose();
+  });
+
+  it("影片排程：worker 回報的 videoState 會更新 proxy 診斷", async () => {
+    const { embedder, workers } = videoHarness(() => undefined);
+    const pending = embedder.embedVideo(videoClip(1));
+    await waitFor(() => workers[0]?.posted.some((message) => message.type === "request") === true);
+    const request = workers[0]!.posted.find((message) => message.type === "request")!;
+    workers[0]!.emit("message", { type: "status", runtimeStatus: { ...STATUS, videoState: "loading" } });
+    expect(embedder.runtimeStatus?.videoState).toBe("loading");
+    workers[0]!.emit("message", {
+      type: "response",
+      id: request.id,
+      ok: true,
+      result: Float32Array.of(1),
+      runtimeStatus: { ...STATUS, videoState: "ready" },
+    });
+    await pending;
+    expect(embedder.runtimeStatus?.videoState).toBe("ready");
+    await embedder.dispose();
   });
 
   it("彙總診斷是快照且只含計數與時間，不洩漏合成輸入；進度到整批完成才結算", async () => {

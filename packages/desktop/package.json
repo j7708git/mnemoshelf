@@ -10,10 +10,13 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "vitest run",
+    "prepare:media": "node scripts/stage-media-bin.mjs",
+    "verify:media": "node scripts/stage-media-bin.mjs --check",
     "dist": "pnpm run build && electron-builder --dir",
     "dist:linux": "pnpm run build && electron-builder --linux --publish never",
     "dist:mac": "pnpm run build && electron-builder --mac --publish never",
     "dist:win": "pnpm run build && electron-builder --win --publish never",
+    "dist:win:media": "pnpm -r run build && pnpm run prepare:media && electron-builder --win --dir",
     "start": "electron ."
   },
   "dependencies": {

@@ -4,3 +4,5 @@ import { FakeEmbedder, runEmbedderContract } from "../src/testing/index.js";
 // 測試名稱即為 "Embedder contract (fake)"。
 runEmbedderContract("fake", () => new FakeEmbedder());
 runEmbedderContract("fake-audio", () => new FakeEmbedder({ audio: true }));
+runEmbedderContract("fake-video", () => new FakeEmbedder({ video: true }));
+runEmbedderContract("fake-audio-video", () => new FakeEmbedder({ audio: true, video: true }));

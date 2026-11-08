@@ -112,6 +112,23 @@ extraResources:
       # 不要把 sourcemap 一起送進產物（asar 那邊也排除了 `*.map`）。
       - "!**/*.map"
 
+  # 影片索引解碼器（FFmpeg／ffprobe）放 asar 之外的 resources/bin：
+  # Node 的 spawn 讀不到 asar 內的執行檔（A1 實測），桌面端（C2）以
+  # `<resourcesPath>/bin` 注入 `MNEMOSHELF_FFMPEG_DIR` 給 Core 服務。
+  #
+  # 來源是 `media-bin/`：git 忽略的 staging 目錄，由 `scripts/stage-media-bin.mjs`
+  # 從已驗證的候選複製（版本／大小／SHA256 見 `scripts/media-bin.lock.json`）。
+  # 沒有先 staging 時這個目錄只有 .gitignore、electron-builder 會略過內容；
+  # 既有 `dist:*` 與發版流程行為不變，帶 binary 的建置另走 `prepare:media`。
+  #
+  # 授權仍是未完成 gate：產物內目前只附 FFmpeg 的 LGPLv3 全文，
+  # third-party notices／源碼與 static link 可重連結方案尚未備妥，不得當成可配送。
+  - from: media-bin
+    to: bin
+    filter:
+      - "**/*"
+      - "!**/.gitignore"
+
 # 四個原生模組都是 N-API／Node-API，不需 @electron/rebuild（研究中已確認）。
 npmRebuild: false
 

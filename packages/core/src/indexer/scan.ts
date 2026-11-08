@@ -7,8 +7,27 @@ import type { ChunkKind, Modality, Root } from "../ports/types.js";
 import { resolveInsideRoot } from "../roots/path-guard.js";
 import { matchesAnyGlob } from "./glob.js";
 
-/** 預設單檔大小上限（bytes）：超過即跳過。 */
+/** 預設單檔大小上限（bytes）：超過即跳過（**不套用影片**，見下）。 */
 export const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
+
+/**
+ * 影片單檔大小上限的預設值（bytes；512 MiB）。
+ *
+ * 為什麼分開：通用 10 MiB 預設對影片太小（幾秒的 1080p 就超過），而影片的實際限制要
+ * per-root 持久化並在 UI 可見（C 階段）；本輪只提供**明確的 scan option**
+ * （`ScanOptions.videoMaxFileBytes`），不改通用 `maxFileBytes` 的既有語意。
+ * 超過此上限的影片在掃描階段記 `video-too-large`（可在預覽看到，讓使用者知道要調上限）。
+ */
+export const DEFAULT_VIDEO_MAX_FILE_BYTES = 512 * 1024 * 1024;
+
+/**
+ * 影片來源時長上限（秒；600 秒）。
+ *
+ * 掃描與預覽**不讀媒體內容**，因此此上限不可能在掃描階段判定：由索引／解碼階段以受控
+ * 探測強制，超出記 `video-duration-exceeded`。預覽只用它算候選片段數上界
+ * （每 4 秒一段 ⇒ 每檔最多 150 段），不是實際時長。
+ */
+export const VIDEO_MAX_DURATION_SECONDS = 600;
 
 /**
  * 跳過的原因。除了任務卡明列的 `blocked`／`excluded`／`modality-off`／`too-large`／
@@ -20,6 +39,13 @@ export const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
  * （`indexer.processFile`）讀入後才判定的（見 `docs/roots-and-privacy.md` 的兩道防線）。
  * 同理，`undecodable` 也不由掃描產生：要在真的把位元組交給 embedder 之後才知道
  * （見 `indexer.isMediaDecodeError`），預覽階段看不到這個原因。
+ *
+ * **影片原因依「誰能判定」分兩組**（不得混用）：
+ * - 掃描可判定（副檔名／大小，不讀內容）：`unsupported-video-format`、`video-too-large`；
+ * - 需 probe／decode 才知（由索引／解碼階段產生，掃描與預覽**看不到**）：
+ *   `video-duration-exceeded`、`video-resolution-exceeded`、`video-no-stream`、`invalid-video`、
+ *   `unsupported-video-codec`、`unsupported-video-audio-track`、`unsupported-video-timeline`。
+ * 影片候選在確認索引前不得宣稱「可解碼」：副檔名只是第一道篩選，實際 codec 由受控探測判斷。
  */
 export type SkipReason =
   | "blocked"
@@ -30,6 +56,19 @@ export type SkipReason =
   | "invalid-audio"
   | "audio-limit-exceeded"
   | "too-large"
+  // 影片：掃描可判定（副檔名／大小）
+  | "unsupported-video-format"
+  | "video-too-large"
+  // 影片：需 probe／decode 才知（索引／解碼階段產生；掃描與預覽不會出現）
+  | "video-duration-exceeded"
+  | "video-resolution-exceeded"
+  /** 容器可讀但沒有影像流（例如 AAC-only 的 .mp4）：不是解碼失敗，是沒有可索引畫面。 */
+  | "video-no-stream"
+  | "invalid-video"
+  | "unsupported-video-codec"
+  | "unsupported-video-audio-track"
+  /** 時間線無法可靠定義（PTS 亂序／重複、段內無幀、decoder 與 probe 不一致）。 */
+  | "unsupported-video-timeline"
   | "unresolved-symlink"
   | "symlink-dir"
   | "unsupported-type"
@@ -67,8 +106,15 @@ export interface ScanRoot {
 export interface ScanOptions {
   /** 呼叫端實際已接通的模態；未提供時只負責列舉，不判斷處理能力。 */
   supportedModalities?: readonly Modality[];
-  /** 單檔大小上限，預設 `DEFAULT_MAX_FILE_BYTES`（10 MB）。 */
+  /** 單檔大小上限，預設 `DEFAULT_MAX_FILE_BYTES`（10 MB）；**不套用影片**。 */
   maxFileBytes?: number;
+  /**
+   * 影片單檔大小上限（bytes），預設 `DEFAULT_VIDEO_MAX_FILE_BYTES`（512 MiB）。
+   *
+   * 只套用 `kind:"video"`；影片**不套用**通用 `maxFileBytes`（10 MiB 對影片太小）。
+   * 這是本輪的明確 scan option：per-root 持久化與 UI 入口屬 C 階段，不在 scan 層猜設定。
+   */
+  videoMaxFileBytes?: number;
   /**
    * 取消訊號（可選）。走訪期間在**每個目錄與每個檔案項目**迭代前檢查一次，
    * 中止時拋 `AbortError`（沿用 core 既有的 `throwIfAborted` 慣例）。
@@ -185,6 +231,19 @@ const CODE_FILENAMES = new Set(["dockerfile", "makefile", "cmakelists.txt", "gem
 const IMAGE_EXTS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".avif", ".heic", ".ico"]);
 const AUDIO_EXTS = new Set([".mp3", ".wav", ".flac", ".ogg", ".oga", ".m4a", ".aac", ".opus", ".wma"]);
 const VIDEO_EXTS = new Set([".mp4", ".mov", ".webm", ".mkv", ".avi", ".m4v", ".wmv", ".flv"]);
+
+/**
+ * 影片 v1 容器白名單：只接受 `.mp4`（首版範圍見影片里程碑；實際 codec 由受控探測判斷）。
+ *
+ * 這只是**副檔名**篩選：`.mp4` 不代表編碼一定支援（HEVC／AV1／HDR 等由解碼階段具名拒絕）；
+ * 其他容器（`.mov`／`.webm`）在 v1 先以 `unsupported-video-format` 跳過，避免拿未驗證的解碼路徑冒險。
+ */
+const VIDEO_V1_EXTS = new Set([".mp4"]);
+
+/** 檔名是否為 v1 支援的影片容器（`supportedModalities` 宣告 video 時使用；只看副檔名、不讀內容）。 */
+export function isSupportedVideoFileName(fileName: string): boolean {
+  return VIDEO_V1_EXTS.has(path.extname(fileName.toLowerCase()));
+}
 
 /** 已知的二進位格式（非文字／程式碼／媒體）：跳過，不當文字硬讀。 */
 const BINARY_EXTS = new Set([
@@ -402,6 +461,7 @@ async function guardedResolve(guardRoot: Root, abs: string): Promise<GuardOutcom
  */
 export async function walkRoot(root: ScanRoot, options: ScanOptions = {}): Promise<ScanResult> {
   const maxFileBytes = options.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES;
+  const videoMaxFileBytes = options.videoMaxFileBytes ?? DEFAULT_VIDEO_MAX_FILE_BYTES;
   const signal = options.signal;
   const rootAbs = path.resolve(root.path);
   const guardRoot: Root = {
@@ -456,7 +516,18 @@ export async function walkRoot(root: ScanRoot, options: ScanOptions = {}): Promi
       skipped.push({ relPath: rel, reason: "unsupported-audio-format" });
       return;
     }
-    if (size > maxFileBytes) {
+    // 影片 v1 只接受 `.mp4`：掃描階段可判定，其他容器具名跳過（不讀內容）。
+    if (options.supportedModalities !== undefined && kind === "video" && !isSupportedVideoFileName(rel)) {
+      skipped.push({ relPath: rel, reason: "unsupported-video-format" });
+      return;
+    }
+    // 影片用專屬大小上限（預設 512 MiB）；通用 10 MiB 上限不套用影片。
+    if (kind === "video") {
+      if (size > videoMaxFileBytes) {
+        skipped.push({ relPath: rel, reason: "video-too-large" });
+        return;
+      }
+    } else if (size > maxFileBytes) {
       skipped.push({ relPath: rel, reason: "too-large" });
       return;
     }

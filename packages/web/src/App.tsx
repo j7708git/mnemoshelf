@@ -4,8 +4,8 @@ import {
   downloadDiagnostics,
   fetchDiagnostics,
   fetchMemoryPolicy,
+  fetchRoots,
   getToken,
-  listRoots,
   MemoryPolicyUnavailableError,
   NetworkError,
   removeRoot,
@@ -14,12 +14,15 @@ import {
   UnauthorizedApiError,
   updateMemoryPolicy,
   updateRootModalities,
+  updateRootVideoMaxFileBytes,
   type DiagnosticsEmbedderRuntime,
   type MemoryPolicy,
   type Root,
+  type VideoCapability,
 } from "./api";
 import { AddRootFlow } from "./AddRootFlow";
 import { toggleModality } from "./audio";
+import { DEFAULT_VIDEO_MAX_FILE_BYTES } from "./media";
 import { AgentGuidePanel } from "./AgentGuidePanel";
 import { COPY_BLOCKED_TEXT } from "./agentGuideText";
 import { BootstrapScreen } from "./BootstrapScreen";
@@ -71,8 +74,16 @@ export function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   /** 正在更新「含照片」設定的 root id（避免重複送出）。 */
   const [imagesBusyRootId, setImagesBusyRootId] = useState<number | null>(null);
+  /** 正在儲存影片單檔上限的 root id（避免重複送出）。 */
+  const [videoLimitBusyRootId, setVideoLimitBusyRootId] = useState<number | null>(null);
   /** 側欄的設定更新錯誤訊息（不切換整個畫面）。 */
   const [rootsError, setRootsError] = useState<string | null>(null);
+  /**
+   * 服務層影片能力（`GET /roots` 的 `video`；`null`＝舊版服務未回報）。
+   *
+   * 與每個 root 自己的 `modalities.video` 無關：用來在**打開開關前**停用並顯示原因。
+   */
+  const [videoCapability, setVideoCapability] = useState<VideoCapability | null>(null);
   /** 等待確認的「移除資料夾」（站內確認框，取代原生 confirm）。 */
   const [pendingRemoveRoot, setPendingRemoveRoot] = useState<Root | null>(null);
   const [removeRootBusy, setRemoveRootBusy] = useState(false);
@@ -164,7 +175,8 @@ export function App() {
   const load = useCallback(async (): Promise<void> => {
     setState({ kind: "loading" });
     try {
-      const roots = await listRoots();
+      const { roots, video } = await fetchRoots();
+      setVideoCapability(video);
       setState({ kind: "ready", roots });
     } catch (error) {
       if (error instanceof UnauthorizedApiError) {
@@ -305,7 +317,9 @@ export function App() {
    */
   const refreshRoots = useCallback(async (): Promise<void> => {
     try {
-      const roots = await listRoots();
+      const { roots, video } = await fetchRoots();
+      // 能力是服務層狀態（decoder 啟動時決定）：順手更新，失敗時保留舊值即可。
+      if (video !== null) setVideoCapability(video);
       setState((current) => (current.kind === "ready" ? { kind: "ready", roots } : current));
     } catch {
       // 靜默失敗（含 401：apiFetch 已派送事件讓 UI 回到貼 token 畫面）。
@@ -480,6 +494,26 @@ export function App() {
     }
   };
 
+  /**
+   * 儲存單一 root 的影片單檔大小上限（`PATCH /roots/:id` 的 additive 欄位）。
+   *
+   * 只改設定、**不自動重新索引**；影片模態未開啟也可以先設定。失敗時在側欄顯示錯誤，
+   * 並刷新清單讓畫面回到伺服器的實際值（不留下沒生效的假狀態）。
+   */
+  const onSetVideoMaxFileBytes = async (root: Root, bytes: number | null): Promise<void> => {
+    setVideoLimitBusyRootId(root.id);
+    setRootsError(null);
+    try {
+      await updateRootVideoMaxFileBytes(root.id, bytes);
+      await refreshRoots();
+    } catch (error) {
+      setRootsError(error instanceof Error ? error.message : "更新影片上限失敗");
+      await refreshRoots();
+    } finally {
+      setVideoLimitBusyRootId(null);
+    }
+  };
+
   const selectedRoot =
     state.kind === "ready"
       ? (state.roots.find((root) => root.id === selectedRootId) ?? state.roots[0] ?? null)
@@ -645,7 +679,12 @@ export function App() {
                   onRemove={(root) => void onRemoveRoot(root)}
                   onToggleImages={(root, enabled) => void onToggleImages(root, enabled)}
                   onToggleAudio={(root, enabled) => void onToggleImages(root, enabled, "audio")}
+                  onToggleVideo={(root, enabled) => void onToggleImages(root, enabled, "video")}
+                  videoCapability={videoCapability}
                   imagesBusyRootId={imagesBusyRootId}
+                  onSetVideoMaxFileBytes={(root, bytes) => void onSetVideoMaxFileBytes(root, bytes)}
+                  videoLimitBusyRootId={videoLimitBusyRootId}
+                  defaultVideoMaxFileBytes={videoCapability?.maxFileBytes ?? DEFAULT_VIDEO_MAX_FILE_BYTES}
                 />
                 {rootsError !== null && (
                   <p role="alert" className="text-xs text-red-600">
@@ -669,16 +708,23 @@ export function App() {
                       void refreshRoots();
                     }}
                     onRootChanged={() => {
-                      // 流程中途改了模態（預覽頁的「含圖片」）：側欄的模態標示要跟著更新。
+                      // 流程中途改了模態（預覽頁的「含圖片」／「含音訊」／「含影片」）：
+                      // 側欄的模態標示要跟著更新。
                       void refreshRoots();
                     }}
+                    videoCapability={videoCapability}
                   />
                 ) : selectedRoot === null ? (
                   <div className="flex h-[60vh] items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center">
                     <p className="text-sm text-muted">請先加入一個資料夾。</p>
                   </div>
                 ) : (
-                  <ExplorerPanel key={selectedRoot.id} root={selectedRoot} refreshKey={refreshKey} />
+                  <ExplorerPanel
+                    key={selectedRoot.id}
+                    root={selectedRoot}
+                    refreshKey={refreshKey}
+                    videoCapability={videoCapability}
+                  />
                 )}
               </main>
             </div>

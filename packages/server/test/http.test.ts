@@ -199,7 +199,11 @@ describe("REST：roots 生命週期", () => {
 
     const afterRemove = await api(server.instance, "POST", "/search", { body: { query: NOTE_TOKEN } });
     expect((afterRemove.body as { hits: unknown[] }).hits).toHaveLength(0);
-    expect((await api(server.instance, "GET", "/roots")).body).toEqual({ roots: [] });
+    // additive：`GET /roots` 另外帶服務層 `video` 能力（未設定 decoder → disabled）。
+    expect((await api(server.instance, "GET", "/roots")).body).toMatchObject({
+      roots: [],
+      video: { state: "disabled", available: false, reason: null },
+    });
   });
 
   it("root 內的 `.gitignore` 是目錄 → preview 仍回 200（不 500）", async () => {
