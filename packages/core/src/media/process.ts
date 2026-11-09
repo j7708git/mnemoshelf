@@ -65,6 +65,14 @@ export async function killProcessTree(pid: number | undefined): Promise<void> {
     });
     return;
   }
+  // 子程序以 detached 啟動，pid 即它自己的 process group id；對 -pid 送訊號才會連
+  // 孫程序一起收掉（只殺 pid 的話孫程序會被 init 收養而繼續活著）。
+  try {
+    process.kill(-pid, "SIGKILL");
+    return;
+  } catch {
+    // 不是 group leader（例如呼叫端自己建立的程序）或已經結束；退回只殺自己。
+  }
   try {
     process.kill(pid, "SIGKILL");
   } catch {
@@ -90,12 +98,16 @@ export function startProcess(command: string, args: readonly string[], options: 
   const maxStderr = options.maxStderrBytes ?? Number.POSITIVE_INFINITY;
 
   // Windows 對不可執行檔（EFTYPE）可能在 spawn() 同步丟錯；一律轉成 spawnError 由呼叫端映射成具名錯誤。
+  // Windows 用 taskkill /T 收整個程序樹；POSIX 沒有等價指令，所以讓子程序自成一個
+  // process group（detached），killProcessTree 再對「-pid」送訊號，孫程序才會一起結束。
+  // 這裡不 unref：輸出管線仍由呼叫端持有，行為與未 detached 時相同。
   let child: ChildProcess;
   let syncSpawnError: string | null = null;
   try {
     child = spawn(command, [...args], {
       shell: false,
       windowsHide: true,
+      ...(process.platform === "win32" ? {} : { detached: true }),
       stdio: ["ignore", "pipe", "pipe", ...(options.extraStdio ?? [])],
       ...(options.cwd !== undefined ? { cwd: options.cwd } : {}),
       ...(options.env !== undefined ? { env: options.env } : {}),
