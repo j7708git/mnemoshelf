@@ -1,5 +1,10 @@
 # L2：對話迴圈 harness
 
+> **已凍結（2026-11-10）**：v0.7.0 移除了摘要 runtime，本 harness 依賴的寫入路徑（`digest` 事件 →
+> 摘要 → 寫卡）已不存在；`host.mjs` 仍傳 `digestLogFile`／`digestTimeoutMs`，但外掛端已無這兩個欄位，
+> **現在跑起來也量不到東西**。保留是為了重跑舊基準與追溯當時的判斷，不要在這裡加新功能。
+> 要復活得先把摘要路徑接回去（見 `src/digest.ts` 開頭的說明），並重寫本檔的預期輸出。
+
 假宿主（假 OpenCode `ctx`）＋真 mnemoshelf server ＋真 embedder，讓 `digest` 的完整對話迴圈
 （terminal 事件 → 快照 → 回合解析 → canned 模型 → 寫入 → 召回注入）在沒有人操作的情況下跑完，
 並輸出逐場景結果報告。
