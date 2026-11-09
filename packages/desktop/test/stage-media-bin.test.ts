@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, promises as fs } from "node:fs";
+import { existsSync, promises as fs, readFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { fileURLToPath } from "node:url";
@@ -25,6 +25,7 @@ const packageDir = path.resolve(here, "..");
 const repoRoot = path.resolve(packageDir, "..", "..");
 const scriptPath = path.join(packageDir, "scripts", "stage-media-bin.mjs");
 const helperPath = path.join(packageDir, "scripts", "media-bin-staging.mjs");
+const lockPath = path.join(packageDir, "scripts", "media-bin.lock.json");
 const tmpRoot = path.join(repoRoot, ".tmp", "wave1");
 
 const binaryName = (base: "ffmpeg" | "ffprobe"): string => (process.platform === "win32" ? base + ".exe" : base);
@@ -33,6 +34,25 @@ interface GatedSource {
   ffmpeg: string;
   ffprobe: string;
   origin: "env" | "media-bin";
+}
+
+/**
+ * `media-bin.lock.json` 目前只登錄了部分平台（現況只有 win32-x64）。CLI 在解析來源前就會
+ * 讀 lock，缺當前平台的候選時一律以用法錯誤（1）結束，所以「不需 binary」那組 CLI 測試
+ * 在沒有候選的平台上測不到 guard 行為——直接略過並說明，不要讓它們假紅。
+ */
+function skipWithoutFrozenCandidate(label: string): boolean {
+  const key = process.platform + "-" + process.arch;
+  let targets: Record<string, unknown> = {};
+  try {
+    targets = (JSON.parse(readFileSync(lockPath, "utf8")) as { targets?: Record<string, unknown> }).targets ?? {};
+  } catch {
+    targets = {};
+  }
+  if (targets[key] !== undefined) return false;
+  const available = Object.keys(targets).join("、") || "無";
+  console.log("[stage-media-bin] 略過（" + label + "）：media-bin.lock.json 沒有 " + key + " 的凍結候選（目前有：" + available + "）");
+  return true;
 }
 
 function resolveGatedSource(): GatedSource | null {
@@ -194,6 +214,7 @@ describe("stage-media-bin：輸出目錄所有權（D7／STD-2）", () => {
   });
 
   it("不需 binary：未知檔案也要先被拒絕（exit 2，且不改動目錄）", async () => {
+    if (skipWithoutFrozenCandidate("未知檔案 guard")) return;
     const outDir = await makeTempDir("sentinel-ungated-");
     const sentinel = path.join(outDir, "unrelated-user-file.txt");
     try {
@@ -208,6 +229,7 @@ describe("stage-media-bin：輸出目錄所有權（D7／STD-2）", () => {
   });
 
   it("不需 binary：未知子目錄也被拒絕並列出項目，內容不動", async () => {
+    if (skipWithoutFrozenCandidate("未知子目錄 guard")) return;
     const outDir = await makeTempDir("unknown-subdir-");
     try {
       await fs.mkdir(path.join(outDir, "nested"));
@@ -224,6 +246,7 @@ describe("stage-media-bin：輸出目錄所有權（D7／STD-2）", () => {
   });
 
   it("不需 binary：--out 指向含既有檔案的一般資料夾時完整保留並拒絕", async () => {
+    if (skipWithoutFrozenCandidate("使用者資料夾 guard")) return;
     const outDir = await makeTempDir("user-folder-");
     try {
       await fs.writeFile(path.join(outDir, "notes.md"), "user content", "utf8");
@@ -241,6 +264,7 @@ describe("stage-media-bin：輸出目錄所有權（D7／STD-2）", () => {
   });
 
   it("不需 binary：空目錄通過 guard，但缺來源時仍以用法錯誤（1）退出", async () => {
+    if (skipWithoutFrozenCandidate("空目錄用法錯誤")) return;
     const outDir = await makeTempDir("empty-usage-");
     try {
       const result = await runCli(["--out", outDir]);
@@ -253,6 +277,7 @@ describe("stage-media-bin：輸出目錄所有權（D7／STD-2）", () => {
   });
 
   it("不需 binary：--check 遇到未知項目時拒絕且不改動", async () => {
+    if (skipWithoutFrozenCandidate("--check 未知項目")) return;
     const outDir = await makeTempDir("check-unknown-");
     try {
       await fs.writeFile(path.join(outDir, "sentinel.bin"), "sentinel", "utf8");
@@ -267,6 +292,7 @@ describe("stage-media-bin：輸出目錄所有權（D7／STD-2）", () => {
   });
 
   it("不需 binary：--check 缺 manifest 時具名失敗（2）", async () => {
+    if (skipWithoutFrozenCandidate("--check 缺 manifest")) return;
     const outDir = await makeTempDir("check-missing-");
     try {
       const result = await runCli(["--check", "--out", outDir]);
@@ -449,7 +475,7 @@ describe("media-bin-staging helper：所有權判斷", () => {
 });
 
 describe("media-bin-staging helper：原子替換", () => {
-  const expected = ["ffmpeg.exe", "ffprobe.exe", "LICENSE.txt", "manifest.json"];
+  const expected = [binaryName("ffmpeg"), binaryName("ffprobe"), "LICENSE.txt", "manifest.json"];
 
   async function makeSources(dir: string): Promise<{
     ffmpeg: string;

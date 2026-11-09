@@ -22,5 +22,9 @@ export default defineConfig({
     // 真實模型的 e2e 較慢（載入 q4 模型約數十秒），給足以免 flaky。
     testTimeout: 300_000,
     hookTimeout: 300_000,
+    // `test/audio-http.test.ts` 的長流程在 4 個以上 worker 同時搶 CPU 時會出現
+    // `fetch failed / ECONNRESET`（單獨跑 4.7s、18 檔並行 8–13s 後失敗；maxWorkers=2 穩定通過）。
+    // 這是測試端的連線重用問題，不是伺服器回錯；先限制 worker 數讓 CI 穩定，之後再查根因。
+    maxWorkers: 2,
   },
 });
