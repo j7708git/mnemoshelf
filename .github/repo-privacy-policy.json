@@ -30,5 +30,10 @@
       "C:\\Users\\<user>\\"
     ],
     "maxFileBytes": 4194304
+  },
+  "metadata": {
+    "allowedEmails": [
+      "49699333+dependabot[bot]@users.noreply.github.com"
+    ]
   }
 }
