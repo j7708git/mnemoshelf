@@ -267,7 +267,7 @@ describe("stepsFor", () => {
     ]);
     expect(stepsFor("other").slice(1)).toEqual([
       "把 mcpServers 片段貼進你的 MCP client 設定檔（Claude Desktop／MiniMax 等位置見「完整說明」）。",
-      "重新啟動 client；工具清單應出現 mnemoshelf 的六個工具。",
+      "重新啟動 client；工具清單應出現 mnemoshelf 的七個工具。",
     ]);
   });
 });

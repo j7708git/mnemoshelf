@@ -6,7 +6,7 @@ Mnemoshelf Core 常駐服務的**組裝層**：把既有的 SQLite `MetadataStor
 1. **REST API**（本機 HTTP，`127.0.0.1` ＋ Bearer token）：roots 管理、預覽、索引、統一搜尋、記憶讀寫。
 2. **Web UI 靜態檔**（同源）：服務 `packages/web/dist`，找不到的非 API 路徑在瀏覽器導航時回 `index.html`
    （SPA fallback）。**靜態檔不需要 token**（`<script src>`／`<link>` 帶不了自訂標頭）。
-3. **MCP 入口**（stdio，薄轉發）：6 個工具，經本機 HTTP 打 REST。
+3. **MCP 入口**（stdio，薄轉發）：7 個工具（含 `read_memory_source`），經本機 HTTP 打 REST。
 
 **MCP 行程不碰資料庫**：只有本服務行程開啟資料庫（單一寫入者，見 `docs/storage-ports.md`）。
 本服務對使用者檔案**只讀不寫**。
