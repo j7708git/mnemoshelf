@@ -18,11 +18,12 @@
  *
  * v1 只服務 `.mp4`（與索引白名單一致）；其他副檔名回 415，不讓這個端點變成任意檔案下載。
  */
-import { promises as fs, type BigIntStats, type Stats } from "node:fs";
+import { promises as fs, type BigIntStats } from "node:fs";
+import { createHash } from "node:crypto";
 import type { FileHandle } from "node:fs/promises";
 import type { ServerResponse } from "node:http";
 import path from "node:path";
-import type { Readable } from "node:stream";
+import { Readable } from "node:stream";
 import { isSupportedVideoFileName, PathOutsideRootError, type Root } from "@mnemoshelf/core";
 import { FileTooLargeError, NotFoundError, UnsupportedFileTypeError, ValidationError } from "../errors.js";
 import { parseRelativePath, resolveTarget, type ResolvedTarget } from "./explorer.js";
@@ -133,6 +134,40 @@ export interface MediaResponseOptions {
   maxFileBytes: number;
   /** 單次 Range 上限（bytes）；預設 4 MiB，測試可覆寫。 */
   rangeMaxBytes?: number;
+  /** 授權播放綁定的版本；每次讀取都核對，不能把舊命中套到新內容。 */
+  expectedVersion?: string;
+  /** 建立播放授權時，以同一 handle 計算 hash 並核對索引版本。 */
+  expectedContentHash?: string;
+  /** 只在完成來源驗證後呼叫；不暴露於 HTTP。 */
+  captureVersion?: (version: string) => void;
+}
+
+/** 來源已變更，呼叫端應提示重新索引（HTTP 409）。 */
+export class MediaSourceChangedError extends Error {
+  constructor() {
+    super("影片來源已變更或原命中已失效；請重新索引並重新搜尋後播放。");
+    this.name = "MediaSourceChangedError";
+  }
+}
+
+function fileVersion(stats: BigIntStats): string {
+  return [stats.dev, stats.ino, stats.size, stats.mtimeNs, stats.ctimeNs].join(":");
+}
+
+/** 有界讀取，每批交付前後核對版本；同一 handle 保持 root 身分綁定。 */
+async function* readVersioned(handle: FileHandle, version: string, start: number, end: number): AsyncGenerator<Buffer> {
+  try {
+    for (let position = start; position <= end;) {
+      if (fileVersion(await handle.stat({ bigint: true })) !== version) throw new MediaSourceChangedError();
+      const buffer = Buffer.allocUnsafe(Math.min(MEDIA_STREAM_HIGH_WATER_MARK, end - position + 1));
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+      if (bytesRead === 0 || fileVersion(await handle.stat({ bigint: true })) !== version) throw new MediaSourceChangedError();
+      position += bytesRead;
+      yield buffer.subarray(0, bytesRead);
+    }
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
 }
 
 function isEnoent(error: unknown): boolean {
@@ -280,12 +315,30 @@ export async function buildMediaResponse(
     // 重新解析 root 邊界並比對 handle 身分；不可證明或已變更一律具名拒絕。
     await assertHandleInsideRoot(root, target, handleStats);
 
+    const version = fileVersion(handleStats);
+    if (options.expectedVersion !== undefined && options.expectedVersion !== version) throw new MediaSourceChangedError();
+    if (options.expectedContentHash !== undefined) {
+      const hash = createHash("sha256");
+      const buffer = Buffer.allocUnsafe(MEDIA_STREAM_HIGH_WATER_MARK);
+      for (let position = 0; position < totalBytes;) {
+        const { bytesRead } = await handle.read(buffer, 0, Math.min(buffer.length, totalBytes - position), position);
+        if (bytesRead === 0) throw new MediaSourceChangedError();
+        hash.update(buffer.subarray(0, bytesRead));
+        position += bytesRead;
+      }
+      if (hash.digest("hex") !== options.expectedContentHash || fileVersion(await handle.stat({ bigint: true })) !== version) {
+        throw new MediaSourceChangedError();
+      }
+    }
+    options.captureVersion?.(version);
+
     const decision = parseMediaRange(input.rangeHeader, totalBytes, options.rangeMaxBytes);
     const baseHeaders: Record<string, string> = {
       "content-type": MEDIA_CONTENT_TYPE,
       "accept-ranges": "bytes",
       "cache-control": MEDIA_CACHE_CONTROL,
       "x-content-type-options": "nosniff",
+      "cross-origin-resource-policy": "same-origin",
     };
 
     if (decision.kind === "unsatisfiable") {
@@ -306,12 +359,14 @@ export async function buildMediaResponse(
     if (input.headOnly || length === 0) return { status, headers, stream: null };
     // 只用**同一個已驗證的 handle** 讀取：驗證後不再依路徑開 stream（D5）。
     // autoClose=true：串流結束／錯誤／destroy 時由串流關閉 fd。
-    const stream = handle.createReadStream({
+    const stream = options.expectedVersion === undefined ? handle.createReadStream({
       start,
       end,
       highWaterMark: MEDIA_STREAM_HIGH_WATER_MARK,
       autoClose: true,
-    });
+    }) : Readable.from(readVersioned(handle, version, start, end), { objectMode: false, highWaterMark: MEDIA_STREAM_HIGH_WATER_MARK });
+    // 尚未開始迭代就被撤銷時，generator 的 finally 不會執行。
+    if (options.expectedVersion !== undefined) stream.once("close", () => { void handle.close().catch(() => undefined); });
     streamHandedOff = true;
     return { status, headers, stream };
   } finally {
@@ -350,7 +405,10 @@ export async function sendStreamResult(response: ServerResponse, result: StreamR
       settled = true;
       resolve();
     };
-    stream.once("close", finish);
+    stream.once("close", () => {
+      if (!stream.readableEnded) response.destroy();
+      finish();
+    });
     stream.once("error", () => {
       // header 已送出，不能改狀態碼；destroy 讓 client 明確看到回應不完整。
       response.destroy();

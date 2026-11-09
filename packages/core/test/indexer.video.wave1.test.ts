@@ -43,7 +43,7 @@ function visualSegments(durationSeconds: number, level = 1): VisualSegment[] {
       startSeconds: start,
       endSeconds,
       frames: [{ pixels: new Uint8Array(16 * 16 * 3).fill(level), width: 16, height: 16, timestampSeconds }],
-      preprocessingVersion: "mp4-h264-rgb24-v2:4s:1f:384:srcpts-v1",
+      preprocessingVersion: "mp4-h264-rgb24-v4:4s:1f:384:srcpts-v3",
     });
   }
   return segments;
@@ -74,6 +74,10 @@ function makeProbe(overrides: Partial<VideoProbe> = {}): VideoProbe {
     selectedAudio: null,
     hasVideo: true,
     hasAudio: false,
+    visualTimeline: visualSegments(overrides.durationSeconds ?? 12).map((segment, segmentIndex) => ({
+      segmentIndex, startSeconds: segment.startSeconds, endSeconds: segment.endSeconds,
+      frameTimeSeconds: segment.frames[0]!.timestampSeconds, rule: "midpoint" as const,
+    })),
     ...overrides,
   };
 }

@@ -13,7 +13,9 @@ import {
   type SelectedAudioStream,
   type VideoProbe,
   type VideoStreamInfo,
+  type VisualFramePick,
 } from "./types.js";
+export type { VisualFramePick } from "./types.js";
 
 /** ffprobe JSON 的最小可用形狀（不信任欄位存在與型別）。 */
 export interface RawProbeJson {
@@ -240,8 +242,8 @@ export function selectFrameIndices(frameTimestampsSeconds: readonly number[], st
   return indices.sort((a, b) => a - b);
 }
 
-/** ffmpeg select 表達式的保守上限（實測 100 項安全、110 項 ffmpeg 解析失敗；留餘量）。 */
-export const MAX_FRAME_SELECT_TERMS = 90;
+/** 600 秒／4 秒／最多 4 幀的有界選幀上限；加法樹採平衡括號避免 FFmpeg 深度上限。 */
+export const MAX_FRAME_SELECT_TERMS = 600;
 
 /**
  * 對「等距格線」的選幀計畫產生極短 select 表達式（D1 長片用）。
@@ -348,14 +350,22 @@ export function parseFramePtsList(text: string): number[] {
   return times;
 }
 
-/** 視覺片段的一個實際取幀計畫（時間全部是播放時間軸 0-based）。 */
-export interface VisualFramePick {
-  readonly segmentIndex: number;
-  readonly startSeconds: number;
-  readonly endSeconds: number;
-  /** 實際解碼來源 PTS（播放時間軸）；會寫進 ChunkMedia.frameTimesSeconds。 */
-  readonly frameTimeSeconds: number;
-  readonly rule: "midpoint" | "tail-last" | "fallback-last";
+/** 解析具欄位名稱的 ffprobe compact 幀表；不依賴 show_entries 的欄位輸出順序。 */
+export function parseFrameTimeline(text: string): { times: number[]; lastFrameDurationSeconds?: number } {
+  const times: number[] = [];
+  let lastFrameDurationSeconds: number | undefined;
+  for (const line of text.split(/\r?\n/)) {
+    // p=1 保留 section 名稱：side_data 等附屬行可略過，frame 行缺 PTS 必須拒絕。
+    if (line !== "frame" && !line.startsWith("frame|")) continue;
+    const fields = Object.fromEntries(line.split("|").slice(1).map((field) => field.split("=")));
+    const pts = asFiniteNumber(fields["pts_time"]);
+    if (pts === null) timelineReject();
+    times.push(pts);
+    const duration = asFiniteNumber(fields["duration_time"]);
+    lastFrameDurationSeconds = duration !== null && duration > 0 ? duration : undefined;
+  }
+  if (times.length === 0) timelineReject();
+  return { times, ...(lastFrameDurationSeconds !== undefined ? { lastFrameDurationSeconds } : {}) };
 }
 
 /** 選幀的固定誤差（秒）：只吸收浮點與 ffprobe 的 6 位小數誤差，不用來放寬規則。 */
@@ -371,7 +381,9 @@ function timelineReject(): never {
  * - 段界：段 i = [i*segmentSeconds, min((i+1)*segmentSeconds, duration))；
  * - 完整段：每個目標偏移（1 幀＝中點）取「該偏移之後第一幀」，沒有則取段內最後一幀；
  * - 尾段（長度 < segmentSeconds）：取段內最後一幀；
- * - 任何一段完全沒有幀、時間重複／亂序、或 duration 非有限 → unsupported-video-timeline。
+ * - 只有最後的不足一段空格可省略，且最後影格的實際時長必須證明覆蓋結尾；
+ *   容器時長只允許向上取整到毫秒的量化差，不推估 FPS、不容許中間缺段。
+ * - 其餘空段、時間重複／亂序、或 duration 非有限 → unsupported-video-timeline。
  *
  * 這裡刻意不使用「段號 × 平均 FPS」推估：frameTimeSeconds 一律是輸入 frame pts 之一。
  */
@@ -380,6 +392,7 @@ export function planVisualFrames(
   durationSeconds: number,
   segmentSeconds = VIDEO_SEGMENT_SECONDS,
   framesPerSegment = VIDEO_FRAMES_PER_SEGMENT,
+  lastFrameDurationSeconds?: number,
 ): VisualFramePick[] {
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) timelineReject();
   if (!Number.isFinite(segmentSeconds) || segmentSeconds <= 0) throw new RangeError("segmentSeconds 必須大於零");
@@ -398,8 +411,19 @@ export function planVisualFrames(
     for (const time of frameTimesSeconds) {
       if (time >= startSeconds - TIMELINE_EPSILON && time < endSeconds - TIMELINE_EPSILON) candidates.push(time);
     }
-    if (candidates.length === 0) timelineReject();
     const isTail = endSeconds - startSeconds < segmentSeconds - TIMELINE_EPSILON;
+    if (candidates.length === 0) {
+      const last = frameTimesSeconds.at(-1)!;
+      const lastEnd = last + (lastFrameDurationSeconds ?? Number.NaN);
+      const roundedEnd = Math.ceil((lastEnd - TIMELINE_EPSILON) * 1000) / 1000;
+      if (segmentIndex === segmentCount - 1 && segmentIndex > 0 && isTail
+        && last >= startSeconds - segmentSeconds && last < startSeconds
+        && Number.isFinite(lastEnd) && lastEnd >= startSeconds - TIMELINE_EPSILON
+        // ffprobe 兩個六位小數相加最多差一個微秒；整數比較避免 60 秒浮點加法再多出 ulp。
+        && Math.round(lastEnd * 1e6) <= Math.round(durationSeconds * 1e6) + 1
+        && durationSeconds <= roundedEnd + TIMELINE_EPSILON) continue;
+      timelineReject();
+    }
     const offsets = frameOffsetsSeconds(segmentSeconds, framesPerSegment);
     const picked: { time: number; rule: VisualFramePick["rule"] }[] = [];
     for (const offset of offsets) {
@@ -428,14 +452,22 @@ export function planVisualFrames(
  * 不要用 `eq(t,X)`（浮點相等不可靠）；用 between 組合。
  */
 export function buildFrameSelectExpression(picks: readonly VisualFramePick[], toleranceSeconds = 0.001): string {
-  if (picks.length === 0) timelineReject();
+  if (picks.length === 0 || picks.length > MAX_FRAME_SELECT_TERMS) timelineReject();
   const terms = picks.map((pick) => {
     const low = Math.max(0, pick.frameTimeSeconds - toleranceSeconds).toFixed(6);
     const high = (pick.frameTimeSeconds + toleranceSeconds).toFixed(6);
     // filtergraph 以逗號分隔濾鏡；between 參數內的逗號必須以反斜線跳脫（不經 shell，反斜線會原樣傳給 ffmpeg）。
     return "between(t\\," + low + "\\," + high + ")";
   });
-  return terms.join("+");
+  // FFmpeg eval.c 的 MAX_DEPTH=100：線性加法樹會超限，平衡樹深度僅 O(log n)。
+  const combine = (start: number, end: number): string => {
+    if (end - start === 1) return terms[start]!;
+    const mid = Math.floor((start + end) / 2);
+    return "(" + combine(start, mid) + "+" + combine(mid, end) + ")";
+  };
+  const expression = combine(0, terms.length);
+  if (expression.length > 28_000) timelineReject();
+  return expression;
 }
 
 /** 音軌播放時間軸（D2）：indexer 預期佈局與 decoder 實際輸出共用同一份計算。 */

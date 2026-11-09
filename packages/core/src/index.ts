@@ -200,10 +200,12 @@ export {
   type MediaDecoderErrorCode,
   type MediaDecoderLimits,
   type MediaSource,
+  type ProbeOptions,
   type SelectedAudioStream,
   type VideoProbe,
   type VideoStreamInfo,
   type VisualFrame,
+  type VisualFramePick,
   type VisualSegment,
 } from "./media/index.js";
 export {

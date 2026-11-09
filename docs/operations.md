@@ -4,7 +4,7 @@
 排隊與取消行為。**契約的權威仍是程式碼**；root 驗證、機密遮罩、信任模型與資料刪除見
 `docs/roots-and-privacy.md`，儲存與檢索語意見 `docs/storage-ports.md`。
 
-服務只綁 `127.0.0.1`。除 `GET /health` 外，所有 REST 請求都要帶
+服務只綁 `127.0.0.1`。除 `GET /health` 與下述已授權的播放 session GET／HEAD 外，REST 請求都要帶
 `Authorization: Bearer <token>`；錯誤一律回 `{error:{name,message}}` 與對應狀態碼。
 
 ## REST 端點速查
@@ -21,7 +21,21 @@
 `POST /search` 與 MCP `search` 的影片命中有 `media.track`（`video`／`video-audio`）、`startSeconds`／`endSeconds`、`frameTimesSeconds`、`streamIndex`、`container`；沒有逐字稿。
 `GET|HEAD /roots/:id/media?path=...` 提供影片播放：單一 `Range`、206／416、單次上限 4 MiB、`Accept-Ranges`、token 與 root 守衛；`GET /roots/:id/file` 仍不服務影片。
 `GET /diagnostics.video` 回 decoder 能力三態（`disabled`／`unavailable`／`available`）、版本、per-root 生效上限與本行程影片索引統計；`GET /roots` 另回 additive `video`，preview 回 `videoCapability`。
-桌面版由 Electron Chromium 播放同源 Range；瀏覽器 standalone 目前不支援影片播放（需桌面版）。
+桌面版與 standalone 瀏覽器共用短效播放 session：先以 Bearer 呼叫
+`POST /roots/:id/media-sessions`，body 為 `{path, chunkId?}`；搜尋命中必須帶原 chunk id。
+成功回 `201`＋`{url, expiresAt}`，秘密只透過 `HttpOnly; SameSite=Strict` cookie 傳送，
+cookie Path 精確限制於該 session URL。URL 的 locator 不是憑證，不能單獨用來播放；
+建立、讀取及撤銷都要求同源 Fetch Metadata，並核對 Origin（若存在）與 Host。
+媒體讀取不需要把 Bearer 放進 URL，也不整檔下載成 blob。
+
+session 最長 15 分鐘、每服務最多 128 個、每個最多 4 條活動串流；重啟即失效。
+`DELETE` 其 URL（仍需 Bearer）立即撤銷，逾期／撤銷會終止尚在傳輸的串流。
+刪除 root 或成功修改其設定也會撤銷該 root 的既有播放 session；之後依新設定重新授權。
+`modalities` 控制索引範圍，關掉影片索引不會禁止已核准 root 的檔案瀏覽／播放。
+建立搜尋命中的 session 時，以同一個通過 root 驗證的 handle 計算 SHA-256，核對原 chunk
+的來源 hash；未知、已刪除或不屬於指定 root／path 的命中，以及來源已修改，回 `409`
+並提示重新索引及搜尋。每次 Range 重驗 root 與檔案版本；每批讀取前後也檢查檔案版本。
+這是檔案系統可觀測的版本檢查，並非不可變播放快照；建立時全檔 hash 的 I/O 成本與 Range 讀取分開。
 
 | 端點 | 說明 |
 |---|---|
@@ -38,6 +52,9 @@
 | `GET /roots/:id/file` | 讀檔（`?path=`；文字回 JSON 預覽，圖片回原始位元組） |
 | `GET /roots/:id/thumb` | 縮圖（`?path=`） |
 | `GET`／`HEAD /roots/:id/media` | 影片播放（`?path=`；只服務 `.mp4`；單一 Range、206／416、單次 4 MiB、`Accept-Ranges`、token 與 root 守衛；不整檔入記憶體） |
+| `POST /roots/:id/media-sessions` | Bearer＋同源建立單一來源版本的短效播放授權；`{path, chunkId?}`；201 回 URL／逾期時間及 HttpOnly cookie；原命中失效回 409 |
+| `GET`／`HEAD /roots/:id/media-sessions/:sessionId` | 同源 cookie 授權的影片串流；沿用 Range／HEAD／root／大小上限，URL 不帶 token |
+| `DELETE /roots/:id/media-sessions/:sessionId` | Bearer＋同源撤銷播放授權並停止活動串流 |
 | `POST /search` | 檔案語意搜尋（`mode`：`vector` 預設／`keyword`／`hybrid`；`k` 上限 100） |
 | `GET /memory-policy` / `PATCH /memory-policy` | 讀取／保存記憶遮罩開關與政策版本 |
 | `POST /memory-sources` | 完整原文回合寫入；8 MiB 上限，事件重送去重 |

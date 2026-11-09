@@ -9,6 +9,7 @@ import {
   buildGridSelectExpression,
   computeAudioTimeline,
   parseFramePtsList,
+  parseFrameTimeline,
   planVisualFrames,
 } from "../../src/media/parse.js";
 import type { VideoProbe } from "../../src/media/types.js";
@@ -53,7 +54,40 @@ describe("parseFramePtsList", () => {
   });
 });
 
+describe("parseFrameTimeline", () => {
+  it("依欄位名讀取來源 PTS 與最後影格時長，缺時長不推估", () => {
+    expect(parseFrameTimeline("frame|duration_time=0.033367|pts_time=0.000000\nframe|pts_time=0.033367|duration_time=0.033367\nside_data|side_data_type=Display Matrix\n"))
+      .toEqual({ times: [0, 0.033367], lastFrameDurationSeconds: 0.033367 });
+    expect(parseFrameTimeline("frame|pts_time=0.000000|duration_time=N/A\n")).toEqual({ times: [0] });
+    expect(() => parseFrameTimeline("frame|pts_time=N/A|duration_time=0.04\n")).toThrow(MediaDecoderError);
+    expect(() => parseFrameTimeline("frame|pts_time=0\nframe|duration_time=0.04\n")).toThrow(MediaDecoderError);
+    expect(() => parseFrameTimeline("frame|pts_time=0\nframe\n")).toThrow(MediaDecoderError);
+  });
+});
+
 describe("planVisualFrames（D1：來源 PTS 選幀）", () => {
+  it.each([30000 / 1001, 24000 / 1001])("%f fps：最後影格時長證明空尾格才省略，保留前段邊界", (fps) => {
+    const count = Math.round(8 * fps);
+    const times = Array.from({ length: count }, (_, index) => Number((index / fps).toFixed(6)));
+    const duration = Math.ceil((count / fps - 1e-9) * 1000) / 1000;
+    const picks = planVisualFrames(times, duration, 4, 1, Number((1 / fps).toFixed(6)));
+    expect(picks.map((pick) => [pick.startSeconds, pick.endSeconds])).toEqual([[0, 4], [4, 8]]);
+    expect(() => planVisualFrames(times, duration)).toThrow(MediaDecoderError);
+    expect(() => planVisualFrames(times, duration + 0.01, 4, 1, 1 / fps)).toThrow(MediaDecoderError);
+  });
+
+  it("尾格內有 PTS 就保留；空的完整尾格／內部空格不能省略", () => {
+    expect(planVisualFrames([0, 2, 4, 6, 8], 8.008, 4, 1, 0.008)).toHaveLength(3);
+    expect(() => planVisualFrames([0, 2], 8, 4, 1, 6)).toThrow(MediaDecoderError);
+    expect(() => planVisualFrames([0, 8], 12.008, 4, 1, 4.008)).toThrow(MediaDecoderError);
+  });
+
+  it("29.97fps 60秒：末幀PTS與時長各六位小數相加的一微秒差不因浮點ulp誤拒", () => {
+    const times = Array.from({ length: 1799 }, (_, index) => Number((index * 1001 / 30000).toFixed(6)));
+    expect(times.at(-1)).toBe(59.993267);
+    expect(planVisualFrames(times, 60.026633, 4, 1, 0.033367)).toHaveLength(15);
+    expect(() => planVisualFrames(times, 60.026630, 4, 1, 0.033367)).toThrow(MediaDecoderError);
+  });
   it("0.2 秒短片：唯一尾段取最後一幀", () => {
     const times = frameTimes(0.2);
     const picks = planVisualFrames(times, 0.2, 4, 1);
@@ -114,6 +148,16 @@ describe("planVisualFrames（D1：來源 PTS 選幀）", () => {
 });
 
 describe("buildFrameSelectExpression", () => {
+  it("150 個非格線 PTS 使用平衡樹且保持每一個 between，不因90項舊上限拒絕", () => {
+    const picks = Array.from({ length: 150 }, (_, index) => ({
+      segmentIndex: index, startSeconds: index * 4, endSeconds: index * 4 + 4,
+      frameTimeSeconds: index * 4 + 2.012, rule: "midpoint" as const,
+    }));
+    const expression = buildFrameSelectExpression(picks);
+    expect(expression.split("between(")).toHaveLength(151);
+    expect(expression.length).toBeLessThan(28_000);
+    expect(() => buildFrameSelectExpression(Array.from({ length: 601 }, () => picks[0]!))).toThrow(MediaDecoderError);
+  });
   it("以 between 組合並跳脫 filtergraph 逗號（不經 shell）", () => {
     const expression = buildFrameSelectExpression([
       { segmentIndex: 0, startSeconds: 0, endSeconds: 4, frameTimeSeconds: 2, rule: "midpoint" },

@@ -48,6 +48,10 @@ export function makeVideoProbe(overrides: Partial<VideoProbe> = {}): VideoProbe 
     selectedAudio: null,
     hasVideo: true,
     hasAudio: false,
+    visualTimeline: visualSegmentsFor(overrides.durationSeconds ?? 8).map((segment, segmentIndex) => ({
+      segmentIndex, startSeconds: segment.startSeconds, endSeconds: segment.endSeconds,
+      frameTimeSeconds: segment.frames[0]!.timestampSeconds, rule: "midpoint" as const,
+    })),
     ...overrides,
   };
 }

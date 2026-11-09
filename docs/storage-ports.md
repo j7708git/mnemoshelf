@@ -123,9 +123,9 @@ interface ChunkMedia {
 - 時間使用原始來源的秒數，區間為 `[startSeconds, endSeconds)`；起點必須有限且非負，終點必須有限且大於起點。
 - `preprocessVersion` 包含解碼／混音／重採樣、分段與極短輸入補零政策；音訊目前為
   `wav-pcm-mono16k-sinc-v1:10s:audio-pad160-v1`。影片畫面為
-  `mp4-h264-rgb24-v2:4s:1f:384:srcpts-v1`、影片所選音軌為
+  `mp4-h264-rgb24-v4:4s:1f:384:srcpts-v3`、影片所選音軌為
   `mp4-aac-mono16k-v2:10s:clamp-v1:stream-align-v1`（再加 `audio-pad160-v1` 與 decoder 版本）；
-  v2 起取幀改保留來源 PTS、音軌改用 per-stream 時長對齊，舊索引必須重建。模型前處理不足 160 樣本時補零到 160 樣本，
+  視覺 v4 由 decoder 提供來源 PTS 佈局，視覺與音軌都以容器 sourceStartSeconds 為播放原點；v2／v3 舊索引重跑時必須重建；音軌仍維持 v2 的 per-stream 時長對齊。模型前處理不足 160 樣本時補零到 160 樣本，
   來源起訖時間不因補零延長，避免極短尾段被模型前處理丟失。
   `embedderId`／`embeddingDim` 記錄向量身分。欄位在寫入前共用驗證，非法資料拒絕且不刪除既有片段。
 - SQLite 遷移 `0007_chunk_media` 新增 nullable `chunks.media_json text`；PostgreSQL 以
@@ -189,11 +189,14 @@ interface ChunkMedia {
   `[startSeconds, endSeconds]`；音軌片段**不得**帶此欄。抽樣政策已凍結為每段 1 幀
   （0.25 fps、每段 4 秒）：完整段取段中點之後第一幀、尾段取段內最後一幀，因此目前長度固定 1。
   時間線無法可靠定義時整檔具名跳過 `unsupported-video-timeline`，不寫入推測值。
-  長片（>360 秒、>90 段）若所有非尾段 pick 落在等距格線，會以單一 `abs(t-最近格點)` 條件壓縮
-  select（正常路徑是同一個解碼程序、不逐段 seek；僅跨 root 讓出程序時在段界以 `-ss` 恢復）；
-  非格線且超過單一 select 表達式安全項數的 VFR／稀疏長片目前具名跳過 `unsupported-video-timeline`（已知限制，不用平均 FPS 虛構）。
-  容器時長恰好略超過 4 秒段界、而該尾段內沒有任何影格（例如 29.97／23.976 fps 的整秒長度片）
-  也屬「段內無幀」具名跳過；目前不自動併段，列波次二「解碼端時間線擁有權」修正項。
+  decoder 的 `probe.visualTimeline` 提供段界與來源 PTS；indexer 的預期片段、實際輸出驗證及增量比對
+  共用這份佈局，不能只從容器時長推算段數。增量比對也核對實際幀時間，不只核對段數。
+  容器結尾略跨段界而最後不足 4 秒的格子沒有 PTS 時，只有末幀的實際 `duration_time` 證明覆蓋結尾
+  才省略該空格；前段仍結束於原本 4 秒邊界。容器只允許向上毫秒量化差、六位小數相加的一微秒差；
+  不推估 FPS、不省略完整空段或中間空段，尾格有 PTS 時仍保留。
+  長片非格線 pick 使用平衡加法樹的 `between` select（最多 600 項／28,000 字元）；
+  等距格線仍可壓縮。正常無競爭時同一程序解完整片；跨 root 讓出程序才在段界以 `-ss` 恢復。
+  佈局或解碼覆蓋不一致一律 `unsupported-video-timeline`，不發布部分索引。
 - 驗證由 `normalizeChunkMedia`（`ports/metadata-store.ts`；兩後端與呼叫端共用同一個入口）
   負責；非法資料拋 `TypeError`，`replaceChunks` 拒絕寫入且**不刪除**既有片段（與音訊
   里程碑相同）。runtime 白名單另匯出 `CHUNK_MEDIA_TRACKS`／`CHUNK_MEDIA_CONTAINERS`／

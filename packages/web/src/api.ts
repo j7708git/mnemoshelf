@@ -12,6 +12,8 @@
 
 /** sessionStorage 的 key。 */
 const TOKEN_KEY = "mnemoshelf.token";
+/** 只保留活動播放器的撤銷憑證；登出與元件卸載後立即移除。 */
+const mediaSessionTokens = new Map<string, string | null>();
 
 /** 401 時派送的全域事件名稱；`App.tsx` 監聽後切回貼 token 畫面。 */
 export const UNAUTHORIZED_EVENT = "mnemoshelf:unauthorized";
@@ -33,6 +35,12 @@ export function setToken(token: string): void {
 
 /** 清除 token。 */
 export function clearToken(): void {
+  for (const [url, token] of mediaSessionTokens) {
+    void fetch(url, { method: "DELETE", credentials: "same-origin", keepalive: true,
+      headers: token === null ? {} : { authorization: `Bearer ${token}` },
+    }).catch(() => undefined);
+  }
+  mediaSessionTokens.clear();
   sessionStorage.removeItem(TOKEN_KEY);
 }
 
@@ -798,11 +806,47 @@ export async function fetchAudioBlobUrl(rootId: number, filePath: string): Promi
  * 影片播放端點的路徑（同源）。
  *
  * **token 不進 URL**：桌面版由 Electron main process 以 `webRequest` 對同源請求注入
- * `Authorization`，因此 `<video src>` 直接用這個路徑即可；瀏覽器模式帶不了標頭，
- * 由呼叫端顯示「需桌面版」而不是拼 token query（見 `media.ts` 的 `videoPlaybackSupport`）。
+ * `Authorization`。此為既有 Bearer 端點；播放器使用短效 session URL，支援 standalone。
  */
 export function mediaUrl(rootId: number, relPath: string): string {
   return `/roots/${rootId}/media?path=${encodeURIComponent(relPath)}`;
+}
+
+/** 播放器只取得 locator；授權 secret 由瀏覽器保存於 HttpOnly cookie。 */
+export interface MediaPlaybackSession { url: string; expiresAt: string }
+
+export async function createMediaPlaybackSession(rootId: number, relPath: string, chunkId?: number): Promise<MediaPlaybackSession> {
+  const token = getToken();
+  const response = await apiFetch(`/roots/${rootId}/media-sessions`, {
+    method: "POST", credentials: "same-origin", cache: "no-store",
+    headers: { "content-type": "application/json" }, body: JSON.stringify({ path: relPath, chunkId }),
+  });
+  if (!response.ok) throw new Error(mediaPlaybackErrorMessage(response.status, await readErrorMessage(response, "建立播放授權失敗")));
+  const session = await response.json() as MediaPlaybackSession;
+  if (!new RegExp(`^/roots/${rootId}/media-sessions/[0-9a-f-]{36}$`).test(session.url) || !Number.isFinite(Date.parse(session.expiresAt))) {
+    throw new Error("播放授權回應不合法。");
+  }
+  mediaSessionTokens.set(session.url, token);
+  return session;
+}
+
+/** 關閉預覽／換來源時撤銷；不讓短效授權繼續供新請求使用。 */
+export async function revokeMediaPlaybackSession(session: MediaPlaybackSession): Promise<void> {
+  const token = mediaSessionTokens.get(session.url) ?? getToken();
+  mediaSessionTokens.delete(session.url);
+  const response = await fetch(session.url, { method: "DELETE", credentials: "same-origin", keepalive: true,
+    headers: token === null ? {} : { authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) throw new Error("撤銷播放授權失敗。");
+}
+
+/** Session 的 401 是播放授權逾期，不應清掉全域 Bearer 登入。 */
+export async function probeMediaPlaybackSession(session: MediaPlaybackSession): Promise<MediaProbeResult> {
+  const response = await fetch(session.url, { method: "HEAD", credentials: "same-origin", cache: "no-store" });
+  if (!response.ok) return { kind: "error", status: response.status, message: response.status === 401
+    ? "播放授權已逾期或撤銷，請重新授權播放。"
+    : mediaPlaybackErrorMessage(response.status, "無法播放這個影片。") };
+  return { kind: "ok", contentLength: Number(response.headers.get("content-length")), acceptRanges: response.headers.get("accept-ranges") === "bytes" };
 }
 
 /**
@@ -819,6 +863,8 @@ export function mediaPlaybackErrorMessage(status: number, fallbackMessage: strin
       return "沒有權限讀取這個影片（不在已加入的資料夾內，或被黑名單排除）。";
     case 404:
       return "影片檔案不存在或已被移動；請重新整理目錄後再試。";
+    case 409:
+      return "影片來源已變更或原命中已失效；請重新索引並重新搜尋後播放。";
     case 413: {
       const limit = typeof maxFileBytes === "number" && Number.isFinite(maxFileBytes) && maxFileBytes > 0
         ? `（目前上限 ${Math.round(maxFileBytes / (1024 * 1024))} MiB）`

@@ -110,7 +110,8 @@ import {
   type TextPreview,
 } from "./explorer.js";
 import { requireLocalHost, requireLoopback, requireToken } from "./auth.js";
-import { buildMediaResponse, sendStreamResult, type StreamRouteResult } from "./media.js";
+import { buildMediaResponse, MediaSourceChangedError, sendStreamResult, type StreamRouteResult } from "./media.js";
+import { MediaSessions, MediaOriginError, requireMediaOrigin } from "./media-sessions.js";
 import { prepareUnifiedSearch, type SearchMode } from "../search.js";
 import type { MemoryEmbeddingWorker } from "../memory-embedder.js";
 import { maskSecrets } from "../secret-masking.js";
@@ -581,6 +582,7 @@ export interface ErrorResponse {
 
 /** JSON 路由結果。 */
 export interface JsonRouteResult {
+  headers?: Record<string, string>;
   status: number;
   body: unknown;
 }
@@ -747,6 +749,9 @@ export function toHttpError(error: unknown): {
   headers: Record<string, string>;
 } {
   const named = (name: string, message: string): ErrorResponse => ({ error: { name, message } });
+
+  if (error instanceof MediaSourceChangedError) return { status: 409, body: named(error.name, error.message), headers: { "cache-control": "no-store" } };
+  if (error instanceof MediaOriginError) return { status: 403, body: named(error.name, error.message), headers: { "cache-control": "no-store" } };
 
   if (error instanceof UnauthorizedError) return { status: 401, body: named(error.name, error.message), headers: {} };
   if (error instanceof NonLoopbackRequestError) return { status: 403, body: named(error.name, error.message), headers: {} };
@@ -1214,6 +1219,7 @@ export function parseRequestTarget(request: IncomingMessage): { url: URL; segmen
 }
 
 export function createRestApp(deps: RestAppDeps): RestApp {
+  const mediaSessions = new MediaSessions();
   const indexingTimings: DiagnosticsResponse["indexingTimings"] = {
     scan: { calls: 0, durationMs: 0 }, read: { calls: 0, durationMs: 0 },
     prepare: { calls: 0, durationMs: 0 }, embed: { calls: 0, durationMs: 0 },
@@ -1486,6 +1492,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const updated = await deps.store.updateRoot(id, patch);
     // 先行 getRootOr404 之後理論上不會是 null；並行刪除時仍以 404 回應，不吞掉。
     if (updated === null) throw new NotFoundError("root", id);
+    mediaSessions.revokeRoot(id);
     return { status: 200, body: updated };
   };
 
@@ -1675,6 +1682,40 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     );
   };
 
+  const createMediaSession = async (id: number, request: IncomingMessage): Promise<RouteResult> => {
+    const origin = requireMediaOrigin(request);
+    const body = await readJsonBody(request);
+    const root = await getRootOr404(id);
+    const relPath = parseRelativePath(typeof body.path === "string" ? body.path : null, { allowEmpty: false });
+    let expectedContentHash: string | undefined;
+    if (body.chunkId !== undefined) {
+      if (typeof body.chunkId !== "number" || !Number.isSafeInteger(body.chunkId) || body.chunkId <= 0) throw new ValidationError("chunkId", "必須為正整數。");
+      const [chunk] = await deps.store.getChunks([body.chunkId]);
+      if (chunk === undefined || chunk.rootId !== id || chunk.relPath !== relPath ||
+          (chunk.media?.track !== "video" && chunk.media?.track !== "video-audio")) throw new MediaSourceChangedError();
+      expectedContentHash = chunk.contentHash;
+    }
+    let version = "";
+    await buildMediaResponse(root, { relPath, rangeHeader: undefined, headOnly: true }, {
+      maxFileBytes: effectiveVideoMaxFileBytes(root), expectedContentHash,
+      captureVersion: (value) => { version = value; },
+    });
+    const currentRoot = await getRootOr404(id);
+    if (JSON.stringify(currentRoot) !== JSON.stringify(root)) throw new MediaSourceChangedError();
+    const { cookie, ...bodyResult } = mediaSessions.create({ rootId: id, relPath, version, origin });
+    return { status: 201, body: bodyResult, headers: { "set-cookie": cookie, "cache-control": "no-store" } };
+  };
+
+  const readMediaSession = async (id: number, sessionId: string, request: IncomingMessage): Promise<RouteResult> => {
+    const session = mediaSessions.authorize(sessionId, id, request);
+    const root = await getRootOr404(id);
+    const result = await buildMediaResponse(root, {
+      relPath: session.relPath, rangeHeader: request.headers.range, headOnly: request.method === "HEAD",
+    }, { maxFileBytes: effectiveVideoMaxFileBytes(root), expectedVersion: session.version });
+    mediaSessions.track(sessionId, result.stream);
+    return result;
+  };
+
   /** `GET /roots/:id/index/status`：輪詢索引进度（行程內記憶體狀態）。 */
   const getIndexStatus = async (id: number): Promise<RouteResult> => {
     await getRootOr404(id);
@@ -1812,6 +1853,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     await getRootOr404(id);
     if (indexing.has(id)) throw new IndexInProgressError(id);
     const { removedChunkIds } = await deps.store.removeRoot(id, deleteData);
+    mediaSessions.revokeRoot(id);
     if (deleteData) await deps.vec.deleteByRoot(id);
     maxFileBytesByRoot.delete(id);
     lastPreviewByRoot.delete(id);
@@ -2019,6 +2061,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     }
 
     if (segments.length === 3) {
+      if (segments[2] === "media-sessions") {
+        if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
+        return await createMediaSession(id, request);
+      }
       if (segments[2] === "preview") {
         if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
         return await previewFor(id);
@@ -2043,6 +2089,20 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         if (method !== "GET" && method !== "HEAD") throw new MethodNotAllowedError(method, ["GET", "HEAD"]);
         return await readMedia(id, request, url);
       }
+    }
+
+    if (segments.length === 4 && segments[2] === "media-sessions") {
+      if (!/^[0-9a-f-]{36}$/.test(segments[3]!)) throw new ValidationError("session", "播放授權識別不合法。");
+      if (method === "DELETE") {
+        requireMediaOrigin(request);
+        mediaSessions.revoke(segments[3]!);
+        return { status: 200, body: { revoked: true }, headers: {
+          "cache-control": "no-store",
+          "set-cookie": `mnemoshelf_media=; HttpOnly; SameSite=Strict; Path=/roots/${id}/media-sessions/${segments[3]!}; Max-Age=0`,
+        } };
+      }
+      if (method !== "GET" && method !== "HEAD") throw new MethodNotAllowedError(method, ["GET", "HEAD", "DELETE"]);
+      return await readMediaSession(id, segments[3]!, request);
     }
 
     // `GET /roots/:id/index/status`（索引进度輪詢）與 `POST /roots/:id/index/cancel`（取消）。
@@ -2484,8 +2544,9 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       return;
     }
 
-    // 除 /health 外一律要 token。
-    requireToken(request, deps.token);
+    // 僅精確的播放 session GET/HEAD 以同源 cookie 授權，其他 API 仍必須帶 Bearer。
+    const sessionRead = segments.length === 4 && segments[0] === "roots" && segments[2] === "media-sessions" && (method === "GET" || method === "HEAD");
+    if (!sessionRead) requireToken(request, deps.token);
 
     let result: RouteResult;
     switch (segments[0]) {
@@ -2528,7 +2589,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       if (isBytesResult(payload)) {
         sendBytes(response, payload.status, payload.contentType, payload.bytes, { ...payload.headers, ...headers });
       } else {
-        sendJson(response, payload.status, payload.body, headers);
+        sendJson(response, payload.status, payload.body, { ...payload.headers, ...headers });
       }
     };
 
@@ -2596,6 +2657,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     videoCapability,
     cancelAllIndexing,
     async settled(): Promise<void> {
+      mediaSessions.close();
       // 索引是背景工作（回應會等它），這裡等所有在途請求結束。
       while (inflight.size > 0) {
         await Promise.allSettled([...inflight]);

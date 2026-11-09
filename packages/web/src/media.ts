@@ -1,16 +1,10 @@
 /**
  * 影片播放與媒體命中的純邏輯（不碰 DOM，可單獨測試）。
  *
- * 播放路線（A1 已驗證）：
- * - **桌面版**：Electron Chromium 以同源 `GET /roots/:id/media?path=` 的 Range 播放；
- *   Authorization 由 main process 的 `webRequest` 注入，**token 不進 URL**。
- * - **瀏覽器 standalone**：`<video src>` 帶不了 `Authorization`，且不得把 token 拼進查詢字串；
- *   本輪明確顯示「播放需桌面版 App」，預覽與時間定位仍可用。之後若要支援，可換成
- *   service worker 代理（在 `videoPlaybackSupport` 加入新分支即可，UI 不必改）。
+ * 桌面與 standalone 共用短效同源播放授權；token 不進 URL。
  */
 import type { ChunkMedia, VideoCapability } from "./api";
 import { formatMediaTime } from "./audio";
-import { isDesktopMode } from "./desktop";
 
 /** 影片視覺抽樣段長（秒）：A 關卡凍結每 4 秒一段、每段 1 幀。 */
 export const VIDEO_SEGMENT_SECONDS = 4;
@@ -20,26 +14,6 @@ export const VIDEO_MAX_DURATION_SECONDS = 600;
 
 /** 影片單檔大小上限（bytes；舊版服務沒有 capability 時的顯示用預設）。 */
 export const DEFAULT_VIDEO_MAX_FILE_BYTES = 512 * 1024 * 1024;
-
-/** 影片播放是否可用（桌面版＝同源 Range＋webRequest 注入；瀏覽器版＝明確限制）。 */
-export type VideoPlaybackSupport =
-  | { kind: "available" }
-  | { kind: "desktop-only"; message: string };
-
-/** 瀏覽器 standalone 的播放限制說明（不提供 token query、也不整檔下載成 blob）。 */
-export const DESKTOP_ONLY_PLAYBACK_MESSAGE =
-  "瀏覽器模式無法在播放器附加授權標頭（token 不會放進網址），因此不支援影片播放。" +
-  "請改用桌面版 App；這裡仍可查看命中時間與片段資訊。";
-
-/**
- * 判斷目前環境能不能播放影片。
- *
- * `desktop` 參數讓測試不必模擬 `window`；預設取 `isDesktopMode()`。
- * 桌面版回 `available`（實際是否 200／206 由播放器與 probeMedia 驗證）。
- */
-export function videoPlaybackSupport(desktop: boolean = isDesktopMode()): VideoPlaybackSupport {
-  return desktop ? { kind: "available" } : { kind: "desktop-only", message: DESKTOP_ONLY_PLAYBACK_MESSAGE };
-}
 
 /** 命中的軌道標籤：「影片畫面」／「影片音軌」／「音訊片段」／「檔案」。 */
 export function mediaTrackLabel(media: ChunkMedia | undefined): string {

@@ -20,7 +20,7 @@ import {
   type VideoProbe, type VisualSegment,
 } from "../src/media/index.js";
 import { FakeEmbedder } from "../src/testing/fake-embedder.js";
-import { videoAudioPreprocessVersion, videoVisualPreprocessVersion } from "../src/indexer/video.js";
+import { assertVideoVisualCoverage, videoAudioPreprocessVersion, videoVisualPreprocessVersion } from "../src/indexer/video.js";
 import type { AudioInput, EmbedDocumentsOptions, VideoInput } from "../src/ports/embedder.js";
 
 const FIXED_DECODER_VERSION = "n9.0.2-test";
@@ -37,6 +37,10 @@ function makeProbe(overrides: Partial<VideoProbe> = {}): VideoProbe {
     selectedAudio: null,
     hasVideo: true,
     hasAudio: false,
+    visualTimeline: visualSegments(overrides.durationSeconds ?? 8).map((segment, segmentIndex) => ({
+      segmentIndex, startSeconds: segment.startSeconds, endSeconds: segment.endSeconds,
+      frameTimeSeconds: segment.frames[0]!.timestampSeconds, rule: "midpoint" as const,
+    })),
     ...overrides,
   };
 }
@@ -61,7 +65,7 @@ function visualSegment(startSeconds: number, endSeconds: number): VisualSegment 
     startSeconds,
     endSeconds,
     frames: [{ pixels: blackPixels(), width: 16, height: 16, timestampSeconds }],
-    preprocessingVersion: "mp4-h264-rgb24-v2:4s:1f:384:srcpts-v1",
+    preprocessingVersion: "mp4-h264-rgb24-v4:4s:1f:384:srcpts-v3",
   };
 }
 
@@ -225,6 +229,78 @@ function baseOptions(decoder: MediaDecoder, extra: Partial<IndexOptions> = {}): 
 }
 
 describe("影片索引主流程（fake decoder）", () => {
+  it("覆蓋不一致使用unsupported-video-timeline；相符時不拋錯", () => {
+    expect(() => assertVideoVisualCoverage(2, 2)).not.toThrow();
+    try { assertVideoVisualCoverage(1, 2); throw new Error("應拒絕缺段"); }
+    catch (error) { expect(error).toMatchObject({ code: "unsupported-video-timeline" }); }
+  });
+
+  it("來源PTS佈局省略空尾格，首建與未變重跑使用相同段數", async () => {
+    await fs.writeFile(path.join(dir, "clip.mp4"), Buffer.from("empty-tail"));
+    const decoder = new FakeDecoder({
+      probeResult: makeProbe({ durationSeconds: 8.008, visualTimeline: makeProbe().visualTimeline! }),
+      visuals: visualSegments(8),
+    });
+    const root = await addRoot(["video"]);
+    const calls = vi.spyOn(embedder, "embedVideo");
+    expect((await indexRoot(root, baseOptions(decoder))).processed).toBe(1);
+    expect((await store.listChunksByPath(root.id, "clip.mp4")).map((chunk) => chunk.media?.endSeconds)).toEqual([4, 8]);
+    expect((await indexRoot(root, baseOptions(decoder))).skippedUnchanged).toBe(1);
+    expect(calls).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["missing", "gap", "nan", "empty"])("畸形probe佈局%s在嵌入前具名拒絕", async (problem) => {
+    await fs.writeFile(path.join(dir, "clip.mp4"), Buffer.from("malformed-layout"));
+    const original = makeProbe();
+    const { visualTimeline, ...withoutTimeline } = original;
+    const probe: VideoProbe = problem === "missing" ? withoutTimeline : {
+      ...original,
+      visualTimeline: problem === "empty" ? [] : visualTimeline!.map((pick, index) => ({
+        ...pick,
+        ...(problem === "gap" && index === 1 ? { startSeconds: 5 } : {}),
+        ...(problem === "nan" && index === 0 ? { frameTimeSeconds: Number.NaN } : {}),
+      })),
+    };
+    const calls = vi.spyOn(embedder, "embedVideo");
+    const result = await indexRoot(await addRoot(["video"]), baseOptions(new FakeDecoder({ probeResult: probe, visuals: visualSegments(8) })));
+    expect(result.skippedFiles).toEqual([{ relPath: "clip.mp4", reason: "unsupported-video-timeline" }]);
+    expect(result.failedFiles).toEqual([]);
+    expect(calls).not.toHaveBeenCalled();
+  });
+
+  it.each(["start", "end", "pts", "count"])("decoder的%s與probe不一致不能發布部分索引", async (problem) => {
+    await fs.writeFile(path.join(dir, "clip.mp4"), Buffer.from("wrong-output"));
+    const segments = visualSegments(8);
+    const segment = segments[1]!;
+    const wrong = {
+      ...segment,
+      ...(problem === "start" ? { startSeconds: 4.5 } : {}),
+      ...(problem === "end" ? { endSeconds: 7.5 } : {}),
+      ...(problem === "pts" ? { frames: [{ ...segment.frames[0]!, timestampSeconds: 6.5 }] } : {}),
+    };
+    const decoder = new FakeDecoder({ probeResult: makeProbe(), visuals: problem === "count" ? [segments[0]!] : [segments[0]!, wrong] });
+    const root = await addRoot(["video"]);
+    const result = await indexRoot(root, baseOptions(decoder));
+    expect(result.skippedFiles).toEqual([{ relPath: "clip.mp4", reason: "unsupported-video-timeline" }]);
+    expect(result.failedFiles).toEqual([]);
+    expect(await store.listChunksByPath(root.id, "clip.mp4")).toEqual([]);
+    expect(await vec.count()).toBe(0);
+  });
+
+  it("增量比較來源PTS：同段內舊時間不同也必須重嵌", async () => {
+    await fs.writeFile(path.join(dir, "clip.mp4"), Buffer.from("pts-identity"));
+    const root = await addRoot(["video"]);
+    const decoder = new FakeDecoder({ probeResult: makeProbe(), visuals: visualSegments(8) });
+    expect((await indexRoot(root, baseOptions(decoder))).processed).toBe(1);
+    const read = store.listChunksByPath.bind(store);
+    vi.spyOn(store, "listChunksByPath").mockImplementationOnce(async (rootId, relPath) => {
+      const chunks = await read(rootId, relPath);
+      return chunks.map((chunk, index) => index === 0 ? { ...chunk, media: { ...chunk.media!, frameTimesSeconds: [2.5] } } : chunk);
+    });
+    expect((await indexRoot(root, baseOptions(decoder))).processed).toBe(1);
+    expect(decoder.calls.visual).toBe(2);
+  });
+
   it("成功：視覺 4 秒 1 幀＋音軌 10 秒，ChunkMedia／seq 跨軌正確、快照用完即刪", async () => {
     const bytes = Buffer.from("synthetic-video-bytes");
     await fs.writeFile(path.join(dir, "clip.mp4"), bytes);
@@ -619,7 +695,7 @@ describe.skipIf(!gated)("影片索引（gated 真 decoder）", () => {
     expect(chunks.map((chunk) => chunk.kind)).toEqual(["video", "audio"]);
     expect(chunks.map((chunk) => chunk.media?.track)).toEqual(["video", "video-audio"]);
     expect(chunks[0]?.media?.frameTimesSeconds).toHaveLength(1);
-    expect(chunks[0]?.media?.preprocessVersion?.startsWith("mp4-h264-rgb24-v2:4s:1f:384:srcpts-v1:ffmpeg-")).toBe(true);
+    expect(chunks[0]?.media?.preprocessVersion?.startsWith("mp4-h264-rgb24-v4:4s:1f:384:srcpts-v3:ffmpeg-")).toBe(true);
     expect(chunks[1]?.media?.preprocessVersion?.startsWith("mp4-aac-mono16k-v2:10s:clamp-v1:stream-align-v1:audio-pad160-v1:ffmpeg-")).toBe(true);
     expect(chunks[1]?.media?.streamIndex).toBeTypeOf("number");
     expect(chunks.every((chunk) => chunk.contentHash === sha256(bytes))).toBe(true);

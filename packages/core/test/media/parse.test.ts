@@ -203,8 +203,8 @@ describe("錯誤分類與訊息", () => {
   });
 
   it("前處理版本字串穩定且含抽樣政策", () => {
-    expect(visualPreprocessingVersion()).toBe("mp4-h264-rgb24-v2:4s:1f:384:srcpts-v1");
-    expect(visualPreprocessingVersion(4, 2, 384)).toBe("mp4-h264-rgb24-v2:4s:2f:384:srcpts-v1");
+    expect(visualPreprocessingVersion()).toBe("mp4-h264-rgb24-v4:4s:1f:384:srcpts-v3");
+    expect(visualPreprocessingVersion(4, 2, 384)).toBe("mp4-h264-rgb24-v4:4s:2f:384:srcpts-v3");
     expect(videoAudioPreprocessingVersion()).toBe("mp4-aac-mono16k-v2:10s:clamp-v1:stream-align-v1");
   });
 

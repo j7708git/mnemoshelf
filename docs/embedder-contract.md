@@ -125,6 +125,11 @@ interface VideoInput {
   由解碼／索引層負責。`timestampSeconds` 必須是實際解碼來源幀 PTS（波次一 D1 起，取幀以
   select 保留來源 PTS，不是 fps 輸出格時間）；時間線無法可靠定義時解碼層具名跳過，不送猜測值。`embedVideo` **不加文字 prefix**；與文字、圖片、音訊共用同一個向量空間，
   輸出同樣截斷到 `info.dim` 並重新 L2 正規化。
+- 視覺前處理身分為 `mp4-h264-rgb24-v4:4s:1f:384:srcpts-v3`（另附 decoder 版本）。解碼端依來源 PTS
+  提供 `VideoProbe.visualTimeline`，indexer 在嵌入前核對每段起訖與來源幀時間；增量比對也使用同份佈局。
+  視覺與音軌共用容器的播放原點，保留視訊自身起點偏移；末幀時長能證明的空尾格可省略，含幀尾段仍保留。
+  細節見 [媒體定位契約](storage-ports.md)。舊 v2／v3 索引須重建，
+  未變重跑不重嵌，但目前仍會在 probe 讀取全片影格表，不能宣稱沒有解碼成本。
 - 驗證在**載入模型前**完成，違反者為 `EmbedderInputError`（穩定錯誤碼 `invalid-video-input`）：
   幀數 1–32、`channels` 3／4、`pixels.length === width×height×channels`、邊長 1–2048、
   全部幀像素總數 ≤ 8,388,608、timestamp 有限非負且非遞減、同段所有幀的寬高通道一致。

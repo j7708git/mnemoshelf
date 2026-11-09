@@ -25,7 +25,7 @@ export interface VideoStreamInfo {
   readonly rotationDegrees: 0 | 90 | 180 | 270;
   readonly avgFrameRate: string;
   readonly rFrameRate: string;
-  /** 視覺流自身起點（秒）；缺時 fallback `VideoProbe.sourceStartSeconds`，用於播放時間軸正規化。 */
+  /** 視覺流自身的來源起點 metadata（秒）；播放時間軸一律使用 `VideoProbe.sourceStartSeconds`。 */
   readonly startTimeSeconds?: number;
   /** 視覺流自身時長（秒）；缺時 fallback `VideoProbe.durationSeconds`。 */
   readonly durationSeconds?: number;
@@ -65,6 +65,17 @@ export interface VideoProbe {
   readonly selectedAudio: SelectedAudioStream | null;
   readonly hasVideo: boolean;
   readonly hasAudio: boolean;
+  /** 解碼端依實際來源 PTS 建立的 4 秒／1 幀佈局；無可支援影像時可省略。 */
+  readonly visualTimeline?: readonly VisualFramePick[];
+}
+
+/** 視覺取幀計畫；所有時間都是播放時間軸，frameTimeSeconds 必須來自來源 PTS。 */
+export interface VisualFramePick {
+  readonly segmentIndex: number;
+  readonly startSeconds: number;
+  readonly endSeconds: number;
+  readonly frameTimeSeconds: number;
+  readonly rule: "midpoint" | "tail-last" | "fallback-last";
 }
 
 /** 一個已解碼的視覺幀（RGB24、row-major）。 */
@@ -119,6 +130,11 @@ export interface DecodeCallOptions {
   readonly signal?: AbortSignal;
   /** 此操作的硬 deadline（毫秒）。probe 預設 15,000；decode 由呼叫端依 probe 時長給。 */
   readonly timeoutMs?: number;
+}
+
+/** probe 預設包含視覺佈局；純音軌解碼可略過影格表。 */
+export interface ProbeOptions extends DecodeCallOptions {
+  readonly includeVisualTimeline?: boolean;
 }
 
 /** 視覺解碼選項。 */
@@ -201,11 +217,12 @@ export const VIDEO_AUDIO_SAMPLE_RATE = 16_000;
 /**
  * 視覺前處理版本；含段長、每段幀數、縮圖最長邊與「來源 PTS」政策。
  *
- * v2（波次一 D1）：取幀改為 select 保留來源 PTS（srcpts-v1），不再用 fps 輸出格；
+ * v4（波次二）：視覺 PTS 與 seek 一律依容器原點，保留影音起點差；
+ * 沿用 v3 的來源 PTS 佈局，經最後影格時長證明才省略空尾格；
  * 舊索引必須重建。改變選幀規則時必須再換版。
  */
 export function visualPreprocessingVersion(segmentSeconds = VIDEO_SEGMENT_SECONDS, framesPerSegment = VIDEO_FRAMES_PER_SEGMENT, longestSide = VIDEO_LONGEST_SIDE): string {
-  return `mp4-h264-rgb24-v2:${segmentSeconds}s:${framesPerSegment}f:${longestSide}:srcpts-v1`;
+  return `mp4-h264-rgb24-v4:${segmentSeconds}s:${framesPerSegment}f:${longestSide}:srcpts-v3`;
 }
 
 /**
@@ -224,7 +241,7 @@ export interface MediaDecoder {
   /** 檢查 binary 可用性（缺失／損毀回 available=false，不拋）。 */
   checkAvailability(): Promise<DecoderAvailability>;
   /** 讀取容器與 stream 資訊；違反硬限制時拋具名錯誤。 */
-  probe(source: MediaSource, options?: DecodeCallOptions): Promise<VideoProbe>;
+  probe(source: MediaSource, options?: ProbeOptions): Promise<VideoProbe>;
   /** 序列解碼並依段輸出視覺幀；正常無競爭時不 seek，僅在讓出解碼程序名額後於段界以 -ss 恢復。 */
   decodeVisualSegments(source: MediaSource, options?: DecodeVisualOptions): AsyncGenerator<VisualSegment>;
   /** 單次解出選定 AAC 音軌為 16 kHz mono，串流切段。 */

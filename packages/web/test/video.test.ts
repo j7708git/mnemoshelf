@@ -1,11 +1,11 @@
 /**
  * 影片 UI 純邏輯與 SSR 狀態測試（C2）。
  *
- * 播放本身需要 Electron（`webRequest` 注入授權＋Chromium 解碼），因此這裡只驗：
+ * 真正解碼／seek 另由瀏覽器驗收；這裡驗純邏輯與 SSR：
  * - 同源媒體網址、軌道標籤、時間與 seek 目標（只用伺服器回報的資料，不猜時長）；
  * - 能力三態 → 開關停用與可讀原因；
  * - 播放失敗的 HTTP 狀態對照（403／404／413／415／416）；
- * - SSR 下各元件的可見狀態（桌面／瀏覽器分流、影片命中標示、開關 disabled）。
+ * - SSR 下各元件的可見狀態（授權前不載影片、影片命中標示、開關 disabled）。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createElement } from "react";
@@ -16,14 +16,12 @@ import { FilePreview } from "../src/FilePreview";
 import { AddRootFlow } from "../src/AddRootFlow";
 import { RootsList } from "../src/RootsList";
 import {
-  DESKTOP_ONLY_PLAYBACK_MESSAGE,
   describeMediaHit,
   describeVideoEntries,
   isVideoReason,
   mediaFrameSeconds,
   mediaSeekSeconds,
   mediaTrackLabel,
-  videoPlaybackSupport,
   videoReasonLabel,
   videoToggleState,
   videoUnavailableReason,
@@ -69,17 +67,6 @@ describe("影片播放路徑與時間", () => {
     expect(mediaUrl(7, "clips/生日 & 派對.mp4")).toBe(
       "/roots/7/media?path=clips%2F%E7%94%9F%E6%97%A5%20%26%20%E6%B4%BE%E5%B0%8D.mp4",
     );
-  });
-
-  it("桌面版可播；瀏覽器版明確顯示需桌面版（不提供 token query）", () => {
-    expect(videoPlaybackSupport(true)).toEqual({ kind: "available" });
-    const browser = videoPlaybackSupport(false);
-    expect(browser.kind).toBe("desktop-only");
-    if (browser.kind === "desktop-only") {
-      expect(browser.message).toBe(DESKTOP_ONLY_PLAYBACK_MESSAGE);
-      expect(browser.message).toContain("桌面版");
-      expect(browser.message).toContain("token 不會放進網址");
-    }
   });
 
   it("畫面與音軌用 media.track 分辨（不是看 kind）", () => {
@@ -203,13 +190,13 @@ describe("API 層：影片能力與 HEAD 探測", () => {
 });
 
 describe("SSR：影片預覽與開關狀態", () => {
-  it("瀏覽器模式顯示需桌面版，不渲染播放器；仍顯示命中時間", () => {
+  it("授權完成前不渲染播放器；仍顯示命中時間", () => {
     const html = renderToStaticMarkup(createElement(FilePreview, {
       rootId: 1,
       entry: { kind: "video", name: "clip.mp4", path: "clip.mp4", size: null, mimeType: null },
       media: videoHit(),
     }));
-    expect(html).toContain("影片播放需要桌面版 App");
+    expect(html).toContain("正在驗證影片來源與播放授權");
     expect(html).toContain("0:04.0–0:08.0");
     expect(html).toContain("取樣幀 0:06.0");
     expect(html).not.toContain("<video");

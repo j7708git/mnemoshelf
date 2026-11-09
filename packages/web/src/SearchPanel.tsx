@@ -178,7 +178,7 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
                         )}
                         <p className="mt-1 text-[11px] text-muted">
                           {hit.media?.track === "video" || hit.media?.track === "video-audio"
-                            ? "點擊在右側預覽並跳到原片時間（播放需桌面版）"
+                            ? "點擊在右側驗證來源並跳到原片時間"
                             : "點擊在右側預覽這個檔案"}
                         </p>
                       </button>
@@ -227,7 +227,7 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
           <div className="h-[60vh] min-h-0 overflow-auto">
             {selected === null ? (
               <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center text-sm text-muted">
-                點選左側的檔案結果即可在這裡預覽（支援文字、圖片、WAV 音訊與影片；影片播放需桌面版）。
+                點選左側的檔案結果即可在這裡預覽（支援文字、圖片、WAV 音訊與影片）。
               </div>
             ) : (
               <FilePreview
@@ -235,6 +235,7 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
                 rootId={selected.rootId}
                 entry={selected.entry}
                 media={selected.media}
+                sourceChunkId={Number(selected.key.slice(2))}
               />
             )}
           </div>

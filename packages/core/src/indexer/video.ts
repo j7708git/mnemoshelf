@@ -8,7 +8,7 @@
  * - 波次一修正契約 D1／D2／D3／D6
  *
  * 時間規則（D1／D2）：視覺與音軌都使用播放時間軸（0-based）；預期 chunk 佈局
- * 與 decoder 實際輸出共用 computeAudioTimeline／VIDEO_SEGMENT_SECONDS 等同一份常數。
+ * 與 decoder 實際輸出共用 visualTimeline／computeAudioTimeline，同時核對實際來源 PTS。
  */
 
 import { createHash } from "node:crypto";
@@ -29,6 +29,7 @@ import {
 import type {
   MediaDecoderErrorCode,
   VideoProbe,
+  VisualFramePick,
   VisualSegment,
 } from "../media/index.js";
 import type { VideoFrameInput } from "../ports/embedder.js";
@@ -215,7 +216,7 @@ export function videoAudioPreprocessVersion(decoderVersion: string | undefined):
 
 const TRACK_RANK: Record<ChunkMediaTrack, number> = { video: 0, "video-audio": 1, audio: 2 };
 
-/** 每個 chunk 的預期身分（增量比對用；不含實際幀時間）。 */
+/** 每個 chunk 的預期身分（增量比對包含來源幀時間）。 */
 export interface VideoChunkExpectation {
   kind: "video" | "audio";
   track: "video" | "video-audio";
@@ -223,12 +224,14 @@ export interface VideoChunkExpectation {
   endSeconds: number;
   streamIndex?: number;
   preprocessVersion: string;
+  frameTimesSeconds?: readonly number[];
 }
 
-/** 一個影片檔的預期 chunk 佈局（只由 probe 推得；比對前不宣稱是實際結果）。 */
+/** 一個影片檔的預期 chunk 佈局；視覺部分由 decoder 的來源 PTS 計畫提供。 */
 export interface VideoChunkLayout {
   durationSeconds: number;
   visualCount: number;
+  visualTimeline: readonly VisualFramePick[];
   /** 已選定音軌時的片段數與播放時間軸結尾；音軌關閉或無音軌為 null。 */
   audio: { count: number; streamIndex: number; endSeconds: number; offsetSeconds: number } | null;
 }
@@ -236,20 +239,41 @@ export interface VideoChunkLayout {
 /**
  * 依 probe（含 per-stream 時間）推導預期片段佈局。
  *
- * 與 decoder 共用同一份時間規則：視覺段數＝ceil(probe.durationSeconds/4)；
+ * 與 decoder 共用同一份來源 PTS 佈局，不從容器時長猜視覺段數；
  * 音軌段數與結尾由 computeAudioTimeline 決定（不是容器時長）。
  */
 export function buildVideoChunkLayout(probe: VideoProbe, audioRequested: boolean): VideoChunkLayout {
   const durationSeconds = probe.durationSeconds;
-  const visualCount = Math.max(1, Math.ceil(durationSeconds / VIDEO_SEGMENT_SECONDS));
+  const visualTimeline = probe.visualTimeline;
+  if (!Array.isArray(visualTimeline) || visualTimeline.length === 0 || visualTimeline.length > 150) {
+    throw new MediaDecoderError("unsupported-video-timeline");
+  }
+  for (let index = 0; index < visualTimeline.length; index += 1) {
+    const pick = visualTimeline[index]!;
+    if (pick === null || typeof pick !== "object" || pick.segmentIndex !== index || pick.startSeconds !== index * VIDEO_SEGMENT_SECONDS
+      || !Number.isFinite(pick.endSeconds) || pick.endSeconds <= pick.startSeconds
+      || pick.endSeconds !== Math.min(durationSeconds, pick.startSeconds + VIDEO_SEGMENT_SECONDS)
+      || !Number.isFinite(pick.frameTimeSeconds) || pick.frameTimeSeconds < pick.startSeconds
+      || pick.frameTimeSeconds >= pick.endSeconds
+      || !["midpoint", "tail-last", "fallback-last"].includes(pick.rule)) {
+      throw new MediaDecoderError("unsupported-video-timeline");
+    }
+  }
+  const finalEnd = visualTimeline.at(-1)!.endSeconds;
+  // decoder 可省略末尾不足 4 秒的空格；不得省略完整格或中間格。
+  if (!Number.isFinite(durationSeconds) || durationSeconds - finalEnd >= VIDEO_SEGMENT_SECONDS || finalEnd > durationSeconds) {
+    throw new MediaDecoderError("unsupported-video-timeline");
+  }
+  const visualCount = visualTimeline.length;
   if (!audioRequested || !probe.hasAudio || probe.selectedAudio === null || !probe.selectedAudio.isAac) {
-    return { durationSeconds, visualCount, audio: null };
+    return { durationSeconds, visualCount, visualTimeline, audio: null };
   }
   const timeline = computeAudioTimeline(probe);
-  if (timeline === null) return { durationSeconds, visualCount, audio: null };
+  if (timeline === null) return { durationSeconds, visualCount, visualTimeline, audio: null };
   return {
     durationSeconds,
     visualCount,
+    visualTimeline,
     audio: {
       count: timeline.segmentCount,
       streamIndex: timeline.streamIndex,
@@ -307,9 +331,18 @@ export function videoFramesForSegment(segment: VisualSegment): VideoFrameInput[]
   }));
 }
 
-/** 視覺片段必須完整覆蓋 probe 推得的段數；少一段代表時間軸不完整，不寫入部分索引。 */
+/** 視覺片段必須完整覆蓋 decoder 佈局的段數；少一段代表時間軸不完整，不寫入部分索引。 */
 export function assertVideoVisualCoverage(actualCount: number, expectedCount: number): void {
-  if (actualCount !== expectedCount) throw new MediaDecoderError("invalid-video");
+  if (actualCount !== expectedCount) throw new MediaDecoderError("unsupported-video-timeline");
+}
+
+/** 每個解碼段的邊界與實際幀時間必須符合 decoder 的 probe 佈局；嵌入前驗證。 */
+export function assertVideoVisualSegment(segment: VisualSegment, expected: VisualFramePick | undefined): void {
+  if (expected === undefined || !closeEnough(segment.startSeconds, expected.startSeconds)
+    || !closeEnough(segment.endSeconds, expected.endSeconds) || segment.frames.length !== VIDEO_FRAMES_PER_SEGMENT
+    || !closeEnough(segment.frames[0]!.timestampSeconds, expected.frameTimeSeconds)) {
+    throw new MediaDecoderError("unsupported-video-timeline");
+  }
 }
 
 /** 增量比對用的身分（全部相同且向量齊全才可跳過重算）。 */
@@ -332,19 +365,19 @@ function sortExpectations(list: VideoChunkExpectation[]): VideoChunkExpectation[
     left.endSeconds - right.endSeconds);
 }
 
-/** 由 probe 佈局與版本身分建立「依 seq 排序」的預期 chunk 清單。 */
+/** 由 decoder 佈局與版本身分建立「依 seq 排序」的預期 chunk 清單。 */
 export function expectedVideoChunks(
   layout: VideoChunkLayout,
   identity: Pick<VideoIndexIdentity, "visualPreprocessVersion" | "audioPreprocessVersion">,
 ): VideoChunkExpectation[] {
   const expected: VideoChunkExpectation[] = [];
-  for (let index = 0; index < layout.visualCount; index += 1) {
-    const startSeconds = index * VIDEO_SEGMENT_SECONDS;
+  for (const pick of layout.visualTimeline) {
     expected.push({
       kind: "video",
       track: "video",
-      startSeconds,
-      endSeconds: Math.min(layout.durationSeconds, startSeconds + VIDEO_SEGMENT_SECONDS),
+      startSeconds: pick.startSeconds,
+      endSeconds: pick.endSeconds,
+      frameTimesSeconds: [pick.frameTimeSeconds],
       preprocessVersion: identity.visualPreprocessVersion,
     });
   }
@@ -380,6 +413,8 @@ function mediaMatchesExpectation(chunk: Chunk, expectation: VideoChunkExpectatio
   }
   const frameTimes = media.frameTimesSeconds;
   if (!Array.isArray(frameTimes) || frameTimes.length !== VIDEO_FRAMES_PER_SEGMENT) return false;
+  if (expectation.frameTimesSeconds === undefined
+    || frameTimes.some((time, index) => !closeEnough(time, expectation.frameTimesSeconds![index]!))) return false;
   let previous = Number.NEGATIVE_INFINITY;
   for (const frameTime of frameTimes) {
     if (typeof frameTime !== "number" || !Number.isFinite(frameTime)) return false;

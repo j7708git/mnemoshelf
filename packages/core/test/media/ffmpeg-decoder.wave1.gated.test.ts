@@ -25,9 +25,9 @@ const gated = process.platform === "win32"
 function fixture(name: string): string { return path.join(fixtureDir, name); }
 function decoder(): FfmpegMediaDecoder { return new FfmpegMediaDecoder({ ffmpegPath, ffprobePath }); }
 
-/** 用 ffprobe 取權威的來源 frame pts（播放時間軸：減去 video stream start）。 */
+/** 用 ffprobe 取權威的來源 frame pts（影音共用播放時間軸：減去 format start）。 */
 function sourceFrameTimes(file: string): number[] {
-  const stream = spawnSync(ffprobePath, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=start_time", "-of", "csv=p=0", file], { encoding: "utf8", windowsHide: true });
+  const stream = spawnSync(ffprobePath, ["-v", "error", "-show_entries", "format=start_time", "-of", "csv=p=0", file], { encoding: "utf8", windowsHide: true });
   const start = Number(stream.stdout.trim()) || 0;
   const result = spawnSync(ffprobePath, ["-v", "error", "-select_streams", "v:0", "-show_frames", "-show_entries", "frame=pts_time", "-of", "csv=p=0", file], { encoding: "utf8", windowsHide: true });
   return result.stdout
@@ -139,9 +139,9 @@ describe.skipIf(!gated)("波次一 D1：短尾段與來源 PTS（真 ffmpeg）",
   it("時間線有缺口（segment 完全沒有幀）→ 具名 unsupported-video-timeline，不是 invalid-video", async () => {
     const instance = decoder();
     const file = fixture("sparse-gap-13s.mp4");
-    const probe = await instance.probe({ path: file });
     let code: string | undefined;
     try {
+      const probe = await instance.probe({ path: file });
       for await (const _ of instance.decodeVisualSegments({ path: file }, { probe })) { /* consume */ }
     } catch (error) {
       code = error instanceof MediaDecoderError ? error.code : "unexpected:" + String(error);
@@ -194,7 +194,7 @@ describe.skipIf(!gated)("波次一 D1：短尾段與來源 PTS（真 ffmpeg）",
   it("視覺前處理版本已 bump 到 v2（srcpts）", async () => {
     const probe = await decoder().probe({ path: fixture("tail-4.8.mp4") });
     const segments = await collect(decoder(), fixture("tail-4.8.mp4"), probe);
-    expect(segments[0]!.preprocessingVersion).toBe("mp4-h264-rgb24-v2:4s:1f:384:srcpts-v1");
+    expect(segments[0]!.preprocessingVersion).toBe("mp4-h264-rgb24-v4:4s:1f:384:srcpts-v3");
   }, 60_000);
 });
 

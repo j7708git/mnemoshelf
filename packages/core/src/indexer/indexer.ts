@@ -27,6 +27,7 @@ import {
 import {
   VIDEO_CONTAINER,
   assertVideoVisualCoverage,
+  assertVideoVisualSegment,
   buildVideoChunkLayout,
   checkVideoProbePolicy,
   decoderSkipReason,
@@ -952,7 +953,15 @@ async function processVideoFile(
       return { status: "skipped", reason: "unsupported-video-audio-track" };
     }
     const streamIndex = selection.status === "ready" ? selection.streamIndex : null;
-    const layout = buildVideoChunkLayout(probe, selection.status === "ready");
+    let layout: ReturnType<typeof buildVideoChunkLayout>;
+    try {
+      layout = buildVideoChunkLayout(probe, selection.status === "ready");
+    } catch (error) {
+      const reason = decoderSkipReason(error);
+      if (reason === undefined) throw error;
+      await purgeChunks(root.id, file.relPath, deps);
+      return { status: "skipped", reason };
+    }
 
     const visualVersion = videoVisualPreprocessVersion(video.decoderVersion);
     const audioVersion = videoAudioPreprocessVersion(video.decoderVersion);
@@ -1003,6 +1012,7 @@ async function processVideoFile(
             break;
           }
           const segment = next.value;
+          assertVideoVisualSegment(segment, layout.visualTimeline[visualCount]);
           throwIfAborted(signal);
           const vector = await embedVideo({ frames: videoFramesForSegment(segment) }, { signal });
           throwIfAborted(signal);
@@ -1029,7 +1039,7 @@ async function processVideoFile(
       } finally {
         if (!iteratorDone) await iterator.return(undefined);
       }
-      // 片段數量必須等於 probe 推得的完整覆蓋；少一段代表時間軸不完整，不寫部分索引。
+      // 片段數量必須等於 decoder 佈局的完整覆蓋；少一段代表時間軸不完整，不寫部分索引。
       assertVideoVisualCoverage(visualCount, layout.visualCount);
 
       if (layout.audio !== null) {

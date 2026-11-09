@@ -37,6 +37,7 @@ import {
   type MediaDecoder,
   type MediaDecoderLimits,
   type MediaSource,
+  type ProbeOptions,
   type VideoProbe,
   type VisualFrame,
   type VisualSegment,
@@ -51,7 +52,7 @@ import {
   displayDimensions,
   normalizeAudioSegmentSeconds,
   normalizeVisualSegmentSeconds,
-  parseFramePtsList,
+  parseFrameTimeline,
   parseProbeJson,
   planVisualFrames,
   scaledDimensions,
@@ -174,6 +175,8 @@ export class FfmpegMediaDecoder implements MediaDecoder {
   /** 跨所有 roots 的解碼程序名額（此 decoder 實例共用；server 只建一個實例）。 */
   readonly decodeBudget: DecodeProcessBudget;
   private availability: Promise<DecoderAvailability> | null = null;
+  /** 綁在本輪 probe 物件；快照釋放後可回收，不以路徑快取可能過期的時間線。 */
+  private readonly frameTimelines = new WeakMap<VideoProbe, ReturnType<typeof parseFrameTimeline>>();
 
   constructor(options: FfmpegMediaDecoderOptions) {
     this.ffmpegPath = options.ffmpegPath;
@@ -213,7 +216,7 @@ export class FfmpegMediaDecoder implements MediaDecoder {
     return { available: false, reason: ffprobe.spawnError !== null && /ENOENT/i.test(ffprobe.spawnError) ? "missing-ffprobe" : "ffprobe-failed" };
   }
 
-  async probe(source: MediaSource, options: DecodeCallOptions = {}): Promise<VideoProbe> {
+  async probe(source: MediaSource, options: ProbeOptions = {}): Promise<VideoProbe> {
     const sourcePath = assertSource(source);
     const availability = await this.checkAvailability();
     if (!availability.available) throw new MediaDecoderError("video-decoder-unavailable", sourcePath);
@@ -242,6 +245,13 @@ export class FfmpegMediaDecoder implements MediaDecoder {
     if (!container.includes("mov") && !container.includes("mp4")) throw new MediaDecoderError("unsupported-video-container", sourcePath);
     if (probe.durationSeconds > this.limits.maxDurationSeconds) throw new MediaDecoderError("video-duration-exceeded", sourcePath);
     if (probe.video && probe.video.width * probe.video.height > this.limits.maxPixels) throw new MediaDecoderError("video-resolution-exceeded", sourcePath);
+    if (options.includeVisualTimeline !== false && probe.video?.codec === "h264"
+      && (probe.video.pixFmt === undefined || SUPPORTED_PIX_FMTS.has(probe.video.pixFmt))) {
+      const frames = await this.readVideoFrameTimes(sourcePath, probe, options);
+      const visualTimeline = planVisualFrames(frames.times, probe.durationSeconds, VIDEO_SEGMENT_SECONDS, VIDEO_FRAMES_PER_SEGMENT, frames.lastFrameDurationSeconds);
+      probe = { ...probe, visualTimeline };
+      this.frameTimelines.set(probe, frames);
+    }
     return probe;
   }
 
@@ -251,10 +261,11 @@ export class FfmpegMediaDecoder implements MediaDecoder {
    * 這是每檔一次的前置探測：不跨嵌入保留、輸出有界（MAX_FRAME_LIST_BYTES），
    * 因此**不納入** decoder 程序生命週期名額（契約 §6）。probe() 同理。
    */
-  private async readVideoFrameTimes(sourcePath: string, probe: VideoProbe, options: DecodeCallOptions): Promise<number[]> {
+  private async readVideoFrameTimes(sourcePath: string, probe: VideoProbe, options: DecodeCallOptions): Promise<ReturnType<typeof parseFrameTimeline>> {
     const result = await runProcess(
       this.ffprobePath,
-      ["-v", "error", "-hide_banner", "-select_streams", "v:0", "-show_frames", "-show_entries", "frame=pts_time", "-of", "csv=p=0", "-f", "mov", "-protocol_whitelist", "file", sourcePath],
+      // 前置完整 PTS 探測固定四個解碼執行緒，避免自動策略在長片超過期限；不略過任何幀。
+      ["-v", "error", "-hide_banner", "-threads", "4", "-select_streams", "v:0", "-show_frames", "-show_entries", "frame=pts_time,duration_time", "-of", "compact=p=1:nk=0", "-f", "mov", "-protocol_whitelist", "file", sourcePath],
       { timeoutMs: options.timeoutMs ?? this.probeTimeoutMs, ...(options.signal !== undefined ? { signal: options.signal } : {}), maxStdoutBytes: MAX_FRAME_LIST_BYTES, maxStderrBytes: this.maxStderrBytes },
     );
     const snapshot: ProcessSnapshot = {
@@ -263,21 +274,21 @@ export class FfmpegMediaDecoder implements MediaDecoder {
     };
     if (snapshot.killed.abort || snapshot.killed.deadline) throw new MediaDecoderError(classifyProcessFailure(snapshot), sourcePath);
     if (failed(snapshot) || result.stdoutTruncated) unsupportedTimeline(sourcePath);
-    const raw = parseFramePtsList(result.stdout.toString("utf8"));
-    if (raw.length === 0) unsupportedTimeline(sourcePath);
-    const start = probe.video?.startTimeSeconds ?? probe.sourceStartSeconds;
+    const frames = parseFrameTimeline(result.stdout.toString("utf8"));
+    // 影音與容器必須共用原點；以 video stream 自行歸零會丟掉相對音軌的起始偏移。
+    const start = probe.sourceStartSeconds;
     if (!Number.isFinite(start)) unsupportedTimeline(sourcePath);
     const duration = probe.durationSeconds;
     const times: number[] = [];
-    for (const value of raw) {
+    for (const value of frames.times) {
       const normalized = value - start;
       if (!Number.isFinite(normalized)) unsupportedTimeline(sourcePath);
       if (normalized < -1e-6) unsupportedTimeline(sourcePath);
-      if (normalized >= duration + 1e-6) continue;
+      if (normalized >= duration + 1e-6) unsupportedTimeline(sourcePath);
       times.push(normalized);
     }
     if (times.length === 0) unsupportedTimeline(sourcePath);
-    return times;
+    return { ...frames, times };
   }
 
   /**
@@ -303,25 +314,27 @@ export class FfmpegMediaDecoder implements MediaDecoder {
     if (probe.video.codec !== "h264") throw new MediaDecoderError("unsupported-video-codec", sourcePath);
     if (probe.video.pixFmt !== undefined && !SUPPORTED_PIX_FMTS.has(probe.video.pixFmt)) throw new MediaDecoderError("unsupported-video-codec", sourcePath);
 
-    const frameTimes = await this.readVideoFrameTimes(sourcePath, probe, options);
+    const frames = this.frameTimelines.get(probe) ?? await this.readVideoFrameTimes(sourcePath, probe, options);
     let picks: VisualFramePick[];
-    try { picks = planVisualFrames(frameTimes, probe.durationSeconds, segmentSeconds, framesPerSegment); }
+    try {
+      picks = segmentSeconds === VIDEO_SEGMENT_SECONDS && framesPerSegment === VIDEO_FRAMES_PER_SEGMENT && this.frameTimelines.has(probe)
+        ? [...probe.visualTimeline!]
+        : planVisualFrames(frames.times, probe.durationSeconds, segmentSeconds, framesPerSegment, frames.lastFrameDurationSeconds);
+    }
     catch (error) {
       if (error instanceof MediaDecoderError) throw new MediaDecoderError(error.code, sourcePath);
       throw error;
     }
-    // 全域上限檢查：一個 select 表達式在約 100 項後會解析失敗（等距格線會壓縮成極短條件；
-    // 實際表達式在每次 session 依剩餘 picks 平移重建）。非格線且超過上限→具名拒絕。
-    const globalCompact = buildGridSelectExpression(picks, segmentSeconds);
-    if (globalCompact === null && picks.length > MAX_FRAME_SELECT_TERMS) unsupportedTimeline(sourcePath);
+    // 最多 600 個 pick；非格線使用有界平衡加法樹，不再因線性樹深度拒絕長片。
+    if (picks.length > MAX_FRAME_SELECT_TERMS) unsupportedTimeline(sourcePath);
 
     const display = displayDimensions(probe.video);
     const scaleFilter = buildScaleFilter(display.width, display.height, longestSide);
     const output = scaledDimensions(display.width, display.height, longestSide);
     const frameBytes = output.width * output.height * 3;
     const duration = probe.durationSeconds;
-    const videoStart = probe.video.startTimeSeconds ?? probe.sourceStartSeconds;
-    if (!Number.isFinite(videoStart)) unsupportedTimeline(sourcePath);
+    const timelineStart = probe.sourceStartSeconds;
+    if (!Number.isFinite(timelineStart)) unsupportedTimeline(sourcePath);
     const preprocessingVersion = visualPreprocessingVersion(segmentSeconds, framesPerSegment, longestSide);
     const signal = options.signal;
     const budget = this.decodeBudget;
@@ -389,11 +402,10 @@ export class FfmpegMediaDecoder implements MediaDecoder {
         rule: pick.rule,
       }));
       const compactLocal = buildGridSelectExpression(shifted, segmentSeconds);
-      if (compactLocal === null && shifted.length > MAX_FRAME_SELECT_TERMS) unsupportedTimeline(sourcePath);
       const expression = compactLocal ?? buildFrameSelectExpression(shifted);
-      if (expression.length > 60_000) unsupportedTimeline(sourcePath);
+      if (expression.length > 28_000) unsupportedTimeline(sourcePath);
       const filters = ["select=" + expression, ...(scaleFilter ? [scaleFilter] : []), "showinfo"].join(",");
-      const seekSeconds = videoStart + startSeconds;
+      const seekSeconds = timelineStart + startSeconds;
       if (!Number.isFinite(seekSeconds) || seekSeconds < 0) unsupportedTimeline(sourcePath);
       const lease = await budget.acquire(signal);
       let proc: StartedProcess;
@@ -402,7 +414,7 @@ export class FfmpegMediaDecoder implements MediaDecoder {
           this.ffmpegPath,
           [
             "-v", "info", "-hide_banner", "-f", "mov", "-protocol_whitelist", "file",
-            // -ss 以來源絕對時間表示（videoStart + 段起點）；-seek_timestamp 1 讓它按絕對 timestamp 解讀。
+            // -ss 以來源絕對時間表示（format start + 段起點），與影音共用的播放原點一致。
             "-seek_timestamp", "1",
             "-ss", seekSeconds.toFixed(6),
             "-i", sourcePath, "-vf", filters, "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
@@ -580,11 +592,11 @@ export class FfmpegMediaDecoder implements MediaDecoder {
               // 所有 picks 都已消費：這裡才驗證完整並交出（含）最後一段。
               if (active.parser.count !== active.localPickCount || active.localFramesSeen !== active.localPickCount) unsupportedTimeline(sourcePath);
               if (framesForSegment.length !== 0) unsupportedTimeline(sourcePath);
-              while (segmentsOut.length > 0) yield segmentsOut.shift()!;
-              const expectedSegments = Math.max(1, Math.ceil(duration / segmentSeconds - 1e-9));
+              const expectedSegments = picks.at(-1)!.segmentIndex + 1;
               const segmentIndexes = new Set(picks.map((pick) => pick.segmentIndex));
               if (segmentIndexes.size !== expectedSegments) unsupportedTimeline(sourcePath);
               if (framesSeen === 0 || currentSegmentIndex < 0) unsupportedTimeline(sourcePath);
+              while (segmentsOut.length > 0) yield segmentsOut.shift()!;
               completed = true;
             }
           }
@@ -614,7 +626,7 @@ export class FfmpegMediaDecoder implements MediaDecoder {
   async *decodeAudioSegments(source: MediaSource, options: DecodeAudioOptions = {}): AsyncGenerator<AudioSegment> {
     const sourcePath = assertSource(source);
     const segmentSeconds = normalizeAudioSegmentSeconds(options.segmentSeconds ?? VIDEO_AUDIO_SEGMENT_SECONDS);
-    const probe = options.probe ?? (await this.probe(source, { ...(options.signal !== undefined ? { signal: options.signal } : {}), timeoutMs: this.probeTimeoutMs }));
+    const probe = options.probe ?? (await this.probe(source, { includeVisualTimeline: false, ...(options.signal !== undefined ? { signal: options.signal } : {}), timeoutMs: this.probeTimeoutMs }));
     if (!probe.hasAudio) throw new MediaDecoderError("no-audio-track", sourcePath);
     const selected = probe.selectedAudio;
     if (!selected) throw new MediaDecoderError("no-audio-track", sourcePath);
