@@ -46,10 +46,42 @@ root 記錄建立後、索引開始前先做一次乾跑（dry run），回報�
   而跳過**：索引階段會對文字／程式碼套用遮罩（見 §機密遮罩），原檔案仍會被納入、只讀不寫。
 
 使用者確認後才開始索引。索引可取消，也可限速，避免占滿 CPU。
+產品索引支援文字、程式碼、圖片與受限 WAV 音訊；`audio` 需使用者手動開啟。
+影片或沒有音訊能力的 embedder 仍以 `unsupported-modality` 跳過，不會送進圖片模型。索引結果的 `scanSkippedFiles`
+記錄掃描階段跳過原因，不計入 `total`；處理階段的 `skippedFiles` 仍計入 `total`，既有對帳語意不變。
+重新索引會依既有清理規則移除未支援模態的舊索引，來源檔案保持不變。
+
+### 音訊索引與來源定位
+
+- 首版只接受 RIFF/WAVE PCM16 或 IEEE float32，單／雙聲道、8–192 kHz；MP3／FLAC、RF64、WAVE extensible 等回報未支援。副檔名符合仍須在索引時驗證內容。
+- 預設單檔 10 MiB 限制保留；音訊另有 64 MiB 解碼硬上限、600 秒時長上限與 RIFF 結構數上限，不能用提高 root 位元組設定繞過。
+- 解碼僅處理已通過 root 守衛的位元組，不啟動外部解碼程序、不追蹤外部檔案或網路參照。逐段轉成 16 kHz mono PCM，每段 10 秒，完整保留最後不足一段的音訊。模型入口每段最多 30 秒。
+- 預覽依副檔名與大小估算可納入數與片段上界，**不讀音訊內容、不保證 codec／時長有效**，也不含首次模型下載時間。處理時另回報 `unsupported-audio-format`、`invalid-audio`、`audio-limit-exceeded`。
+- 首次索引音訊才下載／載入額外音訊 encoder；檔案與解碼 PCM 不上傳。音訊模型狀態為 `not-loaded`／`loading`／`ready`／`failed`；下載預檢失敗可在重跑時重試。若本機多 session 初始化失敗，會停止本行程的音訊重試並提示重新啟動，避免上游部分 session 資源反覆累積；文字與圖片仍可重新載入使用。
+- 本版音訊使用 CPU；第一次啟用後文字／圖片也共用該 CPU backend，不把既有加速器的文字／圖片自測當成音訊加速驗證。
+- 音訊不套文字機密遮罩、不產生逐字稿。搜尋命中包含來源與時間範圍；WAV 預覽經同一授權檔案端點取得，固定上限 10 MiB，可跳到片段起點。播放使用來源檔案當下內容，檔案變更後應重新索引。
+- 取消會停止下一片段，等待當前 native 推論收尾；未完成的整個檔案留待重跑。每檔全部片段成功才進入既有寫入流程，不將部分片段標成完成。
   <!-- 2026-10-19 更新：`POST /roots/:id/index/cancel` 已實作；限速 `MNEMOSHELF_INDEX_RATE=off|normal|low`
        也已實作（`normal` 50ms、`low` 250ms，`off` 為預設），只作用於「檔案與檔案之間」，
-       同一個大檔的嵌入批次仍一次跑完。預設值與完整行為以 `docs/operations.md` 與
+       大檔內部的讓渡由 WorkerEmbedder 視窗排程負責。預設值與完整行為以 `docs/operations.md` 與
        `packages/server/src/config.ts` 為準。 -->
+
+### 影片索引與來源定位（v1 範圍，2026-11-08 起）
+
+- 首版只接受本機單檔 `.mp4`：H.264 8-bit SDR 視覺，可有 AAC 音軌；實際 codec 以受控 probe 判斷，副檔名不是支援保證。HEVC／AV1／HDR、WebM、DRM、播放清單、網路串流、字幕／ASR 不在範圍。
+- 預設只有 text／code；`video` 需手動開啟才納入 `.mp4` 視覺；同時有 `video` 與 `audio` 才索引影片選定音軌；只有 `audio` 不會讀取影片。
+- 音軌選擇：第一個有 default 標記的 AAC，否則第一個 AAC；記錄 stream index。**只有選定音軌不存在或不支援時整檔具名跳過**；同檔其他未選音軌不影響成功。
+- 視覺每 4 秒一段、每段 1 幀（約 0.25 fps）；完整段取段中點之後第一幀、尾段取段內最後一幀，**保存實際解碼來源 PTS**（播放時間軸 0-based）與片段起訖；搜尋命中可定位回原片時間。VFR、非零 container start_time、edit list、旋轉在能可靠換算時支援；時間線無法可靠定義（段內無幀、PTS 重複／亂序、解碼結果與 probe 不一致）時整檔具名跳過 `unsupported-video-timeline`，不用平均 FPS 虛構定位。視覺佈局由 decoder 的實際 PTS 計畫提供，indexer 不再從容器時長猜段數。只有末幀實際時長證明覆蓋結尾時，才省略最後不足 4 秒且沒有 PTS 的空格；容器向上毫秒量化及六位小數相加的一微秒誤差以有界規則處理，完整空段／中間缺段仍拒絕，尾格有幀仍保留。長片非格線選幀用平衡加法樹，最多 600 項／28,000 字元；正常無競爭時同一程序跨段解碼，只有跨 root 讓出程序才於段界以 `-ss` 恢復。視覺與音軌以同一個容器 sourceStartSeconds 正規化播放時間，保留視訊相對容器的起點偏移；v4 視覺前處理身分要求 v2／v3 舊索引重建；未變重跑為零嵌入，但 probe 仍讀全片幀表（有界輸出），成本列長片效能驗收。純音軌解碼的內部 probe 略過視覺幀表。UI 與文件要明示抽樣可能漏掉短暫事件，不能宣稱完整內容理解。
+- 上限：來源最長 600 秒；每 root 可設定 `videoMaxFileBytes`（bytes，整數 1–16 GiB，預設 512 MiB；未設定時沿用服務層 `MNEMOSHELF_VIDEO_MAX_FILE_BYTES` 或 512 MiB，UI 可調）；通用 10 MiB 預設不直接套用 video。解碼、輸出、程序數與 token 皆有界；超過限制具名跳過。
+- 解碼只處理已通過 root 守衛的來源（優先有界快照），固定 demuxer、protocol whitelist、不開外部 dref／絕對路徑；外部參照、root 逃逸、來源替換與壞檔都不得讀取 root 外內容，並在取消／失敗後清理暫存與子程序。快照先開啟檔案 handle、再重新走 root 邊界並比對 handle 身分（dev／ino 為 BigInt；不可用時 realpath 相同＋size／mtime），通過才從同一 handle 複製、複製後再驗 size／mtime；驗證後不依路徑重開（已知殘餘競態窗口見研究紀錄，未宣稱完全消除）。
+- decoder 缺失或損毀時：App／服務仍啟動，`GET /diagnostics.video`／`GET /roots` 的 `video.state` 為 `disabled` 或 `unavailable`（固定 reason，如 `missing-ffmpeg`／`ffprobe-failed`）；設定但不可用時索引逐檔具名 failed `video-decoder-unavailable`，不 crash、不靜默跳過、不誤標成功。
+- 預覽只列舉與估算候選數，不讀媒體、不啟動 probe；顯示 codec／時長待確認、首次模型成本、大小／時長上限跳過原因與抽樣限制。
+- 桌面與 standalone 播放共用受授權與 root 守衛保護的同源 Range：先以 Bearer 建立短效 session，秘密只放 HttpOnly／SameSite=Strict／精確 Path cookie，URL 的 locator 不足以授權，token 不進 URL。建立與讀取要求同源 Fetch Metadata，並核對 Origin（若存在）與 Host，避免 cookie 不隔離 port 所造成的跨源使用。session 最長 15 分鐘、每服務最多 128 個、每個最多 4 條活動串流；Bearer 撤銷、逾期或服務關閉會停止串流，重啟即失效。
+- 搜尋命中播放時帶原 chunk id；建立 session 前以通過 root 驗證的同一 handle 計算 SHA-256，核對 chunk 的 root／path／來源 hash。已刪除命中或原檔修改回 `409`，UI 顯示需重新索引及搜尋，不把舊命中套到新內容。session 綁定 dev／ino／size／mtimeNs／ctimeNs，每次 Range 重驗 root，分批讀取前後核對版本；不為每個 Range 重算全檔 hash。此保證基於檔案系統可觀測版本，並非不可變快照或對同 OS 惡意修改的完整隔離。建立 session 的全檔 hash 有 I/O 成本。首版不做縮圖／海報幀、預覽轉碼或雲端處理。
+- 刪除 root 或成功修改 root 設定會撤銷該 root 的既有播放 session 並停止活動串流；重新授權時套用新設定。模態開關是索引政策，並不撤回已加入 root 的瀏覽權限，關掉 `video` 索引仍可從檔案總管播放該 root 的影片。
+- 影片音軌與獨立 WAV 共用音訊資源預算；影片解碼有兩層獨立名額：(1) **片段排程名額**以每次 decoder `next()` 為單位，取得片段後、送入嵌入前即釋放，長片在嵌入期間其他 root 仍可排程；(2) **程序生命週期名額跨所有 roots 共用、上限固定 1**（以共用 decoder 實例為單位；服務只建立一個），從 ffmpeg spawn 前持有到程序實際 close 後才釋放。正常無競爭時一個解碼程序跨嵌入保留；其他 root 需要時，持有者必須在**段界**關閉程序讓出，下一次再從該段邊界以 `-ss` 恢復（不逐段 seek、不預取未來片段），因此同時存活的解碼 ffmpeg ≤1，且不會恢復成長片整檔鎖。probe／幀表的 ffprobe 是每檔一次、不跨嵌入保留的前置程序，不在此名額內。取消／錯誤／提前結束一律關閉解碼迭代器並回收子程序。
+- 完整幀表的前置 ffprobe 明確指定 `-threads 4`，保留全部 PTS／duration 與預設 15 秒 probe deadline；不靠跳幀縮短探測。這是每個前置程序的解碼執行緒設定，不是全服務的執行緒或程序總上限；多 root 的前置探測仍須量測競爭成本。
+- 影片音軌與視覺時間線對不上、或選定音軌時長／起點無法可靠換算時，整檔具名跳過（`unsupported-video-timeline`），不以容器時長假裝一致。
 
 ## 路徑安全（所有檔案存取都要通過）
 
@@ -181,8 +213,8 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
   - `POST /roots/:id/index` 的回應（`IndexRootResult`）新增 additive `maskedFiles`：只計「內容」
     至少遮一處的檔案（媒體檔、跳過與未變更的檔案不計）。**title-only 遮罩不計入**：既有索引
     若內容未變會跳過，title 的遮罩只對本輪重新嵌入的檔案生效。
-  - 媒體檔（`image`／`audio`／`video`）**不套**文字遮罩，仍以原始位元組嵌入；`contentHash` 仍為
-    原始位元組的 sha256。
+  - 媒體檔**不套**文字遮罩；圖片送已編碼位元組，音訊送解碼後的時間片段。`contentHash` 仍為
+    原始檔案位元組的 sha256；音訊另以片段／前處理版本與 embedding 身分驗證增量完整性。
   - **既有索引需重跑該 root 的索引才會套用**；未重跑前，舊 chunk 仍可能含未遮罩內容
     （本版不自動清除舊索引，避免升級即全庫重嵌）。對受影響的 root 重跑一次索引即可。
 - **限制（誠實標示）**：這是 curated、盡力而為的防護，**不是完整 DLP**；無法保證所有憑證格式

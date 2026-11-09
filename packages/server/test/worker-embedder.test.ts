@@ -8,8 +8,8 @@
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Worker } from "node:worker_threads";
-import { describe, expect, it } from "vitest";
+import { Worker, type Transferable } from "node:worker_threads";
+import { describe, expect, it, vi } from "vitest";
 import type { EmbedderInfo, EmbedderRuntimeStatus } from "@mnemoshelf/core";
 import { FakeEmbedder } from "@mnemoshelf/core/testing";
 import {
@@ -20,7 +20,7 @@ import {
   type EmbedderWorkerLike,
   type WorkerEmbedderOptions,
 } from "../src/index.js";
-import { resolveEmbedderWorkerUrl } from "../src/worker-embedder.js";
+import { EmbedderQueueFullError, resolveEmbedderWorkerUrl } from "../src/worker-embedder.js";
 
 const INFO: EmbedderInfo = new FakeEmbedder().info;
 
@@ -34,12 +34,102 @@ const STATUS: EmbedderRuntimeStatus = {
   dmlDeviceId: 0,
 };
 
+describe("音訊片段排程", () => {
+  const audio = () => ({ samples: Float32Array.of(0.1, -0.1), sampleRate: 16000 as const });
+
+  it("PCM計入准入位元組且排隊時已快照，不修改或detach呼叫端", async () => {
+    const { embedder, requests, release } = controlledEmbedder();
+    const source = audio();
+    const pending = embedder.embedAudio(source);
+    source.samples[0] = 0.8;
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(8);
+    await waitFor(() => requests.length === 1);
+    const params = requests[0]!.message.params as { samples: Float32Array; sampleRate: number };
+    expect(params.samples[0]).toBeCloseTo(0.1);
+    expect(params.samples).not.toBe(source.samples);
+    expect(source.samples.byteLength).toBe(8);
+    expect(params.sampleRate).toBe(16000);
+    await release(0);
+    await pending;
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+    await embedder.dispose();
+  });
+
+  it("超限拒絕且不啟動worker；非法PCM與預先取消同樣不執行", async () => {
+    const { embedder, workers } = controlledEmbedder({ scheduling: { maxInputBytes: 4 } });
+    await expect(embedder.embedAudio(audio())).rejects.toBeInstanceOf(EmbedderQueueFullError);
+    await expect(embedder.embedAudio({ samples: Float32Array.of(NaN), sampleRate: 16000 }))
+      .rejects.toMatchObject({ name: "EmbedderInputError" });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(embedder.embedAudio(audio(), { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(workers).toHaveLength(0);
+    await embedder.dispose();
+  });
+
+  it("音訊間查詢優先，背景音訊仍會前進", async () => {
+    const { embedder, requests, release } = controlledEmbedder();
+    const first = embedder.embedAudio(audio());
+    await waitFor(() => requests.length === 1);
+    const second = embedder.embedAudio(audio());
+    const query = embedder.embedQuery("查詢");
+    await release(0);
+    await release(1);
+    await release(2);
+    await Promise.all([first, second, query]);
+    expect(requests.map(({ message }) => message.method)).toEqual(["embedAudio", "embedQuery", "embedAudio"]);
+    await embedder.dispose();
+  });
+
+  it("排隊音訊立即取消；在途音訊取消與dispose必須等native回應", async () => {
+    const { embedder, requests, release, workers } = controlledEmbedder();
+    const activeController = new AbortController();
+    const active = embedder.embedAudio(audio(), { signal: activeController.signal });
+    const rejected = expect(active).rejects.toMatchObject({ name: "AbortError" });
+    await waitFor(() => requests.length === 1);
+    const queuedController = new AbortController();
+    const queued = embedder.embedAudio(audio(), { signal: queuedController.signal });
+    const queuedRejected = expect(queued).rejects.toMatchObject({ name: "AbortError" });
+    queuedController.abort();
+    await queuedRejected;
+    activeController.abort();
+    let disposed = false;
+    const disposal = embedder.dispose().then(() => { disposed = true; });
+    await flushPromises();
+    expect(disposed).toBe(false);
+    expect(workers[0]!.terminated).toBe(false);
+    await release(0);
+    await Promise.all([rejected, disposal]);
+    expect(requests).toHaveLength(1);
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+  });
+
+  it("worker準備期狀態會傳回proxy，失敗後仍可觀察", async () => {
+    const { embedder, requests, workers } = controlledEmbedder();
+    const pending = embedder.embedAudio(audio());
+    const rejected = expect(pending).rejects.toMatchObject({ name: "ModelLoadError" });
+    await waitFor(() => requests.length === 1);
+    workers[0]!.emit("message", { type: "status", runtimeStatus: { ...STATUS, audioState: "loading" } });
+    expect(embedder.runtimeStatus?.audioState).toBe("loading");
+    workers[0]!.emit("message", {
+      type: "response", id: requests[0]!.message.id, ok: false,
+      error: { name: "ModelLoadError", message: "音訊資產準備失敗" },
+      runtimeStatus: { ...STATUS, audioState: "failed" },
+    });
+    await rejected;
+    expect(embedder.runtimeStatus?.audioState).toBe("failed");
+    await embedder.dispose();
+  });
+});
+
 type FakeMessage = Record<string, unknown>;
 type FakeHandler = (message: FakeMessage, worker: FakeEmbedderWorker) => void;
 
 /** 行程內的假 worker：`postMessage` 以 microtask 非同步回呼，事件介面與真的 Worker 相同。 */
 class FakeEmbedderWorker implements EmbedderWorkerLike {
   readonly posted: FakeMessage[] = [];
+  /** 每次 `postMessage` 的 transfer 清單（與 `posted` 同索引）；用於驗證 buffer 真的被轉移。 */
+  readonly postedTransfers: (readonly Transferable[] | undefined)[] = [];
   terminated = false;
   private readonly listeners: Record<EmbedderWorkerEvent, Set<(...args: unknown[]) => void>> = {
     message: new Set(),
@@ -49,9 +139,10 @@ class FakeEmbedderWorker implements EmbedderWorkerLike {
 
   constructor(private readonly handler: FakeHandler) {}
 
-  postMessage(message: unknown): void {
+  postMessage(message: unknown, transferList?: readonly Transferable[]): void {
     const typed = message as FakeMessage;
     this.posted.push(typed);
+    this.postedTransfers.push(transferList);
     queueMicrotask(() => {
       if (!this.terminated) this.handler(typed, this);
     });
@@ -185,7 +276,8 @@ describe("WorkerEmbedder：序列化與錯誤", () => {
         order.push(method);
         setTimeout(() => {
           active -= 1;
-          worker.respond(id, method === "probe" ? { ok: true } : new Float32Array([1]));
+          worker.respond(id, method === "probe" ? { ok: true } :
+            method === "embedDocuments" ? [new Float32Array([1]), new Float32Array([2])] : new Float32Array([1]));
         }, 15);
       }),
     );
@@ -448,5 +540,551 @@ describe("resolveEmbedderWorkerUrl：Electron asar 解包", () => {
     });
     expect(resolved.href).toBe(new URL("./embedder-worker.js", devModule).href);
     expect(probed).toBe(false);
+  });
+});
+
+
+/** 每個 request 都由測試明確放行；dispose 不占推論測試的 gate。 */
+function controlledEmbedder(overrides: Partial<WorkerEmbedderOptions> = {}) {
+  const requests: { message: FakeMessage; worker: FakeEmbedderWorker }[] = [];
+  const result = makeEmbedder(withRequests((message, worker) => {
+    if (message.method === "dispose") worker.respond(message.id as number, null);
+    else requests.push({ message, worker });
+  }), overrides);
+  return {
+    ...result,
+    requests,
+    async release(index: number): Promise<void> {
+      await waitFor(() => requests.length > index);
+      const { message, worker } = requests[index]!;
+      const params = message.params as { inputs?: { text: string }[]; text?: string };
+      worker.respond(message.id as number, message.method === "embedDocuments"
+        ? params.inputs!.map(({ text }) => new Float32Array([Number(text)]))
+        : new Float32Array([Number(params.text ?? 0)]));
+    },
+  };
+}
+
+/** 只清空 promise continuation，不推進下一個 setImmediate 排程回合。 */
+async function flushPromises(): Promise<void> {
+  for (let i = 0; i < 12; i += 1) await Promise.resolve();
+}
+
+describe("WorkerEmbedder：有界公平排程", () => {
+  it("空批次不建立 worker；已取消的空批次仍遵循取消契約", async () => {
+    const { embedder, workers } = controlledEmbedder();
+    await expect(embedder.embedDocuments([])).resolves.toEqual([]);
+    const controller = new AbortController();
+    controller.abort();
+    await expect(embedder.embedDocuments([], { signal: controller.signal })).rejects.toMatchObject({ name: "AbortError" });
+    expect(workers).toHaveLength(0);
+    expect(embedder.schedulingStatus.admittedRequests).toBe(0);
+    await embedder.dispose();
+  });
+
+  it("逐窗交還排程、查詢優先、有界連續查詢且背景文件輪流進展", async () => {
+    const { embedder, requests, release } = controlledEmbedder({ scheduling: { maxWindowInputs: 1, maxQueryBurst: 2 } });
+    const first = embedder.embedDocuments([0, 1, 2, 3, 4].map((text) => ({ text: String(text) })));
+    await waitFor(() => requests.length === 1);
+    const queries = [10, 11, 12, 13, 14, 15].map((text) => embedder.embedQuery(String(text)));
+    const second = embedder.embedDocuments([{ text: "20" }, { text: "21" }]);
+    const all = Promise.all([first, ...queries, second]);
+    for (let i = 0; i < 13; i += 1) await release(i);
+    const values = await all;
+    const order = requests.map(({ message }) => {
+      const params = message.params as { inputs?: { text: string }[]; text?: string };
+      return Number(params.text ?? params.inputs![0]!.text);
+    });
+    expect(order).toEqual([0, 10, 11, 20, 12, 13, 1, 14, 15, 21, 2, 3, 4]);
+    expect((values[0] as Float32Array[]).map((vec) => vec[0])).toEqual([0, 1, 2, 3, 4]);
+    expect((values[7] as Float32Array[]).map((vec) => vec[0])).toEqual([20, 21]);
+    expect(embedder.schedulingStatus).toMatchObject({
+      admittedRequests: 0, admittedInputs: 0, admittedInputBytes: 0,
+      completedRequests: 8, completedDocumentInputs: 7, completedWindows: 13,
+      maxObservedRequests: 8, maxObservedInputs: 13, maxObservedWindowInputs: 1,
+    });
+    await embedder.dispose();
+  });
+
+  it("每窗採用最新 runtime batchSize 且不超過排程上限；快照保持原順序", async () => {
+    const { embedder, requests, release } = controlledEmbedder({ scheduling: { maxWindowInputs: 3 } });
+    const inputs = Array.from({ length: 7 }, (_, index) => ({ text: String(index), title: "合成標題" }));
+    const run = embedder.embedDocuments(inputs);
+    inputs[0]!.text = "99";
+    await waitFor(() => requests.length === 1);
+    const first = requests[0]!;
+    first.worker.emit("message", {
+      type: "response", id: first.message.id, ok: true,
+      result: [0, 1, 2].map((n) => new Float32Array([n])),
+      runtimeStatus: { ...STATUS, batchSize: 1 },
+    });
+    await waitFor(() => requests.length === 2);
+    const second = requests[1]!;
+    second.worker.emit("message", {
+      type: "response", id: second.message.id, ok: true, result: [new Float32Array([3])],
+      runtimeStatus: { ...STATUS, batchSize: 2 },
+    });
+    await release(2);
+    await release(3);
+    const result = await run;
+    expect(requests.map(({ message }) => (message.params as { inputs: unknown[] }).inputs.length)).toEqual([3, 1, 2, 1]);
+    expect(result.map((vec) => vec[0])).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    expect(embedder.schedulingStatus.completedDocumentInputs).toBe(7);
+    await embedder.dispose();
+  });
+
+  it("排隊取消立即拒絕並釋放准入；不必等正在執行的 native 工作", async () => {
+    const { embedder, requests, release } = controlledEmbedder({ scheduling: { maxRequests: 2 } });
+    const active = embedder.embedQuery("1");
+    await waitFor(() => requests.length === 1);
+    const controller = new AbortController();
+    const queued = embedder.embedDocuments([{ text: "2" }], { signal: controller.signal });
+    const removeListener = vi.spyOn(controller.signal, "removeEventListener");
+    const rejected = expect(queued).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await rejected;
+    expect(removeListener).toHaveBeenCalledWith("abort", expect.any(Function));
+    expect(embedder.schedulingStatus).toMatchObject({ admittedRequests: 1, queuedBackground: 0, cancelledRequests: 1 });
+    const admittedAgain = embedder.embedQuery("3");
+    expect(requests).toHaveLength(1);
+    await release(0);
+    await release(1);
+    await Promise.all([active, admittedAgain]);
+    expect(requests.map(({ message }) => message.method)).toEqual(["embedQuery", "embedQuery"]);
+    await embedder.dispose();
+  });
+
+  it("排隊圖片收到取消後立即移除，不會啟動圖片 native 推論", async () => {
+    const { embedder, requests, release } = controlledEmbedder();
+    const active = embedder.embedQuery("1");
+    await waitFor(() => requests.length === 1);
+    const controller = new AbortController();
+    const run = embedder.embedImage({ bytes: new Uint8Array([1, 2, 3]), mimeType: "image/png" }, { signal: controller.signal });
+    const rejected = expect(run).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await rejected;
+    await release(0);
+    await active;
+    await embedder.drain();
+    expect(requests.map(({ message }) => message.method)).toEqual(["embedQuery"]);
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+    await embedder.dispose();
+  });
+
+  it("執行中圖片取消後仍等 native 回應才完成 drain 與 dispose", async () => {
+    const { embedder, requests, release, workers } = controlledEmbedder();
+    const controller = new AbortController();
+    const run = embedder.embedImage({ bytes: new Uint8Array([1, 2, 3]) }, { signal: controller.signal });
+    const rejected = expect(run).rejects.toMatchObject({ name: "AbortError" });
+    await waitFor(() => requests.length === 1);
+    controller.abort();
+    let drained = false;
+    const drain = embedder.drain().then(() => { drained = true; });
+    const disposing = embedder.dispose();
+    await flushPromises();
+    expect(drained).toBe(false);
+    expect(workers[0]!.terminated).toBe(false);
+    await release(0);
+    await Promise.all([rejected, drain, disposing]);
+    expect(workers[0]!.terminated).toBe(true);
+    expect(requests).toHaveLength(1);
+  });
+
+  it("執行中取消不釋放 native slot；回應後丟棄整批部分結果與剩餘視窗", async () => {
+    const { embedder, requests, release, workers } = controlledEmbedder({ scheduling: { maxWindowInputs: 1 } });
+    const controller = new AbortController();
+    const run = embedder.embedDocuments([{ text: "1" }, { text: "2" }], { signal: controller.signal });
+    const cancelled = expect(run).rejects.toMatchObject({ name: "AbortError" });
+    await waitFor(() => requests.length === 1);
+    controller.abort();
+    const query = embedder.embedQuery("3");
+    await flushPromises();
+    expect(requests).toHaveLength(1);
+    expect(embedder.schedulingStatus.active).toBe(1);
+    expect(workers[0]!.posted.some((message) => message.type === "cancel")).toBe(true);
+    await release(0);
+    await cancelled;
+    await release(1);
+    await query;
+    expect(requests.map(({ message }) => message.method)).toEqual(["embedDocuments", "embedQuery"]);
+    expect(embedder.schedulingStatus).toMatchObject({ completedDocumentInputs: 0, cancelledRequests: 1 });
+    await embedder.dispose();
+  });
+
+  it("取消視窗間隙的工作立即拒絕；drain 不把該間隙當作完成", async () => {
+    const { embedder, release, requests } = controlledEmbedder({ scheduling: { maxWindowInputs: 1 } });
+    const controller = new AbortController();
+    const run = embedder.embedDocuments([{ text: "1" }, { text: "2" }], { signal: controller.signal });
+    const cancelled = expect(run).rejects.toMatchObject({ name: "AbortError" });
+    let drained = false;
+    const drain = embedder.drain().then(() => { drained = true; });
+    await release(0);
+    await flushPromises();
+    expect(drained).toBe(false);
+    expect(embedder.schedulingStatus).toMatchObject({ active: 0, admittedRequests: 1, queuedBackground: 1, completedDocumentInputs: 0 });
+    controller.abort();
+    await cancelled;
+    await drain;
+    expect(requests).toHaveLength(1);
+    await embedder.dispose();
+  });
+
+  it("dispose 在視窗間隙拒絕剩餘邏輯工作；不能漏掉排程而重建 worker", async () => {
+    const { embedder, release, requests, workers } = controlledEmbedder({ scheduling: { maxWindowInputs: 1 } });
+    const run = embedder.embedDocuments([{ text: "1" }, { text: "2" }]);
+    const closed = expect(run).rejects.toBeInstanceOf(EmbedderWorkerClosedError);
+    await release(0);
+    await flushPromises();
+    await embedder.dispose();
+    await closed;
+    expect(requests).toHaveLength(1);
+    expect(workers).toHaveLength(1);
+    expect(workers[0]!.terminated).toBe(true);
+    expect(embedder.schedulingStatus).toMatchObject({ admittedRequests: 0, admittedInputBytes: 0 });
+  });
+
+  it("dispose 在第一個 dispatch 前仍會拒絕工作並釋放准入", async () => {
+    const { embedder, workers } = controlledEmbedder();
+    const run = embedder.embedQuery("1");
+    const rejected = expect(run).rejects.toBeInstanceOf(EmbedderWorkerClosedError);
+    await embedder.dispose();
+    await rejected;
+    expect(workers).toHaveLength(0);
+    expect(embedder.schedulingStatus.admittedRequests).toBe(0);
+  });
+
+  it("後續視窗失敗只拒絕整批；下個邏輯請求仍可使用 worker", async () => {
+    const { embedder, requests, release } = controlledEmbedder({ scheduling: { maxWindowInputs: 1 } });
+    const run = embedder.embedDocuments([{ text: "1" }, { text: "2" }, { text: "3" }]);
+    const rejected = expect(run).rejects.toMatchObject({ code: "input-too-long" });
+    await release(0);
+    await waitFor(() => requests.length === 2);
+    const second = requests[1]!;
+    second.worker.fail(second.message.id as number, { name: "EmbedderInputError", message: "合成超限輸入", code: "input-too-long" });
+    await rejected;
+    const query = embedder.embedQuery("4");
+    await release(2);
+    await query;
+    expect(embedder.schedulingStatus).toMatchObject({ completedDocumentInputs: 0, completedWindows: 2, failedRequests: 1 });
+    await embedder.dispose();
+  });
+
+  it("worker 在視窗間崩潰拒絕所有已准入工作；新請求重建且不重送舊視窗", async () => {
+    const { embedder, requests, release, workers } = controlledEmbedder({ scheduling: { maxWindowInputs: 1 } });
+    const run = embedder.embedDocuments([{ text: "1" }, { text: "2" }]);
+    await waitFor(() => requests.length === 1);
+    const queued = embedder.embedQuery("3");
+    const failed = Promise.allSettled([run, queued]);
+    await release(0);
+    await flushPromises();
+    workers[0]!.emit("exit", 1);
+    expect((await failed).map((result) => result.status)).toEqual(["rejected", "rejected"]);
+    expect(embedder.schedulingStatus.admittedRequests).toBe(0);
+    const next = embedder.embedQuery("4");
+    await release(1);
+    await next;
+    expect(workers).toHaveLength(2);
+    expect(requests.map(({ message }) => message.method)).toEqual(["embedDocuments", "embedQuery"]);
+    expect(embedder.schedulingStatus.completedDocumentInputs).toBe(0);
+    await embedder.dispose();
+  });
+
+  it("回應與 promise 結算之間崩潰也不能把部分文件重新排回新 worker", async () => {
+    const { embedder, requests, workers, release } = controlledEmbedder({ scheduling: { maxWindowInputs: 1 } });
+    const run = embedder.embedDocuments([{ text: "1" }, { text: "2" }]);
+    const rejected = expect(run).rejects.toBeInstanceOf(EmbedderWorkerCrashError);
+    await waitFor(() => requests.length === 1);
+    const request = requests[0]!;
+    request.worker.respond(request.message.id as number, [new Float32Array([1])]);
+    request.worker.emit("exit", 1);
+    await rejected;
+    await embedder.drain();
+    expect(embedder.schedulingStatus).toMatchObject({ admittedRequests: 0, queuedBackground: 0, completedDocumentInputs: 0 });
+    const next = embedder.embedQuery("3");
+    await release(1);
+    await next;
+    expect(workers).toHaveLength(2);
+    expect(requests.map(({ message }) => message.method)).toEqual(["embedDocuments", "embedQuery"]);
+    await embedder.dispose();
+  });
+
+  it("請求數／輸入數／UTF-8 位元組皆含在途工作，超限拒絕且不複製大型輸入", async () => {
+    const { embedder, release } = controlledEmbedder({ scheduling: { maxRequests: 2, maxInputs: 3, maxInputBytes: 8 } });
+    const active = embedder.embedQuery("一");
+    await expect(embedder.embedDocuments([{ text: "二二" }])).rejects.toBeInstanceOf(EmbedderQueueFullError);
+    const inputs = [{ text: "x" }, { text: "y" }, { text: "z" }];
+    Object.defineProperty(inputs, "0", { get: () => { throw new Error("超量時不應讀取或複製輸入"); } });
+    await expect(embedder.embedDocuments(inputs)).rejects.toMatchObject({ code: "EEMBEDDERQUEUEFULL" });
+    const bytes = new Uint8Array(9);
+    Object.defineProperty(bytes, Symbol.iterator, { value: () => { throw new Error("超量時不應複製圖片"); } });
+    await expect(embedder.embedImage({ bytes })).rejects.toBeInstanceOf(EmbedderQueueFullError);
+    const queued = embedder.embedQuery("a");
+    await expect(embedder.probe()).rejects.toBeInstanceOf(EmbedderQueueFullError);
+    expect(embedder.schedulingStatus).toMatchObject({ admittedRequests: 2, admittedInputs: 2, admittedInputBytes: 4, rejectedRequests: 4 });
+    await release(0);
+    await release(1);
+    await Promise.all([active, queued]);
+    expect(embedder.schedulingStatus).toMatchObject({ admittedRequests: 0, admittedInputs: 0, admittedInputBytes: 0 });
+    await embedder.dispose();
+  });
+
+  it("handshake 尚未完成時的取消立即拒絕，不會在 ready 後偷偷送 native 工作", async () => {
+    // 測試自行接管 init，不回應 ready。
+    const { embedder: blocked, workers: blockedWorkers } = makeEmbedder((message, worker) => {
+      if (message.type === "request" && message.method === "dispose") worker.respond(message.id as number, null);
+    });
+    const controller = new AbortController();
+    const run = blocked.embedDocuments([{ text: "1" }], { signal: controller.signal });
+    await waitFor(() => blockedWorkers.length === 1);
+    const cancelled = expect(run).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    await cancelled;
+    expect(blocked.schedulingStatus.admittedRequests).toBe(0);
+    blockedWorkers[0]!.ready();
+    await blocked.drain();
+    expect(blockedWorkers[0]!.posted.some((message) => message.type === "request")).toBe(false);
+    await blocked.dispose();
+  });
+
+  it("handshake 期間 dispose 不啟動 native 工作；所有並行 dispose 等同一個安全邊界", async () => {
+    const { embedder, workers } = makeEmbedder((message, worker) => {
+      if (message.type === "request" && message.method === "dispose") worker.respond(message.id as number, null);
+    });
+    const run = embedder.embedQuery("1");
+    const rejected = expect(run).rejects.toBeInstanceOf(EmbedderWorkerClosedError);
+    await waitFor(() => workers.length === 1);
+    const first = embedder.dispose();
+    const second = embedder.dispose();
+    workers[0]!.ready();
+    await Promise.all([first, second, rejected]);
+    expect(workers[0]!.posted.filter((message) => message.type === "request").map((message) => message.method)).toEqual(["dispose"]);
+    expect(workers[0]!.terminated).toBe(true);
+  });
+
+  it("ready 已結算但尚未送 request 的空隙關閉，不會在 closed 後啟動 native", async () => {
+    const { embedder, workers } = makeEmbedder((message, worker) => {
+      if (message.type === "request" && message.method === "dispose") worker.respond(message.id as number, null);
+    });
+    const run = embedder.embedQuery("1");
+    const rejected = expect(run).rejects.toBeInstanceOf(EmbedderWorkerClosedError);
+    await waitFor(() => workers.length === 1);
+    workers[0]!.ready();
+    await Promise.resolve();
+    await embedder.dispose();
+    await rejected;
+    expect(workers[0]!.posted.filter((message) => message.type === "request").map((message) => message.method)).toEqual(["dispose"]);
+  });
+
+  it("ready 已結算但尚未送 request 的空隙崩潰，不會把 request 留在死 worker", async () => {
+    const { embedder, workers } = makeEmbedder(() => undefined);
+    const run = embedder.embedQuery("1");
+    const rejected = expect(run).rejects.toBeInstanceOf(EmbedderWorkerCrashError);
+    await waitFor(() => workers.length === 1);
+    workers[0]!.ready();
+    await Promise.resolve();
+    workers[0]!.emit("exit", 1);
+    await rejected;
+    await embedder.drain();
+    expect(workers[0]!.posted.some((message) => message.type === "request")).toBe(false);
+    await embedder.dispose();
+  });
+
+  it("並行 dispose 都必須等待正在執行的 native 工作", async () => {
+    const { embedder, requests, release, workers } = controlledEmbedder();
+    const run = embedder.embedQuery("1");
+    await waitFor(() => requests.length === 1);
+    let secondDone = false;
+    const first = embedder.dispose();
+    const second = embedder.dispose().then(() => { secondDone = true; });
+    await flushPromises();
+    expect(secondDone).toBe(false);
+    expect(workers[0]!.terminated).toBe(false);
+    await release(0);
+    await Promise.all([run, first, second]);
+    expect(workers[0]!.terminated).toBe(true);
+  });
+
+  /** 4×4 RGB 合成影格（確定性圖樣；不放任何私人影像）。 */
+  function videoFrame(
+    index: number,
+    overrides: Partial<{
+      pixels: Uint8Array;
+      width: number;
+      height: number;
+      channels: 3 | 4;
+      timestampSeconds: number;
+    }> = {},
+  ): { pixels: Uint8Array; width: number; height: number; channels: 3 | 4; timestampSeconds: number } {
+    const pixels = new Uint8Array(4 * 4 * 3);
+    for (let i = 0; i < pixels.length; i += 1) pixels[i] = (index * 11 + i) % 256;
+    return { pixels, width: 4, height: 4, channels: 3, timestampSeconds: index * 0.25, ...overrides };
+  }
+
+  /** 一段合成影片（預設 2 幀）。 */
+  function videoClip(count = 2) {
+    return { frames: Array.from({ length: count }, (_, index) => videoFrame(index)) };
+  }
+
+  /**
+   * 影片排程用假 worker：init 自動 ready、dispose 自動回應、cancel 以 AbortError 收尾；
+   * 其餘 request 交給 handler（測試自己決定何時／如何回應）。
+   */
+  function videoHarness(
+    handler: (message: FakeMessage, worker: FakeEmbedderWorker) => void,
+    overrides: Partial<WorkerEmbedderOptions> = {},
+  ) {
+    return makeEmbedder((message, worker) => {
+      if (message.type === "init") {
+        worker.ready();
+        return;
+      }
+      if (message.type === "request" && message.method === "dispose") {
+        worker.respond(message.id as number, null);
+        return;
+      }
+      if (message.type === "cancel") {
+        worker.fail(message.id as number, { name: "AbortError", message: "嵌入已取消" });
+        return;
+      }
+      if (message.type === "request") handler(message, worker);
+    }, overrides);
+  }
+
+  it("影片排程：像素 byte 計入准入、准入後才複製、transfer 出去且不 detach 呼叫端", async () => {
+    const { embedder, workers } = videoHarness(() => undefined);
+    const source = videoClip(2);
+    const callerPixels = source.frames.map((entry) => entry.pixels);
+    const pending = embedder.embedVideo(source);
+
+    // 准入在呼叫當下完成：4×4×3×2 幀＝96 bytes（只計像素，不含 metadata）。
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(2 * 4 * 4 * 3);
+    await waitFor(() => workers[0]?.posted.some((message) => message.type === "request") === true);
+    const requestIndex = workers[0]!.posted.findIndex((message) => message.type === "request");
+    const request = workers[0]!.posted[requestIndex]!;
+    expect(request.method).toBe("embedVideo");
+
+    type WireFrame = {
+      pixels: Uint8Array;
+      width: number;
+      height: number;
+      channels: number;
+      timestampSeconds: number;
+    };
+    const params = request.params as { frames: WireFrame[] };
+    expect(params.frames).toHaveLength(2);
+    expect(params.frames[0]).toMatchObject({ width: 4, height: 4, channels: 3, timestampSeconds: 0 });
+    expect(params.frames[1]).toMatchObject({ timestampSeconds: 0.25 });
+    // 准入後才複製：送出的像素是另一個 buffer，呼叫端 buffer 沒有被 detach、仍可續用。
+    expect(params.frames[0]!.pixels).not.toBe(callerPixels[0]);
+    callerPixels[0]![0] = 123;
+    expect(source.frames[0]!.pixels.byteLength).toBe(48);
+    expect(params.frames[0]!.pixels[0]).not.toBe(123);
+    // transfer 清單就是送出的兩份像素 buffer（不是呼叫端的 buffer）。
+    const transfer = workers[0]!.postedTransfers[requestIndex]!;
+    expect(transfer).toHaveLength(2);
+    expect(transfer![0]).toBe(params.frames[0]!.pixels.buffer);
+    expect(transfer!.includes(callerPixels[0]!.buffer as never)).toBe(false);
+
+    workers[0]!.respond(request.id as number, Float32Array.of(1, 0));
+    expect(Array.from(await pending)).toEqual([1, 0]);
+    await embedder.drain();
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+    await embedder.dispose();
+  });
+
+  it("影片排程：非法幀序列在建立 worker 前拒絕；預先取消同樣不執行", async () => {
+    const { embedder, workers } = videoHarness(() => undefined);
+    const invalid: unknown[] = [
+      { frames: [] },
+      {
+        frames: Array.from({ length: 33 }, (_, index) =>
+          videoFrame(index, { width: 1, height: 1, pixels: new Uint8Array(3) })),
+      },
+      { frames: [videoFrame(0, { channels: 2 as never })] },
+      { frames: [videoFrame(0, { timestampSeconds: Number.NaN })] },
+    ];
+    for (const video of invalid) {
+      await expect(embedder.embedVideo(video as never)).rejects.toMatchObject({
+        name: "EmbedderInputError",
+        code: "invalid-video-input",
+      });
+    }
+    expect(workers).toHaveLength(0);
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+
+    const controller = new AbortController();
+    controller.abort();
+    await expect(embedder.embedVideo(videoClip(1), { signal: controller.signal }))
+      .rejects.toMatchObject({ name: "AbortError" });
+    expect(workers).toHaveLength(0);
+    await embedder.dispose();
+  });
+
+  it("影片排程：像素位元組超過准入上限 → EEMBEDDERQUEUEFULL，不建立 worker", async () => {
+    const { embedder, workers } = videoHarness(() => undefined, { scheduling: { maxInputBytes: 10 } });
+    await expect(embedder.embedVideo(videoClip(1))).rejects.toBeInstanceOf(EmbedderQueueFullError);
+    expect(workers).toHaveLength(0);
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+    await embedder.dispose();
+  });
+
+  it("影片排程：在途取消送 cancel、排隊取消立即拒絕，兩者都不採結果", async () => {
+    const controller = new AbortController();
+    const { embedder, workers } = videoHarness(() => undefined);
+    const active = embedder.embedVideo(videoClip(1), { signal: controller.signal });
+    const rejected = expect(active).rejects.toMatchObject({ name: "AbortError" });
+    await waitFor(() => workers[0]?.posted.some((message) => message.type === "request") === true);
+
+    const queuedController = new AbortController();
+    const queued = embedder.embedVideo(videoClip(1), { signal: queuedController.signal });
+    const queuedRejected = expect(queued).rejects.toMatchObject({ name: "AbortError" });
+    queuedController.abort();
+    await queuedRejected;
+
+    controller.abort();
+    await rejected;
+    const requestId = workers[0]!.posted.find((message) => message.type === "request")!.id;
+    expect(workers[0]!.posted.some((message) => message.type === "cancel" && message.id === requestId)).toBe(true);
+    expect(embedder.schedulingStatus.admittedInputBytes).toBe(0);
+    await embedder.dispose();
+  });
+
+  it("影片排程：worker 回報的 videoState 會更新 proxy 診斷", async () => {
+    const { embedder, workers } = videoHarness(() => undefined);
+    const pending = embedder.embedVideo(videoClip(1));
+    await waitFor(() => workers[0]?.posted.some((message) => message.type === "request") === true);
+    const request = workers[0]!.posted.find((message) => message.type === "request")!;
+    workers[0]!.emit("message", { type: "status", runtimeStatus: { ...STATUS, videoState: "loading" } });
+    expect(embedder.runtimeStatus?.videoState).toBe("loading");
+    workers[0]!.emit("message", {
+      type: "response",
+      id: request.id,
+      ok: true,
+      result: Float32Array.of(1),
+      runtimeStatus: { ...STATUS, videoState: "ready" },
+    });
+    await pending;
+    expect(embedder.runtimeStatus?.videoState).toBe("ready");
+    await embedder.dispose();
+  });
+
+  it("彙總診斷是快照且只含計數與時間，不洩漏合成輸入；進度到整批完成才結算", async () => {
+    const { embedder, release, requests } = controlledEmbedder({ scheduling: { maxWindowInputs: 1 } });
+    const run = embedder.embedDocuments([{ text: "1", title: "synthetic-private-title" }, { text: "2" }]);
+    await release(0);
+    await flushPromises();
+    const partial = embedder.schedulingStatus;
+    expect(partial).toMatchObject({ completedWindows: 1, completedDocumentInputs: 0, admittedRequests: 1, admittedInputs: 2 });
+    expect(JSON.stringify(partial)).not.toContain("synthetic-private-title");
+    partial.limits.maxInputs = 999;
+    expect(embedder.schedulingStatus.limits.maxInputs).toBe(8192);
+    await release(1);
+    await run;
+    await embedder.drain();
+    expect(requests).toHaveLength(2);
+    expect(embedder.schedulingStatus).toMatchObject({ completedWindows: 2, completedDocumentInputs: 2, completedRequests: 1 });
+    expect(embedder.schedulingStatus.queueWaitMs).toBeGreaterThanOrEqual(0);
+    expect(embedder.schedulingStatus.workerRunMs).toBeGreaterThanOrEqual(0);
+    await embedder.dispose();
   });
 });

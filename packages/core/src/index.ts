@@ -8,6 +8,9 @@
 export type {
   Chunk,
   ChunkKind,
+  ChunkMedia,
+  ChunkMediaContainer,
+  ChunkMediaTrack,
   Memory,
   MemoryEmbeddingState,
   MemoryKind,
@@ -59,6 +62,15 @@ export {
   MEMORY_SCOPES,
   MEMORY_SEARCH_MAX_K,
   normalizeMemoryLimit,
+  normalizeChunkMedia,
+  normalizeRootVideoMaxFileBytes,
+  VIDEO_MAX_FILE_BYTES_MIN,
+  VIDEO_MAX_FILE_BYTES_MAX,
+  assignChunkMediaSeq,
+  CHUNK_MEDIA_CONTAINERS,
+  CHUNK_MEDIA_MAX_FRAME_TIMES,
+  CHUNK_MEDIA_TRACKS,
+  compareChunkMediaOrder,
   normalizeMemoryPatch,
   normalizeMemorySearchFilter,
   normalizeMemorySearchK,
@@ -75,7 +87,10 @@ export type {
   NormalizedMemorySearchFilter,
 } from "./ports/metadata-store.js";
 export type { VectorIndex, VectorItem } from "./ports/vector-index.js";
+export { inspectWav, decodeWavSegments, WAV_PREPROCESSING_VERSION } from "./audio/wav.js";
+export type { WavInfo, WavSegment } from "./audio/wav.js";
 export type {
+  AudioInput,
   DocumentInput,
   Embedder,
   EmbedderFallbackReason,
@@ -85,7 +100,10 @@ export type {
   EmbedDocumentsOptions,
   ImageInput,
   ProbeResult,
+  VideoFrameInput,
+  VideoInput,
 } from "./ports/embedder.js";
+export { MAX_VIDEO_FRAME_EDGE, MAX_VIDEO_FRAMES, MAX_VIDEO_PIXELS } from "./ports/embedder.js";
 
 export {
   DuplicateRootError,
@@ -148,6 +166,7 @@ export {
   type IndexProgress,
   type IndexRootOptions,
   type IndexRootResult,
+  type IndexTimingEvent,
 } from "./indexer/indexer.js";
 export {
   DEFAULT_PREVIEW_MODALITIES,
@@ -156,12 +175,47 @@ export {
   type PreviewKindStat,
   type PreviewRootInput,
   type RootPreview,
+  type VideoPreviewEstimate,
 } from "./indexer/preview.js";
+export {
+  DEFAULT_MEDIA_DECODER_LIMITS,
+  FfmpegMediaDecoder,
+  MEDIA_DECODER_ERROR_MESSAGES,
+  MediaDecoderError,
+  VIDEO_AUDIO_SAMPLE_RATE,
+  VIDEO_AUDIO_SEGMENT_SECONDS,
+  VIDEO_FRAMES_PER_SEGMENT,
+  VIDEO_LONGEST_SIDE,
+  VIDEO_SEGMENT_SECONDS,
+  videoAudioPreprocessingVersion,
+  visualPreprocessingVersion,
+  type AudioSegment,
+  type AudioStreamInfo,
+  type DecodeAudioOptions,
+  type DecodeCallOptions,
+  type DecodeVisualOptions,
+  type DecoderAvailability,
+  type FfmpegMediaDecoderOptions,
+  type MediaDecoder,
+  type MediaDecoderErrorCode,
+  type MediaDecoderLimits,
+  type MediaSource,
+  type ProbeOptions,
+  type SelectedAudioStream,
+  type VideoProbe,
+  type VideoStreamInfo,
+  type VisualFrame,
+  type VisualFramePick,
+  type VisualSegment,
+} from "./media/index.js";
 export {
   classifyFile,
   DEFAULT_MAX_FILE_BYTES,
+  DEFAULT_VIDEO_MAX_FILE_BYTES,
   isJunkFile,
+  isSupportedVideoFileName,
   mimeTypeFor,
+  VIDEO_MAX_DURATION_SECONDS,
   walkRoot,
   type ScanEntry,
   type ScanOptions,

@@ -3,6 +3,9 @@ import { DuplicateRootError } from "../errors.js";
 import {
   MEMORY_LIST_DEFAULT_LIMIT,
   MEMORY_LIST_MAX_LIMIT,
+  VIDEO_MAX_FILE_BYTES_MAX,
+  assignChunkMediaSeq,
+  normalizeChunkMedia,
   type MemoryFilter,
   type MemorySearchFilter,
   type MetadataStore,
@@ -134,6 +137,65 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       expect(await store.listRoots()).toEqual([]);
     });
 
+    it("root 的影片上限：新增／讀回／更新／清除；未設定時欄位不存在", async () => {
+      const plain = await store.addRoot(rootInput());
+      // NULL（未設定）→ 讀回不得出現該鍵，也不得補 512 MiB。
+      expect(plain).not.toHaveProperty("videoMaxFileBytes");
+      expect(await store.getRoot(plain.id)).not.toHaveProperty("videoMaxFileBytes");
+
+      const configured = await store.addRoot(
+        rootInput({ path: "contract/root-video-limit", videoMaxFileBytes: 2 * 1024 ** 3 }),
+      );
+      expect(configured.videoMaxFileBytes).toBe(2 * 1024 ** 3);
+      expect((await store.getRoot(configured.id))?.videoMaxFileBytes).toBe(2 * 1024 ** 3);
+      expect((await store.listRoots()).find((r) => r.id === configured.id)?.videoMaxFileBytes).toBe(2 * 1024 ** 3);
+
+      // 只改上限：其他欄位不變，讀回來也要是新值。
+      const updated = await store.updateRoot(configured.id, { videoMaxFileBytes: 1024 });
+      expect(updated?.videoMaxFileBytes).toBe(1024);
+      expect(updated?.modalities).toEqual(configured.modalities);
+      expect(updated?.path).toBe(configured.path);
+      expect((await store.getRoot(configured.id))?.videoMaxFileBytes).toBe(1024);
+
+      // null＝清除（回行程層預設）：欄位消失。
+      const cleared = await store.updateRoot(configured.id, { videoMaxFileBytes: null });
+      expect(cleared).not.toHaveProperty("videoMaxFileBytes");
+      expect(await store.getRoot(configured.id)).not.toHaveProperty("videoMaxFileBytes");
+      // 之後省略欄位＝不改（維持清除狀態）。
+      expect(await store.updateRoot(configured.id, {})).toEqual(cleared);
+    });
+
+    it("root 的影片上限邊界與驗證：1／16 GiB 可寫；非法值拋 TypeError 且不改資料", async () => {
+      const root = await store.addRoot(rootInput({ videoMaxFileBytes: VIDEO_MAX_FILE_BYTES_MAX }));
+      expect(root.videoMaxFileBytes).toBe(VIDEO_MAX_FILE_BYTES_MAX);
+
+      const one = await store.updateRoot(root.id, { videoMaxFileBytes: 1 });
+      expect(one?.videoMaxFileBytes).toBe(1);
+
+      const invalid: unknown[] = [
+        0,
+        -1,
+        1.5,
+        VIDEO_MAX_FILE_BYTES_MAX + 1,
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+        "1024",
+        {},
+      ];
+      for (const [index, value] of invalid.entries()) {
+        await expect(
+          store.addRoot(
+            rootInput({ path: `contract/root-invalid-${index}`, videoMaxFileBytes: value as unknown as number }),
+          ),
+        ).rejects.toBeInstanceOf(TypeError);
+        await expect(
+          store.updateRoot(root.id, { videoMaxFileBytes: value as unknown as number }),
+        ).rejects.toBeInstanceOf(TypeError);
+      }
+      // 失敗的更新不得改動資料（仍是 1）。
+      expect(await store.getRoot(root.id)).toEqual(one);
+    });
+
     it("replaceChunks 先清舊再寫新（冪等）", async () => {
       const root = await store.addRoot(rootInput());
       const first = await store.replaceChunks(root.id, "notes/a.md", [
@@ -172,6 +234,126 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       expect(removed).toEqual(chunks.map((c) => c.id));
       expect(await store.searchKeyword("鰻魚飯", {}, 5)).toHaveLength(0);
       expect(await store.getChunks(removed)).toEqual([]);
+    });
+
+    it("舊 audio 媒體定位可讀（不補新欄位），文字 chunk 省略 media", async () => {
+      const root = await store.addRoot(rootInput());
+      // 音訊里程碑寫入的列：沒有 container／streamIndex／frameTimesSeconds，讀回不得多出鍵。
+      const legacyAudio = {
+        startSeconds: 10, endSeconds: 20.125, track: "audio" as const,
+        preprocessVersion: "wav-v1:10s", embedderId: "audio-test", embeddingDim: 512,
+      };
+      const chunks = await store.replaceChunks(root.id, "sample.wav", [
+        { seq: 0, kind: "audio", text: null, contentHash: "audio-hash", media: legacyAudio },
+      ]);
+      const readBack = (await store.getChunks(chunks.map((chunk) => chunk.id)))[0]?.media;
+      expect(readBack).toEqual(legacyAudio);
+      expect(readBack).not.toHaveProperty("container");
+      expect(readBack).not.toHaveProperty("streamIndex");
+      expect(readBack).not.toHaveProperty("frameTimesSeconds");
+      expect((await store.listChunksByPath(root.id, "sample.wav"))[0]?.media).toEqual(legacyAudio);
+
+      const textChunk = await store.replaceChunks(root.id, "note.txt", [
+        { seq: 0, kind: "text", text: "舊呼叫端", contentHash: "text-hash" },
+      ]);
+      expect(textChunk[0]).not.toHaveProperty("media");
+      expect(normalizeChunkMedia(undefined)).toBeUndefined();
+      expect(normalizeChunkMedia(null)).toBeUndefined();
+      expect(normalizeChunkMedia(legacyAudio)).toEqual(legacyAudio);
+      expect(normalizeChunkMedia(legacyAudio)).not.toBe(legacyAudio);
+    });
+
+    it("影片畫面與影片音軌片段往返，seq 依同檔時間軸唯一編號", async () => {
+      const root = await store.addRoot(rootInput());
+      const visual = (start: number, frame: number) => ({
+        startSeconds: start, endSeconds: start + 4, track: "video" as const, container: "mp4" as const,
+        frameTimesSeconds: [frame],
+        preprocessVersion: "video:1fps4s:384", embedderId: "video-test", embeddingDim: 512,
+      });
+      const audioTrack = {
+        startSeconds: 0, endSeconds: 10, track: "video-audio" as const, container: "mp4" as const, streamIndex: 1,
+        preprocessVersion: "audio:10s", embedderId: "video-test", embeddingDim: 512,
+      };
+      const inputs = assignChunkMediaSeq([
+        { seq: 0, kind: "audio" as const, text: null, contentHash: "h", media: audioTrack },
+        { seq: 0, kind: "video" as const, text: null, contentHash: "h", media: visual(8, 10) },
+        { seq: 0, kind: "video" as const, text: null, contentHash: "h", media: visual(0, 2) },
+        { seq: 0, kind: "video" as const, text: null, contentHash: "h", media: visual(4, 6) },
+      ]);
+      // 同起點畫面先於音軌；其餘依 startSeconds 升冪。
+      expect(inputs.map((chunk) => chunk.media.track)).toEqual(["video", "video-audio", "video", "video"]);
+      expect(inputs.map((chunk) => chunk.seq)).toEqual([0, 1, 2, 3]);
+      const written = await store.replaceChunks(root.id, "clip.mp4", inputs);
+      expect(written.map((chunk) => chunk.seq)).toEqual([0, 1, 2, 3]);
+      expect(written.map((chunk) => chunk.kind)).toEqual(["video", "audio", "video", "video"]);
+      expect(written[0]?.media).toEqual(visual(0, 2));
+      expect(written[1]?.media).toEqual(audioTrack);
+      expect(written[2]?.media).toEqual(visual(4, 6));
+      expect(written[3]?.media).toEqual(visual(8, 10));
+      // 三個讀取路徑都要完整帶回新欄位。
+      expect((await store.getChunks(written.map((chunk) => chunk.id))).map((chunk) => chunk.media)).toEqual(
+        written.map((chunk) => chunk.media),
+      );
+      expect((await store.listChunksByPath(root.id, "clip.mp4")).map((chunk) => chunk.seq)).toEqual([0, 1, 2, 3]);
+      expect(normalizeChunkMedia(visual(0, 2))).toEqual(visual(0, 2));
+      expect(normalizeChunkMedia(visual(0, 2))?.frameTimesSeconds).not.toBe(visual(0, 2).frameTimesSeconds);
+    });
+
+    it("非法媒體位置拒絕寫入且不刪除既有 chunk（含影片欄位）", async () => {
+      const root = await store.addRoot(rootInput());
+      const media = {
+        startSeconds: 0, endSeconds: 10, track: "audio" as const,
+        preprocessVersion: "wav-v1", embedderId: "audio-test", embeddingDim: 512,
+      };
+      const old = await store.replaceChunks(root.id, "sample.wav", [
+        { seq: 0, kind: "audio", text: null, contentHash: "old", media },
+      ]);
+      const invalidAudio: readonly Record<string, unknown>[] = [{ startSeconds: -1 }, { endSeconds: 0 },
+        { endSeconds: Infinity }, { startSeconds: NaN }, { preprocessVersion: "" }, { embedderId: "" },
+        { embeddingDim: 0 }, { track: "bogus" }, { container: "webm" }, { frameTimesSeconds: [1] },
+        { streamIndex: -1 }];
+      for (const change of invalidAudio) {
+        await expect(store.replaceChunks(root.id, "sample.wav", [
+          { seq: 0, kind: "audio", text: null, contentHash: "new", media: { ...media, ...change } as never },
+        ])).rejects.toThrow(TypeError);
+        expect(await store.listChunksByPath(root.id, "sample.wav")).toEqual(old);
+      }
+      // 影片欄位的專屬規則：畫面必填 frameTimesSeconds；音軌必填 streamIndex；兩者不得互換。
+      const visual = {
+        startSeconds: 0, endSeconds: 4, track: "video" as const, container: "mp4" as const, frameTimesSeconds: [2],
+        preprocessVersion: "video-v1", embedderId: "video-test", embeddingDim: 512,
+      };
+      const invalidVideo = [
+        { frameTimesSeconds: undefined },
+        { frameTimesSeconds: [] },
+        { frameTimesSeconds: [5] },
+        { frameTimesSeconds: [3, 1] },
+        { frameTimesSeconds: [NaN] },
+        { frameTimesSeconds: Array.from({ length: 33 }, () => 1) },
+        { frameTimesSeconds: [2], track: "video-audio" },
+        { frameTimesSeconds: [2], track: "audio" },
+        { container: 5 },
+      ] as const;
+      for (const change of invalidVideo) {
+        await expect(store.replaceChunks(root.id, "clip.mp4", [
+          { seq: 0, kind: "video", text: null, contentHash: "new", media: { ...visual, ...change } as never },
+        ])).rejects.toThrow(TypeError);
+        expect(await store.listChunksByPath(root.id, "clip.mp4")).toEqual([]);
+      }
+      const videoAudio = {
+        startSeconds: 0, endSeconds: 10, track: "video-audio" as const, container: "mp4" as const, streamIndex: 1,
+        preprocessVersion: "audio-v1", embedderId: "audio-test", embeddingDim: 512,
+      };
+      for (const change of [{ streamIndex: undefined }, { streamIndex: -1 }, { streamIndex: 1.5 },
+        { frameTimesSeconds: [1] }] as const) {
+        await expect(store.replaceChunks(root.id, "clip.mp4", [
+          { seq: 0, kind: "audio", text: null, contentHash: "new", media: { ...videoAudio, ...change } as never },
+        ])).rejects.toThrow(TypeError);
+      }
+      expect(() => normalizeChunkMedia("audio")).toThrow(TypeError);
+      // 舊版「track: video 一律拋錯」改為新契約：畫面片段缺 frameTimesSeconds 才拋錯。
+      expect(() => normalizeChunkMedia({ ...media, track: "video" })).toThrow(TypeError);
+      expect(() => normalizeChunkMedia(visual)).not.toThrow();
     });
 
     it("getChunks 依傳入順序回傳，缺漏者略過", async () => {

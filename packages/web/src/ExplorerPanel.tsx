@@ -16,15 +16,25 @@ import {
   type PollBaseline,
   type PollTrack,
   type Root,
+  type VideoCapability,
 } from "./api";
 import { DirectoryTree } from "./DirectoryTree";
 import { FilePreview } from "./FilePreview";
+import { AudioModelStatus } from "./AudioModelStatus";
 import { formatBytes } from "./format";
+import { describeVideoEntries, isVideoReason, videoToggleState } from "./media";
 
 export interface ExplorerPanelProps {
   root: Root;
   /** 由外部遞增以強制重新載入目錄樹（例如索引完成後）。 */
   refreshKey: number;
+  /**
+   * 服務層影片能力（`GET /roots` 的 `video`）。
+   *
+   * 這個 root 已開啟影片模態、但 decoder 不可用時，面板要明示原因（否則使用者只會看到
+   * 索引時影片檔全數失敗）；不提供時不顯示提醒（舊呼叫端維持原樣）。
+   */
+  videoCapability?: VideoCapability | null;
 }
 
 /** 索引进度輪詢間隔（毫秒）；同時用來把 `INDEX_POLL_GRACE_MS` 換算成寬限 tick 數。 */
@@ -61,7 +71,7 @@ function describeStatus(status: IndexStatus | null): string {
   }
 }
 
-export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
+export function ExplorerPanel({ root, refreshKey, videoCapability }: ExplorerPanelProps) {
   const [selectedEntry, setSelectedEntry] = useState<DirEntry | null>(null);
   const [status, setStatus] = useState<IndexStatus | null>(null);
   const [treeKey, setTreeKey] = useState(refreshKey);
@@ -242,6 +252,17 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
   }, [root.id]);
 
   const running = status?.state === "running";
+  /** 影片開關／能力摘要（只有這個 root 開啟影片時才會顯示）。 */
+  const videoState = videoToggleState(videoCapability ?? null);
+  /** 完成時才有的結果摘要；影片原因另以可讀文字列出（見下方）。 */
+  const completedResult = status?.state === "completed" ? status.result : null;
+  const videoFailedText = completedResult === null ? "" : describeVideoEntries(completedResult.failedFiles);
+  const videoSkippedText = completedResult === null
+    ? ""
+    : describeVideoEntries([...(completedResult.scanSkippedFiles ?? []), ...(completedResult.skippedFiles ?? [])]);
+  const otherFailedFiles = completedResult === null
+    ? []
+    : completedResult.failedFiles.filter((file) => !isVideoReason(file.reason));
 
   return (
     <section className="flex min-h-0 flex-col gap-3">
@@ -282,6 +303,18 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
         </p>
       )}
 
+      {root.modalities.includes("audio") && <AudioModelStatus active={running} />}
+      {root.modalities.includes("video") && (videoState.enabled ? (
+        <p className="text-xs text-muted">
+          影片索引：每 4 秒抽 1 幀（短暫畫面可能被略過）；{videoState.summary}。影片時長在預覽階段未知，
+          實際段數以索引時的 probe 為準。
+        </p>
+      ) : (
+        <p role="status" className="text-xs text-amber-700">
+          這個資料夾已開啟影片，但目前無法索引影片：{videoState.reason ?? "影片能力不可用。"}（已有索引的內容仍可搜尋）
+        </p>
+      ))}
+
       <div className="grid min-h-0 gap-4 lg:grid-cols-2">
         <div className="h-[60vh] min-h-0">
           <DirectoryTree
@@ -295,7 +328,7 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
         <div className="h-[60vh] min-h-0 overflow-auto">
           {selectedEntry === null ? (
             <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center text-sm text-muted">
-              從左側目錄樹選擇一個檔案來預覽（支援文字與圖片）。
+              從左側目錄樹選擇一個檔案來預覽（支援文字、圖片、WAV 音訊與影片；影片播放需桌面版）。
             </div>
           ) : (
             <FilePreview key={selectedEntry.path} rootId={root.id} entry={selectedEntry} />
@@ -306,10 +339,19 @@ export function ExplorerPanel({ root, refreshKey }: ExplorerPanelProps) {
       {status?.state === "completed" && status.result !== null && status.result.removedFiles > 0 && (
         <p className="text-xs text-muted">本次索引清除了 {status.result.removedFiles} 個已不存在檔案的索引資料。</p>
       )}
-      {status?.state === "completed" && status.result !== null && status.result.failedFiles.length > 0 && (
+      {videoFailedText !== "" && (
         <p className="text-xs text-amber-700">
-          有 {status.result.failedFiles.length} 個檔案處理失敗（其餘檔案已完成）：
-          {status.result.failedFiles.map((file) => file.relPath).join("、")}
+          影片處理失敗（其餘檔案已完成）：{videoFailedText}。常見原因：解碼器不可用、編碼或音軌不支援、檔案損毀；
+          修正後重新索引即可。
+        </p>
+      )}
+      {videoSkippedText !== "" && (
+        <p className="text-xs text-muted">影片被跳過（不影響其他檔案）：{videoSkippedText}。</p>
+      )}
+      {otherFailedFiles.length > 0 && (
+        <p className="text-xs text-amber-700">
+          有 {otherFailedFiles.length} 個檔案處理失敗（其餘檔案已完成）：
+          {otherFailedFiles.map((file) => file.relPath).join("、")}
         </p>
       )}
       {selectedEntry !== null && selectedEntry.size !== null && (

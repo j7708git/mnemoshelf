@@ -29,6 +29,22 @@ afterAll(async () => {
 });
 
 describe("previewRoot", () => {
+  it("已開啟但尚未接通的影音回報 unsupported-modality，不列入預估", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "mnemoshelf-preview-media-"));
+    try {
+      await fs.writeFile(path.join(dir, "sound.wav"), Buffer.from([1]));
+      await fs.writeFile(path.join(dir, "clip.mp4"), Buffer.from([2]));
+      const preview = await previewRoot({ path: dir, modalities: ["audio", "video"] }, { supportedModalities: ["text", "code", "image"] });
+      expect(preview.totalFiles).toBe(0);
+      expect(preview.estimatedSeconds).toBe(0);
+      expect(preview.skipped).toEqual([
+        { relPath: "clip.mp4", reason: "unsupported-modality" },
+        { relPath: "sound.wav", reason: "unsupported-modality" },
+      ]);
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
   it("統計與實際檔案相符，並回報各類型分佈", async () => {
     const preview = await previewRoot({ path: rootPath, modalities: ["text", "code"], maxFileBytes: 1000 });
 
@@ -131,5 +147,98 @@ describe("previewRoot", () => {
     } finally {
       db.close();
     }
+  });
+});
+
+describe("previewRoot：影片（v1 語意）", () => {
+  let base = "";
+  let videoRoot = "";
+
+  beforeAll(async () => {
+    base = await fs.mkdtemp(path.join(os.tmpdir(), "mnemoshelf-preview-video-"));
+    videoRoot = path.join(base, "root");
+    await fs.mkdir(videoRoot, { recursive: true });
+    // 內容不重要：預覽只列舉、不讀媒體；檔名與大小才是判定依據。
+    await fs.writeFile(path.join(videoRoot, "short.mp4"), Buffer.alloc(100, 1));
+    await fs.writeFile(path.join(videoRoot, "big.mp4"), Buffer.alloc(2000, 2));
+    await fs.writeFile(path.join(videoRoot, "movie.mov"), Buffer.alloc(100, 3));
+    await fs.writeFile(path.join(videoRoot, "notes.md"), "# 一般文字");
+  });
+
+  afterAll(async () => {
+    await fs.rm(base, { recursive: true, force: true });
+  });
+
+  const VIDEO_SUPPORTED = ["text", "code", "image", "audio", "video"] as const;
+
+  it("宣告支援 video 後計入候選檔；白名單與大小上限以具名原因跳過", async () => {
+    const preview = await previewRoot(
+      { path: videoRoot, modalities: ["text", "video"], videoMaxFileBytes: 1000 },
+      { supportedModalities: [...VIDEO_SUPPORTED] },
+    );
+    expect(preview.byKind.video).toEqual({ count: 1, bytes: 100 });
+    expect(preview.totalFiles).toBe(2);
+    expect(preview.skipped).toContainEqual({ relPath: "big.mp4", reason: "video-too-large" });
+    expect(preview.skipped).toContainEqual({ relPath: "movie.mov", reason: "unsupported-video-format" });
+  });
+
+  it("影片時長未知：短片不會被估成數百秒，estimatedSeconds 不含影片", async () => {
+    const onlyVideoDir = path.join(base, "only-video");
+    await fs.mkdir(onlyVideoDir, { recursive: true });
+    await fs.writeFile(path.join(onlyVideoDir, "short.mp4"), Buffer.alloc(100, 1));
+
+    const preview = await previewRoot(
+      { path: onlyVideoDir, modalities: ["video"] },
+      { supportedModalities: [...VIDEO_SUPPORTED] },
+    );
+    // 這支「短片」只有 100 bytes；預覽不得把它估成 375 秒（更不得估成數百秒）。
+    expect(preview.estimatedSeconds).toBe(0);
+    expect(preview.estimated.seconds).toBe(0);
+    // 可解釋的最小量：每檔 1 段（實際段數未知）。
+    expect(preview.estimatedChunks).toBe(1);
+    // 估時分解不含影片欄位（四欄相加＝seconds 的舊契約不被未知值污染）。
+    expect(preview.estimated).toEqual({ textSeconds: 0, imageSeconds: 0, otherSeconds: 0, seconds: 0 });
+  });
+
+  it("影片候選只給「600 秒上限推算的段數上界」與時長未知旗標", async () => {
+    const preview = await previewRoot(
+      { path: videoRoot, modalities: ["text", "video"], videoMaxFileBytes: 1000 },
+      { supportedModalities: [...VIDEO_SUPPORTED] },
+    );
+    expect(preview.video).toEqual({
+      files: 1,
+      durationKnown: false,
+      includesAudioTrack: false,
+      visualSegmentsPerFileMax: 150,
+      audioSegmentsPerFileMax: 0,
+      estimatedSegmentCountMax: 150,
+      estimatedSecondsMax: 375,
+    });
+  });
+
+  it("video 與 audio 都開啟且都受支援時，才把影片音軌段數計入上界", async () => {
+    const both = await previewRoot(
+      { path: videoRoot, modalities: ["text", "video", "audio"], videoMaxFileBytes: 1000 },
+      { supportedModalities: [...VIDEO_SUPPORTED] },
+    );
+    expect(both.video?.includesAudioTrack).toBe(true);
+    expect(both.video?.audioSegmentsPerFileMax).toBe(60);
+    expect(both.video?.estimatedSegmentCountMax).toBe(210);
+    expect(both.video?.estimatedSecondsMax).toBe(675);
+    // 影片仍不計入 estimatedSeconds：三個可解釋的欄位相加。
+    expect(both.estimatedSeconds).toBe(both.estimated.seconds);
+
+    // 只有 video、沒有 audio 模態：不計音軌段（無音軌權重）。
+    const visualOnly = await previewRoot(
+      { path: videoRoot, modalities: ["video"], videoMaxFileBytes: 1000 },
+      { supportedModalities: [...VIDEO_SUPPORTED] },
+    );
+    expect(visualOnly.video?.includesAudioTrack).toBe(false);
+    expect(visualOnly.video?.audioSegmentsPerFileMax).toBe(0);
+  });
+
+  it("沒有影片候選時 video 為 null（既有 root 不受新增欄位影響）", async () => {
+    const preview = await previewRoot({ path: rootPath, modalities: ["text", "code"] });
+    expect(preview.video).toBeNull();
   });
 });

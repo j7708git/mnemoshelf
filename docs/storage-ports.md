@@ -48,6 +48,13 @@ MetadataStore 新增政策讀寫、來源新增／查重／讀取／列舉／範
 > 2026-10-21 新增 §記憶的來源欄位：`Memory.sourceSession`／`sourceMessage`（additive、可空）與
 > SQLite 遷移 `0005_memory_provenance`；匯出 `schemaVersion` **維持 1**（舊備份缺欄位可匯入，
 > 補 `null`）。既有欄位語意、去重 key、排序與搜尋都不變。
+>
+> 2026-11-08（影片里程碑三 B3a）新增 §影片片段的媒體定位與 seq 規則：`ChunkMedia` 擴充
+> `track`（`audio`／`video`／`video-audio`）、`container`、`streamIndex`、`frameTimesSeconds`
+> （additive；舊音訊列照舊可讀）。**storage 不改 schema**——新欄位全部在既有的
+> `chunks.media_json` 內（SQLite／PostgreSQL 相同），不需要新 migration。同節記錄跨軌 `seq`
+> 排序規則與共用 helper，以及掃描／預覽的影片語意（`.mp4` 白名單、`videoMaxFileBytes`、
+> 跳過原因分組）。兩個後端跑同一組契約測試；PostgreSQL 仍需 `MNEMOSHELF_PG=1` 才是實跑。
 
 | 介面 | 職責 | 預設實作 | 預計的替代實作 |
 |---|---|---|---|
@@ -97,6 +104,182 @@ keyword 路把 vector 路原本正確的命中壓了下去（RRF 讓兩路等權
 （見 §設計規則 1）。需要固定行為的呼叫端請一律明確帶 `mode`。**記憶只進 keyword 那一路**，因此預設
 `vector` 不含記憶命中；要搜尋記憶請帶 `mode: "keyword"` 或 `"hybrid"`。
 
+## 音訊片段與增量索引
+
+`Chunk.media` 是選填的時間片段資料；既有文字、程式碼、圖片與舊版資料**省略**此欄，不補 `null`。
+音訊里程碑時時間片段限音訊，`Chunk.text` 為 `null`，不產生或冒充語音轉錄；2026-11-08 起新增影片片段，沿用同一形狀擴充（見 §影片片段的媒體定位與 seq 規則），下列是當時的音訊形狀：
+
+```ts
+interface ChunkMedia {
+  startSeconds: number;
+  endSeconds: number;
+  track: "audio";
+  preprocessVersion: string;
+  embedderId: string;
+  embeddingDim: number;
+}
+```
+
+- 時間使用原始來源的秒數，區間為 `[startSeconds, endSeconds)`；起點必須有限且非負，終點必須有限且大於起點。
+- `preprocessVersion` 包含解碼／混音／重採樣、分段與極短輸入補零政策；音訊目前為
+  `wav-pcm-mono16k-sinc-v1:10s:audio-pad160-v1`。影片畫面為
+  `mp4-h264-rgb24-v4:4s:1f:384:srcpts-v3`、影片所選音軌為
+  `mp4-aac-mono16k-v2:10s:clamp-v1:stream-align-v1`（再加 `audio-pad160-v1` 與 decoder 版本）；
+  視覺 v4 由 decoder 提供來源 PTS 佈局，視覺與音軌都以容器 sourceStartSeconds 為播放原點；v2／v3 舊索引重跑時必須重建；音軌仍維持 v2 的 per-stream 時長對齊。模型前處理不足 160 樣本時補零到 160 樣本，
+  來源起訖時間不因補零延長，避免極短尾段被模型前處理丟失。
+  `embedderId`／`embeddingDim` 記錄向量身分。欄位在寫入前共用驗證，非法資料拒絕且不刪除既有片段。
+- SQLite 遷移 `0007_chunk_media` 新增 nullable `chunks.media_json text`；PostgreSQL 以
+  `add column if not exists` 補同欄。遷移不重建原表、不刪除舊 chunk 或向量，並可重複執行。
+- `replaceChunks`、`getChunks`、`listChunksByPath` 完整保存並回傳定位資料；向量搜尋命中的 chunk id
+  可藉此定位回來源音訊。沒有將檔名或定位資訊混入音訊內容向量。
+- 音訊的 `contentHash` 仍是原始檔案位元組 SHA-256。只有 hash、片段數／順序／完整時間覆蓋、
+  前處理版本、模型身分與維度全相同，且每個向量 key 都存在時才跳過重算。少尾段或缺向量時整檔重建。
+- 每檔所有片段嵌入成功才替換其 chunk 與向量；取消或推論失敗不發布半份索引。
+  替換仍沿用先刪舊向量、再替換 chunk、再寫新向量的自癒順序。壞格式／無效音訊／超限檔
+  則列為具名跳過並回收其舊索引；未支援的副檔名在掃描時記 `unsupported-audio-format`。
+- WAV 預設每段 10 秒；每次只準備一段 PCM，最後不足 10 秒仍保存。共用 embedder 的多個 root
+  合計最多持有 2 個音訊檔的讀取／處理名額（在讀 WAV 前取得，完整處理後釋放，等待可取消）；
+  含音訊 root 的檔案併發也最多 2；
+  序列推論裝置仍為 1。既有 10 MiB 單檔預設上限保留，解碼另限制 64 MiB 原始輸入、600 秒時長，
+  不會因調大通用檔案大小選項就移除音訊護欄。
+- 預覽只列舉而不讀內容，因此 WAV 是候選格式，實際 codec 與時長在確認索引後驗證。
+  音訊片段估值以最低支援位元率（8 kHz、PCM16、mono）推估上界、最多 60 段；
+  每段 5 秒的成本是保守規模提示，不是裝置效能保證。服務端依實際嵌入能力限制預覽模態。
+
+SQLite 與 PostgreSQL 共用兩項新增契約測試（往返與非法輸入不損資料）。SQLite 遷移已另有
+舊資料庫升級測試；PostgreSQL 必須在啟用 `MNEMOSHELF_PG=1` 的環境實跑，未啟用時不能宣稱驗收通過。
+
+## 影片片段的媒體定位與 seq 規則（2026-11-08，影片里程碑三 B3a）
+
+影片索引沿用 `Chunk.media`，因此**不需要新的表或 migration**：新欄位全部寫在既有的
+`chunks.media_json`（SQLite／PostgreSQL 都是 `text`）內，兩後端走同一個 JSON 欄位。
+舊音訊列只有 `track:"audio"` 與三個嵌入身分欄位；讀回時**不得**補 `container`／
+`streamIndex`／`frameTimesSeconds`（不得變成 `container: undefined` 這類多出來的鍵）。
+
+```ts
+interface ChunkMedia {
+  startSeconds: number;
+  endSeconds: number;
+  track: "audio" | "video" | "video-audio";
+  /** 來源容器；舊資料省略。 */
+  container?: "wav" | "mp4";
+  /** 影片所選音軌的 stream index（`track:"video-audio"` 必填）；畫面片段可省略。 */
+  streamIndex?: number;
+  /** 畫面片段實際採用的幀時間（秒；`track:"video"` 必填）。 */
+  frameTimesSeconds?: number[];
+  preprocessVersion: string;
+  embedderId: string;
+  embeddingDim: number;
+}
+```
+
+| `track` | `kind` | 意思 | 必填欄位 |
+|---|---|---|---|
+| `video` | `video` | 影片**畫面**片段（每 4 秒一段、每段 1 幀） | `frameTimesSeconds` |
+| `video-audio` | `audio` | 影片**所選音軌**片段（沿用 10 秒音訊片段） | `streamIndex` |
+| `audio` | `audio` | 舊資料與獨立 WAV 音訊片段 | 無（僅舊欄位） |
+
+- 影片音軌片段的 `kind` 仍是 `"audio"`（沿用既有音訊嵌入與搜尋語意），以 `media.track`
+  區分來源；「畫面」與「音軌」的差別看 `media.track`，不是看 `kind`。
+- `container` 選填（舊資料沒有）；有值必須是 `wav`／`mp4`。影片 v1 只支援 `.mp4`。
+- `streamIndex` 是影片所選音軌的 stream index（多音軌政策：第一個 default AAC，否則第一個
+  AAC）；`track:"video-audio"` 必填、整數 ≥ 0。畫面片段可省略（可帶視覺 stream index）。
+- `frameTimesSeconds` 是該片段**實際解碼來源幀的 PTS**（秒，播放時間軸 0-based；不是 fps 抽樣格線、
+  也不是平均 FPS 推估值）：`track:"video"` **必填**、長度 1–32、非遞減、每個值落在
+  `[startSeconds, endSeconds]`；音軌片段**不得**帶此欄。抽樣政策已凍結為每段 1 幀
+  （0.25 fps、每段 4 秒）：完整段取段中點之後第一幀、尾段取段內最後一幀，因此目前長度固定 1。
+  時間線無法可靠定義時整檔具名跳過 `unsupported-video-timeline`，不寫入推測值。
+  decoder 的 `probe.visualTimeline` 提供段界與來源 PTS；indexer 的預期片段、實際輸出驗證及增量比對
+  共用這份佈局，不能只從容器時長推算段數。增量比對也核對實際幀時間，不只核對段數。
+  容器結尾略跨段界而最後不足 4 秒的格子沒有 PTS 時，只有末幀的實際 `duration_time` 證明覆蓋結尾
+  才省略該空格；前段仍結束於原本 4 秒邊界。容器只允許向上毫秒量化差、六位小數相加的一微秒差；
+  不推估 FPS、不省略完整空段或中間空段，尾格有 PTS 時仍保留。
+  長片非格線 pick 使用平衡加法樹的 `between` select（最多 600 項／28,000 字元）；
+  等距格線仍可壓縮。正常無競爭時同一程序解完整片；跨 root 讓出程序才在段界以 `-ss` 恢復。
+  佈局或解碼覆蓋不一致一律 `unsupported-video-timeline`，不發布部分索引。
+- 驗證由 `normalizeChunkMedia`（`ports/metadata-store.ts`；兩後端與呼叫端共用同一個入口）
+  負責；非法資料拋 `TypeError`，`replaceChunks` 拒絕寫入且**不刪除**既有片段（與音訊
+  里程碑相同）。runtime 白名單另匯出 `CHUNK_MEDIA_TRACKS`／`CHUNK_MEDIA_CONTAINERS`／
+  `CHUNK_MEDIA_MAX_FRAME_TIMES`。
+
+### seq 規則（同檔跨軌唯一且穩定）
+
+`Chunk.seq` 在同一檔案（`rootId`＋`relPath`）內**唯一**、0 起算、連續。排序鍵依序：
+
+1. `startSeconds` 升冪；
+2. 同時刻依軌道：`video` → `video-audio` → `audio`（畫面先於音軌）；
+3. `endSeconds` 升冪；
+4. 都有 `frameTimesSeconds` 時比較第一個幀時間；
+5. 仍相同＝等價，維持傳入順序（ES2019 起 `sort` 保證穩定）。
+
+純音訊檔（既有 WAV）排序結果與現行的「`seq` = 片段索引」完全相同，因此舊資料不必重編號。
+索引端不得自行排序：`compareChunkMediaOrder(a, b)` 是比較器，`assignChunkMediaSeq(chunks)`
+回傳重新編號後的新陣列（不改傳入物件）；兩者都在 `ports/metadata-store.ts`，
+**尚未**從 `@mnemoshelf/core` 公開入口 export（本輪未改 `src/index.ts`，由 PM 統一補）。
+
+> 例：12 秒畫面＋11.8 秒 AAC、`video` 與 `audio` 都開啟 ⇒ 畫面 0–4／4–8／8–12（`video`）、
+> 音軌 0–10／10–11.8（`video-audio`；段界用音軌自身時長，不是容器 12 秒）；`seq` 依序是
+> 0＝畫面 0–4、1＝音軌 0–10、2＝畫面 4–8、3＝畫面 8–12、4＝音軌 10–11.8。
+> 音軌起點晚於 0 時，decoder 在 leading offset 補靜音並回傳已對齊播放時間軸的片段；
+> 樣本數只允許 AAC priming 級容差（約 `max(2048, 0.1%)`），不沿用半秒級寬容。
+
+### 讀寫、遷移與舊資料
+
+- `replaceChunks`／`getChunks`／`listChunksByPath` 完整保存並回傳新欄位（`media_json` 往返）；
+  沒有把檔名、時長或容器混入向量內容。
+- **沒有新 migration**：SQLite 的 `0007_chunk_media` 已提供 nullable `media_json text`，
+  PostgreSQL 的 `migrate()` 以 `add column if not exists media_json text` 對齊——新欄位是
+  JSON 內容的 additive 擴充，兩者都不重建表、不刪除舊 chunk 或向量，且可重複執行。
+- 舊音訊列（沒有新欄位）照舊可讀：JSON 驗證接受只有 `track:"audio"` 的舊形狀；
+  `sqlite.chunk-media.test.ts` 另有「先建到 0006、插舊列、再升級」的舊資料庫升級測試。
+- 增量身分（原始 hash、模型／維度、decoder 與前處理版本、片長／抽樣／縮放、音軌選擇、
+  所要求的 tracks）與「每檔所有軌都成功才替換、失敗不發布部分索引」由索引端（B3b）負責；
+  本輪只保證儲存層能完整保存與回傳，供增量比對使用。
+
+### 契約測試
+
+`@mnemoshelf/core/testing` 的 `runMetadataStoreContract` 擴充下列案例（SQLite 與 PostgreSQL
+跑同一組；PostgreSQL 需 `MNEMOSHELF_PG=1` 才是實跑）：
+
+- 舊音訊定位往返：`getChunks`／`listChunksByPath` 讀回與寫入完全相同，且不多出
+  `container`／`streamIndex`／`frameTimesSeconds` 鍵；文字 chunk 仍省略 `media`。
+- 影片畫面＋影片音軌（`.mp4`、`frameTimesSeconds`、`streamIndex`）往返；`seq` 由
+  `assignChunkMediaSeq` 排序成同檔唯一編號（畫面先於音軌、再依時間）。
+- 非法資料拒絕且不刪除既有片段：一般欄位（時間、版本、embedder、維度）＋影片專屬欄位
+  （`track` 非白名單、`container` 非白名單、畫面缺／多幀時間、幀時間越界或遞減、`streamIndex`
+  缺漏或非整數、音軌片段帶幀時間）。
+
+另有 `packages/core/test/chunk-media.test.ts`（驗證器與 `seq` 規則的單元測試）、
+`sqlite.chunk-media.test.ts`（遷移冪等與舊列相容）。
+
+### 掃描與預覽的影片語意（摘要）
+
+> 這一小節是 B3a 的實作摘要；產品層的模態語意、per-root 上限與 UI 文案見
+> `docs/roots-and-privacy.md`／`docs/operations.md`。per-root `videoMaxFileBytes` 由 C4
+> 以 SQLite migration `0008_root_video_max_file_bytes`（nullable）與 PostgreSQL
+> `add column if not exists` 持久化，詳見本文件 §root 設定的更新。
+
+- **只在呼叫端宣告支援時納入**：`walkRoot`／`previewRoot` 的 `supportedModalities` 含 `video`
+  才把影片列入候選；未宣告時沿用既有 `unsupported-modality`（服務端在 B3b／C 接線前行為不變）。
+- **v1 容器白名單 `.mp4`**：副檔名不是 `.mp4` 的影片在掃描階段記 `unsupported-video-format`；
+  `.mp4` 只是第一道篩選，實際 codec 由確認索引後的受控探測判斷。`isSupportedVideoFileName()`
+  是白名單的單一實作。
+- **明確的影片大小上限**：`ScanOptions.videoMaxFileBytes`，預設
+  `DEFAULT_VIDEO_MAX_FILE_BYTES`＝512 MiB；超過記 `video-too-large`。通用 `maxFileBytes`
+  （預設 10 MiB）**不套用影片**。per-root 值存於 `Root.videoMaxFileBytes`（C4 落地），
+  未設定時服務端以 `MNEMOSHELF_VIDEO_MAX_FILE_BYTES` 或 512 MiB 作預設。
+- **跳過原因分兩組**（不得混用）：掃描可判定＝`unsupported-video-format`、`video-too-large`；
+  需 probe／decode 才知＝`video-duration-exceeded`、`invalid-video`、`unsupported-video-codec`、
+  `unsupported-video-audio-track`、`unsupported-video-timeline`（時間線無法可靠定義；由索引／解碼
+  階段產生，映射為 skipped，不讓整輪 failed）。
+- **時長上限不猜**：`VIDEO_MAX_DURATION_SECONDS`＝600 秒；掃描與預覽不讀媒體，無法判定。
+- **預覽不讀媒體、不啟動 probe、不由壓縮大小換算時長**：`RootPreview.video` 提供
+  `files`／`durationKnown:false`／`includesAudioTrack`／`visualSegmentsPerFileMax`＝150（600 秒
+  ÷ 4 秒）／`audioSegmentsPerFileMax`＝60（600 秒 ÷ 10 秒）／`estimatedSegmentCountMax`／
+  `estimatedSecondsMax`，全部標明是**上界**。
+- `estimatedChunks`／`estimatedSeconds` **不含**影片未知成本（影片每檔只計 1 段的可解釋最小量），
+  避免把 5 秒短片估成數百秒；影片上界只在 `video` 物件內，UI 顯示「影片時長待確認」。
+
 ## 記憶的釘選（M3 擴充）
 
 管理面的標記：`Memory.pinned: boolean`（型別見 `ports/types.ts`）。既有資料與新增的記憶一律
@@ -131,10 +314,12 @@ root 建立之後只有一部分設定可變更；`MetadataStore.updateRoot(id, 
 
 | 方法 | 語意 |
 |---|---|
-| `MetadataStore.updateRoot(id, patch)` | 更新 `RootPatch`（目前只有 `modalities`）；回傳**更新後**的 `Root` |
+| `MetadataStore.updateRoot(id, patch)` | 更新 `RootPatch`（`modalities` 與 `videoMaxFileBytes`）；回傳**更新後**的 `Root` |
 
-- **目前只有 `modalities` 可改。** `path`／`mode` 變更等同換一個 root（索引內容與清理語意都會變），
-  應以「移除再加入」處理；`include`／`exclude`／`respectGitignore` 尚無變更語意，故不在 `RootPatch`。
+- **目前可改 `modalities` 與 `videoMaxFileBytes`。** `videoMaxFileBytes` 是 bytes、整數
+  1–16 GiB；`null` 表示清除設定（回到服務層預設），`undefined` 表示不變。`path`／`mode`
+  變更等同換一個 root（索引內容與清理語意都會變），應以「移除再加入」處理；
+  `include`／`exclude`／`respectGitignore` 尚無變更語意，故不在 `RootPatch`。
 - **冪等**：同樣的 patch 重複套用結果相同；`patch` 未提供的欄位＝該欄位不變。空陣列 `[]` 是合法值
   （＝全部模態關閉，與 `addRoot` 接受空陣列一致），與「未提供該欄位」不同。
 - **回傳更新後的 `Root`**，呼叫端不必再讀一次；`getRoot` 與 `listRoots` 也都反映新值。
@@ -145,9 +330,11 @@ root 建立之後只有一部分設定可變更；`MetadataStore.updateRoot(id, 
 - **與 `removeRoot` ＋重新 `addRoot` 的差異**：`updateRoot` 保留同一個 `id`、`createdAt` 與既有
   chunks／向量，適合「只是想多索引一種模態」；`removeRoot` ＋ `addRoot` 會得到新 `id`，
   既有索引與衍生資料需重建（`removeRoot(id, true)` 會連 chunks 一起刪掉）。
-- 契約測試（`@mnemoshelf/core/testing` 的 `runMetadataStoreContract`）新增四例：更新並回傳
-  （不可變欄位原樣保留）、冪等與關閉模態、`patch` 未提供欄位、不存在的 id。SQLite 與 PostgreSQL
-  兩個後端都必須通過同一組測試。
+- 契約測試（`@mnemoshelf/core/testing` 的 `runMetadataStoreContract`）涵蓋：更新並回傳
+  （不可變欄位原樣保留）、冪等與關閉模態、`patch` 未提供欄位、不存在的 id，以及
+  `videoMaxFileBytes` 的設定／讀回／清除／1–16 GiB 邊界與非法值不改資料。SQLite 與 PostgreSQL
+  兩個後端都必須通過同一組測試；SQLite migration `0008_root_video_max_file_bytes` 為 nullable、
+  冪等，舊 row 讀回時不補鍵。
 
 ## 記憶的範圍更新（2026-10-18）
 

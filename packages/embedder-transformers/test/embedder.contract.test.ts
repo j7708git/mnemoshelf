@@ -18,8 +18,11 @@ function findRepoRoot(start: string): string {
 
 /** mnemoshelf/ 根。 */
 const REPO_ROOT = findRepoRoot(path.dirname(fileURLToPath(import.meta.url)));
-/** 模型快取固定放 mnemoshelf/.tmp（不進版控）。 */
-const MODEL_CACHE_DIR = path.join(REPO_ROOT, ".tmp", "models");
+/**
+ * 模型快取固定放 mnemoshelf/.tmp（不進版控）；可用 `MNEMOSHELF_MODEL_DIR` 指向既有快取
+ * （例如研究用快取），避免 gated 測試重新下載權重。
+ */
+const MODEL_CACHE_DIR = process.env.MNEMOSHELF_MODEL_DIR ?? path.join(REPO_ROOT, ".tmp", "models");
 
 const E2E_ENABLED = process.env.MNEMOSHELF_E2E === "1";
 

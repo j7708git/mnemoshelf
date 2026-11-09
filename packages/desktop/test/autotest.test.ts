@@ -23,6 +23,10 @@ describe("parseScenarios", () => {
   it("接受 opt-in 情境 hidden", () => {
     expect(parseScenarios("hidden")).toEqual(["hidden"]);
   });
+  it("音訊情境需明確指定，不混入既有 all", () => {
+    expect(parseScenarios("audio")).toEqual(["audio"]);
+    expect(parseScenarios("all")).not.toContain("audio");
+  });
 
   it("opt-in 情境排在 tray 之前（tray 會結束行程，必須最後）", () => {
     expect(parseScenarios("tray,hidden")).toEqual(["hidden", "tray"]);

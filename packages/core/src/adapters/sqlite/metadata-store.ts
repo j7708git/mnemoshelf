@@ -23,7 +23,9 @@ import {
   assertMemoryQueryVector,
   cosineSimilarity,
   normalizeMemoryLimit,
+  normalizeChunkMedia,
   normalizeMemoryPatch,
+  normalizeRootVideoMaxFileBytes,
   normalizeMemorySearchFilter,
   normalizeMemorySearchK,
   type MemoryEmbeddingFailure,
@@ -56,8 +58,9 @@ import { selectRow, selectRows, type SqliteDatabase } from "./driver.js";
 import { runMigrations } from "./db.js";
 import { buildMatchExpression, segmentText } from "./segment.js";
 
-const ROOT_COLUMNS = "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at";
-const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash";
+const ROOT_COLUMNS =
+  "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, video_max_file_bytes";
+const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash, media_json";
 const MEMORY_COLUMNS =
   `id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at,
    source_id, message_index, chunk_index, source_start, source_end, chunk_version`;
@@ -71,7 +74,7 @@ function parseStringArray(value: unknown): string[] {
 }
 
 function rowToRoot(row: Record<string, unknown>): Root {
-  return {
+  const root: Root = {
     id: Number(row.id),
     path: String(row.path),
     mode: String(row.mode) as RootMode,
@@ -82,9 +85,15 @@ function rowToRoot(row: Record<string, unknown>): Root {
     watch: Number(row.watch) !== 0,
     createdAt: String(row.created_at),
   };
+  // NULL（舊資料或未設定）→ 不出現該鍵；不補 512 MiB（預設值屬呼叫端語意）。
+  if (row.video_max_file_bytes !== null && row.video_max_file_bytes !== undefined) {
+    root.videoMaxFileBytes = Number(row.video_max_file_bytes);
+  }
+  return root;
 }
 
 function rowToChunk(row: Record<string, unknown>): Chunk {
+  const media = normalizeChunkMedia(row.media_json == null ? undefined : JSON.parse(String(row.media_json)));
   return {
     id: Number(row.id),
     rootId: Number(row.root_id),
@@ -93,6 +102,7 @@ function rowToChunk(row: Record<string, unknown>): Chunk {
     kind: String(row.kind) as ChunkKind,
     text: row.text === null || row.text === undefined ? null : String(row.text),
     contentHash: String(row.content_hash),
+    ...(media === undefined ? {} : { media }),
   };
 }
 
@@ -394,11 +404,13 @@ export class SqliteMetadataStore implements MetadataStore {
 
   async addRoot(r: NewRoot): Promise<Root> {
     const createdAt = new Date().toISOString();
+    // 驗證在寫入前（非法值不建立資料列）；null＝未設定，資料庫寫 NULL。
+    const videoMaxFileBytes = normalizeRootVideoMaxFileBytes(r.videoMaxFileBytes) ?? null;
     try {
       this.db
         .prepare(
-          `insert into roots(path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at)
-           values (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `insert into roots(path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, video_max_file_bytes)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           r.path,
@@ -409,6 +421,7 @@ export class SqliteMetadataStore implements MetadataStore {
           r.respectGitignore ? 1 : 0,
           r.watch ? 1 : 0,
           createdAt,
+          videoMaxFileBytes,
         );
     } catch (error) {
       if (String(error).includes("UNIQUE constraint failed")) {
@@ -437,14 +450,21 @@ export class SqliteMetadataStore implements MetadataStore {
    * 先讀回現值再寫入（而不是 `update … set modalities = coalesce(?, modalities)`）：
    * 欄位省略＝不變的語意留在這裡，`null` 這種 SQL 值不必進到介面；
    * 代價是多一次 select（roots 只有個位數筆，可忽略）。
+   *
+   * `videoMaxFileBytes`：`undefined`＝保留現值、`null`＝清除（NULL）、`number`＝驗證後寫入。
    */
   async updateRoot(id: number, patch: RootPatch): Promise<Root | null> {
     const existing = await this.getRoot(id);
     if (existing === null) return null;
 
+    const videoMaxFileBytes =
+      patch.videoMaxFileBytes === undefined
+        ? existing.videoMaxFileBytes ?? null
+        : normalizeRootVideoMaxFileBytes(patch.videoMaxFileBytes) ?? null;
+
     this.db
-      .prepare("update roots set modalities = ? where id = ?")
-      .run(JSON.stringify(patch.modalities ?? existing.modalities), id);
+      .prepare("update roots set modalities = ?, video_max_file_bytes = ? where id = ?")
+      .run(JSON.stringify(patch.modalities ?? existing.modalities), videoMaxFileBytes, id);
 
     return await this.getRoot(id);
   }
@@ -473,6 +493,7 @@ export class SqliteMetadataStore implements MetadataStore {
     relPath: string,
     chunks: Omit<NewChunk, "rootId" | "relPath">[],
   ): Promise<Chunk[]> {
+    const normalized = chunks.map((item) => ({ ...item, media: normalizeChunkMedia(item.media) }));
     const replace = this.db.transaction((items: Omit<NewChunk, "rootId" | "relPath">[]): number[] => {
       const existing = selectRows(
         this.db,
@@ -489,13 +510,14 @@ export class SqliteMetadataStore implements MetadataStore {
       }
 
       const insert = this.db.prepare(
-        "insert into chunks(root_id, rel_path, seq, kind, text, content_hash) values (?, ?, ?, ?, ?, ?)",
+        "insert into chunks(root_id, rel_path, seq, kind, text, content_hash, media_json) values (?, ?, ?, ?, ?, ?, ?)",
       );
       const insertFts = this.db.prepare("insert into chunks_fts(rowid, seg) values (?, ?)");
 
       const created: number[] = [];
       for (const item of items) {
-        const info = insert.run(rootId, relPath, item.seq, item.kind, item.text, item.contentHash);
+        const info = insert.run(rootId, relPath, item.seq, item.kind, item.text, item.contentHash,
+          item.media === undefined ? null : JSON.stringify(item.media));
         const chunkId = Number(info.lastInsertRowid);
         created.push(chunkId);
         if (item.text !== null && item.text.trim().length > 0) {
@@ -505,7 +527,7 @@ export class SqliteMetadataStore implements MetadataStore {
       return created;
     });
 
-    return this.getChunks(replace(chunks));
+    return this.getChunks(replace(normalized));
   }
 
   async deleteChunksByPath(rootId: number, relPath: string): Promise<number[]> {

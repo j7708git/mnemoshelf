@@ -9,6 +9,7 @@ import {
   memoryContentHash,
   memorySourceEventHash,
   normalizeMemoryLimit,
+  normalizeChunkMedia,
   normalizeMemoryPatch,
   normalizeMemorySearchFilter,
   normalizeMemorySearchK,
@@ -59,9 +60,32 @@ export interface PgMetadataStoreOptions {
   schema?: string;
 }
 
+/**
+ * root 影片上限的值域（與 core `ports/metadata-store.ts` 的 `normalizeRootVideoMaxFileBytes` 同值）。
+ *
+ * 為什麼暫行重複：storage-pg 只從 `@mnemoshelf/core` 的公開入口 import，而該驗證器目前
+ * 還沒被 PM 統一 export（見 notes 遺留項）；PM export 後應改 import 單一來源。
+ */
+const VIDEO_MAX_FILE_BYTES_MIN = 1;
+const VIDEO_MAX_FILE_BYTES_MAX = 16 * 1024 * 1024 * 1024;
+
+/** 驗證 root 影片上限；語意與 core 的 `normalizeRootVideoMaxFileBytes` 完全相同。 */
+function normalizeRootVideoMaxFileBytes(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < VIDEO_MAX_FILE_BYTES_MIN ||
+    value > VIDEO_MAX_FILE_BYTES_MAX
+  ) {
+    throw new TypeError("root 的影片單檔大小上限必須是 1–16 GiB 的整數（bytes）");
+  }
+  return value;
+}
+
 const ROOT_COLUMNS =
-  "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at";
-const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash";
+  "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, video_max_file_bytes";
+const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash, media_json";
 const MEMORY_COLUMNS =
   `id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at,
    source_id, message_index, chunk_index, source_start, source_end, chunk_version`;
@@ -82,7 +106,7 @@ function parseStringArray(value: unknown): string[] {
 }
 
 function rowToRoot(row: Record<string, unknown>): Root {
-  return {
+  const root: Root = {
     id: Number(row.id),
     path: String(row.path),
     mode: String(row.mode) as RootMode,
@@ -93,9 +117,15 @@ function rowToRoot(row: Record<string, unknown>): Root {
     watch: row.watch === true,
     createdAt: String(row.created_at),
   };
+  // pg 的 bigint 以字串回傳（16 GiB > int4）：轉成 number；NULL → 不出現該鍵。
+  if (row.video_max_file_bytes !== null && row.video_max_file_bytes !== undefined) {
+    root.videoMaxFileBytes = Number(row.video_max_file_bytes);
+  }
+  return root;
 }
 
 function rowToChunk(row: Record<string, unknown>): Chunk {
+  const media = normalizeChunkMedia(row.media_json == null ? undefined : JSON.parse(String(row.media_json)));
   return {
     id: Number(row.id),
     rootId: Number(row.root_id),
@@ -104,6 +134,7 @@ function rowToChunk(row: Record<string, unknown>): Chunk {
     kind: String(row.kind) as ChunkKind,
     text: row.text === null || row.text === undefined ? null : String(row.text),
     contentHash: String(row.content_hash),
+    ...(media === undefined ? {} : { media }),
   };
 }
 
@@ -228,8 +259,10 @@ function metadataSchemaSql(schema: string): string {
       exclude_rules text not null default '[]',
       respect_gitignore boolean not null default true,
       watch boolean not null default false,
-      created_at text not null
+      created_at text not null,
+      video_max_file_bytes bigint
     );
+    alter table ${roots} add column if not exists video_max_file_bytes bigint;
 
     create table if not exists ${chunks} (
       id integer generated always as identity primary key,
@@ -242,6 +275,7 @@ function metadataSchemaSql(schema: string): string {
       seg text,
       tsv tsvector generated always as (to_tsvector('simple', seg)) stored
     );
+    alter table ${chunks} add column if not exists media_json text;
     create index if not exists chunks_root_path_idx on ${chunks}(root_id, rel_path);
     create index if not exists chunks_tsv_gin on ${chunks} using gin (tsv);
 
@@ -574,10 +608,12 @@ export class PgMetadataStore implements MetadataStore {
 
   async addRoot(r: NewRoot): Promise<Root> {
     const createdAt = new Date().toISOString();
+    // 驗證在寫入前（非法值不建立資料列）；null＝未設定，資料庫寫 NULL。
+    const videoMaxFileBytes = normalizeRootVideoMaxFileBytes(r.videoMaxFileBytes) ?? null;
     try {
       await this.pool.query(
-        `insert into ${this.roots}(path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at)
-         values ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        `insert into ${this.roots}(path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, video_max_file_bytes)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
         [
           r.path,
           r.mode,
@@ -587,6 +623,7 @@ export class PgMetadataStore implements MetadataStore {
           r.respectGitignore,
           r.watch,
           createdAt,
+          videoMaxFileBytes,
         ],
       );
     } catch (error) {
@@ -616,15 +653,19 @@ export class PgMetadataStore implements MetadataStore {
    * 不必先 select 再 update（也避免兩個後端語意分岔）。
    */
   async updateRoot(id: number, patch: RootPatch): Promise<Root | null> {
-    if (patch.modalities === undefined) {
-      // 沒有要改的欄位：只確認存在（與 SQLite 端「讀到才回傳」一致）。
-      const current = await this.pool.query(`select ${ROOT_COLUMNS} from ${this.roots} where id = $1`, [id]);
-      return current.rows.length === 0 ? null : rowToRoot(current.rows[0]!);
-    }
+    // 兩個欄位都可能要改，先讀現值（roots 只有個位數筆）：省略欄位＝保留現值。
+    const current = await this.pool.query(`select ${ROOT_COLUMNS} from ${this.roots} where id = $1`, [id]);
+    if (current.rows.length === 0) return null;
+    const existing = rowToRoot(current.rows[0]!);
+
+    const videoMaxFileBytes =
+      patch.videoMaxFileBytes === undefined
+        ? existing.videoMaxFileBytes ?? null
+        : normalizeRootVideoMaxFileBytes(patch.videoMaxFileBytes) ?? null;
 
     const result = await this.pool.query(
-      `update ${this.roots} set modalities = $2 where id = $1 returning ${ROOT_COLUMNS}`,
-      [id, JSON.stringify(patch.modalities)],
+      `update ${this.roots} set modalities = $2, video_max_file_bytes = $3 where id = $1 returning ${ROOT_COLUMNS}`,
+      [id, JSON.stringify(patch.modalities ?? existing.modalities), videoMaxFileBytes],
     );
     return result.rows.length === 0 ? null : rowToRoot(result.rows[0]!);
   }
@@ -648,16 +689,18 @@ export class PgMetadataStore implements MetadataStore {
     relPath: string,
     chunks: Omit<NewChunk, "rootId" | "relPath">[],
   ): Promise<Chunk[]> {
+    const normalized = chunks.map((item) => ({ ...item, media: normalizeChunkMedia(item.media) }));
     return await withTransaction(this.pool, async (client) => {
       await client.query(`delete from ${this.chunks} where root_id = $1 and rel_path = $2`, [rootId, relPath]);
 
       const created: Chunk[] = [];
-      for (const item of chunks) {
+      for (const item of normalized) {
         const result = await client.query(
-          `insert into ${this.chunks}(root_id, rel_path, seq, kind, text, content_hash, seg)
-           values ($1, $2, $3, $4, $5, $6, $7)
+          `insert into ${this.chunks}(root_id, rel_path, seq, kind, text, content_hash, seg, media_json)
+           values ($1, $2, $3, $4, $5, $6, $7, $8)
            returning ${CHUNK_COLUMNS}`,
-          [rootId, relPath, item.seq, item.kind, item.text, item.contentHash, segmentOrNull(item.text)],
+          [rootId, relPath, item.seq, item.kind, item.text, item.contentHash, segmentOrNull(item.text),
+            item.media === undefined ? null : JSON.stringify(item.media)],
         );
         created.push(rowToChunk(result.rows[0]!));
       }

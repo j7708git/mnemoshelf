@@ -1,0 +1,2208 @@
+{
+  "schemaVersion": 1,
+  "corpusId": "mnemoshelf-video-a2-synthetic-v1",
+  "status": "frozen-pending-PM-approval",
+  "frozenAtUtc": "2026-11-08T01:14:37.867Z",
+  "frozenAtLocal": "2026-11-08 09:14:37 +08:00",
+  "frozenBy": "corpus-a (A2 teammate) / task-2",
+  "note": "此 JSON 於模型評測前凍結；任何題目、標註、容差或語料變更都必須重建語料並重新凍結（保留舊結果）。",
+  "scope": "只證明這組程式生成合成語料；不得外推真實影片、真實錄音或任意碼率。",
+  "paths": {
+    "corpusRoot": ".tmp/video-a/corpus",
+    "qualityDir": ".tmp/video-a/corpus/quality",
+    "negativeDir": ".tmp/video-a/corpus/negative",
+    "securityDir": ".tmp/video-a/corpus/security",
+    "evalRoot": ".tmp/video-a/corpus/eval-root",
+    "labelsDir": ".tmp/video-a/corpus/labels",
+    "reportsDir": ".tmp/video-a/corpus/reports"
+  },
+  "evaluationRoot": {
+    "path": ".tmp/video-a/corpus/eval-root",
+    "files": [
+      {
+        "file": "v01.mp4",
+        "role": "quality",
+        "sha256": "11ff9ea4e75d39e9f797e715043d3fd924305998299ffea8ac7e64f00015a313"
+      },
+      {
+        "file": "v02.mp4",
+        "role": "quality",
+        "sha256": "e573bf4da261997387a8a492e1a594a6068ab60b7621379f68cb8da3c50d30b5"
+      },
+      {
+        "file": "v03.mp4",
+        "role": "quality",
+        "sha256": "d1fbf72be07118b6059e0fe10123760ac19a76d7937a33f433861e1fd9a5a500"
+      },
+      {
+        "file": "v04.mp4",
+        "role": "quality",
+        "sha256": "7e8b384957ac5a9d1025a3fce82962f12c1e41a2fbb9d4bd55a19aaf048ae2d5"
+      },
+      {
+        "file": "v05.mp4",
+        "role": "quality",
+        "sha256": "d966c1e7d90021522fdb631e10d4f6b4ba684515c5913b399a04886d07b97429"
+      },
+      {
+        "file": "v06.mp4",
+        "role": "quality",
+        "sha256": "486f09d2f04c7912047fd41ba076241d3e8118a3fb5c45f04004695880482a67"
+      },
+      {
+        "file": "n01.mp4",
+        "role": "negative-control",
+        "sha256": "59a249d71758c8844f54afb9e8dc5a418946ab228af1cde0df76803f52a60a2c"
+      },
+      {
+        "file": "n02.mp4",
+        "role": "negative-control",
+        "sha256": "0c3c3bed70468047dc4536e3b5327af43b72782260536e577af5cae7163600bf"
+      },
+      {
+        "file": "n03.mp4",
+        "role": "negative-control",
+        "sha256": "ab571a8d080d946e747047540d33490f1af5d4ed9d12c740b8de7317545120a4"
+      },
+      {
+        "file": "n04.mp4",
+        "role": "negative-control",
+        "sha256": "57155126b2d6da71d439a86dc202975a661c62a3a85b497233514f4e74fbbd21"
+      }
+    ],
+    "rule": "評測只索引 eval-root/ 下 10 支 MP4；security/ 的 fixture 不得混入，否則預期跳過／失敗會污染排名。"
+  },
+  "generation": {
+    "fixedSeedPolicy": "每支影片固定 seed；所有隨機只能來自 mulberry32/hash32；無外部素材、無私人影片。",
+    "scripts": [
+      "scripts/tts.ps1",
+      "scripts/lib.mjs",
+      "scripts/definitions.mjs",
+      "scripts/generate-quality.mjs",
+      "scripts/verify-corpus.mjs",
+      "scripts/generate-security.mjs",
+      "scripts/freeze.mjs"
+    ],
+    "rerunCommands": [
+      "cd <code repo>",
+      "pwsh -NoProfile -File .tmp/video-a/corpus/scripts/tts.ps1   # Windows PowerShell 5.1 + 本機 SAPI 聲音",
+      "node .tmp/video-a/corpus/scripts/generate-quality.mjs",
+      "node .tmp/video-a/corpus/scripts/verify-corpus.mjs",
+      "node .tmp/video-a/corpus/scripts/generate-security.mjs",
+      "node .tmp/video-a/corpus/scripts/freeze.mjs"
+    ],
+    "encoder": {
+      "tool": "decoder-a 候選 ffmpeg（BtbN win64 LGPLv3 static；無 libx264）",
+      "versionFirstLine": "ffmpeg version n9.0.2-48-gd4070a14ce-20261107 Copyright (c) 2000-2026 the FFmpeg developers",
+      "ffmpegSha256": "71ac0a64a4e3e0caaf7a8c25c7e73d161ac1b269cca930d207e89e1b23959dfb",
+      "ffprobeSha256": "88abaa76c626db34a48795dc42f987e991df426913720ef15a7053063b3c22b4",
+      "videoEncoder": "libopenh264（H.264 Constrained Baseline）",
+      "audioEncoder": "aac（128 kbps、48 kHz、mono）",
+      "qualityEncodeArgs": [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        "640x360",
+        "-r",
+        "24",
+        "-i",
+        "pipe:0",
+        "-i",
+        "<audio.wav>",
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "libopenh264",
+        "-b:v",
+        "900k",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "48",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-ar",
+        "48000",
+        "-ac",
+        "1",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        "<out.mp4>"
+      ],
+      "moovPlacement": "品質語料與多數 fixture 使用 -movflags +faststart；moov-at-end fixture 刻意不加"
+    },
+    "tts": {
+      "engine": "Windows System.Speech（本機已安裝聲音，不連網）",
+      "voices": {
+        "zh-TW": "Microsoft Hanhan Desktop",
+        "en-US": "Microsoft David Desktop"
+      },
+      "lines": [
+        {
+          "id": "t01",
+          "lang": "zh",
+          "text": "把番茄切塊，加入雞蛋，最後加鹽調味。"
+        },
+        {
+          "id": "t02",
+          "lang": "zh",
+          "text": "列車即將進站，請旅客站在黃線後方等候。"
+        },
+        {
+          "id": "t03",
+          "lang": "zh",
+          "text": "明天早上九點開設計審查會議，記得帶圖紙。"
+        },
+        {
+          "id": "t04",
+          "lang": "zh",
+          "text": "市場早上六點開始營業，非常熱鬧。"
+        },
+        {
+          "id": "t05",
+          "lang": "en",
+          "text": "The interview is scheduled for next Tuesday at the downtown office."
+        },
+        {
+          "id": "t06",
+          "lang": "en",
+          "text": "The library is quiet in the afternoon."
+        },
+        {
+          "id": "t07",
+          "lang": "en",
+          "text": "The concert starts at eight in the evening."
+        },
+        {
+          "id": "t08",
+          "lang": "en",
+          "text": "The bakery sells fresh bread every morning."
+        }
+      ],
+      "placement": "語音以 10 秒音訊片段為單位置中；標註時段使用生成後實測的 TTS 長度（scenes.json）。"
+    }
+  },
+  "tolerance": {
+    "hitDefinition": "檢索片段（同檔、同軌）與標註時段 [start,end) 的交集 > 0 秒；同題多個重疊片段只算一次命中。",
+    "overlapRule": "Math.min(retrievedEnd, annotatedEnd) - Math.max(retrievedStart, annotatedStart) > 1e-3 秒",
+    "trackScope": "視覺題只與 kind=video 的片段比對；音軌題只與該檔音軌片段比對（B 契約草案 media.track='video-audio'）。跨軌、跨檔不算命中。",
+    "noAnyTimeCredit": "不得把同檔其他時間的片段當成正確；標註必須重疊指定時段。",
+    "timelineRule": "片段起訖以 decoder 輸出的實際來源時間軸為準；VFR／旋轉／非零 PTS／edit list 不得用平均 FPS 或固定 4 秒硬切推估。",
+    "chunkBoundaryNote": "實際片段切法（視覺 4 秒、音軌 10 秒）由 B 實作決定；只要片段與標註時段重疊即算命中。",
+    "tailEventNote": "V02 標註 30–36 秒（36 秒影片 > 30 秒），只有尾段含事件；重疊的 28–32／32–36 片段都算命中，較早片段不算。",
+    "negativesRule": "4 個負對照 fixture 不得成為 24 題任一題的 Top-1；出現在 Top-3 只記錄不判失敗。",
+    "floatingToleranceSeconds": 0.001
+  },
+  "thresholds": {
+    "recallAt3Overall": {
+      "required": 18,
+      "of": 24,
+      "rule": "Recall@3 ≥ 18/24"
+    },
+    "recallAt3PerTrack": {
+      "required": 9,
+      "of": 12,
+      "visual": "視覺 ≥ 9/12",
+      "audio": "音軌 ≥ 9/12"
+    },
+    "negativeControls": {
+      "rule": "4 個負對照 fixture 任一成為 24 題 Top-1 即失敗",
+      "maxTop1": 0
+    },
+    "passPolicy": "只依上述固定門檻判定；不得看結果後改題、改標註或放寬門檻。"
+  },
+  "files": {
+    "quality": [
+      {
+        "id": "v01",
+        "file": "v01.mp4",
+        "sha256": "11ff9ea4e75d39e9f797e715043d3fd924305998299ffea8ac7e64f00015a313",
+        "sizeBytes": 3336268,
+        "durationSeconds": 36,
+        "role": "quality"
+      },
+      {
+        "id": "v02",
+        "file": "v02.mp4",
+        "sha256": "e573bf4da261997387a8a492e1a594a6068ab60b7621379f68cb8da3c50d30b5",
+        "sizeBytes": 2025797,
+        "durationSeconds": 32,
+        "role": "quality"
+      },
+      {
+        "id": "v03",
+        "file": "v03.mp4",
+        "sha256": "d1fbf72be07118b6059e0fe10123760ac19a76d7937a33f433861e1fd9a5a500",
+        "sizeBytes": 2750990,
+        "durationSeconds": 28,
+        "role": "quality"
+      },
+      {
+        "id": "v04",
+        "file": "v04.mp4",
+        "sha256": "7e8b384957ac5a9d1025a3fce82962f12c1e41a2fbb9d4bd55a19aaf048ae2d5",
+        "sizeBytes": 2458751,
+        "durationSeconds": 34,
+        "role": "quality"
+      },
+      {
+        "id": "v05",
+        "file": "v05.mp4",
+        "sha256": "d966c1e7d90021522fdb631e10d4f6b4ba684515c5913b399a04886d07b97429",
+        "sizeBytes": 1777229,
+        "durationSeconds": 30,
+        "role": "quality"
+      },
+      {
+        "id": "v06",
+        "file": "v06.mp4",
+        "sha256": "486f09d2f04c7912047fd41ba076241d3e8118a3fb5c45f04004695880482a67",
+        "sizeBytes": 1988395,
+        "durationSeconds": 26,
+        "role": "quality"
+      }
+    ],
+    "negative": [
+      {
+        "id": "n01",
+        "file": "n01.mp4",
+        "sha256": "59a249d71758c8844f54afb9e8dc5a418946ab228af1cde0df76803f52a60a2c",
+        "sizeBytes": 28627,
+        "durationSeconds": 20,
+        "visualMotif": "black",
+        "audioKind": "silent",
+        "purpose": "全黑畫面＋靜音音軌",
+        "role": "negative-control"
+      },
+      {
+        "id": "n02",
+        "file": "n02.mp4",
+        "sha256": "0c3c3bed70468047dc4536e3b5327af43b72782260536e577af5cae7163600bf",
+        "sizeBytes": 16104,
+        "durationSeconds": 20,
+        "visualMotif": "gray-flat",
+        "audioKind": "none",
+        "purpose": "全灰靜止＋無音軌",
+        "role": "negative-control"
+      },
+      {
+        "id": "n03",
+        "file": "n03.mp4",
+        "sha256": "ab571a8d080d946e747047540d33490f1af5d4ed9d12c740b8de7317545120a4",
+        "sizeBytes": 344307,
+        "durationSeconds": 20,
+        "visualMotif": "black",
+        "audioKind": "tone440",
+        "purpose": "全黑畫面＋440 Hz 純音",
+        "role": "negative-control"
+      },
+      {
+        "id": "n04",
+        "file": "n04.mp4",
+        "sha256": "57155126b2d6da71d439a86dc202975a661c62a3a85b497233514f4e74fbbd21",
+        "sizeBytes": 321949,
+        "durationSeconds": 20,
+        "visualMotif": "slow-gradient",
+        "audioKind": "silent",
+        "purpose": "極緩慢灰階漸層（無事件）＋靜音",
+        "role": "negative-control"
+      }
+    ],
+    "security": [
+      {
+        "id": "sec01-noaudio",
+        "file": "sec01-noaudio.mp4",
+        "sha256": "7d5fac5dc2f4110182a02e35b171c72bf0eeb4fe97141b5c9cc71f503b4acbbd",
+        "sizeBytes": 92818,
+        "tags": [
+          "no-audio-track"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "視覺索引成功；audio 模態開啟時也不得因『無音軌』失敗或跳過"
+        },
+        "assertions": [
+          "probe 顯示只有 video stream",
+          "視覺片段數與時長覆蓋相符",
+          "音軌索引為空但不報錯"
+        ]
+      },
+      {
+        "id": "sec02-ac3",
+        "file": "sec02-ac3.mp4",
+        "sha256": "fa97b95e88731836c731a04400de71b05a702d95acd32a940811f1d87bad02b5",
+        "sizeBytes": 384190,
+        "tags": [
+          "unsupported-audio-codec"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "skip",
+          "code": "unsupported-video-audio-track",
+          "detail": "audio 開啟時整檔具名跳過，不做部分成功；只開 video 時可視覺成功（需另測）"
+        },
+        "assertions": [
+          "不做任何片段寫入",
+          "skip 原因具名且可對帳",
+          "不得只寫視覺片段卻標成整檔成功"
+        ]
+      },
+      {
+        "id": "sec03-dts",
+        "file": "sec03-dts.mp4",
+        "sha256": "70d9e40de89fa0685e7716ac03c0b7f96caafc33c5afb4f8f545f4beb17f71cb",
+        "sizeBytes": 1249687,
+        "tags": [
+          "unsupported-audio-codec"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "skip",
+          "code": "unsupported-video-audio-track",
+          "detail": "同 AC-3：audio 開啟時整檔具名跳過"
+        },
+        "assertions": [
+          "不做任何片段寫入",
+          "skip 原因具名且可對帳"
+        ]
+      },
+      {
+        "id": "sec04-moov-end",
+        "file": "sec04-moov-end.mp4",
+        "sha256": "80abdce0c298afb230fe310fc46434df6daa2e78b952ec3f1a3ecc12568fa17b",
+        "sizeBytes": 212451,
+        "tags": [
+          "moov-at-end"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "成功；必須讀到檔尾 moov 才能 probe／抽幀"
+        },
+        "assertions": [
+          "probe 時長與串流正確",
+          "可抽幀與解音軌",
+          "不需把整個 mdat 讀進記憶體"
+        ]
+      },
+      {
+        "id": "sec05-vfr",
+        "file": "sec05-vfr.mp4",
+        "sha256": "063aacb0fe078d5980f22290a57c6bcf973d643215f64894c9937f4b598b85aa",
+        "sizeBytes": 174289,
+        "tags": [
+          "vfr"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "成功；時間軸用實際 sample timestamps，不得以平均 FPS 虛構片段時間"
+        },
+        "assertions": [
+          "r_frame_rate != avg_frame_rate",
+          "片段起訖落在來源時間軸",
+          "命中時間可回推原片位置"
+        ]
+      },
+      {
+        "id": "sec06-rotate90",
+        "file": "sec06-rotate90.mp4",
+        "sha256": "53e9a23dbc650bc5da06beb14c50a0cef6cbe0145300aa4eced25c1d9dd619f7",
+        "sizeBytes": 212451,
+        "tags": [
+          "rotation"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "成功；解碼後依旋轉呈現（640x360 -> 360x640），縮放前套用"
+        },
+        "assertions": [
+          "probe 顯示 rotation=90",
+          "輸出幀方向正確且保留比例"
+        ]
+      },
+      {
+        "id": "sec07-nonzero-pts",
+        "file": "sec07-nonzero-pts.mp4",
+        "sha256": "409a89dc509514fe83a0eeaecfa1a61c0b9cdff1884a25111d7c9905b82fb87f",
+        "sizeBytes": 212475,
+        "tags": [
+          "nonzero-pts"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "成功；時間軸正規化到 0，片段時間仍對應來源內容順序"
+        },
+        "assertions": [
+          "probe start_time ≈ 10",
+          "首片段起點對應來源 0 秒內容"
+        ]
+      },
+      {
+        "id": "sec08-editlist",
+        "file": "sec08-editlist.mp4",
+        "sha256": "a66a54aeaef2b5057e9ef7a88f0b161c9faf6161d04fada318186623f349530b",
+        "sizeBytes": 179488,
+        "tags": [
+          "edit-list"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "成功；依 edit list 有效時間軸，不把編輯前 preroll 當成來源時間"
+        },
+        "assertions": [
+          "probe 時長 ≈ 10 秒",
+          "片段時間不含被編輯掉的前 2 秒"
+        ]
+      },
+      {
+        "id": "sec09-external-dref",
+        "file": "sec09-external-dref.mp4",
+        "sha256": "984ca4aadedb05188e7d92dc6cb698bfc1613f66979ba62a8acdb98973ec7c78",
+        "sizeBytes": 212541,
+        "tags": [
+          "external-data-reference",
+          "ssrf"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "實測 FFmpeg n9.0.2 mov demuxer 不解析 dref 外部 URL（debug log「Unknown dref type …」）而用本地 mdat 安全解碼；驗收斷言是『解碼期間零網路請求、零外部檔案讀取』。若日後 wrapper／decoder 會解析外部 dref，必須改為具名拒絕（invalid-video）。"
+        },
+        "assertions": [
+          "沒有 DNS／TCP 連線",
+          "沒有讀取 root 外檔案",
+          "不 crash；錯誤訊息不洩漏環境資訊"
+        ]
+      },
+      {
+        "id": "sec10-text-as-mp4",
+        "file": "sec10-text-as-mp4.mp4",
+        "sha256": "88978c98364f82364db345c5f7e4f2e521a025aae0ab3c9d477213bdb0a1a3b2",
+        "sizeBytes": 1260,
+        "tags": [
+          "fake-extension"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "fail",
+          "code": "invalid-video",
+          "detail": "具名失敗；不得把文字當媒體、不得 crash"
+        },
+        "assertions": [
+          "probe 失敗並具名",
+          "檔案不進入索引"
+        ]
+      },
+      {
+        "id": "sec11-mp4-as-txt",
+        "file": "sec11-mp4-as-txt.txt",
+        "sha256": "80abdce0c298afb230fe310fc46434df6daa2e78b952ec3f1a3ecc12568fa17b",
+        "sizeBytes": 212451,
+        "tags": [
+          "fake-extension"
+        ],
+        "expected": {
+          "stage": "scan",
+          "outcome": "skip",
+          "code": "binary-content",
+          "detail": "掃描／內容判定後具名跳過；不得把 MP4 bytes 當文字索引（若改以內容嗅探判定，須具名且不得送文字模型）"
+        },
+        "assertions": [
+          "不呼叫文字 embedder",
+          "skip 原因具名"
+        ]
+      },
+      {
+        "id": "sec12-webm-as-mp4",
+        "file": "sec12-webm-as-mp4.mp4",
+        "sha256": "3d0131799e0222f31f95cb68b8aa2b2649ea42ff433cc0890489aa5d7b66bc00",
+        "sizeBytes": 50319,
+        "tags": [
+          "fake-extension",
+          "unsupported-container"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "fail",
+          "code": "unsupported-video-container",
+          "detail": "副檔名不得作為支援依據；具名失敗，不得誤標成功"
+        },
+        "assertions": [
+          "probe／demux 具名拒絕",
+          "錯誤碼可與『壞檔』區分"
+        ]
+      },
+      {
+        "id": "sec13-zero-bytes",
+        "file": "sec13-zero-bytes.mp4",
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "sizeBytes": 0,
+        "tags": [
+          "zero-byte"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "fail",
+          "code": "invalid-video",
+          "detail": "具名失敗；不得 crash、不得卡住 probe deadline"
+        },
+        "assertions": [
+          "probe 快速失敗",
+          "失敗原因具名"
+        ]
+      },
+      {
+        "id": "sec14-truncated-no-moov",
+        "file": "sec14-truncated-no-moov.mp4",
+        "sha256": "3e0271eff03a8afa4dddaeacd23cb4771c6afc4ab34d7f66ebf137a9e7bd45b6",
+        "sizeBytes": 84980,
+        "tags": [
+          "truncated"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "fail",
+          "code": "invalid-video",
+          "detail": "具名失敗；不得把可解碼前段當成整檔成功"
+        },
+        "assertions": [
+          "probe 失敗並具名",
+          "不寫任何片段"
+        ]
+      },
+      {
+        "id": "sec15-truncated-mdat",
+        "file": "sec15-truncated-mdat.mp4",
+        "sha256": "16d74c7491c7dc3a33fe02880f4ae336b8755beaa12012f01113b766dbfc3b1c",
+        "sizeBytes": 127470,
+        "tags": [
+          "truncated"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "fail",
+          "code": "invalid-video",
+          "detail": "整檔具名失敗；不得發布部分片段索引（每檔全部片段成功才替換）"
+        },
+        "assertions": [
+          "初建不留下半檔 chunk／向量",
+          "錯誤可重試且可對帳"
+        ]
+      },
+      {
+        "id": "sec16-corrupt-moov",
+        "file": "sec16-corrupt-moov.mp4",
+        "sha256": "bc8697f7bc810810c3f6cd2f2a0c4d8c31c4472155c9c7e74d5f0b3d543a69c0",
+        "sizeBytes": 212451,
+        "tags": [
+          "corrupt"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "fail",
+          "code": "invalid-video",
+          "detail": "具名失敗；不得 crash 或無限迴圈"
+        },
+        "assertions": [
+          "probe 失敗並具名",
+          "程序不殘留、不逾時"
+        ]
+      },
+      {
+        "id": "sec17-oversize-bytes",
+        "file": "sec17-oversize-bytes.mp4",
+        "sha256": "247593f09d7332afc1b2467bebceda28b0ee1ce01ea39d02f58c384573068a2e",
+        "sizeBytes": 537919489,
+        "tags": [
+          "oversize"
+        ],
+        "expected": {
+          "stage": "scan",
+          "outcome": "skip",
+          "code": "too-large",
+          "detail": "掃描階段具名跳過；不得先讀內容或 probe 才判定"
+        },
+        "assertions": [
+          "scanSkippedFiles 具名",
+          "不開啟檔案內容"
+        ]
+      },
+      {
+        "id": "sec18-duration-601s",
+        "file": "sec18-duration-601s.mp4",
+        "sha256": "5049a1aafe2ead0815a8a96d47d7ec1035df15610448aac3c12a07444dea563a",
+        "sizeBytes": 1511489,
+        "tags": [
+          "oversize",
+          "duration-limit"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "skip",
+          "code": "video-duration-exceeded",
+          "detail": "probe 取得時長後具名跳過；不得解碼全部片段"
+        },
+        "assertions": [
+          "skip 原因具名",
+          "未進行大量解碼（時間／記憶體有界）"
+        ]
+      },
+      {
+        "id": "sec19-overres-1440p",
+        "file": "sec19-overres-1440p.mp4",
+        "sha256": "11ea9e4070e3f812146b88c789db78f3e67e83d9fd399aaef820f890b255753c",
+        "sizeBytes": 33931,
+        "tags": [
+          "oversize",
+          "resolution-limit"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "skip",
+          "code": "video-resolution-exceeded",
+          "detail": "在配置巨大畫面／解碼前具名跳過；不得先解碼再檢查"
+        },
+        "assertions": [
+          "skip 原因具名",
+          "峰值配置有界"
+        ]
+      },
+      {
+        "id": "sec20-mixed-audio",
+        "file": "sec20-mixed-audio.mp4",
+        "sha256": "d06a48897e7f028fc9063bfef430ecd5dd0ed8bb4b52fe5846536fd2a3ad02b2",
+        "sizeBytes": 450476,
+        "tags": [
+          "multi-track",
+          "unsupported-audio-codec"
+        ],
+        "expected": {
+          "stage": "process",
+          "outcome": "skip",
+          "code": "unsupported-video-audio-track",
+          "detail": "audio 開啟時整檔具名跳過（v2 決策：含不支援音軌即整檔跳過）；只開 video 時視覺成功"
+        },
+        "assertions": [
+          "不做部分成功",
+          "若 PM 改採『只選第一個 AAC 音軌』須改契約與本列預期（見備註）"
+        ]
+      }
+    ]
+  },
+  "queries": [
+    {
+      "id": "V01",
+      "track": "video",
+      "modality": "video",
+      "lang": "zh",
+      "file": "v01.mp4",
+      "prompt": "深藍色星空背景上有一顆黃色圓形緩慢移動",
+      "annotatedStartSeconds": 0,
+      "annotatedEndSeconds": 8,
+      "sceneId": "v01-s1",
+      "annotationSource": "visual scene boundary"
+    },
+    {
+      "id": "V02",
+      "track": "video",
+      "modality": "video",
+      "lang": "zh",
+      "file": "v01.mp4",
+      "prompt": "影片最後出現紅色愛心形狀在深藍背景上脈動",
+      "annotatedStartSeconds": 30,
+      "annotatedEndSeconds": 36,
+      "sceneId": "v01-s5",
+      "annotationSource": "visual scene boundary"
+    },
+    {
+      "id": "V03",
+      "track": "video",
+      "modality": "video",
+      "lang": "en",
+      "file": "v02.mp4",
+      "prompt": "Yellow and black horizontal stripes scrolling across the screen",
+      "annotatedStartSeconds": 0,
+      "annotatedEndSeconds": 10,
+      "sceneId": "v02-s1",
+      "annotationSource": "visual scene boundary"
+    },
+    {
+      "id": "V04",
+      "track": "video",
+      "modality": "video",
+      "lang": "en",
+      "file": "v02.mp4",
+      "prompt": "A rainbow colored gradient slowly changing across the picture",
+      "annotatedStartSeconds": 18,
+      "annotatedEndSeconds": 26,
+      "sceneId": "v02-s3",
+      "annotationSource": "visual scene boundary"
+    },
+    {
+      "id": "V05",
+      "track": "video",
+      "modality": "video",
+      "lang": "zh",
+      "file": "v03.mp4",
+      "prompt": "奶油色背景上有多個紅色圓形不斷脈動",
+      "annotatedStartSeconds": 0,
+      "annotatedEndSeconds": 8,
+      "sceneId": "v03-s1",
+      "annotationSource": "visual scene boundary"
+    },
+    {
+      "id": "V06",
+      "track": "video",
+      "modality": "video",
+      "lang": "en",
+      "file": "v03.mp4",
+      "prompt": "Small white dots falling against a black background",
+      "annotatedStartSeconds": 8,
+      "annotatedEndSeconds": 18,
+      "sceneId": "v03-s2",
+      "annotationSource": "visual scene boundary"
+    },
+    {
+      "id": "V07",
+      "track": "video",
+      "modality": "video",
+      "lang": "zh",
+      "file": "v04.mp4",
+      "prompt": "深藍背景上有淺藍色垂直線條像下雨一樣落下",
+      "annotatedStartSeconds": 0,
+      "annotatedEndSeconds": 9,
+      "sceneId": "v04-s1",
+      "annotationSource": "visual scene boundary"
+    },
+    {
+      "id": "V08",
+      "track": "video",
+      "modality": "video",
+      "lang": "en",
+      "file": "v04.mp4",
+      "prompt": "Dark circles flashing rapidly on a white background",
+      "annotatedStartSeconds": 17,
+      "annotatedEndSeconds": 25,
+      "sceneId": "v04-s3",
+      "annotationSource": "visual scene boundary"
+    },
+    {
+      "id": "V09",
+      "track": "video",
+      "modality": "video",
+      "lang": "zh",
+      "file": "v05.mp4",
+      "prompt": "黑色背景上橘色火焰不斷閃爍",
+      "annotatedStartSeconds": 0,
+      "annotatedEndSeconds": 7,
+      "sceneId": "v05-s1",
+      "annotationSource": "visual scene boundary"
+    },
+    {
+      "id": "V10",
+      "track": "video",
+      "modality": "video",
+      "lang": "en",
+      "file": "v05.mp4",
+      "prompt": "White lightning bolt shapes flashing on a black background",
+      "annotatedStartSeconds": 23,
+      "annotatedEndSeconds": 30,
+      "sceneId": "v05-s4",
+      "annotationSource": "visual scene boundary"
+    },
+    {
+      "id": "V11",
+      "track": "video",
+      "modality": "video",
+      "lang": "en",
+      "file": "v06.mp4",
+      "prompt": "Thick black diagonal lines sweeping across a white background",
+      "annotatedStartSeconds": 0,
+      "annotatedEndSeconds": 8,
+      "sceneId": "v06-s1",
+      "annotationSource": "visual scene boundary"
+    },
+    {
+      "id": "V12",
+      "track": "video",
+      "modality": "video",
+      "lang": "zh",
+      "file": "v06.mp4",
+      "prompt": "紅色和藍色方塊交替閃爍",
+      "annotatedStartSeconds": 16,
+      "annotatedEndSeconds": 26,
+      "sceneId": "v06-s3",
+      "annotationSource": "visual scene boundary"
+    },
+    {
+      "id": "A01",
+      "track": "audio",
+      "modality": "audio",
+      "lang": "zh",
+      "file": "v01.mp4",
+      "prompt": "持續下雨的沙沙聲",
+      "annotatedStartSeconds": 0.5,
+      "annotatedEndSeconds": 9.5,
+      "eventId": "v01-a1",
+      "eventKind": "env",
+      "env": "rain",
+      "annotationSource": "env event window"
+    },
+    {
+      "id": "A02",
+      "track": "audio",
+      "modality": "audio",
+      "lang": "zh",
+      "file": "v01.mp4",
+      "prompt": "番茄炒蛋的烹飪做法，最後加鹽調味",
+      "annotatedStartSeconds": 12.376,
+      "annotatedEndSeconds": 17.224,
+      "eventId": "v01-a2",
+      "eventKind": "speech",
+      "tts": "t01",
+      "annotationSource": "measured TTS placement"
+    },
+    {
+      "id": "A03",
+      "track": "audio",
+      "modality": "audio",
+      "lang": "en",
+      "file": "v02.mp4",
+      "prompt": "A train arriving at the station, passengers waiting behind the yellow line",
+      "annotatedStartSeconds": 12.277,
+      "annotatedEndSeconds": 17.323,
+      "eventId": "v02-a2",
+      "eventKind": "speech",
+      "tts": "t02",
+      "annotationSource": "measured TTS placement"
+    },
+    {
+      "id": "A04",
+      "track": "audio",
+      "modality": "audio",
+      "lang": "en",
+      "file": "v02.mp4",
+      "prompt": "An interview scheduled next Tuesday at the downtown office",
+      "annotatedStartSeconds": 22.603,
+      "annotatedEndSeconds": 26.998,
+      "eventId": "v02-a3",
+      "eventKind": "speech",
+      "tts": "t05",
+      "annotationSource": "measured TTS placement"
+    },
+    {
+      "id": "A05",
+      "track": "audio",
+      "modality": "audio",
+      "lang": "zh",
+      "file": "v03.mp4",
+      "prompt": "明天早上九點開設計審查會議，記得帶圖紙",
+      "annotatedStartSeconds": 2.235,
+      "annotatedEndSeconds": 7.364,
+      "eventId": "v03-a1",
+      "eventKind": "speech",
+      "tts": "t03",
+      "annotationSource": "measured TTS placement"
+    },
+    {
+      "id": "A06",
+      "track": "audio",
+      "modality": "audio",
+      "lang": "en",
+      "file": "v03.mp4",
+      "prompt": "Someone knocking repeatedly on a wooden door",
+      "annotatedStartSeconds": 20.5,
+      "annotatedEndSeconds": 27.5,
+      "eventId": "v03-a3",
+      "eventKind": "env",
+      "env": "knock",
+      "annotationSource": "env event window"
+    },
+    {
+      "id": "A07",
+      "track": "audio",
+      "modality": "audio",
+      "lang": "zh",
+      "file": "v04.mp4",
+      "prompt": "海浪拍打的聲音",
+      "annotatedStartSeconds": 0.5,
+      "annotatedEndSeconds": 9.5,
+      "eventId": "v04-a1",
+      "eventKind": "env",
+      "env": "waves",
+      "annotationSource": "env event window"
+    },
+    {
+      "id": "A08",
+      "track": "audio",
+      "modality": "audio",
+      "lang": "en",
+      "file": "v04.mp4",
+      "prompt": "A quiet library in the afternoon",
+      "annotatedStartSeconds": 23.278,
+      "annotatedEndSeconds": 26.323,
+      "eventId": "v04-a3",
+      "eventKind": "speech",
+      "tts": "t06",
+      "annotationSource": "measured TTS placement"
+    },
+    {
+      "id": "A09",
+      "track": "audio",
+      "modality": "audio",
+      "lang": "en",
+      "file": "v05.mp4",
+      "prompt": "A concert starting at eight in the evening",
+      "annotatedStartSeconds": 3.35,
+      "annotatedEndSeconds": 6.25,
+      "eventId": "v05-a1",
+      "eventKind": "speech",
+      "tts": "t07",
+      "annotationSource": "measured TTS placement"
+    },
+    {
+      "id": "A10",
+      "track": "audio",
+      "modality": "audio",
+      "lang": "zh",
+      "file": "v05.mp4",
+      "prompt": "市場早上六點開始營業，非常熱鬧",
+      "annotatedStartSeconds": 22.693,
+      "annotatedEndSeconds": 26.907,
+      "eventId": "v05-a4",
+      "eventKind": "speech",
+      "tts": "t04",
+      "annotationSource": "measured TTS placement"
+    },
+    {
+      "id": "A11",
+      "track": "audio",
+      "modality": "audio",
+      "lang": "en",
+      "file": "v06.mp4",
+      "prompt": "A bakery selling fresh bread every morning",
+      "annotatedStartSeconds": 3.198,
+      "annotatedEndSeconds": 6.403,
+      "eventId": "v06-a1",
+      "eventKind": "speech",
+      "tts": "t08",
+      "annotationSource": "measured TTS placement"
+    },
+    {
+      "id": "A12",
+      "track": "audio",
+      "modality": "audio",
+      "lang": "zh",
+      "file": "v06.mp4",
+      "prompt": "鳥鳴聲",
+      "annotatedStartSeconds": 20.5,
+      "annotatedEndSeconds": 25.5,
+      "eventId": "v06-a3",
+      "eventKind": "env",
+      "env": "birds",
+      "annotationSource": "env event window"
+    }
+  ],
+  "negativeControls": [
+    {
+      "id": "n01",
+      "file": "n01.mp4",
+      "sha256": "59a249d71758c8844f54afb9e8dc5a418946ab228af1cde0df76803f52a60a2c",
+      "durationSeconds": 20,
+      "visualMotif": "black",
+      "audioKind": "silent",
+      "purpose": "全黑畫面＋靜音音軌",
+      "assertion": "24 題任何一題的 Top-1 不得為此檔"
+    },
+    {
+      "id": "n02",
+      "file": "n02.mp4",
+      "sha256": "0c3c3bed70468047dc4536e3b5327af43b72782260536e577af5cae7163600bf",
+      "durationSeconds": 20,
+      "visualMotif": "gray-flat",
+      "audioKind": "none",
+      "purpose": "全灰靜止＋無音軌",
+      "assertion": "24 題任何一題的 Top-1 不得為此檔"
+    },
+    {
+      "id": "n03",
+      "file": "n03.mp4",
+      "sha256": "ab571a8d080d946e747047540d33490f1af5d4ed9d12c740b8de7317545120a4",
+      "durationSeconds": 20,
+      "visualMotif": "black",
+      "audioKind": "tone440",
+      "purpose": "全黑畫面＋440 Hz 純音",
+      "assertion": "24 題任何一題的 Top-1 不得為此檔"
+    },
+    {
+      "id": "n04",
+      "file": "n04.mp4",
+      "sha256": "57155126b2d6da71d439a86dc202975a661c62a3a85b497233514f4e74fbbd21",
+      "durationSeconds": 20,
+      "visualMotif": "slow-gradient",
+      "audioKind": "silent",
+      "purpose": "極緩慢灰階漸層（無事件）＋靜音",
+      "assertion": "24 題任何一題的 Top-1 不得為此檔"
+    }
+  ],
+  "securityMatrix": {
+    "path": ".tmp/video-a/corpus/labels/security-matrix.json",
+    "sha256": "15cad0d4cd26d1f5f3fd4623d578e6f64740cd9babcd0d9460a0480c0e33b427",
+    "expectedVocabulary": {
+      "outcome": {
+        "success": "整檔成功（依模態組合做應做的索引）",
+        "skip": "具名跳過（scanSkippedFiles 或 skippedFiles，不寫片段）",
+        "fail": "具名失敗（failedFiles／可重試錯誤；不寫片段、不 crash）"
+      },
+      "stage": {
+        "scan": "掃描階段即可判定（不讀內容）",
+        "process": "處理階段（probe／decode 後）判定"
+      },
+      "codeNote": "錯誤碼為 A2 提案；B 階段契約必須凍結正式名稱並加契約測試。code=null 表示成功不帶錯誤。"
+    },
+    "fixtures": [
+      {
+        "id": "sec01-noaudio",
+        "file": "sec01-noaudio.mp4",
+        "purpose": "無音軌的 H.264 MP4",
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "視覺索引成功；audio 模態開啟時也不得因『無音軌』失敗或跳過"
+        },
+        "assertions": [
+          "probe 顯示只有 video stream",
+          "視覺片段數與時長覆蓋相符",
+          "音軌索引為空但不報錯"
+        ],
+        "sha256": "7d5fac5dc2f4110182a02e35b171c72bf0eeb4fe97141b5c9cc71f503b4acbbd"
+      },
+      {
+        "id": "sec02-ac3",
+        "file": "sec02-ac3.mp4",
+        "purpose": "H.264 + AC-3（不支援音軌）",
+        "expected": {
+          "stage": "process",
+          "outcome": "skip",
+          "code": "unsupported-video-audio-track",
+          "detail": "audio 開啟時整檔具名跳過，不做部分成功；只開 video 時可視覺成功（需另測）"
+        },
+        "assertions": [
+          "不做任何片段寫入",
+          "skip 原因具名且可對帳",
+          "不得只寫視覺片段卻標成整檔成功"
+        ],
+        "sha256": "fa97b95e88731836c731a04400de71b05a702d95acd32a940811f1d87bad02b5"
+      },
+      {
+        "id": "sec03-dts",
+        "file": "sec03-dts.mp4",
+        "purpose": "H.264 + DTS（不支援音軌；實驗性 dca 編碼器產生）",
+        "expected": {
+          "stage": "process",
+          "outcome": "skip",
+          "code": "unsupported-video-audio-track",
+          "detail": "同 AC-3：audio 開啟時整檔具名跳過"
+        },
+        "assertions": [
+          "不做任何片段寫入",
+          "skip 原因具名且可對帳"
+        ],
+        "sha256": "70d9e40de89fa0685e7716ac03c0b7f96caafc33c5afb4f8f545f4beb17f71cb"
+      },
+      {
+        "id": "sec04-moov-end",
+        "file": "sec04-moov-end.mp4",
+        "purpose": "moov 位於 mdat 之後（faststart 關閉）",
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "成功；必須讀到檔尾 moov 才能 probe／抽幀"
+        },
+        "assertions": [
+          "probe 時長與串流正確",
+          "可抽幀與解音軌",
+          "不需把整個 mdat 讀進記憶體"
+        ],
+        "sha256": "80abdce0c298afb230fe310fc46434df6daa2e78b952ec3f1a3ecc12568fa17b"
+      },
+      {
+        "id": "sec05-vfr",
+        "file": "sec05-vfr.mp4",
+        "purpose": "可變幀率（非均勻 frame duration）",
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "成功；時間軸用實際 sample timestamps，不得以平均 FPS 虛構片段時間"
+        },
+        "assertions": [
+          "r_frame_rate != avg_frame_rate",
+          "片段起訖落在來源時間軸",
+          "命中時間可回推原片位置"
+        ],
+        "sha256": "063aacb0fe078d5980f22290a57c6bcf973d643215f64894c9937f4b598b85aa"
+      },
+      {
+        "id": "sec06-rotate90",
+        "file": "sec06-rotate90.mp4",
+        "purpose": "Display Matrix 旋轉 90 度",
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "成功；解碼後依旋轉呈現（640x360 -> 360x640），縮放前套用"
+        },
+        "assertions": [
+          "probe 顯示 rotation=90",
+          "輸出幀方向正確且保留比例"
+        ],
+        "sha256": "53e9a23dbc650bc5da06beb14c50a0cef6cbe0145300aa4eced25c1d9dd619f7"
+      },
+      {
+        "id": "sec07-nonzero-pts",
+        "file": "sec07-nonzero-pts.mp4",
+        "purpose": "第一個視訊 PTS 為 10 秒（非零起始時間）",
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "成功；時間軸正規化到 0，片段時間仍對應來源內容順序"
+        },
+        "assertions": [
+          "probe start_time ≈ 10",
+          "首片段起點對應來源 0 秒內容"
+        ],
+        "sha256": "409a89dc509514fe83a0eeaecfa1a61c0b9cdff1884a25111d7c9905b82fb87f"
+      },
+      {
+        "id": "sec08-editlist",
+        "file": "sec08-editlist.mp4",
+        "purpose": "含 edit list（-ss 2 截取後 remux）",
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "成功；依 edit list 有效時間軸，不把編輯前 preroll 當成來源時間"
+        },
+        "assertions": [
+          "probe 時長 ≈ 10 秒",
+          "片段時間不含被編輯掉的前 2 秒"
+        ],
+        "sha256": "a66a54aeaef2b5057e9ef7a88f0b161c9faf6161d04fada318186623f349530b"
+      },
+      {
+        "id": "sec09-external-dref",
+        "file": "sec09-external-dref.mp4",
+        "purpose": "所有 trak 的 dref/url 都改成外部 URL 的 MP4（container 結構仍可解析）",
+        "expected": {
+          "stage": "process",
+          "outcome": "success",
+          "code": null,
+          "detail": "實測 FFmpeg n9.0.2 mov demuxer 不解析 dref 外部 URL（debug log「Unknown dref type …」）而用本地 mdat 安全解碼；驗收斷言是『解碼期間零網路請求、零外部檔案讀取』。若日後 wrapper／decoder 會解析外部 dref，必須改為具名拒絕（invalid-video）。"
+        },
+        "assertions": [
+          "沒有 DNS／TCP 連線",
+          "沒有讀取 root 外檔案",
+          "不 crash；錯誤訊息不洩漏環境資訊"
+        ],
+        "sha256": "984ca4aadedb05188e7d92dc6cb698bfc1613f66979ba62a8acdb98973ec7c78"
+      },
+      {
+        "id": "sec10-text-as-mp4",
+        "file": "sec10-text-as-mp4.mp4",
+        "purpose": "純文字內容偽裝成 .mp4",
+        "expected": {
+          "stage": "process",
+          "outcome": "fail",
+          "code": "invalid-video",
+          "detail": "具名失敗；不得把文字當媒體、不得 crash"
+        },
+        "assertions": [
+          "probe 失敗並具名",
+          "檔案不進入索引"
+        ],
+        "sha256": "88978c98364f82364db345c5f7e4f2e521a025aae0ab3c9d477213bdb0a1a3b2"
+      },
+      {
+        "id": "sec11-mp4-as-txt",
+        "file": "sec11-mp4-as-txt.txt",
+        "purpose": "有效 MP4 偽裝成 .txt",
+        "expected": {
+          "stage": "scan",
+          "outcome": "skip",
+          "code": "binary-content",
+          "detail": "掃描／內容判定後具名跳過；不得把 MP4 bytes 當文字索引（若改以內容嗅探判定，須具名且不得送文字模型）"
+        },
+        "assertions": [
+          "不呼叫文字 embedder",
+          "skip 原因具名"
+        ],
+        "sha256": "80abdce0c298afb230fe310fc46434df6daa2e78b952ec3f1a3ecc12568fa17b"
+      },
+      {
+        "id": "sec12-webm-as-mp4",
+        "file": "sec12-webm-as-mp4.mp4",
+        "purpose": "WebM（VP9/Opus）內容偽裝成 .mp4",
+        "expected": {
+          "stage": "process",
+          "outcome": "fail",
+          "code": "unsupported-video-container",
+          "detail": "副檔名不得作為支援依據；具名失敗，不得誤標成功"
+        },
+        "assertions": [
+          "probe／demux 具名拒絕",
+          "錯誤碼可與『壞檔』區分"
+        ],
+        "sha256": "3d0131799e0222f31f95cb68b8aa2b2649ea42ff433cc0890489aa5d7b66bc00"
+      },
+      {
+        "id": "sec13-zero-bytes",
+        "file": "sec13-zero-bytes.mp4",
+        "purpose": "0 byte 檔案",
+        "expected": {
+          "stage": "process",
+          "outcome": "fail",
+          "code": "invalid-video",
+          "detail": "具名失敗；不得 crash、不得卡住 probe deadline"
+        },
+        "assertions": [
+          "probe 快速失敗",
+          "失敗原因具名"
+        ],
+        "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "id": "sec14-truncated-no-moov",
+        "file": "sec14-truncated-no-moov.mp4",
+        "purpose": "moov-at-end 檔截斷到 40%（moov 完全缺失）",
+        "expected": {
+          "stage": "process",
+          "outcome": "fail",
+          "code": "invalid-video",
+          "detail": "具名失敗；不得把可解碼前段當成整檔成功"
+        },
+        "assertions": [
+          "probe 失敗並具名",
+          "不寫任何片段"
+        ],
+        "sha256": "3e0271eff03a8afa4dddaeacd23cb4771c6afc4ab34d7f66ebf137a9e7bd45b6"
+      },
+      {
+        "id": "sec15-truncated-mdat",
+        "file": "sec15-truncated-mdat.mp4",
+        "purpose": "moov 完整但 mdat 截斷（可 probe、解碼到一半失敗）",
+        "expected": {
+          "stage": "process",
+          "outcome": "fail",
+          "code": "invalid-video",
+          "detail": "整檔具名失敗；不得發布部分片段索引（每檔全部片段成功才替換）"
+        },
+        "assertions": [
+          "初建不留下半檔 chunk／向量",
+          "錯誤可重試且可對帳"
+        ],
+        "sha256": "16d74c7491c7dc3a33fe02880f4ae336b8755beaa12012f01113b766dbfc3b1c"
+      },
+      {
+        "id": "sec16-corrupt-moov",
+        "file": "sec16-corrupt-moov.mp4",
+        "purpose": "moov 內部位元組損壞",
+        "expected": {
+          "stage": "process",
+          "outcome": "fail",
+          "code": "invalid-video",
+          "detail": "具名失敗；不得 crash 或無限迴圈"
+        },
+        "assertions": [
+          "probe 失敗並具名",
+          "程序不殘留、不逾時"
+        ],
+        "sha256": "bc8697f7bc810810c3f6cd2f2a0c4d8c31c4472155c9c7e74d5f0b3d543a69c0"
+      },
+      {
+        "id": "sec17-oversize-bytes",
+        "file": "sec17-oversize-bytes.mp4",
+        "purpose": "邏輯大小 513 MiB（> 512 MiB 上限；sparse 檔，不實際佔滿磁碟）",
+        "expected": {
+          "stage": "scan",
+          "outcome": "skip",
+          "code": "too-large",
+          "detail": "掃描階段具名跳過；不得先讀內容或 probe 才判定"
+        },
+        "assertions": [
+          "scanSkippedFiles 具名",
+          "不開啟檔案內容"
+        ],
+        "sha256": "247593f09d7332afc1b2467bebceda28b0ee1ce01ea39d02f58c384573068a2e"
+      },
+      {
+        "id": "sec18-duration-601s",
+        "file": "sec18-duration-601s.mp4",
+        "purpose": "時長 601 秒（> 600 秒上限；160x90／4fps 小檔）",
+        "expected": {
+          "stage": "process",
+          "outcome": "skip",
+          "code": "video-duration-exceeded",
+          "detail": "probe 取得時長後具名跳過；不得解碼全部片段"
+        },
+        "assertions": [
+          "skip 原因具名",
+          "未進行大量解碼（時間／記憶體有界）"
+        ],
+        "sha256": "5049a1aafe2ead0815a8a96d47d7ec1035df15610448aac3c12a07444dea563a"
+      },
+      {
+        "id": "sec19-overres-1440p",
+        "file": "sec19-overres-1440p.mp4",
+        "purpose": "2560x1440（> 1920x1080 等價上限）",
+        "expected": {
+          "stage": "process",
+          "outcome": "skip",
+          "code": "video-resolution-exceeded",
+          "detail": "在配置巨大畫面／解碼前具名跳過；不得先解碼再檢查"
+        },
+        "assertions": [
+          "skip 原因具名",
+          "峰值配置有界"
+        ],
+        "sha256": "11ea9e4070e3f812146b88c789db78f3e67e83d9fd399aaef820f890b255753c"
+      },
+      {
+        "id": "sec20-mixed-audio",
+        "file": "sec20-mixed-audio.mp4",
+        "purpose": "兩個音軌：track1 AAC default、track2 AC-3",
+        "expected": {
+          "stage": "process",
+          "outcome": "skip",
+          "code": "unsupported-video-audio-track",
+          "detail": "audio 開啟時整檔具名跳過（v2 決策：含不支援音軌即整檔跳過）；只開 video 時視覺成功"
+        },
+        "assertions": [
+          "不做部分成功",
+          "若 PM 改採『只選第一個 AAC 音軌』須改契約與本列預期（見備註）"
+        ],
+        "sha256": "d06a48897e7f028fc9063bfef430ecd5dd0ed8bb4b52fe5846536fd2a3ad02b2"
+      }
+    ],
+    "note": "錯誤碼為 A2 提案，B 階段必須凍結正式名稱並加契約測試；實測 observation 見 reports/security-fixtures.json。"
+  },
+  "generationReports": {
+    "qualityEncode": {
+      "path": "reports/quality-encode.json",
+      "sha256": "29beb869a0f5a1fa67b5f681ea3cf068a69d84d7c8415f38f731f96dc92368a1"
+    },
+    "verification": {
+      "path": "reports/verification.json",
+      "sha256": "c838faa0b0c2666e67fa7da654c36a6976125e7f62a7498a082fa9a50d853ae3"
+    },
+    "securityFixtures": {
+      "path": "reports/security-fixtures.json",
+      "sha256": "504db9f81fc4b0d4e7a4c5288dcb6f919bdc73f15ce86471d547370c08640d66"
+    }
+  },
+  "provenance": {
+    "decoderManifest": {
+      "path": ".tmp/video-a/decoder/manifest.json",
+      "candidate": {
+        "id": "btbn-ffmpeg-lgpl-n9.0.2-win64",
+        "kind": "external-binary-pinned-autobuild",
+        "releaseTag": "autobuild-2026-11-07-12-47",
+        "asset": "ffmpeg-n9.0.2-48-gd4070a14ce-win64-lgpl-9.0.zip",
+        "versionClaimed": "FFmpeg n9.0.2-48-gd4070a14ce (release/9.0 branch build)",
+        "url": "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/autobuild-2026-11-07-12-47/ffmpeg-n9.0.2-48-gd4070a14ce-win64-lgpl-9.0.zip",
+        "sizeBytes": 168879811,
+        "sha256": "7a347fb3220968b63fc7e025ed78370588726e0d0bf2bd0445d3f8f2387c36db",
+        "sha256Source": "GitHub Releases API asset.digest（下載前記錄，下載後本機重算比對）",
+        "licenseClaimed": "LGPL-2.1-or-later（BtbN 檔名 -lgpl；需以 zip 內 LICENSE 與 -buildconf 實核）",
+        "downloadStartedAt": "2026-11-08T01:00:40.024Z",
+        "why": "官方 ffmpeg.org 只提供原始碼；BtbN 是 ffmpeg.org 下載頁列出的 Windows 第三方建置來源，提供明確 -lgpl 變體與每日 autobuild（可釘選 tag + sha256）。",
+        "downloadVerified": {
+          "downloadedAt": "2026-11-08T01:02:45.641Z",
+          "localArchive": ".tmp\\video-a\\decoder\\download\\ffmpeg-n9.0.2-48-gd4070a14ce-win64-lgpl-9.0.zip",
+          "localSha256": "7a347fb3220968b63fc7e025ed78370588726e0d0bf2bd0445d3f8f2387c36db",
+          "matchesPublishedDigest": true,
+          "extractedRoot": "D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\decoder\\bin\\ffmpeg-n9.0.2-48-gd4070a14ce-win64-lgpl-9.0",
+          "binaries": {
+            "ffmpeg": {
+              "absolutePath": "D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\decoder\\bin\\ffmpeg-n9.0.2-48-gd4070a14ce-win64-lgpl-9.0\\bin\\ffmpeg.exe",
+              "bytes": 132290560,
+              "versionLine": "ffmpeg version n9.0.2-48-gd4070a14ce-20261107 Copyright (c) 2000-2026 the FFmpeg developers"
+            },
+            "ffprobe": {
+              "absolutePath": "D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\decoder\\bin\\ffmpeg-n9.0.2-48-gd4070a14ce-win64-lgpl-9.0\\bin\\ffprobe.exe",
+              "bytes": 132089856,
+              "versionLine": "ffprobe version n9.0.2-48-gd4070a14ce-20261107 Copyright (c) 2007-2026 the FFmpeg developers"
+            },
+            "ffplay": {
+              "absolutePath": "D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\decoder\\bin\\ffmpeg-n9.0.2-48-gd4070a14ce-win64-lgpl-9.0\\bin\\ffplay.exe",
+              "bytes": 135812096,
+              "note": "產品不需要，僅 zip 內附"
+            }
+          },
+          "licenseVerified": {
+            "licenseFile": "D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\decoder\\bin\\ffmpeg-n9.0.2-48-gd4070a14ce-win64-lgpl-9.0\\LICENSE.txt",
+            "licenseFileBytes": 7651,
+            "licenseText": "GNU Lesser General Public License Version 3",
+            "ffmpegL": "LGPL v3 or later",
+            "buildFlagsEvidence": "configuration: --enable-version3 --disable-libx264 --disable-libx265 --disable-libxvid ...（無 --enable-gpl／--enable-nonfree；--disable-libfdk-aac）",
+            "gplComponents": "無（libx264/libx265/libxvid/fdk-aac 皆 disable）",
+            "caveat": "static build 內含多個第三方 lib（openh264/dav1d/aom/soxr/twolame/libmp3lame/libzvbi 等，部分 LGPL/BSD）；zip 只附 LGPLv3 全文、未附第三方 notices。配送義務（source 提供、static link 可重連結、notices）未解決，須 PM 決定。"
+          },
+          "usefulFactsForCorpus": {
+            "h264Encoder": "libopenh264（-c:v libopenh264 -pix_fmt yuv420p）或 h264_mf（MediaFoundation）",
+            "aacEncoder": "native aac（-c:a aac）",
+            "noGplEncoder": "此 build 沒有 libx264；不可用 -c:v libx264",
+            "ffprobeJson": "ffprobe -v error -print_format json -show_streams -show_format <file>",
+            "note": "ffmpeg/ffprobe 為 static exe，無需 DLL；呼叫端建議絕對路徑、無 shell、參數陣列。"
+          }
+        }
+      }
+    },
+    "note": "encoder 由 decoder-a 發布；本語料只記錄使用版本與 hash，不代表產品已核准該 binary。"
+  },
+  "validation": {
+    "checks": [
+      {
+        "name": "quality-hash:v01",
+        "pass": true,
+        "detail": "manifest match"
+      },
+      {
+        "name": "quality-hash:v02",
+        "pass": true,
+        "detail": "manifest match"
+      },
+      {
+        "name": "quality-hash:v03",
+        "pass": true,
+        "detail": "manifest match"
+      },
+      {
+        "name": "quality-hash:v04",
+        "pass": true,
+        "detail": "manifest match"
+      },
+      {
+        "name": "quality-hash:v05",
+        "pass": true,
+        "detail": "manifest match"
+      },
+      {
+        "name": "quality-hash:v06",
+        "pass": true,
+        "detail": "manifest match"
+      },
+      {
+        "name": "security-hash:sec01-noaudio",
+        "pass": true,
+        "detail": "7d5fac5dc2f4110182a02e35b171c72bf0eeb4fe97141b5c9cc71f503b4acbbd"
+      },
+      {
+        "name": "security-hash:sec02-ac3",
+        "pass": true,
+        "detail": "fa97b95e88731836c731a04400de71b05a702d95acd32a940811f1d87bad02b5"
+      },
+      {
+        "name": "security-hash:sec03-dts",
+        "pass": true,
+        "detail": "70d9e40de89fa0685e7716ac03c0b7f96caafc33c5afb4f8f545f4beb17f71cb"
+      },
+      {
+        "name": "security-hash:sec04-moov-end",
+        "pass": true,
+        "detail": "80abdce0c298afb230fe310fc46434df6daa2e78b952ec3f1a3ecc12568fa17b"
+      },
+      {
+        "name": "security-hash:sec05-vfr",
+        "pass": true,
+        "detail": "063aacb0fe078d5980f22290a57c6bcf973d643215f64894c9937f4b598b85aa"
+      },
+      {
+        "name": "security-hash:sec06-rotate90",
+        "pass": true,
+        "detail": "53e9a23dbc650bc5da06beb14c50a0cef6cbe0145300aa4eced25c1d9dd619f7"
+      },
+      {
+        "name": "security-hash:sec07-nonzero-pts",
+        "pass": true,
+        "detail": "409a89dc509514fe83a0eeaecfa1a61c0b9cdff1884a25111d7c9905b82fb87f"
+      },
+      {
+        "name": "security-hash:sec08-editlist",
+        "pass": true,
+        "detail": "a66a54aeaef2b5057e9ef7a88f0b161c9faf6161d04fada318186623f349530b"
+      },
+      {
+        "name": "security-hash:sec09-external-dref",
+        "pass": true,
+        "detail": "984ca4aadedb05188e7d92dc6cb698bfc1613f66979ba62a8acdb98973ec7c78"
+      },
+      {
+        "name": "security-hash:sec10-text-as-mp4",
+        "pass": true,
+        "detail": "88978c98364f82364db345c5f7e4f2e521a025aae0ab3c9d477213bdb0a1a3b2"
+      },
+      {
+        "name": "security-hash:sec11-mp4-as-txt",
+        "pass": true,
+        "detail": "80abdce0c298afb230fe310fc46434df6daa2e78b952ec3f1a3ecc12568fa17b"
+      },
+      {
+        "name": "security-hash:sec12-webm-as-mp4",
+        "pass": true,
+        "detail": "3d0131799e0222f31f95cb68b8aa2b2649ea42ff433cc0890489aa5d7b66bc00"
+      },
+      {
+        "name": "security-hash:sec13-zero-bytes",
+        "pass": true,
+        "detail": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      {
+        "name": "security-hash:sec14-truncated-no-moov",
+        "pass": true,
+        "detail": "3e0271eff03a8afa4dddaeacd23cb4771c6afc4ab34d7f66ebf137a9e7bd45b6"
+      },
+      {
+        "name": "security-hash:sec15-truncated-mdat",
+        "pass": true,
+        "detail": "16d74c7491c7dc3a33fe02880f4ae336b8755beaa12012f01113b766dbfc3b1c"
+      },
+      {
+        "name": "security-hash:sec16-corrupt-moov",
+        "pass": true,
+        "detail": "bc8697f7bc810810c3f6cd2f2a0c4d8c31c4472155c9c7e74d5f0b3d543a69c0"
+      },
+      {
+        "name": "security-hash:sec17-oversize-bytes",
+        "pass": true,
+        "detail": "247593f09d7332afc1b2467bebceda28b0ee1ce01ea39d02f58c384573068a2e"
+      },
+      {
+        "name": "security-hash:sec18-duration-601s",
+        "pass": true,
+        "detail": "5049a1aafe2ead0815a8a96d47d7ec1035df15610448aac3c12a07444dea563a"
+      },
+      {
+        "name": "security-hash:sec19-overres-1440p",
+        "pass": true,
+        "detail": "11ea9e4070e3f812146b88c789db78f3e67e83d9fd399aaef820f890b255753c"
+      },
+      {
+        "name": "security-hash:sec20-mixed-audio",
+        "pass": true,
+        "detail": "d06a48897e7f028fc9063bfef430ecd5dd0ed8bb4b52fe5846536fd2a3ad02b2"
+      },
+      {
+        "name": "visual-scene:V01",
+        "pass": true,
+        "detail": "v01-s1"
+      },
+      {
+        "name": "visual-scene:V02",
+        "pass": true,
+        "detail": "v01-s5"
+      },
+      {
+        "name": "visual-scene:V03",
+        "pass": true,
+        "detail": "v02-s1"
+      },
+      {
+        "name": "visual-scene:V04",
+        "pass": true,
+        "detail": "v02-s3"
+      },
+      {
+        "name": "visual-scene:V05",
+        "pass": true,
+        "detail": "v03-s1"
+      },
+      {
+        "name": "visual-scene:V06",
+        "pass": true,
+        "detail": "v03-s2"
+      },
+      {
+        "name": "visual-scene:V07",
+        "pass": true,
+        "detail": "v04-s1"
+      },
+      {
+        "name": "visual-scene:V08",
+        "pass": true,
+        "detail": "v04-s3"
+      },
+      {
+        "name": "visual-scene:V09",
+        "pass": true,
+        "detail": "v05-s1"
+      },
+      {
+        "name": "visual-scene:V10",
+        "pass": true,
+        "detail": "v05-s4"
+      },
+      {
+        "name": "visual-scene:V11",
+        "pass": true,
+        "detail": "v06-s1"
+      },
+      {
+        "name": "visual-scene:V12",
+        "pass": true,
+        "detail": "v06-s3"
+      },
+      {
+        "name": "audio-event:A01",
+        "pass": true,
+        "detail": "v01-a1"
+      },
+      {
+        "name": "audio-event:A02",
+        "pass": true,
+        "detail": "v01-a2"
+      },
+      {
+        "name": "audio-event:A03",
+        "pass": true,
+        "detail": "v02-a2"
+      },
+      {
+        "name": "audio-event:A04",
+        "pass": true,
+        "detail": "v02-a3"
+      },
+      {
+        "name": "audio-event:A05",
+        "pass": true,
+        "detail": "v03-a1"
+      },
+      {
+        "name": "audio-event:A06",
+        "pass": true,
+        "detail": "v03-a3"
+      },
+      {
+        "name": "audio-event:A07",
+        "pass": true,
+        "detail": "v04-a1"
+      },
+      {
+        "name": "audio-event:A08",
+        "pass": true,
+        "detail": "v04-a3"
+      },
+      {
+        "name": "audio-event:A09",
+        "pass": true,
+        "detail": "v05-a1"
+      },
+      {
+        "name": "audio-event:A10",
+        "pass": true,
+        "detail": "v05-a4"
+      },
+      {
+        "name": "audio-event:A11",
+        "pass": true,
+        "detail": "v06-a1"
+      },
+      {
+        "name": "audio-event:A12",
+        "pass": true,
+        "detail": "v06-a3"
+      },
+      {
+        "name": "query-count:total",
+        "pass": true,
+        "detail": "24"
+      },
+      {
+        "name": "query-count:visual",
+        "pass": true,
+        "detail": "12"
+      },
+      {
+        "name": "query-count:audio",
+        "pass": true,
+        "detail": "12"
+      },
+      {
+        "name": "query-lang:video",
+        "pass": true,
+        "detail": "zh=6 en=6"
+      },
+      {
+        "name": "query-lang:audio",
+        "pass": true,
+        "detail": "zh=6 en=6"
+      },
+      {
+        "name": "query-range:V01",
+        "pass": true,
+        "detail": "0-8"
+      },
+      {
+        "name": "query-file:V01",
+        "pass": true,
+        "detail": "v01.mp4"
+      },
+      {
+        "name": "query-range:V02",
+        "pass": true,
+        "detail": "30-36"
+      },
+      {
+        "name": "query-file:V02",
+        "pass": true,
+        "detail": "v01.mp4"
+      },
+      {
+        "name": "query-range:V03",
+        "pass": true,
+        "detail": "0-10"
+      },
+      {
+        "name": "query-file:V03",
+        "pass": true,
+        "detail": "v02.mp4"
+      },
+      {
+        "name": "query-range:V04",
+        "pass": true,
+        "detail": "18-26"
+      },
+      {
+        "name": "query-file:V04",
+        "pass": true,
+        "detail": "v02.mp4"
+      },
+      {
+        "name": "query-range:V05",
+        "pass": true,
+        "detail": "0-8"
+      },
+      {
+        "name": "query-file:V05",
+        "pass": true,
+        "detail": "v03.mp4"
+      },
+      {
+        "name": "query-range:V06",
+        "pass": true,
+        "detail": "8-18"
+      },
+      {
+        "name": "query-file:V06",
+        "pass": true,
+        "detail": "v03.mp4"
+      },
+      {
+        "name": "query-range:V07",
+        "pass": true,
+        "detail": "0-9"
+      },
+      {
+        "name": "query-file:V07",
+        "pass": true,
+        "detail": "v04.mp4"
+      },
+      {
+        "name": "query-range:V08",
+        "pass": true,
+        "detail": "17-25"
+      },
+      {
+        "name": "query-file:V08",
+        "pass": true,
+        "detail": "v04.mp4"
+      },
+      {
+        "name": "query-range:V09",
+        "pass": true,
+        "detail": "0-7"
+      },
+      {
+        "name": "query-file:V09",
+        "pass": true,
+        "detail": "v05.mp4"
+      },
+      {
+        "name": "query-range:V10",
+        "pass": true,
+        "detail": "23-30"
+      },
+      {
+        "name": "query-file:V10",
+        "pass": true,
+        "detail": "v05.mp4"
+      },
+      {
+        "name": "query-range:V11",
+        "pass": true,
+        "detail": "0-8"
+      },
+      {
+        "name": "query-file:V11",
+        "pass": true,
+        "detail": "v06.mp4"
+      },
+      {
+        "name": "query-range:V12",
+        "pass": true,
+        "detail": "16-26"
+      },
+      {
+        "name": "query-file:V12",
+        "pass": true,
+        "detail": "v06.mp4"
+      },
+      {
+        "name": "query-range:A01",
+        "pass": true,
+        "detail": "0.5-9.5"
+      },
+      {
+        "name": "query-file:A01",
+        "pass": true,
+        "detail": "v01.mp4"
+      },
+      {
+        "name": "query-range:A02",
+        "pass": true,
+        "detail": "12.376-17.224"
+      },
+      {
+        "name": "query-file:A02",
+        "pass": true,
+        "detail": "v01.mp4"
+      },
+      {
+        "name": "query-range:A03",
+        "pass": true,
+        "detail": "12.277-17.323"
+      },
+      {
+        "name": "query-file:A03",
+        "pass": true,
+        "detail": "v02.mp4"
+      },
+      {
+        "name": "query-range:A04",
+        "pass": true,
+        "detail": "22.603-26.998"
+      },
+      {
+        "name": "query-file:A04",
+        "pass": true,
+        "detail": "v02.mp4"
+      },
+      {
+        "name": "query-range:A05",
+        "pass": true,
+        "detail": "2.235-7.364"
+      },
+      {
+        "name": "query-file:A05",
+        "pass": true,
+        "detail": "v03.mp4"
+      },
+      {
+        "name": "query-range:A06",
+        "pass": true,
+        "detail": "20.5-27.5"
+      },
+      {
+        "name": "query-file:A06",
+        "pass": true,
+        "detail": "v03.mp4"
+      },
+      {
+        "name": "query-range:A07",
+        "pass": true,
+        "detail": "0.5-9.5"
+      },
+      {
+        "name": "query-file:A07",
+        "pass": true,
+        "detail": "v04.mp4"
+      },
+      {
+        "name": "query-range:A08",
+        "pass": true,
+        "detail": "23.278-26.323"
+      },
+      {
+        "name": "query-file:A08",
+        "pass": true,
+        "detail": "v04.mp4"
+      },
+      {
+        "name": "query-range:A09",
+        "pass": true,
+        "detail": "3.35-6.25"
+      },
+      {
+        "name": "query-file:A09",
+        "pass": true,
+        "detail": "v05.mp4"
+      },
+      {
+        "name": "query-range:A10",
+        "pass": true,
+        "detail": "22.693-26.907"
+      },
+      {
+        "name": "query-file:A10",
+        "pass": true,
+        "detail": "v05.mp4"
+      },
+      {
+        "name": "query-range:A11",
+        "pass": true,
+        "detail": "3.198-6.403"
+      },
+      {
+        "name": "query-file:A11",
+        "pass": true,
+        "detail": "v06.mp4"
+      },
+      {
+        "name": "query-range:A12",
+        "pass": true,
+        "detail": "20.5-25.5"
+      },
+      {
+        "name": "query-file:A12",
+        "pass": true,
+        "detail": "v06.mp4"
+      },
+      {
+        "name": "tail-event:long-video",
+        "pass": true,
+        "detail": "36"
+      },
+      {
+        "name": "tail-event:only-tail",
+        "pass": true,
+        "detail": "30"
+      },
+      {
+        "name": "coverage:black-screen",
+        "pass": true,
+        "detail": "[{\"video\":\"v02\",\"start\":10,\"end\":18},{\"video\":\"v05\",\"start\":7,\"end\":15}]"
+      },
+      {
+        "name": "coverage:silence",
+        "pass": true,
+        "detail": "6"
+      },
+      {
+        "name": "coverage:av-mismatch",
+        "pass": true,
+        "detail": "[{\"video\":\"v03\",\"note\":\"烹飪視覺（番茄）＋設計審查會議語音\"},{\"video\":\"v04\",\"note\":\"下雨視覺＋海浪聲\"},{\"video\":\"v05\",\"note\":\"火焰視覺＋音樂會語音；黑畫面＋警報\"}]"
+      },
+      {
+        "name": "verification-report:pass",
+        "pass": true,
+        "detail": "{\"videos\":6,\"negativeFixtures\":4,\"failuredCount\":0,\"pass\":true}"
+      },
+      {
+        "name": "security-fixtures:count",
+        "pass": true,
+        "detail": "20"
+      },
+      {
+        "name": "security-matrix:ids-match",
+        "pass": true,
+        "detail": ""
+      },
+      {
+        "name": "negative-controls:count",
+        "pass": true,
+        "detail": "4"
+      },
+      {
+        "name": "negative-control:n01",
+        "pass": true,
+        "detail": "28627 bytes"
+      },
+      {
+        "name": "negative-control:n02",
+        "pass": true,
+        "detail": "16104 bytes"
+      },
+      {
+        "name": "negative-control:n03",
+        "pass": true,
+        "detail": "344307 bytes"
+      },
+      {
+        "name": "negative-control:n04",
+        "pass": true,
+        "detail": "321949 bytes"
+      },
+      {
+        "name": "eval-root-hash:v01",
+        "pass": true,
+        "detail": "11ff9ea4e75d39e9f797e715043d3fd924305998299ffea8ac7e64f00015a313"
+      },
+      {
+        "name": "eval-root-hash:v02",
+        "pass": true,
+        "detail": "e573bf4da261997387a8a492e1a594a6068ab60b7621379f68cb8da3c50d30b5"
+      },
+      {
+        "name": "eval-root-hash:v03",
+        "pass": true,
+        "detail": "d1fbf72be07118b6059e0fe10123760ac19a76d7937a33f433861e1fd9a5a500"
+      },
+      {
+        "name": "eval-root-hash:v04",
+        "pass": true,
+        "detail": "7e8b384957ac5a9d1025a3fce82962f12c1e41a2fbb9d4bd55a19aaf048ae2d5"
+      },
+      {
+        "name": "eval-root-hash:v05",
+        "pass": true,
+        "detail": "d966c1e7d90021522fdb631e10d4f6b4ba684515c5913b399a04886d07b97429"
+      },
+      {
+        "name": "eval-root-hash:v06",
+        "pass": true,
+        "detail": "486f09d2f04c7912047fd41ba076241d3e8118a3fb5c45f04004695880482a67"
+      },
+      {
+        "name": "eval-root-hash:n01",
+        "pass": true,
+        "detail": "59a249d71758c8844f54afb9e8dc5a418946ab228af1cde0df76803f52a60a2c"
+      },
+      {
+        "name": "eval-root-hash:n02",
+        "pass": true,
+        "detail": "0c3c3bed70468047dc4536e3b5327af43b72782260536e577af5cae7163600bf"
+      },
+      {
+        "name": "eval-root-hash:n03",
+        "pass": true,
+        "detail": "ab571a8d080d946e747047540d33490f1af5d4ed9d12c740b8de7317545120a4"
+      },
+      {
+        "name": "eval-root-hash:n04",
+        "pass": true,
+        "detail": "57155126b2d6da71d439a86dc202975a661c62a3a85b497233514f4e74fbbd21"
+      },
+      {
+        "name": "eval-root:file-count",
+        "pass": true,
+        "detail": "10"
+      },
+      {
+        "name": "validation:all-pass",
+        "pass": true,
+        "detail": "see checks"
+      }
+    ],
+    "pass": true
+  },
+  "unresolved": [
+    "模型品質尚未實測；本凍結只固定語料、題目與判定規則。",
+    "錯誤碼（unsupported-video-audio-track／video-duration-exceeded／video-resolution-exceeded／unsupported-video-container／invalid-video）為 A2 提案，B 必須凍結正式名稱。",
+    "sec20 混用音軌（AAC default + AC-3）依 v2『含不支援音軌即整檔跳過』；若 PM 改採『只選第一個 AAC』需改契約與此列預期並重新凍結。",
+    "DC-3/DTS fixture 的可解碼寫入僅靠 FFmpeg 實驗性 dca 編碼器；解碼端支援度不在本語料證明範圍。"
+  ],
+  "coverage": {
+    "tailEvents": [
+      {
+        "video": "v01",
+        "sceneId": "v01-s5",
+        "start": 30,
+        "end": 36
+      }
+    ],
+    "blackScreens": [
+      {
+        "video": "v02",
+        "start": 10,
+        "end": 18
+      },
+      {
+        "video": "v05",
+        "start": 7,
+        "end": 15
+      }
+    ],
+    "silenceWindows": [
+      {
+        "video": "v01",
+        "start": 20,
+        "end": 30
+      },
+      {
+        "video": "v02",
+        "start": 0,
+        "end": 10
+      },
+      {
+        "video": "v03",
+        "start": 10,
+        "end": 20
+      },
+      {
+        "video": "v04",
+        "start": 10,
+        "end": 20
+      },
+      {
+        "video": "v05",
+        "start": 20,
+        "end": 22.5
+      },
+      {
+        "video": "v06",
+        "start": 10,
+        "end": 20
+      }
+    ],
+    "audioVisualMismatch": [
+      {
+        "video": "v03",
+        "note": "烹飪視覺（番茄）＋設計審查會議語音"
+      },
+      {
+        "video": "v04",
+        "note": "下雨視覺＋海浪聲"
+      },
+      {
+        "video": "v05",
+        "note": "火焰視覺＋音樂會語音；黑畫面＋警報"
+      }
+    ]
+  }
+}

@@ -6,7 +6,7 @@
  *   - dtype 逐元件 `{ model:"q4", vision_encoder:"q4" }`（q4 最快、最小；q8／fp32 可設定）。
  *   - 原生 768 維；輸出截斷成 512 維後**重新 L2 正規化**。
  *   - 圖片 `max_soft_tokens = 70`（延遲約 1/4，檢索品質不變）。
- *   - 只載文字＋圖片：`config.audio_config = null`。**不用** `pipeline("feature-extraction")`（會載入全部編碼器）。
+ *   - 初始只載文字＋圖片，首次音訊在安全邊界升級共享 backend；不用 feature-extraction pipeline。
  *
  * 執行裝置（`device` 選項／`MNEMOSHELF_EMBED_DEVICE`）：
  *   - `auto`（預設）：**Windows** 嘗試 DirectML GPU（`dml`）、**macOS** 嘗試 CoreML
@@ -43,8 +43,18 @@
  */
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { AutoConfig, AutoModel, AutoProcessor, env, load_image } from "@huggingface/transformers";
+import {
+  AutoConfig,
+  AutoModel,
+  AutoProcessor,
+  RawImage,
+  RawVideo,
+  RawVideoFrame,
+  env,
+  load_image,
+} from "@huggingface/transformers";
 import type {
+  AudioInput,
   DocumentInput,
   Embedder,
   EmbedderFallbackReason,
@@ -80,8 +90,10 @@ import {
   ModelInferenceError,
   ModelLoadError,
   UnsupportedDtypeError,
+  VideoUnsupportedError,
 } from "./errors.js";
 import { runProbe } from "./probe.js";
+import { assertVideoInput, type VideoInput } from "./video.js";
 import {
   ACCEL_UNAVAILABLE_MESSAGE,
   COREML_MLPROGRAM_FLAG,
@@ -107,6 +119,20 @@ import { assertMrlDimension, truncateAndNormalize } from "./vector.js";
 
 /** 預設模型 id。 */
 export const DEFAULT_MODEL_ID = "onnx-community/embeddinggemma-2-ONNX";
+
+/**
+ * 已知具備影片幀序列入口（`video_processor`）的模型白名單。
+ *
+ * **保守宣告**：`capabilities.video` 只在模型 id 命中這份清單時為 true。理由：
+ * `info` 必須在載入模型前就能同步讀取，而「processor 有沒有 video_processor」要載入後才知道；
+ * 若先宣告 true 再於載入時發現沒有，就會出現「宣告支援但實際沒有」的不一致狀態。
+ * 自訂 modelId 即使同架構也先回 false（黑名單外不猜），真的呼叫 `embedVideo` 時仍以
+ * 具名 `VideoUnsupportedError` 與 `videoState="disabled"` 回報，不假裝 ready。
+ *
+ * 要新增模型時，必須先用真實權重驗證影片推論（gated 測試）再把它加進來。
+ */
+export const VIDEO_CAPABLE_MODEL_IDS: readonly string[] = Object.freeze([DEFAULT_MODEL_ID]);
+
 /** 預設輸出維度（截斷後）。 */
 export const DEFAULT_DIM = 512;
 /** 預設圖片 soft token 預算。 */
@@ -223,8 +249,19 @@ interface LoadedModel {
 
 /** transformers.js processor 的最小介面（避免相依其龐大的型別）。 */
 interface GemmaProcessor {
-  (text: string[] | string | null, images?: unknown): Promise<Record<string, unknown>>;
+  (
+    text: string[] | string | null,
+    images?: unknown,
+    audio?: Float32Array | null,
+    videos?: unknown,
+  ): Promise<Record<string, unknown>>;
   image_processor: { max_soft_tokens: number };
+  /**
+   * 影片處理器；上游只在 processor config 有 `video_processor` 時才建立（見
+   * `EmbeddingGemma2Processor` 建構子）。**沒有這個成員就代表模型不能吃影片幀序列**，
+   * 呼叫端必須以 `VideoUnsupportedError` 具名失敗，不能把前處理例外當成輸入壞掉。
+   */
+  video_processor?: unknown;
 }
 
 /** Tensor 的最小介面。 */
@@ -347,6 +384,27 @@ interface LockWaiter {
   onAbort: (() => void) | undefined;
 }
 
+/**
+ * 把契約輸入轉成上游的 `RawVideo`。
+ *
+ * - 上游的影片處理器**只用** `frame.image`（依順序逐幀過視覺 encoder），
+ *   `timestamp`／`duration` 不進模型（M0 實測：同幀序但 timestamps 改 10 倍，向量逐元素相同）。
+ *   本專案仍照契約把來源時間放進 `RawVideoFrame`，應用層另外保存每段起訖與抽樣時間。
+ * - `duration` 只是 `RawVideo.fps` getter 用的欄位；單幀時為 0，取一個極小正數避免
+ *   除零的 `Infinity`（不影響模型輸入）。
+ */
+function toRawVideo(video: VideoInput): RawVideo {
+  const frames = video.frames.map((frame) => new RawVideoFrame(
+    // 複製像素：與 `embedImage` 一致，避免與呼叫端共用緩衝（呼叫端可能在推論期間改寫）。
+    new RawImage(new Uint8Array(frame.pixels), frame.width, frame.height, frame.channels),
+    frame.timestampSeconds,
+  ));
+  const first = video.frames[0]!;
+  const last = video.frames[video.frames.length - 1]!;
+  const duration = Math.max(last.timestampSeconds - first.timestampSeconds, 0.001);
+  return new RawVideo(frames, duration);
+}
+
 /** 非同步取回 `sentence_embedding`，偶發取不到時重試一次（見 M0 spike「實作踩雷」）。 */
 async function runModel(modelId: string, model: GemmaModel, inputs: unknown): Promise<number[][]> {
   let lastMessage = "未取得輸出";
@@ -452,7 +510,7 @@ function assertWithinInputLimit(tokens: number | null): void {
  *   同一實例的所有推論單位（一批文件、一段文字、一張圖片）永不重疊，呼叫端不需自行排隊。
  * - 等待中的呼叫若被 abort → 直接以取消錯誤拒絕、**不執行**、立即讓出佇列（不卡住後面的呼叫）；
  *   已在執行中的呼叫不受影響（照常跑完或依自己的 signal 中止）。
- * - 退回 CPU 後互斥自動解除（CPU 可並發）。
+ * - 未使用音訊時退回 CPU 後可並發；首次音訊要求後保留鎖以保護共享 backend 升級。
  *
  * 已知限制：`loadModel()` 進行中呼叫 `dispose()` 時，進行中的載入完成後才會實際釋放
  * （`this.loaded` 在載入完成時設定）。此競態視窗為刻意接受：本專案架構為單一寫入者行程，
@@ -512,6 +570,19 @@ export class TransformersEmbedder implements Embedder {
 
   private loaded: LoadedModel | null = null;
   private loading: Promise<LoadedModel> | null = null;
+  /** 首次音訊要求後，所有模型生命週期操作走同一把鎖。 */
+  private audioRequested = false;
+  private loadAudio = false;
+  private audioState: NonNullable<EmbedderRuntimeStatus["audioState"]> = "not-loaded";
+  private audioBackendFailed = false;
+  /** 這個模型是否在白名單內、提供影片幀序列入口（保守宣告；見 `VIDEO_CAPABLE_MODEL_IDS`）。 */
+  private readonly videoCapable: boolean;
+  /** 影片入口的就緒狀態；`disabled`＝模型不在白名單，或載入後發現 processor 沒有 video_processor。 */
+  private videoState: NonNullable<EmbedderRuntimeStatus["videoState"]>;
+  /** `videoState="failed"` 時的重試旗標；影片沿用既有 vision encoder，失敗都可在同行程重試。 */
+  private videoRetryable = true;
+  /** 升級前已開始的 CPU 操作必須先收尾，不能釋放它們正在使用的 session。 */
+  private readonly concurrentCpuOperations = new Set<Promise<unknown>>();
   /** 序列推論的鎖：`true` 表示有人持有（只有 `dml`／`coreml` 會用到）。 */
   private lockHeld = false;
   /** 等待序列鎖的佇列（FIFO）。 */
@@ -550,11 +621,15 @@ export class TransformersEmbedder implements Embedder {
     // 診斷用的 ORT log 等級；同樣先驗證（未設定＝不覆寫）。
     this.ortLogLevel = parseOrtLogLevel(process.env[EMBED_ORT_LOG_ENV]);
 
+    // 影片能力保守宣告：只有白名單模型（預設的 EmbeddingGemma 2）才回 true，
+    // 自訂 modelId 一律 false（見 VIDEO_CAPABLE_MODEL_IDS 的理由）。
+    this.videoCapable = VIDEO_CAPABLE_MODEL_IDS.includes(this.modelId);
+    this.videoState = this.videoCapable ? "not-loaded" : "disabled";
     this.info = {
       id: buildEmbedderId(this.modelId, dtypeLabel(this.dtype)),
       dim: this.dim,
-      // audio_config 已設為 null，故 audio 為 false；本套件不做影片。
-      capabilities: { text: true, image: true, audio: false, video: false },
+      // 能力表示提供入口；音訊／影片資產在首次使用才載入，就緒狀態另外回報。
+      capabilities: { text: true, image: true, audio: true, video: this.videoCapable },
     };
   }
 
@@ -570,11 +645,15 @@ export class TransformersEmbedder implements Embedder {
       loaded: this.loaded !== null,
       fallbackReason: this.fallbackReason === null ? null : { ...this.fallbackReason },
       batchSize: deviceBatchSize(this.device),
-      serializedInference: requiresSerializedInference(this.device),
+      serializedInference: requiresSerializedInference(this.device) || this.audioRequested,
+      audioState: this.audioState,
+      videoState: this.videoState,
       // 設定值（不隨退回改變）：診斷要能看出「DML 是哪一張卡」。
       dmlDeviceId: this.dmlDeviceId,
     };
     if (this.selfTest !== undefined) status.selfTest = { ...this.selfTest };
+    if (this.audioState === "failed") status.audioRetryable = !this.audioBackendFailed;
+    if (this.videoState === "failed") status.videoRetryable = this.videoRetryable;
     return status;
   }
 
@@ -659,7 +738,8 @@ export class TransformersEmbedder implements Embedder {
     return vectors;
   }
 
-  async embedImage(image: ImageInput): Promise<Float32Array> {
+  async embedImage(image: ImageInput, opts?: EmbedDocumentsOptions): Promise<Float32Array> {
+    throwIfAborted(opts?.signal);
     if (image.bytes.length === 0) throw new EmptyImageInputError();
 
     // transformers.js 在 Node 以 sharp 解碼；load_image 接受 Blob。先複製成
@@ -668,14 +748,128 @@ export class TransformersEmbedder implements Embedder {
     const blob = new Blob([bytes], { type: image.mimeType ?? "application/octet-stream" });
 
     const rows = await this.runWithFallback(async ({ processor, model }) => {
+      throwIfAborted(opts?.signal);
       // 解碼與圖片前處理都不碰 ONNX session：這一段的失敗一律標成 EmbedderInputError
       // （見 asImageInputError），因此不會被 shouldFallBack 當成裝置失敗。真正的推論
       // 錯誤發生在下面的 runModel，維持原本「dml 失敗即退回」的判定。
       const rawImage = await this.inImageInputPhase(() => load_image(blob));
+      throwIfAborted(opts?.signal);
       const inputs = await this.inImageInputPhase(() => processor(null, [[rawImage]]));
+      throwIfAborted(opts?.signal);
       return await runModel(this.modelId, model, inputs);
-    }, undefined);
+    }, opts?.signal);
+    throwIfAborted(opts?.signal);
     return this.toVector(rows);
+  }
+
+  async embedAudio(audio: AudioInput, opts?: EmbedDocumentsOptions): Promise<Float32Array> {
+    const signal = opts?.signal;
+    throwIfAborted(signal);
+    if (!(audio.samples instanceof Float32Array) || audio.sampleRate !== 16000 ||
+        audio.samples.length === 0 || audio.samples.length > 480_000 ||
+        audio.samples.some((sample) => !Number.isFinite(sample) || Math.abs(sample) > 1)) {
+      throw new EmbedderInputError("音訊必須為 16 kHz、最多 30 秒的有限單聲道 PCM");
+    }
+    // 上游對少於一個 10 ms hop 的波形可能產生零個 frame；保留內容並在尾端補零。
+    // 這是模型輸入政策，不延長索引器保存的來源時間範圍（audio-pad160-v1）。
+    const samples = new Float32Array(Math.max(160, audio.samples.length));
+    samples.set(audio.samples);
+    // 在第一次 await 前封住新的 CPU 並發，升級時才不會釋放仍在使用的模型。
+    this.audioRequested = true;
+    const rows = await this.runWithFallback(async ({ processor, model }) => {
+      throwIfAborted(signal);
+      let inputs: Record<string, unknown>;
+      try {
+        inputs = await processor(null, null, samples);
+      } catch (error) {
+        if (isAbortError(error)) throw error;
+        const summary = summarizeFailure(error);
+        throw new EmbedderInputError(`音訊前處理失敗：${summary}`);
+      }
+      throwIfAborted(signal);
+      const tokens = promptTokens(inputs);
+      if (tokens === null || !Number.isFinite(tokens) || tokens <= 0) {
+        throw new EmbedderInputError("音訊前處理未提供有效 token 數");
+      }
+      assertWithinInputLimit(tokens);
+      return await runModel(this.modelId, model, inputs);
+    }, signal, true);
+    throwIfAborted(signal);
+    return this.toVector(rows);
+  }
+
+  /**
+   * 影片片段：把已解碼的幀序列轉成上游 `RawVideo`，走**既有** vision encoder 與文字模型。
+   *
+   * - 輸入是已解碼幀（不接受檔案位元組）；`frames` 1–32 幀、同段尺寸一致、timestamp 非遞減，
+   *   驗證在**載入模型前**完成（非法輸入不觸發模型載入或推論）。
+   * - **不加文字 prefix**，與文字／圖片／音訊共用同一個向量空間；輸出截斷到 `info.dim` 並重新 L2。
+   * - **不新增權重**：影片逐幀走載入文字／圖片時就已存在的 vision encoder（M0 已實測同一個
+   *   `EmbeddingGemma2Model` 的 `pixel_values_videos` 入口），因此不會觸發音訊升級或下載。
+   * - 取消在開始推論前檢查；已開始的 native Run 不強制中斷，完成後若已取消則丟棄結果
+   *   （與圖片／音訊同語意）。
+   * - 前處理（`processor(null, null, null, [rawVideo])`）不碰 ONNX session，失敗一律歸類成
+   *   `EmbedderInputError`（不觸發裝置退回）；token 數沿用實際 `input_ids` 形狀與
+   *   `MAX_INPUT_TOKENS`（超過即 `input-too-long`，不送進模型）。
+   * - `videoState`：推論中為 `loading`，成功為 `ready`；輸入類／取消錯誤還原先前狀態；
+   *   processor 沒有影片支援為 `disabled`＋具名 `VideoUnsupportedError`；其餘失敗為
+   *   `failed`＋可重試旗標。**保守宣告**：不在白名單的 modelId 以 `capabilities.video=false`
+   *   開場，呼叫時直接具名失敗，不載入模型。
+   */
+  async embedVideo(video: VideoInput, opts?: EmbedDocumentsOptions): Promise<Float32Array> {
+    const signal = opts?.signal;
+    throwIfAborted(signal);
+    // 保守宣告：不在白名單的模型直接具名失敗，不載入模型、不假裝 ready。
+    if (!this.videoCapable) {
+      this.videoState = "disabled";
+      throw new VideoUnsupportedError(this.modelId);
+    }
+    assertVideoInput(video);
+    const rawVideo = toRawVideo(video);
+    const previousState = this.videoState;
+    this.videoState = "loading";
+    try {
+      const rows = await this.runWithFallback(async ({ processor, model }) => {
+        throwIfAborted(signal);
+        if (processor.video_processor === undefined) {
+          // 白名單模型，但快取／上游 processor config 沒有影片支援：唯一誠實的結果是 disabled。
+          throw new VideoUnsupportedError(this.modelId);
+        }
+        let inputs: Record<string, unknown>;
+        try {
+          inputs = await processor(null, null, null, [rawVideo]);
+        } catch (error) {
+          if (isAbortError(error) || error instanceof EmbedderInputError ||
+              error instanceof VideoUnsupportedError) {
+            throw error;
+          }
+          throw new EmbedderInputError(`影片前處理失敗：${summarizeFailure(error)}`);
+        }
+        throwIfAborted(signal);
+        const tokens = promptTokens(inputs);
+        if (tokens === null || !Number.isFinite(tokens) || tokens <= 0) {
+          throw new EmbedderInputError("影片前處理未提供有效 token 數");
+        }
+        assertWithinInputLimit(tokens);
+        return await runModel(this.modelId, model, inputs);
+      }, signal);
+      throwIfAborted(signal);
+      this.videoState = "ready";
+      this.videoRetryable = true;
+      return this.toVector(rows);
+    } catch (error) {
+      if (error instanceof VideoUnsupportedError) {
+        this.videoState = "disabled";
+        this.videoRetryable = false;
+      } else if (isAbortError(error) || error instanceof EmbedderInputError) {
+        // 輸入壞掉或使用者取消不是資產失敗：還原先前狀態（先前成功過就維持 ready）。
+        this.videoState = previousState;
+      } else {
+        this.videoState = "failed";
+        this.videoRetryable = true;
+      }
+      throw error;
+    }
   }
 
   /** 執行一段「只碰輸入位元組、不碰裝置」的圖片解碼／前處理，失敗一律分類成輸入錯誤。 */
@@ -704,9 +898,22 @@ export class TransformersEmbedder implements Embedder {
    * 反覆踩同一個失敗）。
    */
   async dispose(): Promise<void> {
+    if (this.audioRequested) {
+      // 音訊可能正在升級或推論；和它們排同一把鎖，不釋放在途 session 或讓晚到載入復活。
+      await this.withLock(undefined, () => this.disposeLoaded());
+      return;
+    }
+    await this.disposeLoaded();
+  }
+
+  private async disposeLoaded(): Promise<void> {
     const loaded = this.loaded;
     this.loaded = null;
     this.loading = null;
+    this.loadAudio = false;
+    this.audioState = this.audioBackendFailed ? "failed" : "not-loaded";
+    // 影片沿用同一個 model session：釋放後回到「尚未載入」；disabled 是模型能力狀態，不因 dispose 改變。
+    if (this.videoState === "ready" || this.videoState === "loading") this.videoState = "not-loaded";
     if (loaded?.model.dispose) {
       await loaded.model.dispose();
     }
@@ -766,9 +973,11 @@ export class TransformersEmbedder implements Embedder {
   private async runWithFallback<T>(
     operation: (loaded: LoadedModel) => Promise<T>,
     signal: AbortSignal | undefined,
+    audio = false,
   ): Promise<T> {
     return await this.withLock(signal, async () => {
       throwIfAborted(signal);
+      if (audio) await this.ensureAudioLoaded(signal);
       const loaded = await this.ensureLoaded();
       try {
         return await operation(loaded);
@@ -787,16 +996,99 @@ export class TransformersEmbedder implements Embedder {
    *
    * - 先到先跑（FIFO）；`operation` 拋錯也會釋放，不會卡住佇列。
    * - 等待中被 abort → 以取消錯誤拒絕、**不執行**，且立刻從佇列移除（其他等待者的順序不變）。
-   * - 裝置不需要序列推論時（`cpu`，含退回後）完全不排隊，直接執行。
+   * - 尚未要求音訊且裝置為 CPU 時可並發；音訊升級先等既有 CPU 操作收尾。
    */
   private async withLock<T>(signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
-    if (!requiresSerializedInference(this.device)) return await operation();
+    if (!requiresSerializedInference(this.device) && !this.audioRequested) {
+      const pending = operation();
+      this.concurrentCpuOperations.add(pending);
+      try { return await pending; }
+      finally { this.concurrentCpuOperations.delete(pending); }
+    }
     const release = await this.acquireLock(signal);
     try {
+      await Promise.allSettled([...this.concurrentCpuOperations]);
+      throwIfAborted(signal);
       return await operation();
     } finally {
       release();
     }
+  }
+
+  /** 在模型鎖內升級共享 backend；載入失敗不讓文字／圖片永久失效。 */
+  private async ensureAudioLoaded(signal: AbortSignal | undefined): Promise<void> {
+    if (this.loadAudio && this.loaded !== null) return;
+    if (this.audioBackendFailed) {
+      throw Object.assign(new ModelLoadError(this.modelId, new Error("音訊模型載入失敗，請重新啟動後再試")), { code: "EAUDIORESTART" });
+    }
+    throwIfAborted(signal);
+    this.audioState = "loading";
+    let previousDevice = this.device;
+    let previousFallback = this.fallbackReason;
+    let switching = false;
+    try {
+      // 基礎資產先沿既有路徑就緒；下載音訊失敗時，原文字／圖片 session 完全不動。
+      await this.ensureLoaded();
+      previousDevice = this.device;
+      previousFallback = this.fallbackReason;
+      throwIfAborted(signal);
+      await this.preflightAudio(signal);
+      throwIfAborted(signal);
+      const previous = this.loaded;
+      switching = true;
+      this.loaded = null;
+      this.loading = null;
+      await previous?.model.dispose?.();
+      // 音訊 encoder 尚未通過 DML／CoreML 產品驗收；不用文字／圖片自測結果外推。
+      // 此次政策不寫入加速器決定檔，避免把尚未驗證記成裝置失敗。
+      this.device = "cpu";
+      this.fallbackReason = previousDevice === "cpu" ? previousFallback : {
+        code: "audio-cpu", message: "音訊索引使用 CPU；文字與圖片共用同一個 CPU 模型",
+      };
+      this.loadAudio = true;
+      await this.ensureLoaded();
+      this.audioState = "ready";
+    } catch (error) {
+      this.device = previousDevice;
+      this.fallbackReason = previousFallback;
+      this.loadAudio = false;
+      this.audioState = isAbortError(error) ? "not-loaded" : "failed";
+      if (switching) {
+        this.audioBackendFailed = true;
+        this.loaded = null;
+        this.loading = null;
+      }
+      if (isAbortError(error)) throw error;
+      // 不在此再次連網；下一個文字／圖片要求以原本無音訊 backend 正常重載。
+      const failure = new ModelLoadError(this.modelId, new Error(
+        switching ? "音訊模型載入失敗，請重新啟動後再試" : `音訊資產準備失敗：${summarizeFailure(error)}`,
+      ));
+      throw switching ? Object.assign(failure, { code: "EAUDIORESTART" }) : failure;
+    }
+    throwIfAborted(signal);
+  }
+
+  /**
+   * 公開的 model_file_name＋selective encoder API，只建一個音訊 session 並立即釋放。
+   * 上游多 session 用 Promise.all 且沒有失敗清理；先完整取得音訊檔案，避免下載失敗
+   * 時已建立的文字／圖片 session 無法取回。全模型改用 local_files_only，仍失敗則停止音訊重試。
+   */
+  private async preflightAudio(signal: AbortSignal | undefined): Promise<void> {
+    env.cacheDir = this.cacheDir;
+    const config = await AutoConfig.from_pretrained(this.modelId);
+    const mediaConfig = config as unknown as { audio_config: unknown; vision_config: unknown };
+    mediaConfig.audio_config = null;
+    mediaConfig.vision_config = null;
+    throwIfAborted(signal);
+    const model = await AutoModel.from_pretrained(this.modelId, {
+      config, model_file_name: "audio_encoder", dtype: this.dtype.model, device: "cpu",
+      session_options: {
+        enableCpuMemArena: false, enableMemPattern: false,
+        ...(this.ortLogLevel === undefined ? {} : { logSeverityLevel: this.ortLogLevel }),
+      },
+    });
+    try { throwIfAborted(signal); }
+    finally { await model.dispose(); }
   }
 
   /**
@@ -858,6 +1150,8 @@ export class TransformersEmbedder implements Embedder {
     if (signal?.aborted === true) return false;
     if (isAbortError(error)) return false;
     if (error instanceof EmbedderInputError) return false;
+    // 模型沒有影片入口是設定／能力問題，不是裝置問題：退回 CPU 也不會變好。
+    if (error instanceof VideoUnsupportedError) return false;
     return true;
   }
 
@@ -1080,8 +1374,8 @@ export class TransformersEmbedder implements Embedder {
       env.cacheDir = this.cacheDir;
 
       const config = await AutoConfig.from_pretrained(this.modelId);
-      // 只載文字＋圖片：不要載入音訊編碼器（官方模型卡 Selective Encoder Loading）。
-      (config as unknown as { audio_config: unknown }).audio_config = null;
+      // 未使用音訊時只載文字＋圖片；首次音訊在鎖內升級，共享文字 session。
+      if (!this.loadAudio) (config as unknown as { audio_config: unknown }).audio_config = null;
 
       const processor = (await AutoProcessor.from_pretrained(this.modelId)) as unknown as GemmaProcessor;
       processor.image_processor.max_soft_tokens = this.maxSoftTokens;
@@ -1089,7 +1383,8 @@ export class TransformersEmbedder implements Embedder {
       const model = (await AutoModel.from_pretrained(this.modelId, {
         config,
         device,
-        dtype: this.dtype,
+        dtype: this.loadAudio ? { ...this.dtype, audio_encoder: this.dtype.model } : this.dtype,
+        ...(this.loadAudio ? { local_files_only: true } : {}),
         session_options: {
           // 見上方說明：所有平台、所有裝置路徑、文字與視覺兩個 session 都關閉
           // CPU arena 與 memory pattern（單一配置不得逼近 2 GiB）。

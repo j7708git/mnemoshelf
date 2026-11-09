@@ -19,8 +19,19 @@
  */
 import { parentPort } from "node:worker_threads";
 import type { Transferable } from "node:worker_threads";
-import type { DocumentInput, EmbedderRuntimeStatus, ImageInput } from "@mnemoshelf/core";
-import { TransformersEmbedder, type TransformersEmbedderOptions } from "@mnemoshelf/embedder-transformers";
+import type {
+  AudioInput,
+  DocumentInput,
+  EmbedderRuntimeStatus,
+  ImageInput,
+  VideoInput,
+} from "@mnemoshelf/core";
+import {
+  EmbedderInputError,
+  TransformersEmbedder,
+  assertVideoInput,
+  type TransformersEmbedderOptions,
+} from "@mnemoshelf/embedder-transformers";
 import type {
   EmbedderWorkerCancelMessage,
   EmbedderWorkerOutboundMessage,
@@ -75,6 +86,53 @@ function readImage(params: unknown): ImageInput {
     : { bytes: record.bytes };
 }
 
+/** proxy 只傳已解碼、已限制大小的 PCM，worker 不讀來源檔案。 */
+function readAudio(params: unknown): AudioInput {
+  const record = params as { samples?: unknown; sampleRate?: unknown } | null;
+  if (!(record?.samples instanceof Float32Array) || record.sampleRate !== 16000) {
+    throw new Error("embedAudio 缺少 16 kHz PCM");
+  }
+  return { samples: record.samples, sampleRate: 16000 };
+}
+
+/**
+ * 讀取影片幀序列參數（proxy 已驗證並複製；這裡再驗一次結構是防禦性的）。
+ *
+ * proxy 的准入在**主執行緒**做過同一份 `assertVideoInput`，worker 端再驗一次的成本是
+ * 一次陣列走訪（不含像素複製），換來「協定被繞過時仍不會把畸形輸入送進模型」。
+ */
+function readVideo(params: unknown): VideoInput {
+  const record = params as { frames?: unknown } | null;
+  if (!Array.isArray(record?.frames)) {
+    throw new EmbedderInputError("embedVideo 缺少 frames 陣列", { code: "invalid-video-input" });
+  }
+  // 只做「能安全取出欄位」的最小檢查；完整規則（上限、像素長度、尺寸、timestamp 順序、
+  // 同段尺寸一致）一律交給與 adapter 相同的 `assertVideoInput`，兩邊不會各自漂移。
+  const frames = record.frames.map((entry, index) => {
+    const frame = entry as {
+      pixels?: unknown;
+      width?: unknown;
+      height?: unknown;
+      channels?: unknown;
+      timestampSeconds?: unknown;
+    } | null;
+    if (frame === null || typeof frame !== "object") {
+      throw new EmbedderInputError(`embedVideo 第 ${index} 幀不是物件`, { code: "invalid-video-input" });
+    }
+    return {
+      // 這裡的轉型只是為了讓 `assertVideoInput` 拿到契約形狀；型別錯了它會拒絕。
+      pixels: frame.pixels as Uint8Array,
+      width: frame.width as number,
+      height: frame.height as number,
+      channels: frame.channels as 3 | 4,
+      timestampSeconds: frame.timestampSeconds as number,
+    };
+  });
+  const video: VideoInput = { frames };
+  assertVideoInput(video);
+  return video;
+}
+
 /** 蒐集要 transfer 的 buffer（去重；只有真正的 `ArrayBuffer` 可以轉移）。 */
 function buffersOf(vectors: readonly Float32Array[]): Transferable[] {
   const buffers = new Set<ArrayBuffer>();
@@ -93,7 +151,7 @@ function buffersOf(vectors: readonly Float32Array[]): Transferable[] {
 export function startEmbedderWorker(port: WorkerPort): void {
   /** 真正的 embedder；模型 session 只在這個執行緒內。 */
   let embedder: TransformersEmbedder | null = null;
-  /** 進行中的可取消 request（目前只有 `embedDocuments`）。 */
+  /** 進行中的可取消 request（文件批次與圖片）。 */
   const controllers = new Map<number, AbortController>();
 
   const post = (message: EmbedderWorkerOutboundMessage, transferList?: Transferable[]): void => {
@@ -149,7 +207,9 @@ export function startEmbedderWorker(port: WorkerPort): void {
       replyError(id, new Error("embedder worker 尚未初始化"));
       return;
     }
-    const controller = method === "embedDocuments" ? new AbortController() : null;
+    const controller = method === "embedDocuments" || method === "embedImage" || method === "embedAudio" ||
+        method === "embedVideo"
+      ? new AbortController() : null;
     if (controller !== null) controllers.set(id, controller);
     try {
       switch (method) {
@@ -177,12 +237,38 @@ export function startEmbedderWorker(port: WorkerPort): void {
           return;
         }
         case "embedImage": {
-          const vector = await embedder.embedImage(readImage(message.params));
+          const vector = await embedder.embedImage(readImage(message.params), {
+            ...(controller === null ? {} : { signal: controller.signal }),
+          });
           reply(id, vector, buffersOf([vector]));
           return;
         }
         case "probe": {
           reply(id, await embedder.probe());
+          return;
+        }
+        case "embedAudio": {
+          const status = embedder.runtimeStatus;
+          if (status.audioState !== "ready") {
+            post({ type: "status", runtimeStatus: { ...status, audioState: "loading" } });
+          }
+          const vector = await embedder.embedAudio(readAudio(message.params), {
+            ...(controller === null ? {} : { signal: controller.signal }),
+          });
+          reply(id, vector, buffersOf([vector]));
+          return;
+        }
+        case "embedVideo": {
+          const status = embedder.runtimeStatus;
+          // disabled／ready 不需要「準備中」通知；其餘（首次載入、失敗後重試）先回報 loading，
+          // 讓主執行緒的診斷與 UI 看得到進度（與音訊同一條規則）。
+          if (status.videoState !== "ready" && status.videoState !== "disabled") {
+            post({ type: "status", runtimeStatus: { ...status, videoState: "loading" } });
+          }
+          const vector = await embedder.embedVideo(readVideo(message.params), {
+            ...(controller === null ? {} : { signal: controller.signal }),
+          });
+          reply(id, vector, buffersOf([vector]));
           return;
         }
         case "dispose": {

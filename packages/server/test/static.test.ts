@@ -59,6 +59,15 @@ async function get(
 }
 
 describe("Host header 驗證", () => {
+  it("音訊播放器只允許同源與授權 fetch 產生的 blob 媒體", async () => {
+    server = await startTestServer({ webDir: await makeWebDist() });
+    const response = await fetch(server.instance.url);
+    expect(response.status).toBe(200);
+    const policy = response.headers.get("content-security-policy");
+    expect(policy).toContain("media-src 'self' blob:");
+    expect(policy).toContain("default-src 'self'");
+    expect(policy).not.toContain("media-src *");
+  });
   it("本機 Host（127.0.0.1／localhost／[::1]，可帶埠）→ 200", async () => {
     server = await startTestServer();
     for (const host of ["127.0.0.1", "127.0.0.1:8787", "localhost", "localhost:5173", "[::1]", "[::1]:9000"]) {

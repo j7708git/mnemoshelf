@@ -12,6 +12,10 @@
  * | `MNEMOSHELF_INDEX_RATE` | 索引限速 `off`／`normal`／`low`（索引時每檔之間休眠） | `off` |
  * | `MNEMOSHELF_AGENT_DISCOVERY` | 是否寫出 agent 連線資訊檔（`on`／`off`；檔案含 token） | `off` |
  * | `MNEMOSHELF_RUNTIME_FILE` | 連線資訊檔路徑（覆寫 `<dataDir>/runtime.json`） | `<dataDir>/runtime.json` |
+ * | `MNEMOSHELF_FFMPEG_PATH` | 影片解碼器 ffmpeg 執行檔（絕對路徑；須與 ffprobe 成對） | 未設定＝不啟用影片解碼 |
+ * | `MNEMOSHELF_FFPROBE_PATH` | 影片解碼器 ffprobe 執行檔（絕對路徑；須與 ffmpeg 成對） | 未設定＝不啟用影片解碼 |
+ * | `MNEMOSHELF_FFMPEG_DIR` | 影片解碼器目錄（內含平台檔名 ffmpeg／ffprobe；上面兩個變數優先） | 未設定 |
+ * | `MNEMOSHELF_VIDEO_MAX_FILE_BYTES` | 影片單檔大小上限（bytes；per-root 持久化屬 C2） | 512 MiB |
  *
  * MCP stdio 入口（`loadMcpConfig`）另有自己的三個變數：`MNEMOSHELF_URL`、`MNEMOSHELF_TOKEN`
  * （**兩個都設定**才會直接使用；缺任何一個就改讀 `runtime.json`）與 `MNEMOSHELF_PROJECT`
@@ -43,6 +47,16 @@ import { MissingMcpConfigError, MissingTokenError, ValidationError } from "./err
 /** 服務綁定的位址：只綁 loopback，永遠不可設定成 0.0.0.0。 */
 export const LOOPBACK_HOST = "127.0.0.1";
 
+/**
+ * 影片單檔大小上限的預設值（bytes；512 MiB）。
+ *
+ * 刻意**不 import `@mnemoshelf/core`**：本檔會被 MCP stdio 入口（`mcp/runtime-connection.ts`
+ * 匯入 `loadMcpConfig`）載入，而 core root entry 會拉進 SQLite 原生依賴。目前 MCP 經
+ * `APP_VERSION`（app.ts）已載入 core，是既有狀況、不在本輪範圍；但設定層不該再多一條
+ * 啟動成本。兩邊同值由 `test/config.video.test.ts` 對照 core 的常數鎖定。
+ */
+export const DEFAULT_VIDEO_MAX_FILE_BYTES = 512 * 1024 * 1024;
+
 /** 索引限速等級（`MNEMOSHELF_INDEX_RATE`）。 */
 export type IndexRate = "off" | "normal" | "low";
 
@@ -59,6 +73,20 @@ export const INDEX_RATE_BETWEEN_FILES_MS: Readonly<Record<IndexRate, number>> = 
   normal: 50,
   low: 250,
 };
+
+/**
+ * 影片解碼器 binary（絕對路徑；**不由系統 PATH 解析**）。
+ *
+ * 為什麼不從 PATH 找：A1 的證據顯示「開發機剛好有 ffmpeg」不是可配送的保證；
+ * 明確設定才能讓打包版把 binary 放在 `extraResources` 再指過來，也讓 CI 在沒有
+ * binary 時得到「未設定」而不是不確定的行為。
+ */
+export interface MediaDecoderBinaries {
+  /** ffmpeg 執行檔絕對路徑。 */
+  ffmpegPath: string;
+  /** ffprobe 執行檔絕對路徑。 */
+  ffprobePath: string;
+}
 
 export interface ServerConfig {
   /** 資料目錄（已解析為絕對路徑）。 */
@@ -100,6 +128,22 @@ export interface ServerConfig {
    * （見 `docs/agent-integration.md`）。
    */
   runtimeFile: string;
+  /**
+   * 影片解碼器 binary（`MNEMOSHELF_FFMPEG_PATH`／`MNEMOSHELF_FFPROBE_PATH`，或
+   * `MNEMOSHELF_FFMPEG_DIR` 目錄下的平台檔名）。
+   *
+   * 未設定時為 `undefined`：**不建立 decoder**，服務不宣告影片能力（既有行為不變）。
+   * 設定但 binary 缺失／損毀時仍會建立 decoder；啟動時的可用性檢查回 false，
+   * 服務照常啟動、影片路徑具名失敗（見 `docs/roots-and-privacy.md`）。
+   */
+  mediaDecoder: MediaDecoderBinaries | undefined;
+  /**
+   * 影片單檔大小上限（bytes；`MNEMOSHELF_VIDEO_MAX_FILE_BYTES`，預設 512 MiB）。
+   *
+   * 只套用影片（掃描、有界快照與播放端點共用同一個值）；通用 `maxFileBytes` 的
+   * 10 MiB 不套用影片。per-root 持久化與 UI 入口屬 C2，本輪只有行程層預設值。
+   */
+  videoMaxFileBytes: number;
 }
 
 /**
@@ -123,6 +167,63 @@ function osUserDataDir(home: string): string {
   }
   const xdg = process.env.XDG_DATA_HOME;
   return xdg !== undefined && xdg.trim() !== "" ? xdg : path.join(home, ".local", "share");
+}
+
+/** 平台上的解碼器執行檔檔名（Windows 需要 `.exe`）。 */
+export function mediaDecoderBinaryName(base: "ffmpeg" | "ffprobe", platform: NodeJS.Platform = process.platform): string {
+  return platform === "win32" ? `${base}.exe` : base;
+}
+
+/** 空字串（或全空白）視為「未設定」，與本檔其他環境變數的慣例一致。 */
+function hasSetting(value: string | undefined): value is string {
+  return value !== undefined && value.trim() !== "";
+}
+
+/**
+ * 解析影片解碼器 binary 設定。
+ *
+ * 規則：
+ * - `MNEMOSHELF_FFMPEG_PATH`／`MNEMOSHELF_FFPROBE_PATH` **必須成對**；只設一個直接拒絕啟動
+ *   （解碼器同時需要兩支程式，只設一支等於設定沒生效，最難查）。
+ * - 兩個都設定時以它們為準（`MNEMOSHELF_FFMPEG_DIR` 被忽略）。
+ * - 只設目錄時，以平台檔名組出兩支路徑（`ffmpeg.exe`／`ffprobe.exe` 或 `ffmpeg`／`ffprobe`）。
+ * - 完全未設定 → `undefined`（不啟用影片解碼）。
+ *
+ * 這裡**不檢查檔案是否存在**：缺失／損毀是啟動後可用性檢查的責任（服務仍要能啟動）。
+ */
+export function resolveMediaDecoderBinaries(env: NodeJS.ProcessEnv): MediaDecoderBinaries | undefined {
+  const ffmpegSetting = env.MNEMOSHELF_FFMPEG_PATH;
+  const ffprobeSetting = env.MNEMOSHELF_FFPROBE_PATH;
+  const dirSetting = env.MNEMOSHELF_FFMPEG_DIR;
+
+  if (hasSetting(ffmpegSetting) !== hasSetting(ffprobeSetting)) {
+    throw new ValidationError(
+      "MNEMOSHELF_FFMPEG_PATH",
+      "必須與 MNEMOSHELF_FFPROBE_PATH 成對設定（只設一個無法解碼；也可改用 MNEMOSHELF_FFMPEG_DIR）",
+    );
+  }
+  if (hasSetting(ffmpegSetting) && hasSetting(ffprobeSetting)) {
+    return { ffmpegPath: path.resolve(ffmpegSetting), ffprobePath: path.resolve(ffprobeSetting) };
+  }
+  if (hasSetting(dirSetting)) {
+    const dir = path.resolve(dirSetting);
+    return {
+      ffmpegPath: path.join(dir, mediaDecoderBinaryName("ffmpeg")),
+      ffprobePath: path.join(dir, mediaDecoderBinaryName("ffprobe")),
+    };
+  }
+  return undefined;
+}
+
+/** 解析影片單檔大小上限（bytes）；非法值直接拒絕啟動。 */
+export function resolveVideoMaxFileBytes(env: NodeJS.ProcessEnv): number {
+  const setting = env.MNEMOSHELF_VIDEO_MAX_FILE_BYTES;
+  if (!hasSetting(setting)) return DEFAULT_VIDEO_MAX_FILE_BYTES;
+  const parsed = Number(setting);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new ValidationError("MNEMOSHELF_VIDEO_MAX_FILE_BYTES", "必須是正整數（bytes）");
+  }
+  return parsed;
 }
 
 /** 從環境變數讀出設定；缺少 token 時丟 `MissingTokenError`。 */
@@ -194,6 +295,10 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
       ? path.resolve(runtimeFileSetting)
       : path.join(dataDir, "runtime.json");
 
+  // 影片解碼器與上限：未設定 decoder 時維持既有行為（不宣告影片能力）。
+  const mediaDecoder = resolveMediaDecoderBinaries(env);
+  const videoMaxFileBytes = resolveVideoMaxFileBytes(env);
+
   return {
     dataDir,
     dbPath: path.join(dataDir, "mnemoshelf.db"),
@@ -205,6 +310,8 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     indexRate,
     agentDiscovery,
     runtimeFile,
+    mediaDecoder,
+    videoMaxFileBytes,
   };
 }
 

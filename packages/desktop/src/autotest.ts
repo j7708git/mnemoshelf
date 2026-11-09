@@ -99,7 +99,7 @@ export const ALL_SCENARIOS = ["bootstrap", "app", "agent-guide", "single", "brow
  *
  * - `hidden`：必須以 `--hidden` 啟動，驗「開機自啟的登入啟動不會彈出視窗」。
  */
-export const OPT_IN_SCENARIOS = ["hidden"] as const;
+export const OPT_IN_SCENARIOS = ["hidden", "audio"] as const;
 
 /** 情境的執行順序：opt-in 情境插在 `tray` 之前（`tray` 會結束行程，必須最後）。 */
 function executionOrder(): string[] {
@@ -853,6 +853,79 @@ export async function runAutotest(options: AutotestOptions): Promise<AutotestRes
       );
       if (!hit.hasSample) throw new Error(`搜尋結果沒有命中樣本檔 ${options.sampleTextName}`);
       return `共 ${hit.count} 筆結果，含 ${options.sampleTextName}`;
+    });
+  }
+
+  if (scenarios.includes("audio")) {
+    // 隱藏視窗可能暫停繪製；只在音訊驗收截圖期間解除節流，保持視窗隱藏。
+    const shootAudio = async (win: BrowserWindow, name: string): Promise<string> => {
+      const throttled = win.webContents.getBackgroundThrottling();
+      try {
+        win.webContents.setBackgroundThrottling(false);
+        await evaluate(win, `new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('等待音訊畫面繪製逾時')), 5000);
+          requestAnimationFrame(() => requestAnimationFrame(() => { clearTimeout(timer); resolve(true); }));
+        })`);
+        await delay(100);
+        return await shoot(win, options.outputDir, name);
+      } finally {
+        win.webContents.setBackgroundThrottling(throttled);
+      }
+    };
+    await run("audio", "音訊開關與預覽", async () => {
+      const win = requireWindow();
+      const ready = await waitForBootstrapPhase(["ready"], options.bootstrapTimeoutMs);
+      if (ready.phase !== "ready") throw new Error("模型未就緒");
+      await waitFor(win, buttonExistsExpression("加入"), "主畫面就緒", options.stepTimeoutMs);
+      await evaluate(win, clickByTextExpression("加入"));
+      await waitFor(win, 'document.querySelector("#add-root-path") !== null', "加入表單", options.stepTimeoutMs);
+      await evaluate(win, setInputExpression("#add-root-path", options.sampleRoot));
+      await evaluate(win, `(() => {
+        const label = [...document.querySelectorAll('label')].find(item => item.textContent.includes('這個資料夾含音訊'));
+        if (!label) throw new Error('缺少音訊開關');
+        label.querySelector('input').click();
+      })()`);
+      await evaluate(win, clickByTextExpression("加入並預覽"));
+      await waitFor(win, buttonExistsExpression("開始索引"), "音訊預覽", options.stepTimeoutMs);
+      shots.push(await shootAudio(win, "audio-preview.png"));
+      return "透過音訊開關加入 root，預覽後才確認索引";
+    });
+    await run("audio", "打包模型索引與搜尋", async () => {
+      const win = requireWindow();
+      await evaluate(win, clickByTextExpression("開始索引"));
+      await waitFor(win, 'document.body.innerText.includes("索引完成")', "音訊索引完成", options.indexTimeoutMs);
+      const result = await evaluate<{ audioChunks: number; end: number; failures: number }>(win, `(async () => {
+        const roots = await (await fetch('/roots')).json();
+        const root = roots.roots.find(item => item.path === ${JSON.stringify(options.sampleRoot)});
+        if (!root || !root.modalities.includes('audio')) throw new Error('音訊 root 未建立');
+        const status = await (await fetch('/roots/' + root.id + '/index/status')).json();
+        const result = await (await fetch('/search', { method: 'POST', headers: {'content-type':'application/json'},
+          body: JSON.stringify({query:${JSON.stringify(options.searchQuery)},mode:'vector',rootIds:[root.id],k:100}) })).json();
+        const hits = result.hits.filter(hit => hit.kind === 'audio' && hit.media);
+        return {audioChunks:hits.length,end:Math.max(...hits.map(hit=>hit.media.endSeconds)),failures:status.result?.failedFiles?.length ?? -1};
+      })()`);
+      if (result.audioChunks < 4 || result.end <= 30 || result.failures !== 0) throw new Error("長音訊片段不完整或索引失敗");
+      await evaluate(win, clickByTextExpression("搜尋"));
+      await waitFor(win, 'document.querySelector("#mnemoshelf-search-query") !== null', "搜尋畫面", options.stepTimeoutMs);
+      await evaluate(win, setInputExpression("#mnemoshelf-search-query", options.searchQuery));
+      await evaluate(win, clickByTextExpression("向量 vector"));
+      await evaluate(win, clickSelectorExpression('form button[type="submit"]'));
+      await waitFor(win, 'document.body.innerText.includes("音訊片段")', "音訊搜尋命中", options.stepTimeoutMs);
+      shots.push(await shootAudio(win, "audio-search.png"));
+      return `打包產品索引 ${result.audioChunks} 個音訊片段，來源涵蓋 ${result.end} 秒`;
+    });
+    await run("audio", "播放器定位與授權音訊", async () => {
+      const win = requireWindow();
+      await evaluate(win, `(() => {
+        const hit = [...document.querySelectorAll('button')].find(item => item.textContent.includes('音訊片段 0:30.0'));
+        if (!hit) throw new Error('缺少30秒後命中');
+        hit.click();
+      })()`);
+      await waitFor(win, 'document.querySelector("audio")?.readyState >= 1', "音訊 metadata 載入", options.stepTimeoutMs);
+      await evaluate(win, clickByTextExpression("定位到命中片段"));
+      await waitFor(win, 'Math.abs(document.querySelector("audio").currentTime - 30) < 0.1', "定位30秒", options.stepTimeoutMs);
+      shots.push(await shootAudio(win, "audio-position.png"));
+      return "授權 WAV 載入成功，播放器定位30秒；不自動播放聲音";
     });
   }
 

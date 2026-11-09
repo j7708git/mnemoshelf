@@ -4,18 +4,46 @@
 排隊與取消行為。**契約的權威仍是程式碼**；root 驗證、機密遮罩、信任模型與資料刪除見
 `docs/roots-and-privacy.md`，儲存與檢索語意見 `docs/storage-ports.md`。
 
-服務只綁 `127.0.0.1`。除 `GET /health` 外，所有 REST 請求都要帶
+服務只綁 `127.0.0.1`。除 `GET /health` 與下述已授權的播放 session GET／HEAD 外，REST 請求都要帶
 `Authorization: Bearer <token>`；錯誤一律回 `{error:{name,message}}` 與對應狀態碼。
 
 ## REST 端點速查
 
+音訊索引先以 `PATCH /roots/:id` 的 `modalities` 明確加入 `audio`，再預覽並索引。
+本版只支援受限 WAV；格式與上限見 [音訊契約](roots-and-privacy.md#音訊索引與來源定位)。
+`POST /search` 與 MCP `search` 的音訊命中有 `media.startSeconds`／`endSeconds`、
+`track`、`preprocessVersion`、`embedderId`、`embeddingDim`，沒有逐字稿；以 vector／hybrid 查詢。
+`GET /roots/:id/file?path=...` 對支援 WAV 回 `audio/wav`，仍需 token 與 root 守衛，最多 10 MiB。
+`GET /diagnostics` 的 `embedderRuntime.audioState` 區分未載入／準備中／就緒／失敗；
+失敗且 `audioRetryable=false` 時需重啟後再試，否則可修正下載問題後重跑索引。
+
+影片索引以 `PATCH /roots/:id` 的 `modalities` 明確加入 `video`；同時有 `audio` 才會索引影片選定音軌（只有 `audio` 不會讀取影片）。格式與限制見 [影片契約](roots-and-privacy.md)。
+`POST /search` 與 MCP `search` 的影片命中有 `media.track`（`video`／`video-audio`）、`startSeconds`／`endSeconds`、`frameTimesSeconds`、`streamIndex`、`container`；沒有逐字稿。
+`GET|HEAD /roots/:id/media?path=...` 提供影片播放：單一 `Range`、206／416、單次上限 4 MiB、`Accept-Ranges`、token 與 root 守衛；`GET /roots/:id/file` 仍不服務影片。
+`GET /diagnostics.video` 回 decoder 能力三態（`disabled`／`unavailable`／`available`）、版本、per-root 生效上限與本行程影片索引統計；`GET /roots` 另回 additive `video`，preview 回 `videoCapability`。
+桌面版與 standalone 瀏覽器共用短效播放 session：先以 Bearer 呼叫
+`POST /roots/:id/media-sessions`，body 為 `{path, chunkId?}`；搜尋命中必須帶原 chunk id。
+成功回 `201`＋`{url, expiresAt}`，秘密只透過 `HttpOnly; SameSite=Strict` cookie 傳送，
+cookie Path 精確限制於該 session URL。URL 的 locator 不是憑證，不能單獨用來播放；
+建立、讀取及撤銷都要求同源 Fetch Metadata，並核對 Origin（若存在）與 Host。
+媒體讀取不需要把 Bearer 放進 URL，也不整檔下載成 blob。
+
+session 最長 15 分鐘、每服務最多 128 個、每個最多 4 條活動串流；重啟即失效。
+`DELETE` 其 URL（仍需 Bearer）立即撤銷，逾期／撤銷會終止尚在傳輸的串流。
+刪除 root 或成功修改其設定也會撤銷該 root 的既有播放 session；之後依新設定重新授權。
+`modalities` 控制索引範圍，關掉影片索引不會禁止已核准 root 的檔案瀏覽／播放。
+建立搜尋命中的 session 時，以同一個通過 root 驗證的 handle 計算 SHA-256，核對原 chunk
+的來源 hash；未知、已刪除或不屬於指定 root／path 的命中，以及來源已修改，回 `409`
+並提示重新索引及搜尋。每次 Range 重驗 root 與檔案版本；每批讀取前後也檢查檔案版本。
+這是檔案系統可觀測的版本檢查，並非不可變播放快照；建立時全檔 hash 的 I/O 成本與 Range 讀取分開。
+
 | 端點 | 說明 |
 |---|---|
 | `GET /health` | 免 token；服務身分、版本與 build（建置 commit） |
-| `GET /diagnostics` | 診斷資訊（版本、平台、embedder 裝置與退回原因、每 root 統計、記憶向量狀態） |
-| `GET /roots` / `POST /roots` | 列出／加入 root（`POST` 可帶 `maxFileBytes` 指定**單檔大小上限**，預設 10 MB） |
+| `GET /diagnostics` | 診斷資訊（版本、平台、embedder 裝置與退回原因、每 root 統計、記憶向量狀態、影片能力／decoder 狀態與索引統計） |
+| `GET /roots` / `POST /roots` | 列出／加入 root（`POST` 可帶 `maxFileBytes` 指定通用單檔上限，預設 10 MB；可帶 `videoMaxFileBytes` 指定 per-root 影片上限，bytes、1–16 GiB；`GET` 另回 additive `video` 能力摘要） |
 | `GET /roots/:id` | 單一 root |
-| `PATCH /roots/:id` | 改模態（`modalities`） |
+| `PATCH /roots/:id` | 改模態與 per-root 影片上限（`modalities`／`videoMaxFileBytes`；後者 `null` 清除、值域 1–16 GiB） |
 | `DELETE /roots/:id?deleteData=1` | 移除 root；`deleteData` 決定是否連帶刪已索引資料。接受 `1`／`0`／`true`／`false`／`yes`／`no` |
 | `POST /roots/:id/preview` | 索引前預覽（乾跑，不寫入；root 需已加入） |
 | `POST /roots/:id/index` | 開始索引；同一 root 已在索引中會回 `409` |
@@ -23,6 +51,10 @@
 | `GET /roots/:id/entries` | 條目（`?path=` 相對路徑；省略＝root 根目錄） |
 | `GET /roots/:id/file` | 讀檔（`?path=`；文字回 JSON 預覽，圖片回原始位元組） |
 | `GET /roots/:id/thumb` | 縮圖（`?path=`） |
+| `GET`／`HEAD /roots/:id/media` | 影片播放（`?path=`；只服務 `.mp4`；單一 Range、206／416、單次 4 MiB、`Accept-Ranges`、token 與 root 守衛；不整檔入記憶體） |
+| `POST /roots/:id/media-sessions` | Bearer＋同源建立單一來源版本的短效播放授權；`{path, chunkId?}`；201 回 URL／逾期時間及 HttpOnly cookie；原命中失效回 409 |
+| `GET`／`HEAD /roots/:id/media-sessions/:sessionId` | 同源 cookie 授權的影片串流；沿用 Range／HEAD／root／大小上限，URL 不帶 token |
+| `DELETE /roots/:id/media-sessions/:sessionId` | Bearer＋同源撤銷播放授權並停止活動串流 |
 | `POST /search` | 檔案語意搜尋（`mode`：`vector` 預設／`keyword`／`hybrid`；`k` 上限 100） |
 | `GET /memory-policy` / `PATCH /memory-policy` | 讀取／保存記憶遮罩開關與政策版本 |
 | `POST /memory-sources` | 完整原文回合寫入；8 MiB 上限，事件重送去重 |
@@ -98,7 +130,10 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
 | `MNEMOSHELF_EMBED_DML_DEVICE_ID` | embedder（Windows 的 DirectML） | `0`（預設顯示卡） | DirectML adapter 索引；多顯卡時指定獨顯。只接受十進位非負整數字串，非法值直接拒絕啟動（不靜默回預設）。 |
 | `MNEMOSHELF_EMBED_ORT_LOG` | embedder | 未設定（不覆寫 ORT 預設） | ONNX Runtime log 等級 `0`–`4`（`0`＝verbose），僅診斷用。 |
 | `MNEMOSHELF_MEMORY_BACKFILL` | 服務端 | `on` | 啟動時是否回填既有記憶向量；只接受 `on`／`off`（大小寫不拘），非法值直接拒絕啟動。`off` 只停啟動回填，**新寫入的記憶仍會嵌入**。 |
-| `MNEMOSHELF_INDEX_RATE` | 服務端 | `off` | 索引限速：`normal` 每檔之間休眠 50ms、`low` 250ms，`off` 不休眠。**只作用於檔案與檔案之間**，同一個大檔的嵌入批次仍一次跑完；非法值直接拒絕啟動。 |
+| `MNEMOSHELF_INDEX_RATE` | 服務端 | `off` | 索引限速：`normal` 每檔之間休眠 50ms、`low` 250ms，`off` 不休眠。**只作用於檔案與檔案之間**；大檔內的讓渡由下述視窗排程負責。非法值直接拒絕啟動。 |
+| `MNEMOSHELF_FFMPEG_PATH` / `MNEMOSHELF_FFPROBE_PATH` | 服務端、桌面版（打包版由桌面注入） | 未設定 | 影片解碼器 ffmpeg／ffprobe 絕對路徑；**必須成對**。未設定＝影片能力 `disabled`。 |
+| `MNEMOSHELF_FFMPEG_DIR` | 服務端、桌面版 | 未設定 | 影片解碼器目錄（內含平台檔名 ffmpeg／ffprobe）；與成對 PATH 變數二選一，PATH 優先。打包版為 `<resources>/bin`。 |
+| `MNEMOSHELF_VIDEO_MAX_FILE_BYTES` | 服務端 | `512 MiB` | 影片單檔大小上限（bytes）；per-root `videoMaxFileBytes` 優先，未設定時用本值。 |
 | `MNEMOSHELF_BUILD_COMMIT` | 建置腳本（server）；服務端僅在讀不到 build-info 時後備 | `unknown` | **build 時 fallback**：`git rev-parse HEAD` 不可用時（例如從 tarball build）寫入的 commit；不用於執行期設定。 |
 
 測試專用的變數（`MNEMOSHELF_E2E`、`MNEMOSHELF_AUTOTEST_*`、`MNEMOSHELF_SMOKE_NO_SANDBOX`、
@@ -110,10 +145,21 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
 - **一次只跑一個推論**：推論在 **server 行程的 worker thread** 執行（`node:worker_threads`），
   主執行緒只做 HTTP、DB 與索引編排，worker 內只有一個模型 session——索引、搜尋與記憶背景嵌入
   共用這條序列佇列。需要嵌入的請求（`POST /search`、`POST /memories/search`、記憶的背景嵌入）
-  會排在**目前批次**之後，索引期間可能等數十秒。要避免等待請等索引完成，或把大 root 拆成
-  小 root 分批索引；讓查詢插隊的**查詢優先權**目前列為後續工作。
+  在有界工作視窗間排程。文字查詢優先，連續最多 4 個查詢後讓等待中的背景工作執行一窗；
+  背景工作輪流前進。每個文字視窗最多 16 筆且不超過裝置上限，模型仍可依 token 預算縮窗。
+  正在執行的 native 推論不能搶占，因此不保證固定毫秒回應。
 - **取消**（`POST /roots/:id/index/cancel`）在 native 推論的**下一個邊界**生效，最長等目前
-  一個檔案的嵌入批次（大檔可能數十秒），不是立即中斷。
+  一個排程視窗；排隊中的文字／圖片直接取消，不再啟動新視窗，已在 native 中的工作等待收尾。
 - 不需要嵌入的請求（`GET /health`、`GET /diagnostics`、`GET /roots/:id/index/status` 等）
   在索引期間照常回應。
 - 關閉服務時的取消與等待語意，見 `docs/roots-and-privacy.md` §資料存放與刪除。
+
+診斷新增 `embedderScheduling`（不提供排程資訊的實作為 `null`），包含准入數、輸入位元組、
+已完成視窗／邏輯請求、累計排隊時間、worker 往返時間與上限。`indexingTimings` 是本行程
+累計的 scan／read／prepare／embed／write 次數及耗時；prepare 含增量檢查，embed 含排隊、
+解碼、tokenize 與推論，尚未細拆為純模型時間；併發時各階段加總不等於整輪牆鐘時間。
+上述只含計數與耗時，不含檔案內容。視窗完成與逐檔持久化完成分開，不將部分向量假報為索引成功。
+
+排程准入預設最多 128 個邏輯請求、8,192 個輸入與 64 MiB 輸入位元組（含正在執行的工作）。
+搜尋超限回 `503 EmbedderQueueFullError`、碼 `EEMBEDDERQUEUEFULL`，附 `Retry-After: 1`；
+單一請求本身超限應縮小輸入。詳細契約見 [embedder-contract.md](embedder-contract.md)。

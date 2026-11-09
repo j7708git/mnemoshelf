@@ -10,10 +10,13 @@
 import { promises as fs } from "node:fs";
 import http from "node:http";
 import {
+  FfmpegMediaDecoder,
   openDatabase,
   SqliteMetadataStore,
   SqliteVectorIndex,
+  type DecoderAvailability,
   type Embedder,
+  type MediaDecoder,
   type MetadataStore,
   type SqliteDatabase,
   type VectorIndex,
@@ -45,6 +48,13 @@ export interface CreateServerOptions {
    * `TransformersEmbedder`，模型 lazy 載入，主執行緒不被推論阻塞）。
    */
   embedder?: Embedder;
+  /**
+   * 覆寫影片解碼器（測試注入 fake；正式路徑由 `MNEMOSHELF_FFMPEG_PATH`／
+   * `MNEMOSHELF_FFPROBE_PATH` 或 `MNEMOSHELF_FFMPEG_DIR` 建立 `FfmpegMediaDecoder`）。
+   *
+   * 未提供且環境變數也未設定時，服務不建立 decoder（影片能力 `disabled`）。
+   */
+  decoder?: MediaDecoder;
   /** 「過寬 root」判定的家目錄基準；預設 `os.homedir()`。 */
   homeDir?: string;
   /**
@@ -189,6 +199,23 @@ async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boo
 }
 
 /**
+ * 釋放影片解碼器（選配能力）。
+ *
+ * B1 的 `FfmpegMediaDecoder` 沒有常駐資源（每次呼叫都自己開／收 ffmpeg 子程序），因此目前是
+ * no-op；用 duck-typing 呼叫，讓未來帶暫存或連線池的 decoder 不必改 server 的關閉流程。
+ */
+async function disposeMediaDecoder(decoder: MediaDecoder | undefined): Promise<void> {
+  if (decoder === undefined) return;
+  const candidate = decoder as { dispose?: () => Promise<void> | void };
+  if (typeof candidate.dispose !== "function") return;
+  try {
+    await candidate.dispose();
+  } catch (error) {
+    console.error("[mnemoshelf] 影片解碼器釋放失敗：", error instanceof Error ? error.message : String(error));
+  }
+}
+
+/**
  * 建立並啟動常駐服務。
  *
  * embedder 預設是 `WorkerEmbedder`：真的 `TransformersEmbedder` 在 **worker thread** 內
@@ -240,6 +267,34 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     });
   const vec: VectorIndex = new SqliteVectorIndex(db, embedder.info.dim);
 
+  // 影片解碼器：只在環境變數（或測試注入）提供時建立。缺失／損毀不阻止啟動——
+  // 可用性檢查的結果會注入 REST app，供 preview／index／diagnostics 回報。
+  const decoder: MediaDecoder | undefined =
+    options.decoder ??
+    (config.mediaDecoder === undefined
+      ? undefined
+      : new FfmpegMediaDecoder({
+          ffmpegPath: config.mediaDecoder.ffmpegPath,
+          ffprobePath: config.mediaDecoder.ffprobePath,
+          // 解碼器的來源大小上限與掃描／播放端點共用同一個值（避免三處不一致）。
+          limits: { maxSourceBytes: config.videoMaxFileBytes },
+        }));
+  let decoderAvailability: DecoderAvailability | null = null;
+  if (decoder !== undefined) {
+    try {
+      decoderAvailability = await decoder.checkAvailability();
+    } catch {
+      decoderAvailability = { available: false };
+    }
+    if (!decoderAvailability.available) {
+      // 只印固定原因碼，不印 binary 路徑（見 repo 隱私規範）。
+      console.error(
+        `[mnemoshelf] 影片解碼器不可用（${decoderAvailability.reason ?? "unknown"}）：` +
+          "服務照常啟動，影片索引將以 video-decoder-unavailable 失敗",
+      );
+    }
+  }
+
   // 記憶向量背景 worker（卡 B1）：非阻塞回填既有記憶，之後由 POST /memories enqueue。
   const memoryEmbedder = new MemoryEmbeddingWorker({
     store,
@@ -257,6 +312,10 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     webDir: config.webDir,
     memoryEmbedder,
     ...(options.homeDir === undefined ? {} : { homeDir: options.homeDir }),
+    // 影片：decoder 與可用性一次注入（未設定時完全不傳＝既有行為）。
+    ...(decoder === undefined ? {} : { decoder, decoderAvailability }),
+    // 影片上限（MNEMOSHELF_VIDEO_MAX_FILE_BYTES；預設 512 MiB）：preview／index／播放共用。
+    videoMaxFileBytes: config.videoMaxFileBytes,
     // 索引限速（MNEMOSHELF_INDEX_RATE）：0＝off，完全不傳（行為與舊版相同）。
     ...(INDEX_RATE_BETWEEN_FILES_MS[config.indexRate] > 0
       ? { indexThrottle: { betweenFilesMs: INDEX_RATE_BETWEEN_FILES_MS[config.indexRate] } }
@@ -304,6 +363,7 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     if (!drained) {
       console.error("[mnemoshelf] 啟動失敗回滾：背景工作未在期限內結束，仍繼續關閉（不 hang）");
     }
+    await disposeMediaDecoder(decoder);
     await embedder.dispose().catch(() => undefined);
     db.close();
     throw error;
@@ -384,13 +444,22 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
         // 正常路徑：優雅關閉 embedder；強制路徑已 dispose 過（第二次是 no-op）。
         await embedder.dispose();
       }
+      await disposeMediaDecoder(decoder);
       db.close();
     },
   };
 }
 
-export { LOOPBACK_HOST, loadMcpConfig, loadServerConfig } from "./config.js";
-export type { IndexRate, McpConfig, ServerConfig } from "./config.js";
+export {
+  DEFAULT_VIDEO_MAX_FILE_BYTES,
+  LOOPBACK_HOST,
+  loadMcpConfig,
+  loadServerConfig,
+  mediaDecoderBinaryName,
+  resolveMediaDecoderBinaries,
+  resolveVideoMaxFileBytes,
+} from "./config.js";
+export type { IndexRate, McpConfig, MediaDecoderBinaries, ServerConfig } from "./config.js";
 export {
   AGENT_RUNTIME_SCHEMA_VERSION,
   createAgentDiscovery,
@@ -409,6 +478,7 @@ export type {
 export {
   EmbedderWorkerClosedError,
   EmbedderWorkerCrashError,
+  EmbedderQueueFullError,
   WorkerEmbedder,
 } from "./worker-embedder.js";
 export type {
@@ -416,6 +486,8 @@ export type {
   EmbedderWorkerLike,
   EmbedderWorkerMethod,
   WorkerEmbedderOptions,
+  EmbedderSchedulingStatus,
+  EmbedderSchedulingLimits,
 } from "./worker-embedder.js";
 export {
   FileTooLargeError,
@@ -478,6 +550,15 @@ export {
   STATIC_CSP,
   toHttpError,
 } from "./http/app.js";
+export {
+  MEDIA_CACHE_CONTROL,
+  MEDIA_CONTENT_TYPE,
+  MEDIA_RANGE_MAX_BYTES,
+  parseMediaRange,
+  buildMediaResponse,
+  sendStreamResult,
+} from "./http/media.js";
+export type { MediaRangeDecision, MediaRequestInput, MediaResponseOptions, StreamRouteResult } from "./http/media.js";
 export type {
   AddMemoryResponse,
   AddRootRequest,
@@ -488,6 +569,8 @@ export type {
   DiagnosticsIndexSummary,
   DiagnosticsResponse,
   DiagnosticsRoot,
+  DiagnosticsVideo,
+  DiagnosticsVideoIndexing,
   ErrorResponse,
   ForgetMemoryResponse,
   HardDeleteMemoryResponse,
@@ -502,6 +585,8 @@ export type {
   RestApp,
   RestAppDeps,
   RouteResult,
+  VideoCapability,
+  VideoCapabilityReason,
 } from "./http/app.js";
 export { isLocalHostHeader, isLoopbackAddress, parseBearerToken, requireLocalHost, requireToken, tokensMatch } from "./http/auth.js";
 export {

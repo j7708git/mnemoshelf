@@ -11,6 +11,7 @@ export {
   MAX_INPUT_TOKENS,
   SUPPORTED_DTYPES,
   TransformersEmbedder,
+  VIDEO_CAPABLE_MODEL_IDS,
   defaultDeviceDecisionPath,
   defaultModelCacheDir,
   type DtypeOption,
@@ -89,7 +90,18 @@ export {
   UnsupportedDimensionError,
   UnsupportedDtypeError,
   VectorTruncationError,
+  VideoUnsupportedError,
 } from "./errors.js";
+
+export {
+  MAX_VIDEO_FRAME_EDGE,
+  MAX_VIDEO_FRAMES,
+  MAX_VIDEO_PIXELS,
+  assertVideoInput,
+  videoInputBytes,
+  type VideoFrameInput,
+  type VideoInput,
+} from "./video.js";
 
 export {
   PROBE_MARGIN_THRESHOLD,

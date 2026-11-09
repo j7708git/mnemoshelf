@@ -8,6 +8,7 @@
  *   伺服器以 `MNEMOSHELF_WEB_DIR` 讀取。
  */
 import path from "node:path";
+import { hasConfiguredMediaDecoderEnv } from "./media-binaries.js";
 
 /** 桌面殼執行期需要的路徑（全部已解析為絕對路徑）。 */
 export interface DesktopPaths {
@@ -79,6 +80,9 @@ export function parseCliArgs(argv: readonly string[]): CliOptions {
  * **桌面開關優先於 shell 環境變數**：`agentDiscovery` 一律覆寫
  * `MNEMOSHELF_AGENT_DISCOVERY`，`runtimeFile` 也明確指定（桌面設定頁要能顯示與刪除
  * 同一個檔案；不讓外部環境變數把檔案指到桌面不知道的位置）。
+ *
+ * 影片解碼器（`mediaDecoderDirectory`）反過來：只有在環境變數**沒有**明確設定時才注入
+ * `MNEMOSHELF_FFMPEG_DIR`（見 `media-binaries.ts` 的優先序；使用者／CI 的設定優先）。
  */
 export function buildServerEnv(input: {
   base: NodeJS.ProcessEnv;
@@ -90,8 +94,21 @@ export function buildServerEnv(input: {
   agentDiscovery: boolean;
   /** 連線資訊檔路徑（`<dataDir>/runtime.json`）。 */
   runtimeFile: string;
+  /**
+   * 桌面解析到的影片解碼器目錄（內含 `ffmpeg`／`ffprobe` 平台檔名）。
+   *
+   * 省略或空字串＝不設定；環境變數已設定時也不覆寫（見 `hasConfiguredMediaDecoderEnv`）。
+   */
+  mediaDecoderDirectory?: string;
 }): NodeJS.ProcessEnv {
   const port = input.base.MNEMOSHELF_PORT;
+  const mediaDecoderDirectory = input.mediaDecoderDirectory;
+  const mediaDecoderEnv =
+    mediaDecoderDirectory === undefined ||
+    mediaDecoderDirectory.trim() === "" ||
+    hasConfiguredMediaDecoderEnv(input.base)
+      ? {}
+      : { MNEMOSHELF_FFMPEG_DIR: path.resolve(mediaDecoderDirectory) };
   return {
     ...input.base,
     MNEMOSHELF_TOKEN: input.token,
@@ -101,5 +118,6 @@ export function buildServerEnv(input: {
     MNEMOSHELF_PORT: port === undefined || port.trim() === "" ? "0" : port,
     MNEMOSHELF_AGENT_DISCOVERY: input.agentDiscovery ? "on" : "off",
     MNEMOSHELF_RUNTIME_FILE: input.runtimeFile,
+    ...mediaDecoderEnv,
   };
 }

@@ -8,6 +8,9 @@ import type {
 } from "../memory/source.js";
 import type {
   Chunk,
+  ChunkMedia,
+  ChunkMediaContainer,
+  ChunkMediaTrack,
   Memory,
   MemoryEmbeddingState,
   MemoryKind,
@@ -21,6 +24,139 @@ import type {
   RootPatch,
   SearchFilter,
 } from "./types.js";
+
+/** `ChunkMedia.track` 的合法值（runtime 檢查用；型別上是 `ChunkMediaTrack`）。 */
+export const CHUNK_MEDIA_TRACKS: readonly ChunkMediaTrack[] = ["audio", "video", "video-audio"];
+
+/** `ChunkMedia.container` 的合法值（v1 白名單；未提供＝舊資料或未記錄）。 */
+export const CHUNK_MEDIA_CONTAINERS: readonly ChunkMediaContainer[] = ["wav", "mp4"];
+
+/** 單一時間片段最多可記錄的視覺幀時間數（與 embedder 契約的上限一致）。 */
+export const CHUNK_MEDIA_MAX_FRAME_TIMES = 32;
+
+/**
+ * 同一時間起點時各軌道的先後權重（`seq` 規則的一部分；數字小的排在前面）。
+ *
+ * 排序目的：讓同檔跨軌的 `seq` 唯一且**可重現**，不因產生順序（先解畫面或先解音軌）而變動。
+ */
+const CHUNK_MEDIA_TRACK_WEIGHT: Record<ChunkMediaTrack, number> = { video: 0, "video-audio": 1, audio: 2 };
+
+/**
+ * 驗證並複製媒體定位資料；不存在代表舊版或非時間型 chunk。
+ *
+ * 這是兩後端與呼叫端共用的**唯一**驗證入口（不得各自解讀）：
+ * - 舊資料（音訊里程碑）只有 `track:"audio"`，照舊可讀；不得因為新增欄位而拒絕。
+ * - `track:"video"` 是影片畫面片段，`frameTimesSeconds` **必填**（1–32 個、非遞減、落在片段區間內）；
+ * - `track:"video-audio"` 是影片所選音軌，`streamIndex` **必填**（整數 ≥ 0，記所選音軌）；
+ * - `container` 選填；有值必須在白名單內。
+ */
+export function normalizeChunkMedia(value: unknown): ChunkMedia | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "object" || Array.isArray(value)) throw new TypeError("媒體定位資料必須是物件");
+  const item = value as Record<string, unknown>;
+  if (
+    typeof item.startSeconds !== "number" || !Number.isFinite(item.startSeconds) || item.startSeconds < 0 ||
+    typeof item.endSeconds !== "number" || !Number.isFinite(item.endSeconds) || item.endSeconds <= item.startSeconds ||
+    typeof item.track !== "string" || !(CHUNK_MEDIA_TRACKS as readonly string[]).includes(item.track) ||
+    typeof item.preprocessVersion !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(item.preprocessVersion) ||
+    typeof item.embedderId !== "string" || item.embedderId.trim().length === 0 || item.embedderId.length > 512 ||
+    typeof item.embeddingDim !== "number" || !Number.isInteger(item.embeddingDim) || item.embeddingDim <= 0
+  ) throw new TypeError("媒體定位資料不合法");
+  const track = item.track as ChunkMediaTrack;
+
+  // container 選填（舊資料沒有）；有值必須在白名單內。
+  let container: ChunkMediaContainer | undefined;
+  if (item.container !== undefined) {
+    if (
+      typeof item.container !== "string" ||
+      !(CHUNK_MEDIA_CONTAINERS as readonly string[]).includes(item.container)
+    ) throw new TypeError("媒體定位資料不合法");
+    container = item.container as ChunkMediaContainer;
+  }
+
+  // streamIndex 選填；影片所選音軌必須記錄，其他軌道可省略（畫面片段可省略）。
+  let streamIndex: number | undefined;
+  if (item.streamIndex !== undefined) {
+    if (
+      typeof item.streamIndex !== "number" || !Number.isInteger(item.streamIndex) || item.streamIndex < 0
+    ) throw new TypeError("媒體定位資料不合法");
+    streamIndex = item.streamIndex;
+  } else if (track === "video-audio") {
+    throw new TypeError("媒體定位資料不合法");
+  }
+
+  // frameTimesSeconds：只有畫面片段能有；必填、非遞減、落在片段區間內。
+  let frameTimesSeconds: number[] | undefined;
+  if (item.frameTimesSeconds !== undefined) {
+    if (track !== "video") throw new TypeError("媒體定位資料不合法");
+    const raw = item.frameTimesSeconds;
+    if (!Array.isArray(raw) || raw.length === 0 || raw.length > CHUNK_MEDIA_MAX_FRAME_TIMES) {
+      throw new TypeError("媒體定位資料不合法");
+    }
+    const times: number[] = [];
+    let previous = Number.NEGATIVE_INFINITY;
+    for (const entry of raw) {
+      if (typeof entry !== "number" || !Number.isFinite(entry)) throw new TypeError("媒體定位資料不合法");
+      if (entry < item.startSeconds || entry > item.endSeconds) throw new TypeError("媒體定位資料不合法");
+      if (entry < previous) throw new TypeError("媒體定位資料不合法");
+      previous = entry;
+      times.push(entry);
+    }
+    frameTimesSeconds = times;
+  } else if (track === "video") {
+    throw new TypeError("媒體定位資料不合法");
+  }
+
+  const media: ChunkMedia = {
+    startSeconds: item.startSeconds, endSeconds: item.endSeconds, track,
+    preprocessVersion: item.preprocessVersion, embedderId: item.embedderId, embeddingDim: item.embeddingDim,
+  };
+  // 只有真的有值才寫入選填欄位：舊資料讀回後不得多出 `container: undefined` 這類鍵。
+  if (container !== undefined) media.container = container;
+  if (streamIndex !== undefined) media.streamIndex = streamIndex;
+  if (frameTimesSeconds !== undefined) media.frameTimesSeconds = frameTimesSeconds;
+  return media;
+}
+
+/**
+ * 比較兩個媒體片段在時間軸上的先後（`seq` 規則的**唯一**實作；呼叫端不得自行排序）。
+ *
+ * 規則（依序）：
+ * 1. `startSeconds` 升冪；
+ * 2. 同時刻依軌道：`video` → `video-audio` → `audio`（畫面先於音軌）；
+ * 3. `endSeconds` 升冪；
+ * 4. 都有 `frameTimesSeconds` 時比較第一個幀時間；
+ * 5. 仍相同＝視為等價（由穩定排序保留傳入順序）。
+ *
+ * 純音訊檔（既有 WAV）的結果與現行的「seq = 片段索引」完全相同，因此舊資料不必重編號。
+ */
+export function compareChunkMediaOrder(a: ChunkMedia, b: ChunkMedia): number {
+  if (a.startSeconds !== b.startSeconds) return a.startSeconds - b.startSeconds;
+  const byTrack = CHUNK_MEDIA_TRACK_WEIGHT[a.track] - CHUNK_MEDIA_TRACK_WEIGHT[b.track];
+  if (byTrack !== 0) return byTrack;
+  if (a.endSeconds !== b.endSeconds) return a.endSeconds - b.endSeconds;
+  const aFrame = a.frameTimesSeconds?.[0];
+  const bFrame = b.frameTimesSeconds?.[0];
+  if (aFrame !== undefined && bFrame !== undefined && aFrame !== bFrame) return aFrame - bFrame;
+  return 0;
+}
+
+/**
+ * 把**同一個檔案**的媒體片段排成契約的 `seq` 順序並重新編號（0 起算、連續）。
+ *
+ * 為什麼存在：影片同時有畫面與音軌片段，若兩軌各自從 0 編號會互相覆寫；多軌的 `seq`
+ * 必須同檔唯一且穩定（重跑同一個檔案要得到相同順序），所以由這支函式統一定序——
+ * 索引端（B3b）在 `replaceChunks` 前用它填 `seq`；儲存層不自行解讀順序。
+ *
+ * - 只排序、不改傳入物件：回傳新陣列，`seq` 已依 `compareChunkMediaOrder` 重新指定。
+ * - 使用穩定排序（ES2019 起 `Array.prototype.sort` 保證），完全等價的片段維持傳入順序。
+ * - 空陣列回傳空陣列；不驗證片段內容（驗證在 `normalizeChunkMedia`）。
+ */
+export function assignChunkMediaSeq<T extends { seq: number; media: ChunkMedia }>(chunks: readonly T[]): T[] {
+  return [...chunks]
+    .sort((left, right) => compareChunkMediaOrder(left.media, right.media))
+    .map((chunk, index) => (chunk.seq === index ? chunk : { ...chunk, seq: index }));
+}
 
 /** `listMemories` 未指定 `limit` 時的預設筆數。 */
 export const MEMORY_LIST_DEFAULT_LIMIT = 100;
@@ -329,6 +465,41 @@ export function assertMemoryEmbeddingFailure(reason: MemoryEmbeddingFailure): vo
 }
 
 /**
+ * root 的影片單檔大小上限（`Root.videoMaxFileBytes`）的最小值（bytes）。
+ *
+ * 值域刻意與掃描層的 `DEFAULT_VIDEO_MAX_FILE_BYTES`（512 MiB 預設）分開：
+ * 這裡是**持久化設定**的合法範圍，預設值屬呼叫端（server）的 fallback 語意。
+ */
+export const VIDEO_MAX_FILE_BYTES_MIN = 1;
+
+/** root 的影片單檔大小上限最大值（16 GiB）。 */
+export const VIDEO_MAX_FILE_BYTES_MAX = 16 * 1024 * 1024 * 1024;
+
+/**
+ * 驗證並正規化 root 的影片單檔大小上限（bytes）。
+ *
+ * 這是兩後端（SQLite／PostgreSQL）與呼叫端共用的**唯一**驗證入口（不得各自解讀）：
+ * - `undefined`／`null` → `undefined`（未設定；呼叫端沿用行程層預設，不寫入資料庫）；
+ * - 整數且落在 1–16 GiB → 原值；
+ * - 其他（0／負數／小數／NaN／Infinity／超過 16 GiB／非數字）→ 拋 `TypeError`。
+ *
+ * 為什麼上限是 16 GiB：A1 的產品上限是 512 MiB，但 per-root 設定要能覆寫；
+ * 16 GiB 足以涵蓋高碼率長片，同時保證值是安全整數（< 2^53）且不會誤把 GB 當 bytes。
+ */
+export function normalizeRootVideoMaxFileBytes(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < VIDEO_MAX_FILE_BYTES_MIN ||
+    value > VIDEO_MAX_FILE_BYTES_MAX
+  ) {
+    throw new TypeError("root 的影片單檔大小上限必須是 1–16 GiB 的整數（bytes）");
+  }
+  return value;
+}
+
+/**
  * 中繼資料儲存介面（預設實作為 SQLite）。
  * 職責：roots、檔案 chunk 文字、記憶、遷移。
  * 全文檢索的斷詞方式屬於實作細節，不得洩漏到介面。
@@ -349,18 +520,26 @@ export interface MetadataStore {
   /** 套用遷移。必須可重複呼叫（冪等）。 */
   migrate(): Promise<void>;
 
+  /**
+   * 新增 root。
+   *
+   * `r.videoMaxFileBytes` 選填：有值時必須通過 `normalizeRootVideoMaxFileBytes`
+   * （1–16 GiB 整數），未提供／`null` 時資料庫寫 NULL；讀回時該鍵不出現。
+   */
   addRoot(r: NewRoot): Promise<Root>;
   getRoot(id: number): Promise<Root | null>;
   listRoots(): Promise<Root[]>;
 
   /**
-   * 更新 root 的可變設定（見 `RootPatch`；目前只有 `modalities`）。
+   * 更新 root 的可變設定（見 `RootPatch`；`modalities` 與 `videoMaxFileBytes`）。
    *
    * - 回傳**更新後**的 root，讓呼叫端不必再讀一次；
    * - id 不存在時回 `null`（呼叫端據此回 404；本方法自己不拋錯，
    *   與 `setMemoryPinned` 對不存在 id 的「不拋錯」風格一致）；
    * - 只改設定，**不動**任何 chunk／向量：模態要在下一次 `indexRoot` 才會生效
    *   （關掉模態不會立刻釋放既有向量，重新索引時才由清理迴圈清掉）。
+   * - `videoMaxFileBytes`：`number`＝設定（驗證同上）、`null`＝清除（寫 NULL）、
+   *   `undefined`＝不改；只影響之後的 preview／index／播放，不動既有索引。
    */
   updateRoot(id: number, patch: RootPatch): Promise<Root | null>;
 

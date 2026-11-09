@@ -106,3 +106,48 @@ describe("buildServerEnv", () => {
     expect(env.MNEMOSHELF_RUNTIME_FILE).toBe("/data/runtime.json");
   });
 });
+
+describe("buildServerEnv 的影片解碼器目錄", () => {
+  const decoderDir = path.join("tmp", "example-decoder-bin");
+
+  it("沒有指定時不注入 MNEMOSHELF_FFMPEG_DIR（服務維持影片 disabled）", () => {
+    const env = buildServerEnv({
+      base: {},
+      token: "tok",
+      dataDir: "/data",
+      modelDir: "/models",
+      webDir: "/web",
+      agentDiscovery: false,
+      runtimeFile: "/data/runtime.json",
+    });
+    expect(env.MNEMOSHELF_FFMPEG_DIR).toBeUndefined();
+  });
+
+  it("指定目錄時注入解析後的絕對路徑", () => {
+    const env = buildServerEnv({
+      base: {},
+      token: "tok",
+      dataDir: "/data",
+      modelDir: "/models",
+      webDir: "/web",
+      agentDiscovery: false,
+      runtimeFile: "/data/runtime.json",
+      mediaDecoderDirectory: decoderDir,
+    });
+    expect(env.MNEMOSHELF_FFMPEG_DIR).toBe(path.resolve(decoderDir));
+  });
+
+  it("shell／CI 已明確設定時不覆寫（使用者設定優先）", () => {
+    const env = buildServerEnv({
+      base: { MNEMOSHELF_FFMPEG_DIR: path.join("tmp", "custom-bin") },
+      token: "tok",
+      dataDir: "/data",
+      modelDir: "/models",
+      webDir: "/web",
+      agentDiscovery: false,
+      runtimeFile: "/data/runtime.json",
+      mediaDecoderDirectory: decoderDir,
+    });
+    expect(env.MNEMOSHELF_FFMPEG_DIR).toBe(path.join("tmp", "custom-bin"));
+  });
+});

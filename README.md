@@ -32,7 +32,7 @@ pnpm --filter @mnemoshelf/desktop dist
 | 功能 | 說明 |
 |---|---|
 | 檔案總管 | 自己挑選要納入的資料夾（root）；加入後先乾跑預覽統計（會納入什麼、會跳過什麼），確認後才開始索引。提供目錄樹、檔案預覽與圖片縮圖。 |
-| 語意搜尋 | 文字與圖片落在同一個向量空間，可以用文字搜圖片；三種模式 `vector`（預設）、`keyword`、`hybrid`。 |
+| 語意搜尋 | 文字、圖片與支援的 WAV 音訊落在同一個向量空間；音訊需手動開啟，可用文字查詢並定位時間片段。三種模式 `vector`（預設）、`keyword`、`hybrid`。 |
 | 共用記憶 | 每則記憶有 `content`、`kind`（fact／decision／pitfall／preference）、`scope`（global／project／agent）、`project`、`agent`、`pinned`；支援 NDJSON 備份匯出／匯入。 |
 | Agent 整合 | MCP 七個工具 `search`、`remember`、`recall`、`forget`、`list_roots`、`search_memories`、`read_memory_source`（[docs/operations.md](docs/operations.md)）；OpenCode／OpenChamber 外掛在模型請求前檢查，於 session 的第一則 prompt 或訊息含明示線索時召回（預設 `first-turn+explicit`；[docs/opencode-plugin.md](docs/opencode-plugin.md)）；dsh 外掛在每個回合第一步召回，回合結束保存原文來源（[docs/agent-integration.md](docs/agent-integration.md)）。 |
 | 連接 Agent | 四種 harness 的接入指引、狀態偵測與可複製片段；只讀使用者層設定，不寫入、不執行安裝（[docs/agent-integration.md](docs/agent-integration.md)、[docs/opencode-plugin.md](docs/opencode-plugin.md)）。 |

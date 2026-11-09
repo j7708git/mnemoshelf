@@ -24,6 +24,10 @@ interface EmbedderInfo {
 
 `text` 與 `image` 兩者缺一就不能註冊成 embedder。
 
+`video` 為 true 表示實作提供 `embedVideo` 入口、且模型屬於已知具備影片幀序列支援的白名單
+（預設實作對自訂 modelId 保守回 false）；它**不代表**解碼器可用或權重已就緒，見
+「影片幀序列」一節。
+
 ## 介面
 
 ```ts
@@ -38,7 +42,11 @@ interface Embedder {
   /** 文件文字批次；輸出與 inputs 一一對應且順序相同（見「批次方法」一節）。 */
   embedDocuments(inputs: readonly DocumentInput[], opts?: EmbedDocumentsOptions): Promise<Float32Array[]>;
   /** 圖片。輸入為已解碼的像素或檔案位元組，由實作決定，但必須明確定義。 */
-  embedImage(image: ImageInput): Promise<Float32Array>;
+  embedImage(image: ImageInput, opts?: EmbedDocumentsOptions): Promise<Float32Array>;
+  /** 已解碼的單聲道音訊片段；選配，audio=true 時必須提供。 */
+  embedAudio?(audio: AudioInput, opts?: EmbedDocumentsOptions): Promise<Float32Array>;
+  /** 已解碼的影片幀序列；選配，video=true 時必須提供。 */
+  embedVideo?(video: VideoInput, opts?: EmbedDocumentsOptions): Promise<Float32Array>;
   /** 啟動探測，見「啟動探測」一節。 */
   probe(): Promise<ProbeResult>;
   dispose(): Promise<void>;
@@ -46,6 +54,103 @@ interface Embedder {
 ```
 
 所有回傳的向量：長度為 `info.dim`、**已 L2 正規化**（模長 1，容差 1e-3）。
+
+## 音訊片段與模型就緒
+
+```ts
+interface AudioInput {
+  samples: Float32Array;
+  sampleRate: 16000;
+}
+```
+
+- 輸入是已解碼、已混音的 16 kHz 單聲道 PCM，1 至 480,000 個有限樣本，每個值在 [-1, 1]。
+  最大 30 秒，超出必須拒絕，不能讓上游 processor 靜默截短；檔案解碼與時間切段由索引器處理。
+- 少於 160 個樣本的非空尾段補零至 160（10 ms），避免上游產生零個音訊 frame；原始樣本保留，
+  補零不延長來源起訖時間。增量索引的前處理身分包含 `audio-pad160-v1`。
+- `embedAudio` 不加文字 prefix；與文字、圖片使用相同模型的共同向量空間，同樣截斷到 `info.dim`
+  並重新 L2 正規化。每段檢查實際 `input_ids` token 數，不超過 8,192；缺有效形狀時拒絕。
+- 空、非有限值、錯誤取樣率、超限 PCM 為 `EmbedderInputError`，不載模型；取消優先於輸入驗證。
+  前處理錯誤不觸發裝置退回。已開始的 native Run 不強制中斷，完成後若已取消則丟棄結果。
+- `capabilities.audio=true` 表示有音訊處理入口，不代表權重已下載。選配的
+  `runtimeStatus.audioState` 值為 `disabled`／`not-loaded`／`loading`／`ready`／`failed`。
+  本實作起始為 `not-loaded`；首次音訊要求才透過既有模型快取下載／載入 audio encoder，下載失敗可重試。
+  q4 音訊權重約 189 MB，純文字／圖片使用不會觸發此下載。
+- 首次音訊在共享模型鎖內，先等既有推論與下述資產預檢完成、釋放舊 session，再載入三個 encoder；不常駐第二份文字模型。
+  音訊升級失敗時恢復原裝置設定，下一個文字／圖片要求仍可重載原 backend。
+- 升級前先以公開 `model_file_name` 選項建立**單一音訊 session**，取得並驗證音訊權重後立即釋放；
+  這個階段失敗會保留既有文字／圖片模型，`audioRetryable=true`，可重跑索引。三 encoder 的正式升級
+  僅讀本機快取。上游多 session 建置使用 `Promise.all`，一般原生建置失敗沒有公開的部分 session
+  清理入口，因此仍可能保留部分資源直到行程結束；這類失敗以 `EAUDIORESTART`、`audioState=failed`、
+  `audioRetryable=false` 回報，**需重新啟動後再試**。同一實例停止音訊重試，避免逐檔累積資源；文字／圖片仍可恢復。
+- 直接使用 adapter 時，音訊升級／推論中呼叫 `dispose()` 也會等安全邊界再釋放，並行 dispose 冪等；
+  後續明確 `embed*` 呼叫可重新載入，但不解除上述本實例音訊 terminal 失敗狀態。
+- **首版音訊使用 CPU**。DML／CoreML 的文字與圖片自我測試不代表音訊 encoder 已驗收。
+  原先使用加速器的實例在首次音訊成功後，文字與圖片也共用 CPU backend；診斷保留 `requestedDevice`，
+  `fallbackReason.code=audio-cpu`。這是本次執行的政策，不把既有加速器決定快取覆寫成失敗。
+  首次音訊後該實例所有模型操作序列執行，`serializedInference=true`；未使用音訊的既有路徑維持原行為。
+- 服務 worker 將一個音訊片段視為一個背景排程視窗，PCM 位元組計入全域准入上限；准入後複製並 transfer，
+  不 detach 呼叫端 buffer。查詢可在片段邊界穿插，取消與安全關閉沿用同一個 drain 契約。
+
+## 影片幀序列（`embedVideo`）
+
+> 本節於 **2026-11-08 經 PM 同意新增**（影片索引里程碑三 B2）。抽樣政策已凍結：
+> 每 4 秒一段、每段 **1 幀**（0.25 fps）；`frames` 的 1–32 幀上限是契約與測試用的容許範圍，
+> 產品索引器目前每段只送 1 幀。
+
+```ts
+interface VideoFrameInput {
+  /** 已解碼像素；row-major、不做 alpha 預乘；長度必須等於 width × height × channels。 */
+  pixels: Uint8Array;
+  /** 影格寬度（像素整數），1–2048。 */
+  width: number;
+  /** 影格高度（像素整數），1–2048。 */
+  height: number;
+  /** 3＝RGB、4＝RGBA。 */
+  channels: 3 | 4;
+  /**
+   * 實際解碼來源幀的 PTS（秒，播放時間軸 0-based；不是抽樣格線或平均 FPS 推估）；
+   * 有限、非負，同一片段內非遞減。由解碼層提供；模型不編碼時間，但應用保存與驗證。
+   */
+  timestampSeconds: number;
+}
+
+interface VideoInput {
+  /** 1–32 幀；超過上限必須拒絕，不得默默抽樣。 */
+  frames: readonly VideoFrameInput[];
+}
+```
+
+- 輸入是**已解碼**的幀，不接受檔案位元組、路徑或容器；解碼、縮放（最長邊 384）與時間線正規化
+  由解碼／索引層負責。`timestampSeconds` 必須是實際解碼來源幀 PTS（波次一 D1 起，取幀以
+  select 保留來源 PTS，不是 fps 輸出格時間）；時間線無法可靠定義時解碼層具名跳過，不送猜測值。`embedVideo` **不加文字 prefix**；與文字、圖片、音訊共用同一個向量空間，
+  輸出同樣截斷到 `info.dim` 並重新 L2 正規化。
+- 視覺前處理身分為 `mp4-h264-rgb24-v4:4s:1f:384:srcpts-v3`（另附 decoder 版本）。解碼端依來源 PTS
+  提供 `VideoProbe.visualTimeline`，indexer 在嵌入前核對每段起訖與來源幀時間；增量比對也使用同份佈局。
+  視覺與音軌共用容器的播放原點，保留視訊自身起點偏移；末幀時長能證明的空尾格可省略，含幀尾段仍保留。
+  細節見 [媒體定位契約](storage-ports.md)。舊 v2／v3 索引須重建，
+  未變重跑不重嵌，但目前仍會在 probe 讀取全片影格表，不能宣稱沒有解碼成本。
+- 驗證在**載入模型前**完成，違反者為 `EmbedderInputError`（穩定錯誤碼 `invalid-video-input`）：
+  幀數 1–32、`channels` 3／4、`pixels.length === width×height×channels`、邊長 1–2048、
+  全部幀像素總數 ≤ 8,388,608、timestamp 有限非負且非遞減、同段所有幀的寬高通道一致。
+  超過 32 幀**不得**交給上游 processor 默默均勻抽樣（上游 `max_frames=32` 會那樣做）。
+- 每段檢查實際 `input_ids` token 數 ≤ 8,192（與文字／音訊同一條上限）；缺有效形狀時拒絕。
+  一幀的影片 soft token 數由 processor 依 `max_soft_tokens`（預設影片 140／幀）與影像長寬比決定，
+  **不是**固定值；不得用固定值乘幀數取代實際 token 檢查。
+- 取消在開始推論前檢查；已開始的 native Run 不強制中斷，完成後若已取消則丟棄結果。
+  影片前處理失敗歸類為輸入類失敗（`EmbedderInputError`），不觸發裝置退回；模型本身不支援影片
+  時以具名 `VideoUnsupportedError`（穩定錯誤碼 `video-unsupported`）失敗，**不**降級成 `ready`。
+- `capabilities.video=true` 表示**這個實作提供入口**，且模型是已知具備 `video_processor` 的
+  白名單模型（本專案預設實作以白名單保守宣告；自訂 modelId 先回 false）。它**不代表 decoder 可用**，
+  也不代表權重已就緒。decoder 是否可用屬解碼／索引層，不塞進 embedder 的 `videoState`。
+- 選配的 `runtimeStatus.videoState` 值為 `disabled`／`not-loaded`／`loading`／`ready`／`failed`；
+  `failed` 時 `videoRetryable` 表示可否在同一行程重試。目前影片沿用既有 vision encoder，
+  不存在需要下載的獨立影片權重。
+- 影片沿用既有 vision encoder（逐幀過與圖片相同的視覺編碼器），**不需要額外權重**；
+  第一次 `embedVideo` 會載入模型（與第一次圖片推論相同），不會觸發音訊 encoder 升級或下載。
+- 服務 worker 將一個影片片段視為一個背景排程視窗，所有幀的像素位元組計入全域准入上限；
+  准入後才複製並 transfer 像素，**不 detach 呼叫端 buffer**。查詢可在片段邊界穿插，
+  取消與安全關閉沿用同一個 drain 契約。
 
 ## 執行裝置狀態（`runtimeStatus`，選配）
 
@@ -58,6 +163,14 @@ interface Embedder {
 ```ts
 /** embedder 的執行裝置狀態（選配能力，供診斷與排程參考）。 */
 interface EmbedderRuntimeStatus {
+  /** 音訊資產狀態（選配），與能力宣告分開。 */
+  audioState?: "disabled" | "not-loaded" | "loading" | "ready" | "failed";
+  /** failed 時提供；false 表示需重新啟動後再試。 */
+  audioRetryable?: boolean;
+  /** 影片入口狀態（選配），與能力宣告分開；decoder 可用性另由解碼／索引層回報。 */
+  videoState?: "disabled" | "not-loaded" | "loading" | "ready" | "failed";
+  /** failed 時提供；false 表示需重新啟動後再試（目前影片沿用既有模型，失敗皆可在同行程重試）。 */
+  videoRetryable?: boolean;
   /** 要求／設定的裝置選項（`auto` 表示依平台自動決定）；值由實作定義。 */
   requestedDevice: string;
   /**
@@ -284,6 +397,30 @@ token ≈ 最多約 2,048 真實 token）離這個值很遠，這是安全網而
 並不保證配置低於 PartitionAlloc 的單一配置上限。**不要**因為預算「看起來夠小」就把 pattern 打開：
 那條路正是 macOS 索引閃退的成因。
 
+## 服務端批次排程
+
+`WorkerEmbedder` 保留 `embedDocuments` 的順序、數量與整批成功／失敗契約，內部將文件拆成
+不超過 16 筆、且不超過目前裝置 `batchSize` 的工作視窗。每個視窗仍受模型實作的實際 token
+預算約束；模型內部可能再縮窗。視窗完成後讓出執行機會，同時最多一個 worker 請求進行推論。
+查詢優先，但連續最多 4 個查詢後，已等待的背景工作可前進一個視窗；背景請求輪流執行。
+這是工作視窗邊界的公平性，不保證正在執行的 native Run 可搶占或固定毫秒延遲。
+
+預設准入上限含正在執行的邏輯請求：128 個請求、8,192 個輸入、64 MiB 輸入 UTF-8／媒體
+位元組。文件標題也計入；准入後才複製輸入。超限拋 `EEMBEDDERQUEUEFULL`，服務搜尋端點
+回 `503` 與 `Retry-After: 1`；單一輸入本身超限時需要縮小輸入。索引仍按檔案記錄失敗並於下次重跑補齊。
+這些限制控制排程持有的輸入，並非整個行程 RSS 或圖片解碼像素的上限。
+
+圖片也接受選用的 `signal`；排隊中的文件／圖片取消可立即拒絕，圖片在解碼與前處理邊界檢查取消。
+影片片段同樣接受選用的 `signal`：一個片段是一個背景排程視窗，所有幀的像素位元組計入
+准入上限（預設 64 MiB）；非法幀序列在建立 worker 前就被拒絕，准入後才複製並 transfer 像素。
+執行中的 native 推論等待安全邊界，之後不再啟動下一視窗，
+累積的部分向量不回傳為成功。關閉會拒絕尚未執行的工作並等待目前視窗收尾；`drain()`
+涵蓋視窗間隙。保留既有 memory-pattern／CPU arena 與 token 護欄。
+
+`GET /diagnostics` 的 `embedderScheduling` 只回傳彙總計數、排隊／worker 往返耗時及上限。
+`completedWindows` 是完成的工作視窗；`completedDocumentInputs` 是整個邏輯文件呼叫成功的輸入數，
+兩者都不代表索引資料已持久化；逐檔的 `processedChunks` 才是成功寫入量。
+
 ## 啟動探測（probe）
 
 註冊 embedder 後、建立任何索引前，必須先通過探測；未通過就拒絕啟用，
@@ -331,6 +468,11 @@ core 目前以錯誤**名稱**（`EmbedderInputError`／`EmptyImageInputError`�
 就是靠這個碼把這類失敗回應成 **4xx（不是 500）**；只帶名稱而不帶這個碼的實作，會過得了
 core 的歸類、卻過不了契約測試與 HTTP 分級。
 
+**影片幀序列的結構錯誤也是輸入類失敗（穩定錯誤碼 `invalid-video-input`）。** 幀數為 0 或超過 32、
+像素長度不符、通道數不是 3／4、邊長超出上限、像素總數超限、timestamp 非有限／負值／遞減、
+同段幀尺寸不一致，皆以 `EmbedderInputError` 回報且**不送進模型**；語意與上面兩者相同
+（與執行裝置無關、重試同一份幀結果相同、不觸發裝置退回）。
+
 **索引路徑的行為＝不讓整輪失敗。** 這一類錯誤在索引路徑上屬「可跳過的輸入類失敗」，
 **不會**讓整輪索引中斷：該筆不會被嵌入，該檔依 core 既有的輸入類規則處置
 （媒體檔記成 `skipped(undecodable)`、不進 `failedFiles`；文字／程式碼檔記在該檔的
@@ -352,7 +494,8 @@ sharp／transformers.js 版本變動）。
   查詢與文件必須用相同維度。預設採用 512 維，實測後可調整。
 - 精度只能用 `bfloat16` 或 `float32`，**不可用 `float16`**（會出現 NaN 或靜默劣化）。
   ONNX 量化版（q8、q4）是另外釋出的檔案，不受此限，但需實測品質。
-- 上下文共 8192 token；圖片預設每張 280 token，音訊每秒 25 token，影片每幀 140 token。
+- 上下文共 8192 token；圖片預設每張 280 token，音訊每秒 25 token，影片每幀**上限** 140 token。
+  實際 token 數依長寬比而不同（實測 4 幀 64×64 約 121 token／幀），不得用固定值乘幀數估算。
   單筆輸入的 token 數硬上限就用這個值（`MAX_INPUT_TOKENS`；見「批次方法」與
   「無法解碼／處理的輸入」兩節）。
 - 視覺與音訊編碼器可以選擇性載入，只用文字加圖片時不需載入音訊編碼器。

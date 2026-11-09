@@ -1,0 +1,1487 @@
+{
+  "schemaVersion": 1,
+  "corpusId": "mnemoshelf-video-a2-security-matrix-v1",
+  "generatedAt": "2026-11-08T01:13:30.887Z",
+  "generator": "scripts/generate-security.mjs",
+  "tool": {
+    "ffmpegVersion": "n9.0.2-48-gd4070a14ce（BtbN win64 LGPLv3 static build；無 libx264）",
+    "encoder": "libopenh264（H.264 Constrained Baseline）+ aac"
+  },
+  "expectationVocabulary": {
+    "outcome": {
+      "success": "整檔成功（依模態組合做應做的索引）",
+      "skip": "具名跳過（scanSkippedFiles 或 skippedFiles，不寫片段）",
+      "fail": "具名失敗（failedFiles／可重試錯誤；不寫片段、不 crash）"
+    },
+    "stage": {
+      "scan": "掃描階段即可判定（不讀內容）",
+      "process": "處理階段（probe／decode 後）判定"
+    },
+    "codeNote": "錯誤碼為 A2 提案；B 階段契約必須凍結正式名稱並加契約測試。code=null 表示成功不帶錯誤。"
+  },
+  "fixtures": [
+    {
+      "id": "sec01-noaudio",
+      "file": "sec01-noaudio.mp4",
+      "tags": [
+        "no-audio-track"
+      ],
+      "purpose": "無音軌的 H.264 MP4",
+      "expected": {
+        "stage": "process",
+        "outcome": "success",
+        "code": null,
+        "detail": "視覺索引成功；audio 模態開啟時也不得因『無音軌』失敗或跳過"
+      },
+      "assertions": [
+        "probe 顯示只有 video stream",
+        "視覺片段數與時長覆蓋相符",
+        "音軌索引為空但不報錯"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "12.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 640,
+            "height": 360,
+            "avgFrameRate": "24/1",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "moov",
+            "size": 1950
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 90828
+          }
+        ],
+        "moovOffset": 32,
+        "mdatOffset": 1990,
+        "moovBeforeMdat": true,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        }
+      },
+      "sha256": "7d5fac5dc2f4110182a02e35b171c72bf0eeb4fe97141b5c9cc71f503b4acbbd",
+      "sizeBytes": 92818
+    },
+    {
+      "id": "sec02-ac3",
+      "file": "sec02-ac3.mp4",
+      "tags": [
+        "unsupported-audio-codec"
+      ],
+      "purpose": "H.264 + AC-3（不支援音軌）",
+      "expected": {
+        "stage": "process",
+        "outcome": "skip",
+        "code": "unsupported-video-audio-track",
+        "detail": "audio 開啟時整檔具名跳過，不做部分成功；只開 video 時可視覺成功（需另測）"
+      },
+      "assertions": [
+        "不做任何片段寫入",
+        "skip 原因具名且可對帳",
+        "不得只寫視覺片段卻標成整檔成功"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "12.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 640,
+            "height": 360,
+            "avgFrameRate": "24/1",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          },
+          {
+            "index": 1,
+            "codecType": "audio",
+            "codecName": "ac3",
+            "avgFrameRate": "0/0",
+            "rFrameRate": "0/0",
+            "sampleRate": "32000",
+            "channels": 1,
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 36
+          },
+          {
+            "type": "moov",
+            "size": 5318
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 378828
+          }
+        ],
+        "moovOffset": 36,
+        "mdatOffset": 5362,
+        "moovBeforeMdat": true,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        }
+      },
+      "sha256": "fa97b95e88731836c731a04400de71b05a702d95acd32a940811f1d87bad02b5",
+      "sizeBytes": 384190
+    },
+    {
+      "id": "sec03-dts",
+      "file": "sec03-dts.mp4",
+      "tags": [
+        "unsupported-audio-codec"
+      ],
+      "purpose": "H.264 + DTS（不支援音軌；實驗性 dca 編碼器產生）",
+      "expected": {
+        "stage": "process",
+        "outcome": "skip",
+        "code": "unsupported-video-audio-track",
+        "detail": "同 AC-3：audio 開啟時整檔具名跳過"
+      },
+      "assertions": [
+        "不做任何片段寫入",
+        "skip 原因具名且可對帳"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "12.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 640,
+            "height": 360,
+            "avgFrameRate": "24/1",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          },
+          {
+            "index": 1,
+            "codecType": "audio",
+            "codecName": "dts",
+            "avgFrameRate": "0/0",
+            "rFrameRate": "0/0",
+            "sampleRate": "16000",
+            "channels": 1,
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "moov",
+            "size": 6819
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 1242828
+          }
+        ],
+        "moovOffset": 32,
+        "mdatOffset": 6859,
+        "moovBeforeMdat": true,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        }
+      },
+      "sha256": "70d9e40de89fa0685e7716ac03c0b7f96caafc33c5afb4f8f545f4beb17f71cb",
+      "sizeBytes": 1249687
+    },
+    {
+      "id": "sec04-moov-end",
+      "file": "sec04-moov-end.mp4",
+      "tags": [
+        "moov-at-end"
+      ],
+      "purpose": "moov 位於 mdat 之後（faststart 關閉）",
+      "expected": {
+        "stage": "process",
+        "outcome": "success",
+        "code": null,
+        "detail": "成功；必須讀到檔尾 moov 才能 probe／抽幀"
+      },
+      "assertions": [
+        "probe 時長與串流正確",
+        "可抽幀與解音軌",
+        "不需把整個 mdat 讀進記憶體"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "12.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 640,
+            "height": 360,
+            "avgFrameRate": "24/1",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          },
+          {
+            "index": 1,
+            "codecType": "audio",
+            "codecName": "aac",
+            "avgFrameRate": "0/0",
+            "rFrameRate": "0/0",
+            "sampleRate": "48000",
+            "channels": 1,
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 205012
+          },
+          {
+            "type": "moov",
+            "size": 7399
+          }
+        ],
+        "moovOffset": 205052,
+        "mdatOffset": 40,
+        "moovBeforeMdat": false,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        }
+      },
+      "sha256": "80abdce0c298afb230fe310fc46434df6daa2e78b952ec3f1a3ecc12568fa17b",
+      "sizeBytes": 212451
+    },
+    {
+      "id": "sec05-vfr",
+      "file": "sec05-vfr.mp4",
+      "tags": [
+        "vfr"
+      ],
+      "purpose": "可變幀率（非均勻 frame duration）",
+      "expected": {
+        "stage": "process",
+        "outcome": "success",
+        "code": null,
+        "detail": "成功；時間軸用實際 sample timestamps，不得以平均 FPS 虛構片段時間"
+      },
+      "assertions": [
+        "r_frame_rate != avg_frame_rate",
+        "片段起訖落在來源時間軸",
+        "命中時間可回推原片位置"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "12.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 640,
+            "height": 360,
+            "avgFrameRate": "91/12",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          },
+          {
+            "index": 1,
+            "codecType": "audio",
+            "codecName": "aac",
+            "avgFrameRate": "0/0",
+            "rFrameRate": "0/0",
+            "sampleRate": "48000",
+            "channels": 1,
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "moov",
+            "size": 6391
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 167858
+          }
+        ],
+        "moovOffset": 32,
+        "mdatOffset": 6431,
+        "moovBeforeMdat": true,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        },
+        "ptsSample": [
+          0,
+          0.208333,
+          0.291667,
+          0.416667,
+          0.583333,
+          0.625,
+          0.833333,
+          0.875,
+          1.041667,
+          1.166667
+        ]
+      },
+      "sha256": "063aacb0fe078d5980f22290a57c6bcf973d643215f64894c9937f4b598b85aa",
+      "sizeBytes": 174289
+    },
+    {
+      "id": "sec06-rotate90",
+      "file": "sec06-rotate90.mp4",
+      "tags": [
+        "rotation"
+      ],
+      "purpose": "Display Matrix 旋轉 90 度",
+      "expected": {
+        "stage": "process",
+        "outcome": "success",
+        "code": null,
+        "detail": "成功；解碼後依旋轉呈現（640x360 -> 360x640），縮放前套用"
+      },
+      "assertions": [
+        "probe 顯示 rotation=90",
+        "輸出幀方向正確且保留比例"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "12.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 640,
+            "height": 360,
+            "avgFrameRate": "24/1",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": 90
+          },
+          {
+            "index": 1,
+            "codecType": "audio",
+            "codecName": "aac",
+            "avgFrameRate": "0/0",
+            "rFrameRate": "0/0",
+            "sampleRate": "48000",
+            "channels": 1,
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "moov",
+            "size": 7399
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 205012
+          }
+        ],
+        "moovOffset": 32,
+        "mdatOffset": 7439,
+        "moovBeforeMdat": true,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        }
+      },
+      "sha256": "53e9a23dbc650bc5da06beb14c50a0cef6cbe0145300aa4eced25c1d9dd619f7",
+      "sizeBytes": 212451
+    },
+    {
+      "id": "sec07-nonzero-pts",
+      "file": "sec07-nonzero-pts.mp4",
+      "tags": [
+        "nonzero-pts"
+      ],
+      "purpose": "第一個視訊 PTS 為 10 秒（非零起始時間）",
+      "expected": {
+        "stage": "process",
+        "outcome": "success",
+        "code": null,
+        "detail": "成功；時間軸正規化到 0，片段時間仍對應來源內容順序"
+      },
+      "assertions": [
+        "probe start_time ≈ 10",
+        "首片段起點對應來源 0 秒內容"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "12.021333",
+        "formatStartTime": "9.978667",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 640,
+            "height": 360,
+            "avgFrameRate": "24/1",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          },
+          {
+            "index": 1,
+            "codecType": "audio",
+            "codecName": "aac",
+            "avgFrameRate": "0/0",
+            "rFrameRate": "0/0",
+            "sampleRate": "48000",
+            "channels": 1,
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "moov",
+            "size": 7423
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 205012
+          }
+        ],
+        "moovOffset": 32,
+        "mdatOffset": 7463,
+        "moovBeforeMdat": true,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        }
+      },
+      "sha256": "409a89dc509514fe83a0eeaecfa1a61c0b9cdff1884a25111d7c9905b82fb87f",
+      "sizeBytes": 212475
+    },
+    {
+      "id": "sec08-editlist",
+      "file": "sec08-editlist.mp4",
+      "tags": [
+        "edit-list"
+      ],
+      "purpose": "含 edit list（-ss 2 截取後 remux）",
+      "expected": {
+        "stage": "process",
+        "outcome": "success",
+        "code": null,
+        "detail": "成功；依 edit list 有效時間軸，不把編輯前 preroll 當成來源時間"
+      },
+      "assertions": [
+        "probe 時長 ≈ 10 秒",
+        "片段時間不含被編輯掉的前 2 秒"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "10.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 640,
+            "height": 360,
+            "avgFrameRate": "24/1",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          },
+          {
+            "index": 1,
+            "codecType": "audio",
+            "codecName": "aac",
+            "avgFrameRate": "0/0",
+            "rFrameRate": "0/0",
+            "sampleRate": "48000",
+            "channels": 1,
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "moov",
+            "size": 6395
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 173053
+          }
+        ],
+        "moovOffset": 32,
+        "mdatOffset": 6435,
+        "moovBeforeMdat": true,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        }
+      },
+      "sha256": "a66a54aeaef2b5057e9ef7a88f0b161c9faf6161d04fada318186623f349530b",
+      "sizeBytes": 179488
+    },
+    {
+      "id": "sec09-external-dref",
+      "file": "sec09-external-dref.mp4",
+      "tags": [
+        "external-data-reference",
+        "ssrf"
+      ],
+      "purpose": "所有 trak 的 dref/url 都改成外部 URL 的 MP4（container 結構仍可解析）",
+      "expected": {
+        "stage": "process",
+        "outcome": "success",
+        "code": null,
+        "detail": "實測 FFmpeg n9.0.2 mov demuxer 不解析 dref 外部 URL（debug log「Unknown dref type …」）而用本地 mdat 安全解碼；驗收斷言是『解碼期間零網路請求、零外部檔案讀取』。若日後 wrapper／decoder 會解析外部 dref，必須改為具名拒絕（invalid-video）。"
+      },
+      "assertions": [
+        "沒有 DNS／TCP 連線",
+        "沒有讀取 root 外檔案",
+        "不 crash；錯誤訊息不洩漏環境資訊"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "12.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 640,
+            "height": 360,
+            "avgFrameRate": "24/1",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          },
+          {
+            "index": 1,
+            "codecType": "audio",
+            "codecName": "aac",
+            "avgFrameRate": "0/0",
+            "rFrameRate": "0/0",
+            "sampleRate": "48000",
+            "channels": 1,
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 205012
+          },
+          {
+            "type": "moov",
+            "size": 7489
+          }
+        ],
+        "moovOffset": 205052,
+        "mdatOffset": 40,
+        "moovBeforeMdat": false,
+        "hasElst": true,
+        "hasDrefExternalUrl": true
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        },
+        "fullDecode": {
+          "code": 0,
+          "stderrTail": ""
+        },
+        "drefLogs": [
+          "Reading option '-i' ... matched as input url with argument 'D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec09-external-dref.mp4'.",
+          "Parsing a group of options: input url D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec09-external-dref.mp4.",
+          "Opening an input file: D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec09-external-dref.mp4.",
+          "[in#0 @ 000001392d33e200] Opening 'D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec09-external-dref.mp4' for reading",
+          "[in#0 @ 000001392d33e200] Unknown dref type 0x206c7275 size 57",
+          "[in#0 @ 000001392d33e200] Unknown dref type 0x206c7275 size 57",
+          "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec09-external-dref.mp4':",
+          "[in#0/mov,mp4,m4a,3gp,3g2,mj2 @ 000001392d33de00] Input file #0 (D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec09-external-dref.mp4):"
+        ],
+        "networkRefsInLog": 0
+      },
+      "sha256": "984ca4aadedb05188e7d92dc6cb698bfc1613f66979ba62a8acdb98973ec7c78",
+      "sizeBytes": 212541
+    },
+    {
+      "id": "sec10-text-as-mp4",
+      "file": "sec10-text-as-mp4.mp4",
+      "tags": [
+        "fake-extension"
+      ],
+      "purpose": "純文字內容偽裝成 .mp4",
+      "expected": {
+        "stage": "process",
+        "outcome": "fail",
+        "code": "invalid-video",
+        "detail": "具名失敗；不得把文字當媒體、不得 crash"
+      },
+      "assertions": [
+        "probe 失敗並具名",
+        "檔案不進入索引"
+      ],
+      "actualProbe": {
+        "ok": false,
+        "error": "[mov,mp4,m4a,3gp,3g2,mj2 @ 000002ad7641e840] moov atom not found\r\nD:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec10-text-as-mp4.mp4: Invalid data found when processing input"
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": " is ",
+            "size": 1952999795
+          }
+        ],
+        "moovOffset": null,
+        "mdatOffset": null,
+        "moovBeforeMdat": null,
+        "hasElst": false,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 3199971767,
+          "stderrTail": "[in#0 @ 00000170455ae1c0] Error opening input: Invalid data found when processing input | Error opening input file D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec10-text-as-mp4.mp4. | Error opening input files: Invalid data found when processing input"
+        }
+      },
+      "sha256": "88978c98364f82364db345c5f7e4f2e521a025aae0ab3c9d477213bdb0a1a3b2",
+      "sizeBytes": 1260
+    },
+    {
+      "id": "sec11-mp4-as-txt",
+      "file": "sec11-mp4-as-txt.txt",
+      "tags": [
+        "fake-extension"
+      ],
+      "purpose": "有效 MP4 偽裝成 .txt",
+      "expected": {
+        "stage": "scan",
+        "outcome": "skip",
+        "code": "binary-content",
+        "detail": "掃描／內容判定後具名跳過；不得把 MP4 bytes 當文字索引（若改以內容嗅探判定，須具名且不得送文字模型）"
+      },
+      "assertions": [
+        "不呼叫文字 embedder",
+        "skip 原因具名"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "12.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 640,
+            "height": 360,
+            "avgFrameRate": "24/1",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          },
+          {
+            "index": 1,
+            "codecType": "audio",
+            "codecName": "aac",
+            "avgFrameRate": "0/0",
+            "rFrameRate": "0/0",
+            "sampleRate": "48000",
+            "channels": 1,
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 205012
+          },
+          {
+            "type": "moov",
+            "size": 7399
+          }
+        ],
+        "moovOffset": 205052,
+        "mdatOffset": 40,
+        "moovBeforeMdat": false,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        }
+      },
+      "sha256": "80abdce0c298afb230fe310fc46434df6daa2e78b952ec3f1a3ecc12568fa17b",
+      "sizeBytes": 212451
+    },
+    {
+      "id": "sec12-webm-as-mp4",
+      "file": "sec12-webm-as-mp4.mp4",
+      "tags": [
+        "fake-extension",
+        "unsupported-container"
+      ],
+      "purpose": "WebM（VP9/Opus）內容偽裝成 .mp4",
+      "expected": {
+        "stage": "process",
+        "outcome": "fail",
+        "code": "unsupported-video-container",
+        "detail": "副檔名不得作為支援依據；具名失敗，不得誤標成功"
+      },
+      "assertions": [
+        "probe／demux 具名拒絕",
+        "錯誤碼可與『壞檔』區分"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "3.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "vp9",
+            "width": 320,
+            "height": 180,
+            "avgFrameRate": "24/1",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 0
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "\u001fB\u0006\u0001",
+            "size": 440786851
+          }
+        ],
+        "moovOffset": null,
+        "mdatOffset": null,
+        "moovBeforeMdat": null,
+        "hasElst": false,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        },
+        "ffprobeFormat": {
+          "format_name": "matroska,webm",
+          "duration": "3.000000"
+        }
+      },
+      "sha256": "3d0131799e0222f31f95cb68b8aa2b2649ea42ff433cc0890489aa5d7b66bc00",
+      "sizeBytes": 50319
+    },
+    {
+      "id": "sec13-zero-bytes",
+      "file": "sec13-zero-bytes.mp4",
+      "tags": [
+        "zero-byte"
+      ],
+      "purpose": "0 byte 檔案",
+      "expected": {
+        "stage": "process",
+        "outcome": "fail",
+        "code": "invalid-video",
+        "detail": "具名失敗；不得 crash、不得卡住 probe deadline"
+      },
+      "assertions": [
+        "probe 快速失敗",
+        "失敗原因具名"
+      ],
+      "actualProbe": {
+        "ok": false,
+        "error": "[mov,mp4,m4a,3gp,3g2,mj2 @ 0000020807bdd280] moov atom not found\r\nD:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec13-zero-bytes.mp4: Invalid data found when processing input"
+      },
+      "layout": {
+        "topLevelBoxes": [],
+        "moovOffset": null,
+        "mdatOffset": null,
+        "moovBeforeMdat": null,
+        "hasElst": false,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 3199971767,
+          "stderrTail": "[in#0 @ 00000255af03d400] Error opening input: Invalid data found when processing input | Error opening input file D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec13-zero-bytes.mp4. | Error opening input files: Invalid data found when processing input"
+        }
+      },
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "sizeBytes": 0
+    },
+    {
+      "id": "sec14-truncated-no-moov",
+      "file": "sec14-truncated-no-moov.mp4",
+      "tags": [
+        "truncated"
+      ],
+      "purpose": "moov-at-end 檔截斷到 40%（moov 完全缺失）",
+      "expected": {
+        "stage": "process",
+        "outcome": "fail",
+        "code": "invalid-video",
+        "detail": "具名失敗；不得把可解碼前段當成整檔成功"
+      },
+      "assertions": [
+        "probe 失敗並具名",
+        "不寫任何片段"
+      ],
+      "actualProbe": {
+        "ok": false,
+        "error": "[mov,mp4,m4a,3gp,3g2,mj2 @ 00000280e608bc00] moov atom not found\r\nD:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec14-truncated-no-moov.mp4: Invalid data found when processing input"
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 205012
+          }
+        ],
+        "moovOffset": null,
+        "mdatOffset": 40,
+        "moovBeforeMdat": null,
+        "hasElst": false,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 3199971767,
+          "stderrTail": "[in#0 @ 000001dafdd1e7c0] Error opening input: Invalid data found when processing input | Error opening input file D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec14-truncated-no-moov.mp4. | Error opening input files: Invalid data found when processing input"
+        }
+      },
+      "sha256": "3e0271eff03a8afa4dddaeacd23cb4771c6afc4ab34d7f66ebf137a9e7bd45b6",
+      "sizeBytes": 84980
+    },
+    {
+      "id": "sec15-truncated-mdat",
+      "file": "sec15-truncated-mdat.mp4",
+      "tags": [
+        "truncated"
+      ],
+      "purpose": "moov 完整但 mdat 截斷（可 probe、解碼到一半失敗）",
+      "expected": {
+        "stage": "process",
+        "outcome": "fail",
+        "code": "invalid-video",
+        "detail": "整檔具名失敗；不得發布部分片段索引（每檔全部片段成功才替換）"
+      },
+      "assertions": [
+        "初建不留下半檔 chunk／向量",
+        "錯誤可重試且可對帳"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "12.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 640,
+            "height": 360,
+            "avgFrameRate": "24/1",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          },
+          {
+            "index": 1,
+            "codecType": "audio",
+            "codecName": "aac",
+            "avgFrameRate": "0/0",
+            "rFrameRate": "0/0",
+            "sampleRate": "48000",
+            "channels": 1,
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "moov",
+            "size": 7399
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 205012
+          }
+        ],
+        "moovOffset": 32,
+        "mdatOffset": 7439,
+        "moovBeforeMdat": true,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        },
+        "fullDecode": {
+          "code": 0,
+          "stderrTail": "[in#0/mov,mp4,m4a,3gp,3g2,mj2 @ 000001332383e6c0] stream 1, offset 0x1f2bd: partial file | [h264 @ 0000013325551940] Invalid NAL unit size (1819 > 1612). | [h264 @ 0000013325551940] Error splitting the input into NAL units. | [vist#0:0/h264 @ 000001332392edc0] [dec:h264 @ 00000133238c8000] Decoding error: Invalid data found when processing input"
+        },
+        "decodedFrames": 168,
+        "expectedFrames": 288,
+        "note": "實測：ffmpeg 退出碼仍為 0，但 stderr 有 partial file／Invalid NAL，只解出部分幀。decoder wrapper 不能只看 exit code，必須比對解出幀數／時長並具名失敗。"
+      },
+      "sha256": "16d74c7491c7dc3a33fe02880f4ae336b8755beaa12012f01113b766dbfc3b1c",
+      "sizeBytes": 127470
+    },
+    {
+      "id": "sec16-corrupt-moov",
+      "file": "sec16-corrupt-moov.mp4",
+      "tags": [
+        "corrupt"
+      ],
+      "purpose": "moov 內部位元組損壞",
+      "expected": {
+        "stage": "process",
+        "outcome": "fail",
+        "code": "invalid-video",
+        "detail": "具名失敗；不得 crash 或無限迴圈"
+      },
+      "assertions": [
+        "probe 失敗並具名",
+        "程序不殘留、不逾時"
+      ],
+      "actualProbe": {
+        "ok": false,
+        "error": "[mov,mp4,m4a,3gp,3g2,mj2 @ 000001c02f6b9280] moov atom not found\r\nD:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec16-corrupt-moov.mp4: Invalid data found when processing input"
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "\u0000\u0000\u0000\u0000",
+            "size": 212419
+          }
+        ],
+        "moovOffset": null,
+        "mdatOffset": null,
+        "moovBeforeMdat": null,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 3199971767,
+          "stderrTail": "[in#0 @ 000001ec5ad6dd80] Error opening input: Invalid data found when processing input | Error opening input file D:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec16-corrupt-moov.mp4. | Error opening input files: Invalid data found when processing input"
+        },
+        "note": "解碼第一幀觀測記錄；不代表產品驗收"
+      },
+      "sha256": "bc8697f7bc810810c3f6cd2f2a0c4d8c31c4472155c9c7e74d5f0b3d543a69c0",
+      "sizeBytes": 212451
+    },
+    {
+      "id": "sec17-oversize-bytes",
+      "file": "sec17-oversize-bytes.mp4",
+      "tags": [
+        "oversize"
+      ],
+      "purpose": "邏輯大小 513 MiB（> 512 MiB 上限；sparse 檔，不實際佔滿磁碟）",
+      "expected": {
+        "stage": "scan",
+        "outcome": "skip",
+        "code": "too-large",
+        "detail": "掃描階段具名跳過；不得先讀內容或 probe 才判定"
+      },
+      "assertions": [
+        "scanSkippedFiles 具名",
+        "不開啟檔案內容"
+      ],
+      "actualProbe": {
+        "ok": false,
+        "error": "[mov,mp4,m4a,3gp,3g2,mj2 @ 0000012f0080dcc0] moov atom not found\r\nD:\\Agent_WorkSpace\\mnemoshelf\\.tmp\\video-a\\corpus\\security\\sec17-oversize-bytes.mp4: Invalid data found when processing input"
+      },
+      "layout": null,
+      "observed": {
+        "note": "依預期在掃描／probe 階段即跳過，不做解碼（避免無意義的大量 I/O）"
+      },
+      "sha256": "247593f09d7332afc1b2467bebceda28b0ee1ce01ea39d02f58c384573068a2e",
+      "sizeBytes": 537919489
+    },
+    {
+      "id": "sec18-duration-601s",
+      "file": "sec18-duration-601s.mp4",
+      "tags": [
+        "oversize",
+        "duration-limit"
+      ],
+      "purpose": "時長 601 秒（> 600 秒上限；160x90／4fps 小檔）",
+      "expected": {
+        "stage": "process",
+        "outcome": "skip",
+        "code": "video-duration-exceeded",
+        "detail": "probe 取得時長後具名跳過；不得解碼全部片段"
+      },
+      "assertions": [
+        "skip 原因具名",
+        "未進行大量解碼（時間／記憶體有界）"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "601.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 160,
+            "height": 90,
+            "avgFrameRate": "4/1",
+            "rFrameRate": "4/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "moov",
+            "size": 10609
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 1500840
+          }
+        ],
+        "moovOffset": 32,
+        "mdatOffset": 10649,
+        "moovBeforeMdat": true,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "note": "依預期在掃描／probe 階段即跳過，不做解碼（避免無意義的大量 I/O）"
+      },
+      "sha256": "5049a1aafe2ead0815a8a96d47d7ec1035df15610448aac3c12a07444dea563a",
+      "sizeBytes": 1511489
+    },
+    {
+      "id": "sec19-overres-1440p",
+      "file": "sec19-overres-1440p.mp4",
+      "tags": [
+        "oversize",
+        "resolution-limit"
+      ],
+      "purpose": "2560x1440（> 1920x1080 等價上限）",
+      "expected": {
+        "stage": "process",
+        "outcome": "skip",
+        "code": "video-resolution-exceeded",
+        "detail": "在配置巨大畫面／解碼前具名跳過；不得先解碼再檢查"
+      },
+      "assertions": [
+        "skip 原因具名",
+        "峰值配置有界"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "1.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 2560,
+            "height": 1440,
+            "avgFrameRate": "8/1",
+            "rFrameRate": "8/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 32
+          },
+          {
+            "type": "moov",
+            "size": 810
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 33081
+          }
+        ],
+        "moovOffset": 32,
+        "mdatOffset": 850,
+        "moovBeforeMdat": true,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        },
+        "note": "解碼第一幀觀測記錄；不代表產品驗收"
+      },
+      "sha256": "11ea9e4070e3f812146b88c789db78f3e67e83d9fd399aaef820f890b255753c",
+      "sizeBytes": 33931
+    },
+    {
+      "id": "sec20-mixed-audio",
+      "file": "sec20-mixed-audio.mp4",
+      "tags": [
+        "multi-track",
+        "unsupported-audio-codec"
+      ],
+      "purpose": "兩個音軌：track1 AAC default、track2 AC-3",
+      "expected": {
+        "stage": "process",
+        "outcome": "skip",
+        "code": "unsupported-video-audio-track",
+        "detail": "audio 開啟時整檔具名跳過（v2 決策：含不支援音軌即整檔跳過）；只開 video 時視覺成功"
+      },
+      "assertions": [
+        "不做部分成功",
+        "若 PM 改採『只選第一個 AAC 音軌』須改契約與本列預期（見備註）"
+      ],
+      "actualProbe": {
+        "ok": true,
+        "formatDuration": "12.000000",
+        "formatStartTime": "0.000000",
+        "streams": [
+          {
+            "index": 0,
+            "codecType": "video",
+            "codecName": "h264",
+            "width": 640,
+            "height": 360,
+            "avgFrameRate": "24/1",
+            "rFrameRate": "24/1",
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          },
+          {
+            "index": 1,
+            "codecType": "audio",
+            "codecName": "aac",
+            "avgFrameRate": "0/0",
+            "rFrameRate": "0/0",
+            "sampleRate": "16000",
+            "channels": 1,
+            "disposition": {
+              "default": 1
+            },
+            "rotation": null
+          },
+          {
+            "index": 2,
+            "codecType": "audio",
+            "codecName": "ac3",
+            "avgFrameRate": "0/0",
+            "rFrameRate": "0/0",
+            "sampleRate": "32000",
+            "channels": 1,
+            "disposition": {
+              "default": 0
+            },
+            "rotation": null
+          }
+        ]
+      },
+      "layout": {
+        "topLevelBoxes": [
+          {
+            "type": "ftyp",
+            "size": 36
+          },
+          {
+            "type": "moov",
+            "size": 6835
+          },
+          {
+            "type": "free",
+            "size": 8
+          },
+          {
+            "type": "mdat",
+            "size": 443597
+          }
+        ],
+        "moovOffset": 36,
+        "mdatOffset": 6879,
+        "moovBeforeMdat": true,
+        "hasElst": true,
+        "hasDrefExternalUrl": false
+      },
+      "observed": {
+        "firstFrame": {
+          "code": 0,
+          "stderrTail": ""
+        }
+      },
+      "sha256": "d06a48897e7f028fc9063bfef430ecd5dd0ed8bb4b52fe5846536fd2a3ad02b2",
+      "sizeBytes": 450476
+    }
+  ]
+}

@@ -12,6 +12,8 @@
 
 /** sessionStorage 的 key。 */
 const TOKEN_KEY = "mnemoshelf.token";
+/** 只保留活動播放器的撤銷憑證；登出與元件卸載後立即移除。 */
+const mediaSessionTokens = new Map<string, string | null>();
 
 /** 401 時派送的全域事件名稱；`App.tsx` 監聽後切回貼 token 畫面。 */
 export const UNAUTHORIZED_EVENT = "mnemoshelf:unauthorized";
@@ -33,6 +35,12 @@ export function setToken(token: string): void {
 
 /** 清除 token。 */
 export function clearToken(): void {
+  for (const [url, token] of mediaSessionTokens) {
+    void fetch(url, { method: "DELETE", credentials: "same-origin", keepalive: true,
+      headers: token === null ? {} : { authorization: `Bearer ${token}` },
+    }).catch(() => undefined);
+  }
+  mediaSessionTokens.clear();
   sessionStorage.removeItem(TOKEN_KEY);
 }
 
@@ -75,6 +83,16 @@ export interface Root {
   respectGitignore: boolean;
   watch: boolean;
   createdAt: string;
+  /**
+   * 這個 root 的影片單檔大小上限（bytes；只套用影片）。
+   *
+   * - 有值：per-root 設定（1–16 GiB）；
+   * - **缺省**：未設定，沿用服務層預設（`videoCapability.maxFileBytes`，產品預設 512 MiB）。
+   *   契約明定舊資料列不得補 512 MiB，因此未設定時這個鍵**不存在**（不是 null）。
+   *
+   * 舊版服務沒有這個欄位，UI 一律視為未設定。
+   */
+  videoMaxFileBytes?: number;
 }
 
 /**
@@ -132,17 +150,48 @@ export function updateMemoryPolicy(maskSecrets: boolean): Promise<MemoryPolicy> 
   });
 }
 
-/** 讀取 roots 清單。 */
-export async function listRoots(): Promise<Root[]> {
+/** 影片能力三態的形狀檢查（舊版服務沒有這個欄位，不能假設一定存在）。 */
+export function isVideoCapability(value: unknown): value is VideoCapability {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.available === "boolean" &&
+    (record.state === "disabled" || record.state === "unavailable" || record.state === "available") &&
+    (record.reason === null || typeof record.reason === "string") &&
+    typeof record.embedderVideo === "boolean" &&
+    typeof record.maxFileBytes === "number" &&
+    typeof record.durationLimitSeconds === "number"
+  );
+}
+
+/** `GET /roots` 的回應：清單＋服務層的影片能力（additive `video` 欄位）。 */
+export interface RootsResponse {
+  roots: Root[];
+  /** 舊版服務沒有這個欄位時為 `null`（UI 不可據此宣告影片可用）。 */
+  video: VideoCapability | null;
+}
+
+/**
+ * 讀取 roots 清單與影片能力（一次請求）。
+ *
+ * `video` 是**服務層**能力（decoder 是否可用），與每個 root 自己的 `modalities` 無關；
+ * UI 用它決定「含影片」開關能不能開、以及不能開的原因。
+ */
+export async function fetchRoots(): Promise<RootsResponse> {
   const response = await apiFetch("/roots");
   if (!response.ok) {
     throw new Error(`讀取資料夾清單失敗（HTTP ${response.status}）`);
   }
-  const body = (await response.json()) as { roots?: unknown };
+  const body = (await response.json()) as { roots?: unknown; video?: unknown };
   if (!Array.isArray(body.roots)) {
     throw new Error("伺服器回應格式不正確");
   }
-  return body.roots as Root[];
+  return { roots: body.roots as Root[], video: isVideoCapability(body.video) ? body.video : null };
+}
+
+/** 讀取 roots 清單（只要清單的呼叫端用；需要影片能力請用 `fetchRoots`）。 */
+export async function listRoots(): Promise<Root[]> {
+  return (await fetchRoots()).roots;
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +209,62 @@ export interface DirEntry {
   kind: EntryKind;
   size: number | null;
   mimeType: string | null;
+}
+
+/**
+ * 影片能力不可用的固定原因碼（與 server `VideoCapabilityReason` 一致）。
+ *
+ * 刻意只有穩定標籤、不含路徑或 stderr：UI 依此顯示「為什麼影片不能用」。
+ */
+export type VideoCapabilityReason =
+  | "missing-ffmpeg"
+  | "missing-ffprobe"
+  | "ffmpeg-failed"
+  | "ffprobe-failed"
+  | "embedder-video-unsupported";
+
+/**
+ * 影片能力三態（`GET /roots` 的 `video`、preview 的 `videoCapability`、diagnostics 的 `video`）。
+ *
+ * - `disabled`：服務沒有設定解碼器（產品預設）；
+ * - `unavailable`：已設定但不可用（binary 缺失／損毀，或 embedder 不支援影片）；
+ * - `available`：可預覽、索引與播放。
+ *
+ * UI 據此在**使用者打開開關前**停用並顯示原因，而不是讓使用者開了才在索引時全數失敗。
+ */
+export interface VideoCapability {
+  available: boolean;
+  state: "disabled" | "unavailable" | "available";
+  reason: VideoCapabilityReason | null;
+  embedderVideo: boolean;
+  /** 影片單檔大小上限（bytes；掃描、有界快照與播放端點共用同一個值）。 */
+  maxFileBytes: number;
+  /** 影片時長上限（秒；600）。 */
+  durationLimitSeconds: number;
+  ffmpegVersion: string | null;
+  ffprobeVersion: string | null;
+}
+
+/**
+ * 影片候選的預覽語意（B3a）：**不讀媒體、不啟動 probe、不由壓縮大小換算時長**。
+ *
+ * 所有段數／秒數欄位都是**上界**，不是實際值；實際時長與片段數要等確認索引後 probe 才知道。
+ */
+export interface VideoPreviewEstimate {
+  /** 候選影片檔數（掃描納入者；`video-too-large` 等跳過的不計）。 */
+  files: number;
+  /** 預覽不讀媒體，時長一律未知。 */
+  durationKnown: false;
+  /** 是否計入影片音軌（`video` 與 `audio` 都開啟才計入）。 */
+  includesAudioTrack: boolean;
+  /** 每檔畫面片段數上界（600 秒 ÷ 4 秒 = 150）。 */
+  visualSegmentsPerFileMax: number;
+  /** 每檔音軌片段數上界（600 秒 ÷ 10 秒 = 60）；未計入音軌時為 0。 */
+  audioSegmentsPerFileMax: number;
+  /** 全部候選片段數上界（**不是**實際片段數）。 */
+  estimatedSegmentCountMax: number;
+  /** 以片段上界推估的索引秒數上界（**不是**實際耗時、也不是影片時長）。 */
+  estimatedSecondsMax: number;
 }
 
 /** `POST /roots/:id/preview` 的統計（欄位以 Core 契約為準）。 */
@@ -181,6 +286,19 @@ export interface RootPreview {
     otherSeconds: number;
     seconds: number;
   };
+  /**
+   * 影片候選的預覽語意（B3a；預覽不讀媒體、不啟動 probe）。
+   *
+   * 沒有影片候選時為 `null`；**舊版服務沒有這個欄位**（此時 UI 視為沒有影片候選）。
+   * 時長一律 `durationKnown: false`：不得由壓縮大小換算或顯示捏造的秒數。
+   */
+  video?: VideoPreviewEstimate | null;
+  /**
+   * 影片能力三態（C1 additive 欄位；與 `GET /roots` 的 `video` 同形狀）。
+   *
+   * 舊版服務沒有此欄位：UI 只能依候選數推測，不把它當成「已確認可用」。
+   */
+  videoCapability?: VideoCapability;
 }
 
 /** 文字預覽的回應主體。 */
@@ -222,6 +340,14 @@ export interface IndexStatus {
     skippedUnchanged: number;
     removedFiles: number;
     failedFiles: { relPath: string; reason: string }[];
+    /**
+     * 被跳過的檔案與固定原因（additive；舊版服務沒有這兩個欄位）。
+     *
+     * 影片的 probe 階段原因（時長／解析度／codec／音軌）會出現在這裡；
+     * 掃描階段的原因（`video-too-large` 等）在 `scanSkippedFiles`。
+     */
+    skippedFiles?: { relPath: string; reason: string }[];
+    scanSkippedFiles?: { relPath: string; reason: string }[];
   } | null;
 }
 
@@ -248,6 +374,12 @@ export async function addRoot(input: {
   path: string;
   mode?: "browse" | "index";
   modalities?: string[];
+  /**
+   * 影片單檔大小上限（bytes；1–16 GiB）。省略＝沿用服務預設。
+   *
+   * UI 以 MiB 輸入、換算成 bytes 後送出（見 `media.ts` 的 `parseVideoLimitMiB`）。
+   */
+  videoMaxFileBytes?: number;
 }): Promise<Root> {
   const response = await apiFetch("/roots", {
     method: "POST",
@@ -271,6 +403,31 @@ export async function updateRootModalities(rootId: number, modalities: string[])
     body: JSON.stringify({ modalities }),
   });
   if (!response.ok) throw new Error(await readErrorMessage(response, "更新資料夾設定失敗"));
+  return (await response.json()) as Root;
+}
+
+/** 影片單檔大小上限的契約上限（bytes；16 GiB）。 */
+const VIDEO_MAX_FILE_BYTES_LIMIT = 16 * 1024 * 1024 * 1024;
+
+/**
+ * 更新單一 root 的影片單檔大小上限（`PATCH /roots/:id` 的 additive 欄位）。
+ *
+ * `videoMaxFileBytes` 是 **bytes**（1–16 GiB）；傳 `null` 表示**清除設定**、回到服務層預設
+ * （Core 的 `RootPatch` 契約）。UI 的輸入單位是 MiB，由呼叫端先以 `parseVideoLimitMiB`
+ * 驗證與換算。只改設定、不自動重新索引（與 modalities 相同）；影片模態未開啟時也可以設定。
+ */
+export async function updateRootVideoMaxFileBytes(rootId: number, videoMaxFileBytes: number | null): Promise<Root> {
+  if (videoMaxFileBytes !== null) {
+    if (!Number.isSafeInteger(videoMaxFileBytes) || videoMaxFileBytes < 1 || videoMaxFileBytes > VIDEO_MAX_FILE_BYTES_LIMIT) {
+      throw new Error("影片單檔大小上限必須是 1 byte–16 GiB 的整數 bytes。");
+    }
+  }
+  const response = await apiFetch(`/roots/${rootId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ videoMaxFileBytes }),
+  });
+  if (!response.ok) throw new Error(await readErrorMessage(response, "更新影片上限失敗"));
   return (await response.json()) as Root;
 }
 
@@ -631,6 +788,130 @@ export async function fetchImageBlobUrl(
   return URL.createObjectURL(await response.blob());
 }
 
+/** 音訊經授權端點取得；呼叫端負責釋放 blob URL。 */
+export async function fetchAudioBlobUrl(rootId: number, filePath: string): Promise<string> {
+  const response = await apiFetch(`/roots/${rootId}/file?path=${encodeURIComponent(filePath)}`);
+  if (!response.ok) throw new Error(await readErrorMessage(response, "讀取音訊失敗"));
+  if (!(response.headers.get("content-type") ?? "").startsWith("audio/wav")) {
+    throw new Error("此檔案不是支援的 WAV 音訊。");
+  }
+  return URL.createObjectURL(await response.blob());
+}
+
+// ---------------------------------------------------------------------------
+// 影片播放（`GET|HEAD /roots/:id/media?path=`；同源單一 Range）
+// ---------------------------------------------------------------------------
+
+/**
+ * 影片播放端點的路徑（同源）。
+ *
+ * **token 不進 URL**：桌面版由 Electron main process 以 `webRequest` 對同源請求注入
+ * `Authorization`。此為既有 Bearer 端點；播放器使用短效 session URL，支援 standalone。
+ */
+export function mediaUrl(rootId: number, relPath: string): string {
+  return `/roots/${rootId}/media?path=${encodeURIComponent(relPath)}`;
+}
+
+/** 播放器只取得 locator；授權 secret 由瀏覽器保存於 HttpOnly cookie。 */
+export interface MediaPlaybackSession { url: string; expiresAt: string }
+
+export async function createMediaPlaybackSession(rootId: number, relPath: string, chunkId?: number): Promise<MediaPlaybackSession> {
+  const token = getToken();
+  const response = await apiFetch(`/roots/${rootId}/media-sessions`, {
+    method: "POST", credentials: "same-origin", cache: "no-store",
+    headers: { "content-type": "application/json" }, body: JSON.stringify({ path: relPath, chunkId }),
+  });
+  if (!response.ok) throw new Error(mediaPlaybackErrorMessage(response.status, await readErrorMessage(response, "建立播放授權失敗")));
+  const session = await response.json() as MediaPlaybackSession;
+  if (!new RegExp(`^/roots/${rootId}/media-sessions/[0-9a-f-]{36}$`).test(session.url) || !Number.isFinite(Date.parse(session.expiresAt))) {
+    throw new Error("播放授權回應不合法。");
+  }
+  mediaSessionTokens.set(session.url, token);
+  return session;
+}
+
+/** 關閉預覽／換來源時撤銷；不讓短效授權繼續供新請求使用。 */
+export async function revokeMediaPlaybackSession(session: MediaPlaybackSession): Promise<void> {
+  const token = mediaSessionTokens.get(session.url) ?? getToken();
+  mediaSessionTokens.delete(session.url);
+  const response = await fetch(session.url, { method: "DELETE", credentials: "same-origin", keepalive: true,
+    headers: token === null ? {} : { authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) throw new Error("撤銷播放授權失敗。");
+}
+
+/** Session 的 401 是播放授權逾期，不應清掉全域 Bearer 登入。 */
+export async function probeMediaPlaybackSession(session: MediaPlaybackSession): Promise<MediaProbeResult> {
+  const response = await fetch(session.url, { method: "HEAD", credentials: "same-origin", cache: "no-store" });
+  if (!response.ok) return { kind: "error", status: response.status, message: response.status === 401
+    ? "播放授權已逾期或撤銷，請重新授權播放。"
+    : mediaPlaybackErrorMessage(response.status, "無法播放這個影片。") };
+  return { kind: "ok", contentLength: Number(response.headers.get("content-length")), acceptRanges: response.headers.get("accept-ranges") === "bytes" };
+}
+
+/**
+ * 播放端點的 HTTP 錯誤 → 中文訊息（對應 server `media.ts` 的狀態碼語意）。
+ *
+ * `<video>` 的 `error` 事件拿不到 HTTP 狀態碼，因此播放失敗時用 `probeMedia` 的 HEAD 結果
+ * 補上可讀原因（401 由 `apiFetch` 全域處理，不會走到這裡）。
+ */
+export function mediaPlaybackErrorMessage(status: number, fallbackMessage: string, maxFileBytes?: number): string {
+  switch (status) {
+    case 400:
+      return "影片路徑不合法。";
+    case 403:
+      return "沒有權限讀取這個影片（不在已加入的資料夾內，或被黑名單排除）。";
+    case 404:
+      return "影片檔案不存在或已被移動；請重新整理目錄後再試。";
+    case 409:
+      return "影片來源已變更或原命中已失效；請重新索引並重新搜尋後播放。";
+    case 413: {
+      const limit = typeof maxFileBytes === "number" && Number.isFinite(maxFileBytes) && maxFileBytes > 0
+        ? `（目前上限 ${Math.round(maxFileBytes / (1024 * 1024))} MiB）`
+        : "";
+      return `影片超過單檔大小上限${limit}，不支援播放。`;
+    }
+    case 415:
+      return "這個檔案不是支援的 .mp4 影片（v1 只播放 MP4）。";
+    case 416:
+      return "播放器要求的位元組範圍無效（檔案可能已變更）；請重新載入。";
+    default:
+      return status >= 500 ? `本機服務發生錯誤（HTTP ${status}）。` : fallbackMessage;
+  }
+}
+
+/** 播放前探測的結果（HEAD，不讀取 body）。 */
+export type MediaProbeResult =
+  | { kind: "ok"; contentLength: number | null; acceptRanges: boolean }
+  | { kind: "error"; status: number; message: string };
+
+/**
+ * 以 HEAD 探測影片端點（授權請求；不讀取內容）。
+ *
+ * 用途：`<video>` 播放失敗時判斷是授權、root 守衛、大小上限、格式還是 Range 問題，
+ * 讓錯誤訊息可讀而不是只說「無法播放」。
+ */
+export async function probeMedia(rootId: number, relPath: string): Promise<MediaProbeResult> {
+  const response = await apiFetch(mediaUrl(rootId, relPath), { method: "HEAD", cache: "no-store" });
+  if (!response.ok) {
+    return {
+      kind: "error",
+      status: response.status,
+      message: mediaPlaybackErrorMessage(
+        response.status,
+        await readErrorMessage(response, "無法播放這個影片"),
+      ),
+    };
+  }
+  const lengthHeader = response.headers.get("content-length");
+  const parsedLength = lengthHeader === null ? Number.NaN : Number(lengthHeader);
+  return {
+    kind: "ok",
+    contentLength: Number.isSafeInteger(parsedLength) && parsedLength >= 0 ? parsedLength : null,
+    acceptRanges: response.headers.get("accept-ranges") === "bytes",
+  };
+}
+
 // ---------------------------------------------------------------------------
 // M3 收尾：統一搜尋、記憶管理（列表／釘選／編輯／刪除／來源）
 // ---------------------------------------------------------------------------
@@ -682,6 +963,35 @@ export interface Memory extends MemorySourceReference {
 export const SEARCH_MODES = ["vector", "hybrid", "keyword"] as const;
 export type SearchMode = (typeof SEARCH_MODES)[number];
 
+/** 時間片段的來源軌道（與 core `ChunkMedia.track` 一致）。 */
+export type ChunkMediaTrack = "audio" | "video" | "video-audio";
+
+/** 時間片段的來源容器（舊資料沒有；影片 v1 只有 `mp4`）。 */
+export type ChunkMediaContainer = "wav" | "mp4";
+
+/**
+ * 搜尋命中的時間定位資訊（`Chunk.media`；見 `docs/storage-ports.md` §影片片段）。
+ *
+ * 「畫面」與「音軌」的差別看 `track`，**不是**看 `kind`：
+ * - `track:"video"`：影片**畫面**片段（`kind:"video"`，`frameTimesSeconds` 必填）；
+ * - `track:"video-audio"`：影片**所選音軌**片段（`kind:"audio"`，`streamIndex` 必填）；
+ * - `track:"audio"`：獨立 WAV 音訊片段（舊資料只有這種形狀）。
+ */
+export interface ChunkMedia {
+  startSeconds: number;
+  endSeconds: number;
+  track: ChunkMediaTrack;
+  /** 來源容器；舊音訊資料沒有這個欄位。 */
+  container?: ChunkMediaContainer;
+  /** 影片所選音軌的 stream index（`track:"video-audio"` 必填）。 */
+  streamIndex?: number;
+  /** 畫面片段實際採用的幀時間（秒；`track:"video"` 必填）。 */
+  frameTimesSeconds?: number[];
+  preprocessVersion: string;
+  embedderId: string;
+  embeddingDim: number;
+}
+
 /** 檔案片段命中。 */
 export interface ChunkSearchHit {
   type: "chunk";
@@ -694,6 +1004,8 @@ export interface ChunkSearchHit {
   kind: EntryKind;
   text: string | null;
   textTruncated: boolean;
+  /** 時間定位；文字 chunk 沒有這個欄位。 */
+  media?: ChunkMedia;
 }
 
 /** 記憶命中。 */
@@ -1191,6 +1503,8 @@ export interface DiagnosticsEmbedderSelfTest {
  * 未提供時 `embedderRuntime` 為 `null`；`fallbackReason` 有值代表曾經從 GPU 退回 CPU。
  */
 export interface DiagnosticsEmbedderRuntime {
+  audioState?: "not-loaded" | "loading" | "ready" | "failed";
+  audioRetryable?: boolean;
   /** 要求／設定的裝置選項（`auto`／`cpu`／`dml`／`coreml`）。 */
   requestedDevice: string;
   /** 目前使用的裝置（`cpu`／`dml`／`coreml`）；模型尚未載入時為計畫值。 */
@@ -1205,8 +1519,32 @@ export interface DiagnosticsEmbedderRuntime {
   serializedInference: boolean;
   /** DirectML adapter 索引（設定值，0＝預設顯示卡）；沒有 adapter 概念的實作為 `null`。 */
   dmlDeviceId: number | null;
+  /** 影片嵌入入口狀態（選配；與 decoder 可用性分開）。 */
+  videoState?: "disabled" | "not-loaded" | "loading" | "ready" | "failed";
+  /** `videoState === "failed"` 時是否可在同行程重試。 */
+  videoRetryable?: boolean;
   /** 加速器自我測試的結果（選配；見 `DiagnosticsEmbedderSelfTest`）。 */
   selfTest?: DiagnosticsEmbedderSelfTest;
+}
+
+/** 本行程的影片索引統計（`GET /diagnostics` 的 `video.indexing`；不含路徑）。 */
+export interface DiagnosticsVideoIndexing {
+  /** 本行程跑完的影片索引輪數。 */
+  runs: number;
+  lastFinishedAt: string | null;
+  /** 最近一輪掃描階段跳過的影片原因（例如 `video-too-large`）。 */
+  scanSkippedByReason: Record<string, number>;
+  /** 最近一輪處理階段跳過的影片原因（例如 `invalid-video`）。 */
+  skippedByReason: Record<string, number>;
+  /** 最近一輪失敗的影片原因（例如 `video-decoder-unavailable`）。 */
+  failedByReason: Record<string, number>;
+  /** 最近一次 preview 看到的影片候選檔數（跨 root 加總）；從未 preview 過為 `null`。 */
+  previewCandidateFiles: number | null;
+}
+
+/** `GET /diagnostics` 的影片區塊：能力摘要＋解碼器版本＋索引統計。 */
+export interface DiagnosticsVideo extends VideoCapability {
+  indexing: DiagnosticsVideoIndexing;
 }
 
 /** `GET /diagnostics` 的回應。 */
@@ -1218,6 +1556,8 @@ export interface DiagnosticsResponse {
   embedderRuntime: DiagnosticsEmbedderRuntime | null;
   roots: DiagnosticsRoot[];
   indexing: { rootId: number; startedAt: string | null }[];
+  /** 影片能力與本行程統計（additive；舊版服務沒有此欄位）。 */
+  video?: DiagnosticsVideo;
 }
 
 /** 取得診斷資訊（`GET /diagnostics`）。 */

@@ -1,0 +1,11 @@
+# 影片索引解碼器（FFmpeg／ffprobe）的 staging 目錄。
+#
+# 為什麼整個目錄忽略：這裡只放第三方 binary（static LGPLv3 候選）與由腳本產生的
+# manifest／授權全文，全部不進版控。建置前由
+# `packages/desktop/scripts/stage-media-bin.mjs` 從已驗證的來源複製；
+# 預期版本／大小／SHA256 在 `packages/desktop/scripts/media-bin.lock.json`。
+#
+# 這個 .gitignore 本身要進版控（下面的 negation）：fresh checkout 也有目錄，
+# electron-builder 的 extraResources 來源才不會有「目錄不存在」的警告。
+*
+!.gitignore
