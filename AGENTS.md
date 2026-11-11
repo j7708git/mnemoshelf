@@ -36,8 +36,19 @@
   - 隱私掃描 hook 被擋（退出碼 1／2）時**不得**用 `--no-verify` 繞過，回報後由使用者決定。
 - **push**：一律等使用者**逐次確認**；不自行 `git push`、不 `--force`、不改寫歷史、不改 repo 可見度。
   成功與失敗要如實回報（程式碼 repo 與 notes repo 分別回報）。
-- **分支**：本機開發一律在專用分支（例如 `dsh/mac-dev`）上 commit，不直接在 `main` 提交；
-  分支何時合併回 `main` 由使用者決定。
+- **分支**：GitHub flow ＋ release 分支，**不設 `develop`**。主線只有 `main`，所有變更都走
+  短命分支，不直接在 `main` 提交：
+  - `feat/<task-id>-<slug>`、`fix/<task-id>-<slug>`、`chore/<slug>`、`hotfix/<slug>`：
+    從 `origin/main` 開，任務卡記錄 base SHA。各平台（mac／Linux／Windows）的修改一律走
+    這套命名，沒有平台專屬的長命分支。
+  - `release/<version>`：只做發版整備（版本號、發版文件），從 `origin/main` 開；完成後在
+    `main` 打 `vX.Y.Z` tag，再把整備 commit 併回 `main`。
+  - 每個分支的 upstream 是**同名的遠端分支**（`git push -u origin <branch>`）；**不要**把
+    upstream 指到 `origin/main`，否則 `git push` 的預設目標會變成主線。
+  - 合併走 PR。本 repo 既有慣例是 **merge commit**（訊息形如 `合併 PR #N：…`），不改成
+    squash 或 rebase，除非使用者當次指定。**何時合併、用哪種方式合併由使用者決定。**
+  - 分支併入 `main` 後即可刪除；判斷方式是 `git rev-list --count main..<branch>` 為 0。
+    遠端殘留分支是否刪除仍由使用者決定。
 - CI 也會跑隱私掃描（`.github/workflows/privacy-scan.yml`）：**本機 hook 不是唯一防線**，但
   CI 是**事後偵測**（推上來才檢查），不涵蓋更早的歷史 commit、force push 覆蓋掉的中間 commit、
   commit message／PR 描述、GitHub 以外的備份，也不是推送當下的阻擋。這個 repo 的規則以
