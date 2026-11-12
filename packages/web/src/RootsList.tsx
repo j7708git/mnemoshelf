@@ -102,7 +102,15 @@ export function RootsList({
    * 父層之後若回傳一致的值，就以父層的資料為準（見 `viewRoot`）。
    */
   const [overrides, setOverrides] = useState<Record<number, Root>>({});
-  const [busy, setBusy] = useState<{ rootId: number; field: "agent" | "max" } | null>(null);
+  /**
+   * 進行中的寫入請求集合，key 為 `"<rootId>:<field>"`。
+   *
+   * 為什麼是集合而不是單一 slot：不同 root／欄位的請求可以並行，單一 slot 只記得
+   * 最後開始的那個；若它先完成就會把仍在飛行的另一個一起清掉，讓控制項提前恢復可用。
+   */
+  const busyKey = (rootId: number, field: "agent" | "max"): string => `${rootId}:${field}`;
+  const [busyKeys, setBusyKeys] = useState<Record<string, true>>({});
+  const isBusy = (rootId: number, field: "agent" | "max"): boolean => busyKeys[busyKey(rootId, field)] === true;
   const [actionError, setActionError] = useState<string | null>(null);
 
   /** 伺服器已同步（父層刷新後的值與 override 一致）就丟棄 override，避免畫面停在舊值。 */
@@ -120,7 +128,8 @@ export function RootsList({
     action: () => Promise<Root>,
     fallbackMessage: string,
   ): Promise<void> => {
-    setBusy({ rootId: root.id, field });
+    const key = busyKey(root.id, field);
+    setBusyKeys((previous) => ({ ...previous, [key]: true }));
     setActionError(null);
     try {
       const updated = await action();
@@ -128,8 +137,13 @@ export function RootsList({
     } catch (error) {
       setActionError(error instanceof Error ? error.message : fallbackMessage);
     } finally {
-      // 只清自己的旗標：不同 root／欄位的請求並行時，先完成的不該把另一個仍在進行的 busy 清掉。
-      setBusy((current) => (current?.rootId === root.id && current?.field === field ? null : current));
+      // 只刪自己的 key：不同 root／欄位的請求並行時，先完成的不該把另一個仍在進行的 busy 清掉。
+      setBusyKeys((previous) => {
+        if (previous[key] !== true) return previous;
+        const next = { ...previous };
+        delete next[key];
+        return next;
+      });
     }
   };
 
@@ -190,7 +204,7 @@ export function RootsList({
                     type="checkbox"
                     className="mt-0.5"
                     checked={root.allowAgentSearch === true}
-                    disabled={busy?.rootId === root.id}
+                    disabled={isBusy(root.id, "agent")}
                     onChange={(event) => toggleAgentSearch(root, event.target.checked)}
                     // 點開關不該同時把這個資料夾選取起來（外層是可點的按鈕區塊）。
                     onClick={(event) => event.stopPropagation()}
@@ -258,7 +272,7 @@ export function RootsList({
                   <MaxFileLimitEditor
                     root={root}
                     fallbackBytes={DEFAULT_MAX_FILE_BYTES}
-                    busy={busy?.rootId === root.id && busy.field === "max"}
+                    busy={isBusy(root.id, "max")}
                     onSave={saveMaxFileBytes}
                   />
                 )}
