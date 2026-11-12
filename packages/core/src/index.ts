@@ -65,6 +65,8 @@ export {
   normalizeChunkMedia,
   normalizeRootMaxFileBytes,
   normalizeRootVideoMaxFileBytes,
+  MAX_FILE_BYTES_MIN,
+  MAX_FILE_BYTES_MAX,
   VIDEO_MAX_FILE_BYTES_MIN,
   VIDEO_MAX_FILE_BYTES_MAX,
   assignChunkMediaSeq,

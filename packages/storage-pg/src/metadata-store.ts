@@ -63,8 +63,8 @@ export interface PgMetadataStoreOptions {
 /**
  * root 影片上限的值域（與 core `ports/metadata-store.ts` 的 `normalizeRootVideoMaxFileBytes` 同值）。
  *
- * 為什麼暫行重複：storage-pg 只從 `@mnemoshelf/core` 的公開入口 import，而該驗證器目前
- * 還沒被 PM 統一 export（見 notes 遺留項）；PM export 後應改 import 單一來源。
+ * 本套件保留同語意副本：這個副本必須與 core 的版本保持同語意，兩後端由同一組契約測試
+ * 各跑一遍（SQLite／PostgreSQL），實作一旦分歧測試就會失敗。
  */
 const VIDEO_MAX_FILE_BYTES_MIN = 1;
 const VIDEO_MAX_FILE_BYTES_MAX = 16 * 1024 * 1024 * 1024;
@@ -86,8 +86,8 @@ function normalizeRootVideoMaxFileBytes(value: unknown): number | undefined {
 /**
  * root 通用單檔上限的值域（與 core `ports/metadata-store.ts` 的 `normalizeRootMaxFileBytes` 同值）。
  *
- * 為什麼重複一份：storage-pg 只從 `@mnemoshelf/core` 的公開入口 import；兩個後端都必須
- * 在沒有 core 執行期相依的情況下驗證，語意以 core 為準（見該函式的契約註解）。
+ * 本套件保留同語意副本：這個副本必須與 core 的版本保持同語意，兩後端由同一組契約測試
+ * 各跑一遍（SQLite／PostgreSQL），實作一旦分歧測試就會失敗。
  */
 const MAX_FILE_BYTES_MIN = 1;
 const MAX_FILE_BYTES_MAX = 16 * 1024 * 1024 * 1024;
