@@ -68,6 +68,7 @@ import {
   normalizeMemoryPatch,
   normalizeMemorySourceScope,
   normalizeRootMaxFileBytes,
+  normalizeRootVideoMaxFileBytes,
   PathBlockedError,
   PathOutsideRootError,
   previewRoot,
@@ -180,17 +181,6 @@ const MODALITIES: readonly Modality[] = ["text", "code", "image", "audio", "vide
  * 清單對齊 core：掃描階段兩個（`unsupported-video-format`／`video-too-large`）、
  * 處理階段六個（時長／解析度／無影像流／壞檔／codec／音軌），以及 decoder 環境錯誤。
  */
-/**
- * per-root 影片單檔大小上限的值域（bytes）；與 core `ports/metadata-store.ts` 的
- * `normalizeRootVideoMaxFileBytes` 同值。
- *
- * 為什麼這裡也有一份：core 的驗證器目前還沒從 `@mnemoshelf/core` 公開 export（PM 統一
- * export）；server 先擋是為了讓非法值回 `400 ValidationError` 而不是 store 的 `TypeError`
- * 變成 500。PM export 後應改 import 單一來源（見 notes 遺留項）。
- */
-const VIDEO_MAX_FILE_BYTES_MIN = 1;
-const VIDEO_MAX_FILE_BYTES_MAX = 16 * 1024 * 1024 * 1024;
-
 const VIDEO_INDEX_REASONS: ReadonlySet<string> = new Set([
   "unsupported-video-format",
   "video-too-large",
@@ -1037,23 +1027,21 @@ function optionalStringArray(value: unknown, field: string): string[] | undefine
 /**
  * 解析 root 的影片單檔大小上限欄位（`POST /roots`／`PATCH /roots/:id` 共用）。
  *
+ * 驗證走 core 的 `normalizeRootVideoMaxFileBytes`（1 B–16 GiB 整數；兩後端與呼叫端共用同一套語意）；
+ * 此處只把 core 的 `TypeError` 轉成 `400 ValidationError`，避免變成 500：
  * - `undefined` → `undefined`：未提供（POST＝未設定；PATCH＝不改）；
  * - `null` → `null`：清除／未設定（回行程層預設）；
- * - 1–16 GiB 的整數 → 原值；
- * - 其他（0／負數／小數／非數字／超過上限）→ `400 ValidationError`。
+ * - 合法整數 → 原值；
+ * - 其他（0／負數／小數／NaN／Infinity／非數字／超過上限）→ `400 ValidationError`。
  */
 function parseRootVideoMaxFileBytes(value: unknown, field: string): number | null | undefined {
   if (value === undefined) return undefined;
   if (value === null) return null;
-  if (
-    typeof value !== "number" ||
-    !Number.isInteger(value) ||
-    value < VIDEO_MAX_FILE_BYTES_MIN ||
-    value > VIDEO_MAX_FILE_BYTES_MAX
-  ) {
+  try {
+    return normalizeRootVideoMaxFileBytes(value);
+  } catch {
     throw new ValidationError(field, "必須是 1–16 GiB 的整數（bytes），或 null 表示未設定");
   }
-  return value;
 }
 
 /**
