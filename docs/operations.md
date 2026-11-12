@@ -126,7 +126,7 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
 | `MNEMOSHELF_PROJECT` | MCP 入口、外掛、dsh 外掛 | 未設定 | 預設專案名稱（MCP 的 `remember`／`search_memories`；外掛的召回範圍）。 |
 | `DSH_HOME` | dsh 外掛 | `~/.dsh` | dsh 的家目錄；外掛的待補送 spool 在 `<DSH_HOME>/mnemoshelf-spool`（選項 `spoolDir` 可覆寫）。 |
 | `MNEMOSHELF_DESKTOP_USER_DATA` | 桌面版 | Electron 預設 `userData` | 覆寫桌面版的 userData（開發／驗收用）。 |
-| `MNEMOSHELF_EMBED_DEVICE` | embedder（服務端／桌面版） | `auto` | 執行裝置 `auto`／`cpu`／`dml`／`coreml`；`auto` 依平台挑加速器（Windows → `dml`、macOS → `coreml`），其中 macOS 的 `auto` 會**先跑自我測試、通過才採用**並把決定快取起來；載入或推論失敗自動退回 CPU（語意見 `docs/embedder-contract.md` 的「加速器自我測試」一節）。 |
+| `MNEMOSHELF_EMBED_DEVICE` | embedder（服務端／桌面版） | `cpu` | 未設定或空白使用 CPU。可明示 `webgpu`（首輪限 macOS arm64）、`auto`、`dml`、`coreml`；`auto` 保留 Windows → DML、macOS → CoreML 自測的政策，不自選 WebGPU。探測、退回及批次限制見下方「可選 WebGPU」。 |
 | `MNEMOSHELF_EMBED_DML_DEVICE_ID` | embedder（Windows 的 DirectML） | `0`（預設顯示卡） | DirectML adapter 索引；多顯卡時指定獨顯。只接受十進位非負整數字串，非法值直接拒絕啟動（不靜默回預設）。 |
 | `MNEMOSHELF_EMBED_ORT_LOG` | embedder | 未設定（不覆寫 ORT 預設） | ONNX Runtime log 等級 `0`–`4`（`0`＝verbose），僅診斷用。 |
 | `MNEMOSHELF_MEMORY_BACKFILL` | 服務端 | `on` | 啟動時是否回填既有記憶向量；只接受 `on`／`off`（大小寫不拘），非法值直接拒絕啟動。`off` 只停啟動回填，**新寫入的記憶仍會嵌入**。 |
@@ -139,6 +139,36 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
 測試專用的變數（`MNEMOSHELF_E2E`、`MNEMOSHELF_AUTOTEST_*`、`MNEMOSHELF_SMOKE_NO_SANDBOX`、
 `MNEMOSHELF_DEV_CORE`、`MNEMOSHELF_PG`）不在上表：它們只給 repo 內的測試／煙霧測試使用，
 不是產品設定。
+
+## 可選 WebGPU
+
+預設使用 CPU。要在已支援的 macOS arm64 嘗試 WebGPU，從帶有下列環境變數的終端啟動服務或桌面程式：
+
+```bash
+MNEMOSHELF_EMBED_DEVICE=webgpu pnpm --filter @mnemoshelf/server serve
+```
+
+切換裝置需重新啟動；設定頁只顯示目前狀態，不保存裝置偏好。模型、量化、前處理與 embedder id
+不因裝置改變，因此不要求重建既有索引。`auto` 仍沿用既有平台政策；明示 `coreml` 的行為不變。
+
+`GET /diagnostics` 回應的 `embedderRuntime` 欄位與設定頁會區分要求裝置、目前裝置、模型是否載入、
+`webgpuProbe` 的 `pending`／`passed`／`failed` 與固定原因代碼；CoreML 的 `selfTest`
+不代表 WebGPU 探測。通過代表原生 ORT 後端可用、選定模型已載入且小型文字／圖片推論產生有效向量。
+模型尚未載入時，顯示的裝置仍只是計畫值。其他平台以 `unsupported-platform` 退回 CPU；
+後端不可用或探測失敗也會保留具名原因。
+
+WebGPU 同一實例序列推論，最多 8 筆、2,700 個實際 `input_ids` tokens（batch × sequence，包含 padding）。
+文字、圖片及影片都依實際形狀把關；多筆超預算縮小視窗，合法單筆超過 GPU 預算則改由 CPU 完整處理，
+不截斷內容。`batchSize` 與選配的 `batchTokenBudget` 回報目前限制。既有 8,192-token 輸入上限仍有效。
+
+可捕捉的 WebGPU 載入或裝置推論錯誤會在鎖內清理舊 backend、永久改用 CPU，原操作最多重試一次；
+CPU 再失敗向呼叫端回報。取消、輸入錯誤或不支援模態不觸發這項退回。首次音訊成功後，共享模型也改用
+CPU，保留 `requestedDevice=webgpu` 與 `fallbackReason.code=audio-cpu`；這時的混合索引時間包含 CPU，
+不能解讀為全程 GPU。完整語意見 [embedder 契約](embedder-contract.md)。
+
+原生 ORT 若使整個行程硬崩潰，JavaScript 與 worker thread 無法保證攔截或退回；需重新啟動。
+既有 `enableCpuMemArena=false`／`enableMemPattern=false` 護欄仍保留。這項一般原生崩潰界線
+不表示 CoreML 的 ORT #28005 在目前版本仍未修復。
 
 ## 索引期間的排隊與取消
 

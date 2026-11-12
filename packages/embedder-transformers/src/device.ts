@@ -69,13 +69,13 @@ export const DEFAULT_DML_DEVICE_ID = 0;
  * - `coreml`：CoreML EP（**只有 macOS 的 onnxruntime 預編二進位內建**；需通過內建自我測試
  *   才會自動採用，見 `self-test.ts`）。
  */
-export type EmbedDevice = "cpu" | "dml" | "coreml";
+export type EmbedDevice = "cpu" | "dml" | "coreml" | "webgpu";
 
 /** 裝置選項：`auto` 表示依平台自動決定。 */
 export type EmbedDeviceOption = EmbedDevice | "auto";
 
 /** 支援的裝置選項（解析與錯誤訊息共用同一份清單）。 */
-export const EMBED_DEVICE_OPTIONS: readonly EmbedDeviceOption[] = ["auto", "cpu", "dml", "coreml"];
+export const EMBED_DEVICE_OPTIONS: readonly EmbedDeviceOption[] = ["auto", "cpu", "dml", "coreml", "webgpu"];
 
 /**
  * CPU 的批次視窗上限。
@@ -89,6 +89,10 @@ export const CPU_BATCH_SIZE = 16;
 
 /** DirectML 的批次視窗上限；來源：dml-bench 實測（batch 32 最快，8／16／64 都較差）。 */
 export const DML_BATCH_SIZE = 32;
+
+/** WebGPU 保守視窗與含 padding 的 token 預算。 */
+export const WEBGPU_BATCH_SIZE = 8;
+export const WEBGPU_TOKEN_BUDGET = 2700;
 
 /**
  * 單一推論視窗的 **prompt token 總量**上限（batch × 序列長度，含 padding）。
@@ -113,12 +117,12 @@ export const BATCH_TOKEN_BUDGET = 8192;
 export const FALLBACK_MESSAGE_MAX_CHARS = 200;
 
 /**
- * 解析裝置選項。未設定或空字串視為 `auto`；其他無法識別的值一律拋錯。
+ * 解析裝置選項。未設定或空字串視為 `cpu`；其他無法識別的值一律拋錯。
  *
  * 值可能來自建構子選項或環境變數，因此錯誤訊息一併說明兩個來源。
  */
 export function parseEmbedDeviceOption(value: string | undefined): EmbedDeviceOption {
-  if (value === undefined || value.trim() === "") return "auto";
+  if (value === undefined || value.trim() === "") return "cpu";
   const normalized = value.trim().toLowerCase();
   if ((EMBED_DEVICE_OPTIONS as readonly string[]).includes(normalized)) {
     return normalized as EmbedDeviceOption;
@@ -195,7 +199,12 @@ export interface EmbedDevicePlan {
  * - `coreml`：macOS 上嘗試 `coreml`；其他平台直接以 `cpu` 開始並註明原因。
  *   明示 `coreml` 的語意是「**使用者自負的強制嘗試**」：忽略自我測試快取、不寫回快取。
  */
-export function resolveEmbedDevice(option: EmbedDeviceOption, platform: string): EmbedDevicePlan {
+export function resolveEmbedDevice(option: EmbedDeviceOption, platform: string, arch: string = process.arch): EmbedDevicePlan {
+  if (option === "webgpu") {
+    return platform === "darwin" && arch === "arm64"
+      ? { device: "webgpu", fallbackReason: null }
+      : { device: "cpu", fallbackReason: { code: "unsupported-platform", message: "WebGPU 目前只支援 macOS arm64" } };
+  }
   if (option === "cpu") return { device: "cpu", fallbackReason: null };
   if (option === "auto") {
     if (isDmlPlatform(platform)) return { device: "dml", fallbackReason: null };
@@ -231,6 +240,7 @@ export function resolveEmbedDevice(option: EmbedDeviceOption, platform: string):
  */
 export function deviceBatchSize(device: EmbedDevice): number {
   if (device === "dml") return DML_BATCH_SIZE;
+  if (device === "webgpu") return WEBGPU_BATCH_SIZE;
   return CPU_BATCH_SIZE;
 }
 
@@ -241,7 +251,7 @@ export function deviceBatchSize(device: EmbedDevice): number {
  * 邊界搬運沒有好處，且與 DML 共用同一條序列化骨架最單純（先保守，未實測前不改）。
  */
 export function requiresSerializedInference(device: EmbedDevice): boolean {
-  return device === "dml" || device === "coreml";
+  return device === "dml" || device === "coreml" || device === "webgpu";
 }
 
 /**

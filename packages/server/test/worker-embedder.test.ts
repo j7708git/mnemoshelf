@@ -225,6 +225,29 @@ async function waitFor(predicate: () => boolean, timeoutMs = 2_000): Promise<voi
 }
 
 describe("WorkerEmbedder：info 與 handshake", () => {
+  it("保留 WebGPU 探測與 token 預算，退回回應仍保留要求裝置", async () => {
+    const { embedder, requests, workers } = controlledEmbedder();
+    const pending = embedder.embedQuery("合成查詢");
+    await waitFor(() => requests.length === 1);
+    const gpu: EmbedderRuntimeStatus = {
+      ...STATUS, requestedDevice: "webgpu", device: "webgpu", loaded: true,
+      batchSize: 8, batchTokenBudget: 2700, serializedInference: true, webgpuProbe: { status: "passed" },
+    };
+    workers[0]!.emit("message", { type: "status", runtimeStatus: gpu });
+    expect(embedder.runtimeStatus).toEqual(gpu);
+    workers[0]!.emit("message", {
+      type: "response", id: requests[0]!.message.id, ok: true, result: new Float32Array([1]),
+      runtimeStatus: { ...gpu, device: "cpu", batchSize: 16, batchTokenBudget: 8192,
+        fallbackReason: { code: "token-budget", message: "輸入超過 WebGPU token 預算，已改用 CPU。" } },
+    });
+    await pending;
+    expect(embedder.runtimeStatus).toMatchObject({
+      requestedDevice: "webgpu", device: "cpu", batchTokenBudget: 8192,
+      webgpuProbe: { status: "passed" }, fallbackReason: { code: "token-budget" },
+    });
+    await embedder.dispose();
+  });
+
   it("info 同步可用；第一次呼叫才建立 worker，之後 runtimeStatus 由 worker 提供", async () => {
     const { embedder, workers } = makeEmbedder(
       withRequests((message, worker) => {

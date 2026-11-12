@@ -7,8 +7,8 @@
  *   - 建 session 的成本是**編譯時間**（官方文件：不設 `ModelCacheDirectory` 時每次都要重編，
  *     可能數分鐘；而 Node 綁定拿不到該選項），所以「每次啟動都先試」不可接受
  *     → 必須「量測一次、把決定快取起來」。
- *   - 已知的上游風險：`onnxruntime#28005`（CoreML EP＋external data＋以檔案路徑建 session 的
- *     SIGBUS，未修）可能在**任何一次**碰 CoreML 時殺掉行程。因此每一條「先落 marker、再碰
+ *   - `onnxruntime#28005` 的 external-data 路徑缺陷已於 ORT 1.26.0 修補；其他原生崩潰
+ *     仍可能終止行程。因此每一條「先落 marker、再碰
  *     CoreML」的路徑都有存活標記：自我測試期用 `pending(self-test)`，正式載入期用
  *     `pending(load)`（見 `classifyDecision` 與 `nextLoadCrashDecision`）。**marker 落不了地時
  *     一律不碰 CoreML**（`{kind:"unavailable"}`）——保護鏈的前提不存在，就沒有理由去踩那條路。
@@ -672,7 +672,7 @@ export async function runCoreMlSelfTest<TBackend>(
 
   // 1. `pending(self-test)`：這是「測試中」的存活證明（崩潰後由下一次啟動推導成 `crashed`）。
   //    **寫不進去就不得碰 CoreML**：保護鏈的價值全在這張標記上，沒有它就去踩已知會殺掉行程的
-  //    路徑（`onnxruntime#28005`）＝每次啟動都可能閃退一次，正是要避免的最壞情況。
+  //    路徑可能導致原生崩潰，正是要避免的最壞情況。
   const markerWritten = writeDecisionRecord(options.decisionPath, {
     schema: DEVICE_DECISION_SCHEMA,
     ...options.identity,

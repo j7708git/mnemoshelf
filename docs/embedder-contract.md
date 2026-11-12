@@ -175,13 +175,17 @@ interface EmbedderRuntimeStatus {
   requestedDevice: string;
   /**
    * 目前使用的裝置；模型尚未載入時為**依平台與設定解析出的計畫裝置**。
-   * 值由實作定義（本專案的預設實作為 `cpu`／`dml`／`coreml`）。
+   * 值由實作定義（本專案的預設實作為 `cpu`／`dml`／`coreml`／`webgpu`）。
    */
   device: string;
   /** 模型是否已載入；true 代表 `device` 是**實際使用**的裝置，而非計畫值。 */
   loaded: boolean;
   /** 曾從 GPU 退回 CPU 時的原因；未退回為 `null`。 */
   fallbackReason: EmbedderFallbackReason | null;
+  /** 含 padding 的單次推論 token 預算（選配）。 */
+  batchTokenBudget?: number;
+  /** WebGPU 實際模型探測結果（選配；與 CoreML selfTest 分開）。 */
+  webgpuProbe?: { status: "pending" | "passed" | "failed"; reason?: string };
   /** 目前的批次視窗大小（一次送進模型的輸入數上限）。 */
   batchSize: number;
   /**
@@ -208,6 +212,20 @@ interface EmbedderFallbackReason {
   message: string;
 }
 ```
+
+**預設與 WebGPU**：未指定或空白時使用 CPU。明示 `auto` 沿用平台政策（Windows 嘗試
+DirectML、macOS 依 CoreML 自我測試決定），不自動選 WebGPU。明示 `webgpu` 目前僅在
+macOS arm64 嘗試：先列舉原生 ORT 後端，再載入選定模型並各執行一次小型文字與圖片推論，
+檢查輸入形狀和輸出維度、有限值及正規化。`webgpuProbe` 的 `pending`／`passed`／`failed`
+分別表示尚未完成、通過、失敗；失敗的 `reason` 使用固定代碼。這不是 CoreML 的 `selfTest`。
+
+WebGPU 限制單一模型實例序列推論，批次最多 8 筆、實際 `input_ids` 含 padding 的
+batch × sequence 最多 2700 token；多筆超限時縮窗保持順序。合法單筆超過預算、或無法
+確認有效形狀時退回 CPU 完整處理；超過既有 8192 單筆上限仍拒絕。圖片與影片同樣受限。
+裝置載入或推論失敗時釋放舊 backend，該實例永久退回 CPU 並至多重試一次；輸入錯誤、
+取消和不支援模態不視為裝置失敗。首次音訊仍切換共用模型至 CPU，原因為 `audio-cpu`。
+裝置變更不改模型、dtype、前處理及 `info.id`。可捕捉的例外能退回，但原生行程硬崩潰
+無法由 JavaScript 攔截或保證退回。
 
 **ONNX Runtime log 等級（`MNEMOSHELF_EMBED_ORT_LOG`，選配、純診斷）**：設定後覆寫推論 session 的
 `logSeverityLevel`；值是 `0`–`4`（`0`＝verbose、`1`＝info、`2`＝warning、`3`＝error、`4`＝fatal），
@@ -280,9 +298,8 @@ interface EmbedderSelfTestStatus {
 **明示 `coreml` 的語意**：只有 `auto` 會跑自我測試並讀寫決定快取；**明示** `coreml`
 （環境變數或建構子選項）代表「忽略已快取的決定、強制嘗試」，因此**不執行自我測試、也不讀寫
 決定快取**——載入失敗時 `selfTest` 只反映該次載入的結果、不落地。
-這個模式**只供單次驗證，不要當成日常設定**：上游的 `onnxruntime#28005`（CoreML EP＋external
-data、以檔案路徑建 session 的 `SIGBUS`）仍未修，可能在**任何一次**載入時直接結束行程（證據見
-`packages/embedder-transformers/src/self-test.ts` 的模組註解與自我測試入口），而明示模式也
+這個模式**只供單次驗證，不要當成日常設定**：上游 `onnxruntime#28005` 的 external-data 路徑缺陷已於 1.26.0 修補（本專案使用 1.30.0）；
+這不代表 CoreML 沒有其他原生崩潰風險。明示模式也
 **不套用**下方「載入期的崩潰政策」段落的存活標記護欄（沒有決定快取就沒有可寫的 marker，見
 `packages/embedder-transformers/src/embedder.ts` 的 `loadCoreMl` 分岔註解），等於少了自我測試
 那次的量測把關。macOS 的 CoreML EP 對這種量化模型也**沒有實測過的加速證據**。

@@ -110,7 +110,7 @@ describe("session options（CPU 路徑）", () => {
 describe("session options（DirectML 路徑）", () => {
   it("建立 session 時同樣帶兩個開關，並保留 DML 的 executionProviders", async () => {
     process.env.MNEMOSHELF_EMBED_DML_DEVICE_ID = "2";
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: "unused" });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: "unused" });
     await embedder.embedQuery("測試");
 
     expect(embedder.runtimeStatus.device).toBe("dml");
@@ -126,7 +126,7 @@ describe("session options（DirectML 路徑）", () => {
 
   it("從 dml 退回 CPU 後，重新建立的 session 也帶同一組開關", async () => {
     state.failInferenceOnDml = true;
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: "unused" });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: "unused" });
     await embedder.embedQuery("測試");
 
     expect(embedder.runtimeStatus.device).toBe("cpu");

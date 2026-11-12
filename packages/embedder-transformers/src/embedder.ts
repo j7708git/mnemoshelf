@@ -9,7 +9,7 @@
  *   - 初始只載文字＋圖片，首次音訊在安全邊界升級共享 backend；不用 feature-extraction pipeline。
  *
  * 執行裝置（`device` 選項／`MNEMOSHELF_EMBED_DEVICE`）：
- *   - `auto`（預設）：**Windows** 嘗試 DirectML GPU（`dml`）、**macOS** 嘗試 CoreML
+ *   - `auto`（明示）：**Windows** 嘗試 DirectML GPU（`dml`）、**macOS** 嘗試 CoreML
  *     （`coreml`，需通過內建自我測試才會採用）、其他平台維持現狀 CPU。
  *   - `dml` 載入或推論失敗時**自動退回 CPU**，不中斷；原因可在 `runtimeStatus.fallbackReason` 讀到。
  *   - `coreml` 的處置與 `dml` 相同（載入／推論失敗一律退回 CPU），但**多了一層自我測試**：
@@ -42,6 +42,7 @@
  * （無標題用 `title: none`）。**圖片不加 prefix**。
  */
 import { homedir } from "node:os";
+import { hasNativeWebGpu } from "./webgpu.js";
 import { join } from "node:path";
 import {
   AutoConfig,
@@ -67,6 +68,7 @@ import type {
 } from "@mnemoshelf/core";
 import {
   BATCH_TOKEN_BUDGET,
+  WEBGPU_TOKEN_BUDGET,
   CPU_BATCH_SIZE,
   EMBED_DEVICE_ENV,
   EMBED_DML_DEVICE_ID_ENV,
@@ -204,7 +206,7 @@ export interface TransformersEmbedderOptions {
   /** dtype，預設 q4（逐元件 `{model:"q4", vision_encoder:"q4"}`）。 */
   dtype?: DtypeOption;
   /**
-   * 嵌入裝置，預設 `auto`（環境變數 `MNEMOSHELF_EMBED_DEVICE` 可設定；選項優先於環境變數）。
+   * 嵌入裝置，預設 `cpu`（環境變數 `MNEMOSHELF_EMBED_DEVICE` 可設定；選項優先於環境變數）。
    *
    * `auto`＝Windows 試 `dml`（DirectML GPU）、macOS 試 `coreml`（CoreML，需通過自我測試）、
    * 其他平台維持 CPU；不可用或失敗時自動退回 `cpu`，原因見 `runtimeStatus.fallbackReason`。
@@ -239,9 +241,13 @@ export interface TransformersEmbedderOptions {
    * 產品碼不需要設定。
    */
   platform?: string;
+  /** 僅測試覆寫 CPU 架構。 */
+  arch?: string;
 }
 
 /** 已載入的模型資源。 */
+class WebGpuBudgetError extends Error {}
+
 interface LoadedModel {
   processor: GemmaProcessor;
   model: GemmaModel;
@@ -460,7 +466,9 @@ function promptTokens(processed: Record<string, unknown>): number | null {
   const dims = inputIds?.dims;
   if (!Array.isArray(dims) || dims.length !== 2) return null;
   const [batch, length] = dims as unknown[];
-  if (typeof batch !== "number" || typeof length !== "number") return null;
+  if (typeof batch !== "number" || typeof length !== "number" ||
+      !Number.isSafeInteger(batch) || !Number.isSafeInteger(length) || batch <= 0 || length <= 0 ||
+      !Number.isSafeInteger(batch * length)) return null;
   return batch * length;
 }
 
@@ -567,6 +575,7 @@ export class TransformersEmbedder implements Embedder {
   private fallbackReason: EmbedderFallbackReason | null;
   /** 加速器自我測試的摘要（有快取或跑過測試時才有值）。 */
   private selfTest: EmbedderSelfTestStatus | undefined;
+  private webgpuProbe: EmbedderRuntimeStatus["webgpuProbe"];
 
   private loaded: LoadedModel | null = null;
   private loading: Promise<LoadedModel> | null = null;
@@ -603,7 +612,7 @@ export class TransformersEmbedder implements Embedder {
 
     this.cacheDir = options.cacheDir ?? defaultModelCacheDir();
 
-    // 選項優先於環境變數；兩者皆未設時為 "auto"。
+    // 選項優先於環境變數；兩者皆未設時為 "cpu"。
     this.requestedDevice = parseEmbedDeviceOption(options.device ?? process.env[EMBED_DEVICE_ENV]);
     this.platform = options.platform ?? process.platform;
     this.appVersion = options.appVersion ?? "unknown";
@@ -611,9 +620,12 @@ export class TransformersEmbedder implements Embedder {
     this.deviceDecisionPath = options.deviceDecisionPath ?? defaultDeviceDecisionPath(this.cacheDir);
     this.deviceDecisionEnabled = this.requestedDevice === "auto" && isCoreMlPlatform(this.platform);
 
-    const plan = resolveEmbedDevice(this.requestedDevice, this.platform);
+    const plan = resolveEmbedDevice(this.requestedDevice, this.platform, options.arch ?? process.arch);
     this.device = plan.device;
     this.fallbackReason = plan.fallbackReason;
+    if (this.requestedDevice === "webgpu") {
+      this.webgpuProbe = plan.fallbackReason ? { status: "failed", reason: "unsupported-platform" } : { status: "pending" };
+    }
     // macOS 的 auto：先把已快取的決定套上（同步讀一個 tiny JSON；理由見 applyCachedDecision）。
     if (this.deviceDecisionEnabled) this.applyCachedDecision();
     // adapter 索引一律先驗證（非法值立即失敗，不等到真的載入 dml 才發現）。
@@ -645,12 +657,14 @@ export class TransformersEmbedder implements Embedder {
       loaded: this.loaded !== null,
       fallbackReason: this.fallbackReason === null ? null : { ...this.fallbackReason },
       batchSize: deviceBatchSize(this.device),
-      serializedInference: requiresSerializedInference(this.device) || this.audioRequested,
+      batchTokenBudget: this.device === "webgpu" ? WEBGPU_TOKEN_BUDGET : BATCH_TOKEN_BUDGET,
+      serializedInference: requiresSerializedInference(this.device) || this.audioRequested || this.requestedDevice === "webgpu",
       audioState: this.audioState,
       videoState: this.videoState,
       // 設定值（不隨退回改變）：診斷要能看出「DML 是哪一張卡」。
       dmlDeviceId: this.dmlDeviceId,
     };
+    if (this.webgpuProbe !== undefined) status.webgpuProbe = { ...this.webgpuProbe };
     if (this.selfTest !== undefined) status.selfTest = { ...this.selfTest };
     if (this.audioState === "failed") status.audioRetryable = !this.audioBackendFailed;
     if (this.videoState === "failed") status.videoRetryable = this.videoRetryable;
@@ -705,6 +719,7 @@ export class TransformersEmbedder implements Embedder {
           const window = inputs.slice(windowStart, windowStart + windowSize);
           const prefixed = window.map((input) => this.documentPrefix(input.text, input.title));
           const processed = await processor(prefixed);
+          throwIfAborted(opts?.signal);
           // token 護欄（兩層，順序有意義）：
           // 1. 單筆硬上限：`window.length === 1` 時這一窗就是那一筆，`tokens` 即該筆的
           //    實際 token 數；超過 `MAX_INPUT_TOKENS` 即拒絕、**不送進模型**。
@@ -713,11 +728,14 @@ export class TransformersEmbedder implements Embedder {
           //    （至少減 1 筆，收斂到單筆後由第 1 層接手）。
           const tokens = promptTokens(processed);
           if (window.length === 1) assertWithinInputLimit(tokens);
-          if (tokens !== null && tokens > BATCH_TOKEN_BUDGET && window.length > 1) {
-            const scaled = Math.floor((BATCH_TOKEN_BUDGET * window.length) / tokens);
+          const budget = this.device === "webgpu" ? WEBGPU_TOKEN_BUDGET : BATCH_TOKEN_BUDGET;
+          if (this.device === "webgpu" && (tokens === null || (processed["input_ids"] as { dims: number[] }).dims[0] !== window.length)) throw new WebGpuBudgetError();
+          if (tokens !== null && tokens > budget && window.length > 1) {
+            const scaled = Math.floor((budget * window.length) / tokens);
             windowSize = Math.max(1, Math.min(window.length - 1, scaled));
             continue;
           }
+          if (this.device === "webgpu" && tokens !== null && tokens > budget) throw new WebGpuBudgetError();
           const rows = await runModel(this.modelId, model, processed);
           if (rows.length !== window.length) {
             throw new ModelInferenceError(
@@ -756,6 +774,7 @@ export class TransformersEmbedder implements Embedder {
       throwIfAborted(opts?.signal);
       const inputs = await this.inImageInputPhase(() => processor(null, [[rawImage]]));
       throwIfAborted(opts?.signal);
+      this.guardWebGpuTokens(inputs);
       return await runModel(this.modelId, model, inputs);
     }, opts?.signal);
     throwIfAborted(opts?.signal);
@@ -851,6 +870,7 @@ export class TransformersEmbedder implements Embedder {
           throw new EmbedderInputError("影片前處理未提供有效 token 數");
         }
         assertWithinInputLimit(tokens);
+        this.guardWebGpuTokens(inputs);
         return await runModel(this.modelId, model, inputs);
       }, signal);
       throwIfAborted(signal);
@@ -898,7 +918,7 @@ export class TransformersEmbedder implements Embedder {
    * 反覆踩同一個失敗）。
    */
   async dispose(): Promise<void> {
-    if (this.audioRequested) {
+    if (this.audioRequested || this.requestedDevice === "webgpu") {
       // 音訊可能正在升級或推論；和它們排同一把鎖，不釋放在途 session 或讓晚到載入復活。
       await this.withLock(undefined, () => this.disposeLoaded());
       return;
@@ -930,9 +950,19 @@ export class TransformersEmbedder implements Embedder {
       // 單筆文字入口（生產路徑為 `/search` 的查詢、desktop 的模型驗證與啟動探測）受同一條
       // 硬上限約束：這裡的 `promptTokens` 就是這一筆的實際 token 數（batch 1，沒有 padding）。
       assertWithinInputLimit(promptTokens(inputs));
+      this.guardWebGpuTokens(inputs);
       return await runModel(this.modelId, model, inputs);
     }, undefined);
     return this.toVector(rows);
+  }
+
+  private guardWebGpuTokens(inputs: Record<string, unknown>): void {
+    const tokens = promptTokens(inputs);
+    assertWithinInputLimit(tokens);
+    if (this.device === "webgpu" && (tokens === null ||
+        (inputs["input_ids"] as { dims: number[] }).dims[0] !== 1 || tokens > WEBGPU_TOKEN_BUDGET)) {
+      throw new WebGpuBudgetError();
+    }
   }
 
   /** 取第一筆並依 `info.dim` 截斷＋重新 L2 正規化。 */
@@ -944,10 +974,10 @@ export class TransformersEmbedder implements Embedder {
     return truncateAndNormalize(Float32Array.from(row), this.dim);
   }
 
-  private async ensureLoaded(): Promise<LoadedModel> {
+  private async ensureLoaded(signal?: AbortSignal): Promise<LoadedModel> {
     if (this.loaded) return this.loaded;
     if (!this.loading) {
-      this.loading = this.loadModel();
+      this.loading = this.loadModel(signal);
     }
     try {
       const loaded = await this.loading;
@@ -978,15 +1008,20 @@ export class TransformersEmbedder implements Embedder {
     return await this.withLock(signal, async () => {
       throwIfAborted(signal);
       if (audio) await this.ensureAudioLoaded(signal);
-      const loaded = await this.ensureLoaded();
+      const loaded = await this.ensureLoaded(signal);
+      throwIfAborted(signal);
       try {
-        return await operation(loaded);
+        const result = await operation(loaded);
+        throwIfAborted(signal);
+        return result;
       } catch (error) {
         if (!this.shouldFallBack(signal, error)) throw error;
-        await this.fallBackToCpu("inference-failed", error);
+        await this.fallBackToCpu(error instanceof WebGpuBudgetError ? "token-budget" : "inference-failed", error);
         throwIfAborted(signal);
-        const reloaded = await this.ensureLoaded();
-        return await operation(reloaded);
+        const reloaded = await this.ensureLoaded(signal);
+        const result = await operation(reloaded);
+        throwIfAborted(signal);
+        return result;
       }
     });
   }
@@ -999,7 +1034,7 @@ export class TransformersEmbedder implements Embedder {
    * - 尚未要求音訊且裝置為 CPU 時可並發；音訊升級先等既有 CPU 操作收尾。
    */
   private async withLock<T>(signal: AbortSignal | undefined, operation: () => Promise<T>): Promise<T> {
-    if (!requiresSerializedInference(this.device) && !this.audioRequested) {
+    if (!requiresSerializedInference(this.device) && !this.audioRequested && this.requestedDevice !== "webgpu") {
       const pending = operation();
       this.concurrentCpuOperations.add(pending);
       try { return await pending; }
@@ -1028,7 +1063,7 @@ export class TransformersEmbedder implements Embedder {
     let switching = false;
     try {
       // 基礎資產先沿既有路徑就緒；下載音訊失敗時，原文字／圖片 session 完全不動。
-      await this.ensureLoaded();
+      await this.ensureLoaded(signal);
       previousDevice = this.device;
       previousFallback = this.fallbackReason;
       throwIfAborted(signal);
@@ -1146,7 +1181,7 @@ export class TransformersEmbedder implements Embedder {
    * （見 `fallBackToCpu`）。
    */
   private shouldFallBack(signal: AbortSignal | undefined, error: unknown): boolean {
-    if (this.device !== "dml" && this.device !== "coreml") return false;
+    if (this.device !== "dml" && this.device !== "coreml" && this.device !== "webgpu") return false;
     if (signal?.aborted === true) return false;
     if (isAbortError(error)) return false;
     if (error instanceof EmbedderInputError) return false;
@@ -1169,7 +1204,7 @@ export class TransformersEmbedder implements Embedder {
     this.loaded = null;
     this.loading = null;
     this.device = "cpu";
-    this.fallbackReason = { code, message: summarizeFailure(error) };
+    this.fallbackReason = { code, message: previous === "webgpu" ? `WebGPU 已退回 CPU（${code}）` : summarizeFailure(error) };
     if (previous === "coreml") {
       const measured = this.measurementFields();
       this.selfTest = {
@@ -1421,14 +1456,59 @@ export class TransformersEmbedder implements Embedder {
    *
    * CPU 也載不起來時 `ModelLoadError` 照常往外拋（沒有可退的地方）。
    */
-  private async loadModel(): Promise<LoadedModel> {
+  private async loadModel(signal?: AbortSignal): Promise<LoadedModel> {
     if (this.device === "cpu") return await this.createBackend("cpu");
     if (this.device === "coreml") return await this.loadCoreMl();
+    if (this.device === "webgpu") return await this.loadWebGpu(signal);
     try {
       return await this.createBackend("dml");
     } catch (error) {
       this.fallbackReason = { code: "load-failed", message: summarizeFailure(error) };
       this.device = "cpu";
+      return await this.createBackend("cpu");
+    }
+  }
+
+  private checkProbeVector(rows: number[][]): void {
+    if (rows.length !== 1) throw new Error("probe vector count");
+    const vector = this.toVector(rows);
+    let sum = 0;
+    for (const value of vector) { if (!Number.isFinite(value)) throw new Error("probe vector value"); sum += value * value; }
+    if (Math.abs(sum - 1) > 0.001) throw new Error("probe vector norm");
+  }
+
+  /** 先確認原生後端列舉，再以選定模型執行小型文字及圖片推論。 */
+  private async loadWebGpu(signal?: AbortSignal): Promise<LoadedModel> {
+    let backend: LoadedModel | null = null;
+    let reason = "backend-unavailable";
+    try {
+      // 從 transformers 自己的位置解析其 ORT，避免把傳遞依賴當成直接依賴。
+      throwIfAborted(signal);
+      if (!hasNativeWebGpu()) throw new Error(reason);
+      reason = "load-failed";
+      backend = await this.createBackend("webgpu");
+      throwIfAborted(signal);
+      reason = "probe-failed";
+      const text = await backend.processor(["test"]);
+      throwIfAborted(signal);
+      this.guardWebGpuTokens(text);
+      this.checkProbeVector(await runModel(this.modelId, backend.model, text));
+      throwIfAborted(signal);
+      const image = new RawImage(new Uint8ClampedArray(16 * 16 * 3), 16, 16, 3);
+      const picture = await backend.processor(null, [[image]]);
+      throwIfAborted(signal);
+      this.guardWebGpuTokens(picture);
+      this.checkProbeVector(await runModel(this.modelId, backend.model, picture));
+      throwIfAborted(signal);
+      this.webgpuProbe = { status: "passed" };
+      return backend;
+    } catch (error) {
+      try { await backend?.model.dispose?.(); } catch { /* 釋放失敗仍需退回。 */ }
+      if (signal?.aborted) throwIfAborted(signal);
+      if (isAbortError(error)) throw error;
+      this.webgpuProbe = { status: "failed", reason };
+      this.device = "cpu";
+      this.fallbackReason = { code: reason, message: `WebGPU 不可用，已退回 CPU（${reason}）` };
       return await this.createBackend("cpu");
     }
   }
@@ -1504,7 +1584,7 @@ export class TransformersEmbedder implements Embedder {
   /**
    * `auto`＋已有可沿用的決定：**載入期護欄**。
    *
-   * 為什麼要有這一層：`#28005` 的 SIGBUS 若只是間歇性的，那麼「自我測試剛好沒踩到、
+   * 為什麼要有這一層：原生崩潰若只是間歇性的，那麼「自我測試剛好沒踩到、
    * 之後每次啟動都踩到」就會變成**無上限的啟動閃退迴圈**，而記錄永遠停在 `usable`
    * ——超出使用者核准的「閃一次就記住」。因此每次為正式使用建 CoreML session 前，
    * 先原子落地 `pending(load)`；成功才把決定寫回 `usable`（計數歸零），

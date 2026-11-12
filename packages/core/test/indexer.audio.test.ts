@@ -199,10 +199,12 @@ describe("音訊檔案索引", () => {
     await fs.writeFile(file, wav(1));
     await indexRoot(root, { store, vec, embedder });
     expect(await vec.count()).toBe(1);
+    // 掃描後使用 canonical 路徑，macOS 的暫存目錄可能經符號連結指向另一個位置。
+    const canonicalFile = await fs.realpath(file);
     const original = pathGuard.resolveInsideRoot;
     let scanned = false;
     vi.spyOn(pathGuard, "resolveInsideRoot").mockImplementation(async (roots, requested) => {
-      if (scanned && requested === file) throw new PathOutsideRootError(requested);
+      if (scanned && requested === canonicalFile) throw new PathOutsideRootError(requested);
       return original(roots, requested);
     });
     const open = vi.spyOn(fs, "open");
