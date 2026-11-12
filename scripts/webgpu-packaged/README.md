@@ -26,4 +26,10 @@ PACKAGED_APP="$PWD/.tmp/webgpu-packaged/fault-copies/fault-copy-01/Mnemoshelf.ap
 
 判定器的正反向測試：`packages/core/node_modules/.bin/vitest run scripts/webgpu-packaged/assertions.test.mjs`。
 
-所有案例啟動參數使用 `--use-mock-keychain`，報告記為 `mock-for-isolated-smoke`。Electron 44.10.0 的 [Chromium patch](https://github.com/electron/electron/blob/v44.10.0/patches/chromium/revert_oscrypt_remove_sync_backend.patch) 在此開關下選用 FakeKeychainV2；本輪是隔離的假 keychain，不驗證 OS keychain 或 token 持久化。隨機 token 透過環境變數傳入。
+以上 `run.mjs` 案例啟動參數使用 `--use-mock-keychain`，報告記為 `mock-for-isolated-smoke`。Electron 44.10.0 的 [Chromium patch](https://github.com/electron/electron/blob/v44.10.0/patches/chromium/revert_oscrypt_remove_sync_backend.patch) 在此開關下選用 FakeKeychainV2；這些案例使用隔離的假 keychain，不驗證 OS keychain 或 token 持久化。隨機 token 透過環境變數傳入。
+
+## 真 Keychain 與跨重啟 token
+
+此項與前面的 mock-keychain 案例獨立。從 repo 根執行 `KEYCHAIN_APP_ASAR_SHA256=<已驗證原件的64位小寫SHA256> KEYCHAIN_ID=real-01 node scripts/webgpu-packaged/keychain.mjs`；每個 ID 建立全新隔離 profile，不可續用。腳本核對任務卡指定的原 App asar 與簽章、複製並驗證模型後，直接啟動同一原件的 headless main 三次，不帶 mock 參數或 token 環境變數。每輪等待服務時每 15 秒提示；若系統出現 Keychain 授權視窗，由使用者自行操作，腳本不輸入密碼或讀取 Keychain。每次最多 20 分鐘、6 GiB，並分開記錄啟動等待時間與模型操作時間。
+
+檢查生成後兩次讀取既有加密 token、舊 token 對新服務可授權、錯誤及缺失 token 得到 401、既有文字／圖片索引的向量搜尋與 WebGPU probe。三輪的 token 值及 token.bin 位元組只在記憶體比較，報告只寫真假，密文相等不宣稱檔案未被重寫。程序正常結束後必須自行刪除 runtime；下一次要求新的 PID 與 runtime 時間。輸出於 `.tmp/webgpu-keychain/runs/<ID>`；其中 profile 含敏感連線資訊及密文，勿分享。此流程不安裝 App、不修改產品碼或系統安全設定；測試沒有封鎖網路。
