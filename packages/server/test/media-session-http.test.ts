@@ -85,6 +85,18 @@ describe("同源授權播放 HTTP", () => {
     expect((await api(server!.instance, "DELETE", `/roots/${rootId}`)).status).toBe(200);
     expect((await fetch(`${server!.instance.url}${freshBody.url}`, { headers: { cookie: freshCookie, "sec-fetch-site": "same-origin" } })).status).toBe(401);
   });
+  it("非播放欄位的 PATCH 不撤銷授權，影片上限變動才撤銷", async () => {
+    const { grant, rootId } = await fixture();
+    const response = await grant();
+    const cookie = response.headers.get("set-cookie")!.split(";")[0]!;
+    const { url } = await response.json() as { url: string };
+    // allowAgentSearch 只影響 agent 搜尋範圍，不影響播放：舊 cookie 仍可用。
+    expect((await api(server!.instance, "PATCH", `/roots/${rootId}`, { body: { allowAgentSearch: true } })).status).toBe(200);
+    expect((await fetch(`${server!.instance.url}${url}`, { method: "HEAD", headers: { cookie, "sec-fetch-site": "same-origin" } })).status).toBe(200);
+    // 影片上限會影響播放：舊授權撤銷。
+    expect((await api(server!.instance, "PATCH", `/roots/${rootId}`, { body: { videoMaxFileBytes: 1 } })).status).toBe(200);
+    expect((await fetch(`${server!.instance.url}${url}`, { method: "HEAD", headers: { cookie, "sec-fetch-site": "same-origin" } })).status).toBe(401);
+  });
   it("Bearer 換短效 cookie；Range/HEAD/416，locator/其他API不繼承授權，撤銷失效", async () => {
     const { grant, rootId, headers, bytes } = await fixture();
     expect((await grant(undefined, { authorization: "" })).status).toBe(401);

@@ -520,7 +520,12 @@ export function createMcpServer(options: McpServerOptions): Server {
           const agentOnly = args.agentOnly === undefined ? true : args.agentOnly;
           let sharedRootsCount: number | undefined;
           if (agentOnly === true) {
-            sharedRootsCount = (await loadRootsListing()).sharedRootsCount;
+            const listing = await loadRootsListing();
+            const requestedIds = Array.isArray(args.rootIds) ? (args.rootIds as unknown[]) : undefined;
+            // 帶了 rootIds 就只算交集：指向未分享的 root 時應為 0（否則 hint 不會出現卻又是空結果）。
+            sharedRootsCount = listing.roots.filter(
+              (root) => root.allowAgentSearch === true && (requestedIds === undefined || requestedIds.includes(root.id)),
+            ).length;
           }
           const result = (await callRestWithReconnect("POST", "/search", "retry", {
             query: args.query,

@@ -110,7 +110,8 @@ export function RootsList({
     const override = overrides[root.id];
     if (override === undefined) return root;
     if (override.allowAgentSearch === root.allowAgentSearch && override.maxFileBytes === root.maxFileBytes) return root;
-    return override;
+    // 只覆寫這兩個欄位：override 是整份 PATCH 回應，其他欄位仍以父層最新資料為準。
+    return { ...root, allowAgentSearch: override.allowAgentSearch, maxFileBytes: override.maxFileBytes };
   };
 
   const runUpdate = async (
@@ -127,7 +128,8 @@ export function RootsList({
     } catch (error) {
       setActionError(error instanceof Error ? error.message : fallbackMessage);
     } finally {
-      setBusy(null);
+      // 只清自己的旗標：不同 root／欄位的請求並行時，先完成的不該把另一個仍在進行的 busy 清掉。
+      setBusy((current) => (current?.rootId === root.id && current?.field === field ? null : current));
     }
   };
 

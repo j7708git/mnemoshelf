@@ -414,7 +414,8 @@ export async function addRoot(input: {
 }
 
 /**
- * 更新已加入 root 的可變設定（`PATCH /roots/:id`；目前只有 `modalities`）。
+ * 更新已加入 root 的可變設定（`PATCH /roots/:id`；接受 `modalities`、`allowAgentSearch`、
+ * `maxFileBytes` 與 `videoMaxFileBytes`）。
  *
  * **只改設定，不會自動重新索引**：新模態要等下一次索引才會生效，因此呼叫端要自己提示
  * 使用者「重新索引」。

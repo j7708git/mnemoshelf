@@ -1529,7 +1529,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const updated = await deps.store.updateRoot(id, patch);
     // 先行 getRootOr404 之後理論上不會是 null；並行刪除時仍以 404 回應，不吞掉。
     if (updated === null) throw new NotFoundError("root", id);
-    mediaSessions.revokeRoot(id);
+    // 只有會影響播放的欄位才撤銷：切換 agent 分享或通用上限不該踢掉正在播放的影片連線。
+    if (patch.modalities !== undefined || patch.videoMaxFileBytes !== undefined) mediaSessions.revokeRoot(id);
     return { status: 200, body: updated };
   };
 
