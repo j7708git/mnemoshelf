@@ -15,6 +15,8 @@ import {
   normalizeMemorySearchK,
   normalizeMemorySourceEventCheck,
   normalizeMemorySourceScope,
+  normalizeRootMaxFileBytes,
+  normalizeRootVideoMaxFileBytes,
   readMemoryPolicy,
   validateMemorySourceWrite,
   type Chunk,
@@ -61,51 +63,10 @@ export interface PgMetadataStoreOptions {
 }
 
 /**
- * root 影片上限的值域（與 core `ports/metadata-store.ts` 的 `normalizeRootVideoMaxFileBytes` 同值）。
- *
- * 本套件保留同語意副本：這個副本必須與 core 的版本保持同語意，兩後端由同一組契約測試
- * 各跑一遍（SQLite／PostgreSQL），實作一旦分歧測試就會失敗。
+ * root 上限驗證一律走 `@mnemoshelf/core` 的 `normalizeRootMaxFileBytes` 與
+ * `normalizeRootVideoMaxFileBytes`（兩後端與呼叫端共用的唯一驗證入口，不得各自解讀）；
+ * 本檔不再保留同語意副本，避免日後與 core 漂移。
  */
-const VIDEO_MAX_FILE_BYTES_MIN = 1;
-const VIDEO_MAX_FILE_BYTES_MAX = 16 * 1024 * 1024 * 1024;
-
-/** 驗證 root 影片上限；語意與 core 的 `normalizeRootVideoMaxFileBytes` 完全相同。 */
-function normalizeRootVideoMaxFileBytes(value: unknown): number | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value < VIDEO_MAX_FILE_BYTES_MIN ||
-    value > VIDEO_MAX_FILE_BYTES_MAX
-  ) {
-    throw new TypeError("root 的影片單檔大小上限必須是 1–16 GiB 的整數（bytes）");
-  }
-  return value;
-}
-
-/**
- * root 通用單檔上限的值域（與 core `ports/metadata-store.ts` 的 `normalizeRootMaxFileBytes` 同值）。
- *
- * 本套件保留同語意副本：這個副本必須與 core 的版本保持同語意，兩後端由同一組契約測試
- * 各跑一遍（SQLite／PostgreSQL），實作一旦分歧測試就會失敗。
- */
-const MAX_FILE_BYTES_MIN = 1;
-const MAX_FILE_BYTES_MAX = 16 * 1024 * 1024 * 1024;
-
-/** 驗證 root 通用單檔上限；語意與 core 的 `normalizeRootMaxFileBytes` 完全相同。 */
-function normalizeRootMaxFileBytes(value: unknown): number | undefined {
-  if (value === undefined || value === null) return undefined;
-  if (
-    typeof value !== "number" ||
-    !Number.isSafeInteger(value) ||
-    value < MAX_FILE_BYTES_MIN ||
-    value > MAX_FILE_BYTES_MAX
-  ) {
-    throw new TypeError("root 的單檔大小上限必須是 1–16 GiB 的整數（bytes）");
-  }
-  return value;
-}
-
 const ROOT_COLUMNS =
   "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, allow_agent_search, max_file_bytes, video_max_file_bytes";
 const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash, media_json";
