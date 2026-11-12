@@ -3,6 +3,7 @@ import { DuplicateRootError } from "../errors.js";
 import {
   MEMORY_LIST_DEFAULT_LIMIT,
   MEMORY_LIST_MAX_LIMIT,
+  MAX_FILE_BYTES_MAX,
   VIDEO_MAX_FILE_BYTES_MAX,
   assignChunkMediaSeq,
   normalizeChunkMedia,
@@ -196,6 +197,91 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       expect(await store.getRoot(root.id)).toEqual(one);
     });
 
+    it("root 的 agent 分享開關：新增預設 false、可更新為 true、省略欄位不變", async () => {
+      const plain = await store.addRoot(rootInput());
+      expect(plain.allowAgentSearch).toBe(false);
+      expect((await store.getRoot(plain.id))?.allowAgentSearch).toBe(false);
+
+      const shared = await store.addRoot(rootInput({ path: "contract/root-shared", allowAgentSearch: true }));
+      expect(shared.allowAgentSearch).toBe(true);
+      expect((await store.getRoot(shared.id))?.allowAgentSearch).toBe(true);
+      expect((await store.listRoots()).find((r) => r.id === shared.id)?.allowAgentSearch).toBe(true);
+
+      // 只改分享開關：其他欄位不變，讀回來也要是新值。
+      const updated = await store.updateRoot(plain.id, { allowAgentSearch: true });
+      expect(updated?.allowAgentSearch).toBe(true);
+      expect(updated?.path).toBe(plain.path);
+      expect(updated?.modalities).toEqual(plain.modalities);
+      expect((await store.getRoot(plain.id))?.allowAgentSearch).toBe(true);
+
+      // 省略欄位＝不改（維持 true）。
+      expect((await store.updateRoot(plain.id, { modalities: ["text"] }))?.allowAgentSearch).toBe(true);
+
+      // 明確關閉。
+      expect((await store.updateRoot(plain.id, { allowAgentSearch: false }))?.allowAgentSearch).toBe(false);
+    });
+
+    it("root 的通用單檔上限：新增／讀回／更新／清除；未設定時欄位不存在", async () => {
+      const plain = await store.addRoot(rootInput());
+      // NULL（未設定）→ 讀回不得出現該鍵，也不得補 10 MiB。
+      expect(plain).not.toHaveProperty("maxFileBytes");
+      expect(await store.getRoot(plain.id)).not.toHaveProperty("maxFileBytes");
+
+      const configured = await store.addRoot(
+        rootInput({ path: "contract/root-max-file-limit", maxFileBytes: 2 * 1024 ** 2 }),
+      );
+      expect(configured.maxFileBytes).toBe(2 * 1024 ** 2);
+      expect((await store.getRoot(configured.id))?.maxFileBytes).toBe(2 * 1024 ** 2);
+      expect((await store.listRoots()).find((r) => r.id === configured.id)?.maxFileBytes).toBe(2 * 1024 ** 2);
+      // 通用上限與影片上限是獨立的兩個欄位。
+      expect(configured).not.toHaveProperty("videoMaxFileBytes");
+
+      // 只改上限：其他欄位不變，讀回來也要是新值。
+      const updated = await store.updateRoot(configured.id, { maxFileBytes: 1024 });
+      expect(updated?.maxFileBytes).toBe(1024);
+      expect(updated?.modalities).toEqual(configured.modalities);
+      expect(updated?.path).toBe(configured.path);
+      expect((await store.getRoot(configured.id))?.maxFileBytes).toBe(1024);
+
+      // null＝清除（回服務層預設）：欄位消失。
+      const cleared = await store.updateRoot(configured.id, { maxFileBytes: null });
+      expect(cleared).not.toHaveProperty("maxFileBytes");
+      expect(await store.getRoot(configured.id)).not.toHaveProperty("maxFileBytes");
+      // 之後省略欄位＝不改（維持清除狀態）。
+      expect(await store.updateRoot(configured.id, {})).toEqual(cleared);
+    });
+
+    it("root 的通用單檔上限邊界與驗證：1 B／16 GiB 可寫；非法值拋 TypeError 且不改資料", async () => {
+      const root = await store.addRoot(rootInput({ maxFileBytes: MAX_FILE_BYTES_MAX }));
+      expect(root.maxFileBytes).toBe(MAX_FILE_BYTES_MAX);
+
+      const one = await store.updateRoot(root.id, { maxFileBytes: 1 });
+      expect(one?.maxFileBytes).toBe(1);
+
+      const invalid: unknown[] = [
+        0,
+        -1,
+        1.5,
+        MAX_FILE_BYTES_MAX + 1,
+        Number.NaN,
+        Number.POSITIVE_INFINITY,
+        "1024",
+        {},
+      ];
+      for (const [index, value] of invalid.entries()) {
+        await expect(
+          store.addRoot(
+            rootInput({ path: `contract/root-max-invalid-${index}`, maxFileBytes: value as unknown as number }),
+          ),
+        ).rejects.toBeInstanceOf(TypeError);
+        await expect(
+          store.updateRoot(root.id, { maxFileBytes: value as unknown as number }),
+        ).rejects.toBeInstanceOf(TypeError);
+      }
+      // 失敗的更新不得改動資料（仍是 1）。
+      expect(await store.getRoot(root.id)).toEqual(one);
+    });
+
     it("replaceChunks 先清舊再寫新（冪等）", async () => {
       const root = await store.addRoot(rootInput());
       const first = await store.replaceChunks(root.id, "notes/a.md", [
@@ -234,6 +320,33 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       expect(removed).toEqual(chunks.map((c) => c.id));
       expect(await store.searchKeyword("鰻魚飯", {}, 5)).toHaveLength(0);
       expect(await store.getChunks(removed)).toEqual([]);
+    });
+
+    it("searchKeyword 的 rootIds 與 includeMemories：可只縮小 chunk 範圍、仍保留記憶", async () => {
+      const root = await store.addRoot(rootInput());
+      const chunks = await store.replaceChunks(root.id, "notes/scope.md", [
+        { seq: 0, kind: "text", text: "範圍測試：檔案片段", contentHash: "scope-hash" },
+      ]);
+      const chunkId = chunks[0]!.id;
+      const memory = await store.addMemory(memoryInput({ content: "範圍測試：共享記憶" }));
+
+      // 預設：指定 rootIds → 只有 chunk，沒有記憶。
+      const chunksOnly = await store.searchKeyword("範圍測試", { rootIds: [root.id] }, 10);
+      expect(chunksOnly.map((hit) => hit.key)).toContain(`c:${chunkId}`);
+      expect(chunksOnly.some((hit) => hit.key === `m:${memory.id}`)).toBe(false);
+
+      // includeMemories: true → chunk 仍受 rootIds 限制，記憶也回。
+      const withMemories = await store.searchKeyword("範圍測試", { rootIds: [root.id], includeMemories: true }, 10);
+      expect(withMemories.map((hit) => hit.key)).toContain(`c:${chunkId}`);
+      expect(withMemories.map((hit) => hit.key)).toContain(`m:${memory.id}`);
+
+      // 空 rootIds + includeMemories: true → 沒有 chunk、但有記憶（agentOnly 沒有分享 root 的情境）。
+      const memoryOnly = await store.searchKeyword("範圍測試", { rootIds: [], includeMemories: true }, 10);
+      expect(memoryOnly.map((hit) => hit.key)).toEqual([`m:${memory.id}`]);
+
+      // includeMemories: false → 即使未指定 rootIds 也不含記憶。
+      const noMemories = await store.searchKeyword("範圍測試", { includeMemories: false }, 10);
+      expect(noMemories.map((hit) => hit.key)).toEqual([`c:${chunkId}`]);
     });
 
     it("舊 audio 媒體定位可讀（不補新欄位），文字 chunk 省略 media", async () => {

@@ -17,6 +17,7 @@ function makeRoot(id: number, rootPath: string): Root {
     respectGitignore: true,
     watch: false,
     createdAt: new Date(0).toISOString(),
+    allowAgentSearch: false,
   };
 }
 

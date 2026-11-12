@@ -84,6 +84,21 @@ export interface Root {
   watch: boolean;
   createdAt: string;
   /**
+   * 是否允許 agent 搜尋這個 root 的檔案片段（MCP `search` 的預設範圍）。
+   *
+   * 預設 `false`；舊版服務沒有這個欄位時 UI 一律視為未分享。
+   * 這是分享意圖／防誤用，不是多租戶硬隔離（單一 token 仍是本機 owner 全權）。
+   */
+  allowAgentSearch: boolean;
+  /**
+   * 這個 root 的通用單檔大小上限（bytes；**不套用影片**）。
+   *
+   * - 有值：per-root 設定（1 B–16 GiB）；
+   * - **缺省**：未設定，沿用服務層預設 10 MiB。契約明定舊資料列不得補值，
+   *   因此未設定時這個鍵**不存在**（不是 null）。
+   */
+  maxFileBytes?: number;
+  /**
    * 這個 root 的影片單檔大小上限（bytes；只套用影片）。
    *
    * - 有值：per-root 設定（1–16 GiB）；
@@ -375,11 +390,19 @@ export async function addRoot(input: {
   mode?: "browse" | "index";
   modalities?: string[];
   /**
+   * 通用單檔大小上限（bytes；1 B–16 GiB）。省略＝沿用服務預設 10 MiB。
+   *
+   * UI 以 MiB 輸入、換算成 bytes 後送出（見 `RootsList.tsx` 的 `parseMaxFileLimitMiB`）。
+   */
+  maxFileBytes?: number;
+  /**
    * 影片單檔大小上限（bytes；1–16 GiB）。省略＝沿用服務預設。
    *
    * UI 以 MiB 輸入、換算成 bytes 後送出（見 `media.ts` 的 `parseVideoLimitMiB`）。
    */
   videoMaxFileBytes?: number;
+  /** 是否允許 agent 搜尋；省略＝false（預設關閉）。 */
+  allowAgentSearch?: boolean;
 }): Promise<Root> {
   const response = await apiFetch("/roots", {
     method: "POST",
@@ -428,6 +451,50 @@ export async function updateRootVideoMaxFileBytes(rootId: number, videoMaxFileBy
     body: JSON.stringify({ videoMaxFileBytes }),
   });
   if (!response.ok) throw new Error(await readErrorMessage(response, "更新影片上限失敗"));
+  return (await response.json()) as Root;
+}
+
+/** 通用單檔大小上限的契約上限（bytes；16 GiB）。 */
+const MAX_FILE_BYTES_LIMIT = 16 * 1024 * 1024 * 1024;
+
+/**
+ * 更新單一 root 的**通用**單檔大小上限（`PATCH /roots/:id` 的 `maxFileBytes`）。
+ *
+ * `maxFileBytes` 是 **bytes**（1 B–16 GiB）；傳 `null` 表示**清除設定**、回到服務層預設
+ * 10 MiB（Core 的 `RootPatch` 契約）。UI 的輸入單位是 MiB，由呼叫端先驗證與換算。
+ * 只改設定、不自動重新索引；影片不套用這個上限。
+ */
+export async function updateRootMaxFileBytes(rootId: number, maxFileBytes: number | null): Promise<Root> {
+  if (maxFileBytes !== null) {
+    if (!Number.isSafeInteger(maxFileBytes) || maxFileBytes < 1 || maxFileBytes > MAX_FILE_BYTES_LIMIT) {
+      throw new Error("單檔大小上限必須是 1 byte–16 GiB 的整數 bytes。");
+    }
+  }
+  const response = await apiFetch(`/roots/${rootId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ maxFileBytes }),
+  });
+  if (!response.ok) throw new Error(await readErrorMessage(response, "更新單檔上限失敗"));
+  return (await response.json()) as Root;
+}
+
+/**
+ * 更新單一 root 的「允許 Agent 搜尋此資料夾」開關（`PATCH /roots/:id` 的 `allowAgentSearch`）。
+ *
+ * 這是分享意圖／防誤用，不是多租戶硬隔離；只影響之後 agent 的搜尋範圍，不動既有索引，
+ * 也不需要重新索引。
+ */
+export async function updateRootAgentSearch(rootId: number, allowAgentSearch: boolean): Promise<Root> {
+  if (typeof allowAgentSearch !== "boolean") {
+    throw new Error("allowAgentSearch 必須是布林值。");
+  }
+  const response = await apiFetch(`/roots/${rootId}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ allowAgentSearch }),
+  });
+  if (!response.ok) throw new Error(await readErrorMessage(response, "更新 Agent 搜尋設定失敗"));
   return (await response.json()) as Root;
 }
 

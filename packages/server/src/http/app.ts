@@ -67,6 +67,7 @@ import {
   type Modality,
   normalizeMemoryPatch,
   normalizeMemorySourceScope,
+  normalizeRootMaxFileBytes,
   PathBlockedError,
   PathOutsideRootError,
   previewRoot,
@@ -262,8 +263,14 @@ export interface AddRootRequest {
   include?: string[];
   exclude?: string[];
   respectGitignore?: boolean;
-  /** 單檔大小上限；`Root` 契約沒有此欄位，因此只存在行程內，重啟後回退預設 10 MB（見 docs/operations.md）。 */
-  maxFileBytes?: number;
+  /**
+   * 通用單檔大小上限（bytes；**per-root 持久化**，寫入 `Root.maxFileBytes`）。
+   *
+   * - 未提供或 `null`＝未設定（沿用服務層預設 10 MiB）；
+   * - 有值必須是 1–16 GiB 的整數，否則 `400 ValidationError`；
+   * - 影片不套用此上限（見 `videoMaxFileBytes`）。
+   */
+  maxFileBytes?: number | null;
   /**
    * 影片單檔大小上限（bytes；**per-root 持久化**，寫入 `Root.videoMaxFileBytes`）。
    *
@@ -271,15 +278,25 @@ export interface AddRootRequest {
    * - 有值必須是 1–16 GiB 的整數，否則 `400 ValidationError`。
    */
   videoMaxFileBytes?: number | null;
+  /**
+   * 是否允許 agent 搜尋這個 root（**per-root 持久化**）；未提供＝`false`（預設關閉）。
+   *
+   * 這是分享意圖／防誤用，不是安全邊界（單一 token 仍是本機 owner 全權）。
+   */
+  allowAgentSearch?: boolean;
 }
 
 /**
  * `PATCH /roots/:id` 的請求主體（見 `RootPatch`）。
  *
- * `modalities` 與 `videoMaxFileBytes` 至少要提供一項；未提供的欄位＝不變。
+ * 四個欄位至少要提供一項；未提供的欄位＝不變。
  */
 export interface PatchRootRequest {
   modalities?: Modality[];
+  /** 是否允許 agent 搜尋（只影響之後的搜尋範圍，不需重新索引）。 */
+  allowAgentSearch?: boolean;
+  /** 通用單檔大小上限（bytes）；`null`＝清除設定（回服務層預設 10 MiB）、未提供＝不改。 */
+  maxFileBytes?: number | null;
   /** 影片單檔大小上限（bytes）；`null`＝清除設定（回行程層預設）、未提供＝不改。 */
   videoMaxFileBytes?: number | null;
 }
@@ -1040,6 +1057,34 @@ function parseRootVideoMaxFileBytes(value: unknown, field: string): number | nul
 }
 
 /**
+ * 解析 root 的通用單檔大小上限欄位（`POST /roots`／`PATCH /roots/:id` 共用）。
+ *
+ * 驗證走 core 的 `normalizeRootMaxFileBytes`（1 B–16 GiB 整數；兩後端與呼叫端共用同一套語意）：
+ * - `undefined` → `undefined`：未提供（POST＝未設定；PATCH＝不改）；
+ * - `null` → `null`：清除／未設定（回服務層預設 10 MiB）；
+ * - 合法整數 → 原值；
+ * - 其他（0／負數／小數／非數字／超過上限）→ `400 ValidationError`。
+ */
+function parseRootMaxFileBytes(value: unknown, field: string): number | null | undefined {
+  if (value === undefined) return undefined;
+  if (value === null) return null;
+  try {
+    return normalizeRootMaxFileBytes(value);
+  } catch {
+    throw new ValidationError(field, "必須是 1–16 GiB 的整數（bytes），或 null 表示未設定");
+  }
+}
+
+/**
+ * 解析 root 的分享開關（`allowAgentSearch`）；非 boolean → `400`，未提供＝`undefined`。
+ */
+function parseAllowAgentSearch(value: unknown): boolean | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "boolean") throw new ValidationError("allowAgentSearch", "必須是布林值");
+  return value;
+}
+
+/**
  * 寫入路徑的 metadata 檢查：`agent`／`project` 若含 token-like 機密 → 拒絕（400）。
  *
  * 為什麼不遮而要拒絕：agent／project 是**查詢鍵**（過濾、召回 bucket 都用它精確比對）；
@@ -1312,11 +1357,6 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   };
 
   /**
-   * 行程內的每 root 單檔大小上限（`Root` 契約無此欄位，重啟即失、回退 indexer 預設 10 MB）。
-   * 這是刻意的取捨（PM 裁示：文件化，不持久化）；要持久化需 migration 與契約變更。
-   */
-  const maxFileBytesByRoot = new Map<number, number>();
-  /**
    * 每 root 最近一次 preview 的統計（行程內記憶體）。
    *
    * 為什麼要留：preview 端點本身不寫入任何狀態，而 `GET /diagnostics` 需要「已加入的 root
@@ -1445,13 +1485,13 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     }
     let maxFileBytes: number | undefined;
     if (body.maxFileBytes !== undefined) {
-      if (!Number.isInteger(body.maxFileBytes) || body.maxFileBytes <= 0) {
-        throw new ValidationError("maxFileBytes", "必須是正整數");
-      }
-      maxFileBytes = body.maxFileBytes;
+      const parsed = parseRootMaxFileBytes(body.maxFileBytes, "maxFileBytes");
+      // undefined 只代表「未提供」（上面已排除），因此這裡必定是 number 或 null。
+      if (typeof parsed === "number") maxFileBytes = parsed;
     }
     // 影片上限是 per-root 持久化欄位（null／未提供＝未設定，沿用行程層預設）。
     const videoMaxFileBytesSetting = parseRootVideoMaxFileBytes(body.videoMaxFileBytes, "videoMaxFileBytes");
+    const allowAgentSearch = parseAllowAgentSearch(body.allowAgentSearch);
 
     const root = await deps.store.addRoot({
       path: realPath,
@@ -1461,17 +1501,21 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       exclude,
       respectGitignore: body.respectGitignore ?? true,
       watch: false,
+      ...(allowAgentSearch === undefined ? {} : { allowAgentSearch }),
+      ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
       ...(typeof videoMaxFileBytesSetting === "number" ? { videoMaxFileBytes: videoMaxFileBytesSetting } : {}),
     });
-    if (maxFileBytes !== undefined) maxFileBytesByRoot.set(root.id, maxFileBytes);
     return { status: 201, body: root };
   };
 
   /**
-   * `PATCH /roots/:id`：更新 root 的可變設定（`modalities` 與 `videoMaxFileBytes`）。
+   * `PATCH /roots/:id`：更新 root 的可變設定（`modalities`、`allowAgentSearch`、
+   * `maxFileBytes` 與 `videoMaxFileBytes`）。
    *
    * 語意：
-   * - 兩個欄位**至少提供一項**；未提供＝不變；非法 → `400`；未知的 root → `404`。
+   * - 四個欄位**至少提供一項**；未提供＝不變；非法 → `400`；未知的 root → `404`。
+   * - `allowAgentSearch`：boolean；只影響之後 agent 的搜尋範圍，不需重新索引。
+   * - `maxFileBytes`：number＝設定、`null`＝清除（回服務層預設 10 MiB）。
    * - `videoMaxFileBytes`：number＝設定、`null`＝清除（回行程層預設）。
    * - 成功回 `200`＋更新後的 root。
    * - **不自動觸發重新索引**：改的是設定，掃描層下一次索引才會看到新的模態／上限；
@@ -1483,11 +1527,16 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const body = (await readJsonBody(request)) as unknown as PatchRootRequest;
     const patch: RootPatch = {};
     if (body.modalities !== undefined) patch.modalities = validateModalities(body.modalities);
+    const allowAgentSearch = parseAllowAgentSearch(body.allowAgentSearch);
+    if (allowAgentSearch !== undefined) patch.allowAgentSearch = allowAgentSearch;
+    const maxFileBytesSetting = parseRootMaxFileBytes(body.maxFileBytes, "maxFileBytes");
+    // undefined＝不改；null＝清除；number＝設定（RootPatch 的 null 有語意，不能和 undefined 混用）。
+    if (maxFileBytesSetting !== undefined) patch.maxFileBytes = maxFileBytesSetting;
     const videoMaxFileBytesSetting = parseRootVideoMaxFileBytes(body.videoMaxFileBytes, "videoMaxFileBytes");
     // undefined＝不改；null＝清除；number＝設定（RootPatch 的 null 有語意，不能和 undefined 混用）。
     if (videoMaxFileBytesSetting !== undefined) patch.videoMaxFileBytes = videoMaxFileBytesSetting;
     if (Object.keys(patch).length === 0) {
-      throw new ValidationError("body", "至少要提供 modalities 或 videoMaxFileBytes");
+      throw new ValidationError("body", "至少要提供 modalities、allowAgentSearch、maxFileBytes 或 videoMaxFileBytes");
     }
     const updated = await deps.store.updateRoot(id, patch);
     // 先行 getRootOr404 之後理論上不會是 null；並行刪除時仍以 404 回應，不吞掉。
@@ -1498,7 +1547,6 @@ export function createRestApp(deps: RestAppDeps): RestApp {
 
   const previewFor = async (id: number): Promise<{ status: number; body: unknown }> => {
     const root = await getRootOr404(id);
-    const maxFileBytes = maxFileBytesByRoot.get(id);
     // 支援的模態：decoder 可用時才宣告 video（不可用時預覽不列影片候選；原因由 videoCapability 回報）。
     const supportedModalities: Modality[] = ["text", "code", "image"];
     if (deps.embedder.info.capabilities.audio && typeof deps.embedder.embedAudio === "function") {
@@ -1511,9 +1559,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       include: root.include,
       exclude: root.exclude,
       respectGitignore: root.respectGitignore,
+      // 通用上限與 indexer 共用同一個持久化值：per-root 設定 → 服務層預設 10 MiB。
+      ...(root.maxFileBytes === undefined ? {} : { maxFileBytes: root.maxFileBytes }),
       // 影片上限與 indexer／播放端點共用同一個值：per-root 設定 → 行程層預設。
       videoMaxFileBytes: effectiveVideoMaxFileBytes(root),
-      ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
     }, { supportedModalities });
     // 記住這次 preview 的統計：`GET /diagnostics` 會回報「上次量到的數字」（不重新掃描磁碟）。
     lastPreviewByRoot.set(id, preview);
@@ -1533,7 +1582,6 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     }
 
     const startedAt = Date.now();
-    const maxFileBytes = maxFileBytesByRoot.get(id);
     const controller = new AbortController();
     indexStatus.begin(id);
     const run = indexRoot(root, {
@@ -1546,7 +1594,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         indexingTimings[stage].calls += 1;
         indexingTimings[stage].durationMs += durationMs;
       },
-      ...(maxFileBytes === undefined ? {} : { maxFileBytes }),
+      // 通用上限：per-root 持久化設定 → 服務層預設 10 MiB（indexer 自己的 default）。
+      ...(root.maxFileBytes === undefined ? {} : { maxFileBytes: root.maxFileBytes }),
       // 影片：decoder 設定且 embedder 有入口就傳（不可用時 indexer 逐檔具名 failed）。
       // videoMaxFileBytes 與 preview／播放端點共用同一個值（per-root 設定 → 行程層預設）。
       ...(videoSupportedForIndex
@@ -1855,7 +1904,6 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const { removedChunkIds } = await deps.store.removeRoot(id, deleteData);
     mediaSessions.revokeRoot(id);
     if (deleteData) await deps.vec.deleteByRoot(id);
-    maxFileBytesByRoot.delete(id);
     lastPreviewByRoot.delete(id);
     indexStatus.clear(id);
     const body: RemoveRootResponse = {
@@ -2127,6 +2175,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         query: body.query as string,
         mode: body.mode as SearchMode | undefined,
         rootIds: body.rootIds as number[] | undefined,
+        agentOnly: body.agentOnly as boolean | undefined,
         k: body.k as number | undefined,
       },
     );

@@ -56,6 +56,7 @@ function root(overrides: Partial<Root> = {}): Root {
     respectGitignore: true,
     watch: false,
     createdAt: "2026-11-08",
+    allowAgentSearch: false,
     ...overrides,
   };
 }

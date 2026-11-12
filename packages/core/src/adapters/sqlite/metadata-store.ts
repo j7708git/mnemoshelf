@@ -25,6 +25,7 @@ import {
   normalizeMemoryLimit,
   normalizeChunkMedia,
   normalizeMemoryPatch,
+  normalizeRootMaxFileBytes,
   normalizeRootVideoMaxFileBytes,
   normalizeMemorySearchFilter,
   normalizeMemorySearchK,
@@ -59,7 +60,7 @@ import { runMigrations } from "./db.js";
 import { buildMatchExpression, segmentText } from "./segment.js";
 
 const ROOT_COLUMNS =
-  "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, video_max_file_bytes";
+  "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, allow_agent_search, max_file_bytes, video_max_file_bytes";
 const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash, media_json";
 const MEMORY_COLUMNS =
   `id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at,
@@ -84,7 +85,12 @@ function rowToRoot(row: Record<string, unknown>): Root {
     respectGitignore: Number(row.respect_gitignore) !== 0,
     watch: Number(row.watch) !== 0,
     createdAt: String(row.created_at),
+    allowAgentSearch: Number(row.allow_agent_search) !== 0,
   };
+  // NULL（舊資料或未設定）→ 不出現該鍵；不補 10 MiB（預設值屬呼叫端語意）。
+  if (row.max_file_bytes !== null && row.max_file_bytes !== undefined) {
+    root.maxFileBytes = Number(row.max_file_bytes);
+  }
   // NULL（舊資料或未設定）→ 不出現該鍵；不補 512 MiB（預設值屬呼叫端語意）。
   if (row.video_max_file_bytes !== null && row.video_max_file_bytes !== undefined) {
     root.videoMaxFileBytes = Number(row.video_max_file_bytes);
@@ -405,12 +411,13 @@ export class SqliteMetadataStore implements MetadataStore {
   async addRoot(r: NewRoot): Promise<Root> {
     const createdAt = new Date().toISOString();
     // 驗證在寫入前（非法值不建立資料列）；null＝未設定，資料庫寫 NULL。
+    const maxFileBytes = normalizeRootMaxFileBytes(r.maxFileBytes) ?? null;
     const videoMaxFileBytes = normalizeRootVideoMaxFileBytes(r.videoMaxFileBytes) ?? null;
     try {
       this.db
         .prepare(
-          `insert into roots(path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, video_max_file_bytes)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `insert into roots(path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, allow_agent_search, max_file_bytes, video_max_file_bytes)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           r.path,
@@ -421,6 +428,8 @@ export class SqliteMetadataStore implements MetadataStore {
           r.respectGitignore ? 1 : 0,
           r.watch ? 1 : 0,
           createdAt,
+          r.allowAgentSearch === true ? 1 : 0,
+          maxFileBytes,
           videoMaxFileBytes,
         );
     } catch (error) {
@@ -451,20 +460,34 @@ export class SqliteMetadataStore implements MetadataStore {
    * 欄位省略＝不變的語意留在這裡，`null` 這種 SQL 值不必進到介面；
    * 代價是多一次 select（roots 只有個位數筆，可忽略）。
    *
+   * `maxFileBytes`：`undefined`＝保留現值、`null`＝清除（NULL）、`number`＝驗證後寫入。
    * `videoMaxFileBytes`：`undefined`＝保留現值、`null`＝清除（NULL）、`number`＝驗證後寫入。
    */
   async updateRoot(id: number, patch: RootPatch): Promise<Root | null> {
     const existing = await this.getRoot(id);
     if (existing === null) return null;
 
+    const maxFileBytes =
+      patch.maxFileBytes === undefined
+        ? existing.maxFileBytes ?? null
+        : normalizeRootMaxFileBytes(patch.maxFileBytes) ?? null;
     const videoMaxFileBytes =
       patch.videoMaxFileBytes === undefined
         ? existing.videoMaxFileBytes ?? null
         : normalizeRootVideoMaxFileBytes(patch.videoMaxFileBytes) ?? null;
 
     this.db
-      .prepare("update roots set modalities = ?, video_max_file_bytes = ? where id = ?")
-      .run(JSON.stringify(patch.modalities ?? existing.modalities), videoMaxFileBytes, id);
+      .prepare(
+        `update roots set modalities = ?, allow_agent_search = ?, max_file_bytes = ?, video_max_file_bytes = ?
+          where id = ?`,
+      )
+      .run(
+        JSON.stringify(patch.modalities ?? existing.modalities),
+        (patch.allowAgentSearch ?? existing.allowAgentSearch) ? 1 : 0,
+        maxFileBytes,
+        videoMaxFileBytes,
+        id,
+      );
 
     return await this.getRoot(id);
   }
@@ -1001,7 +1024,7 @@ export class SqliteMetadataStore implements MetadataStore {
    * 排名：chunk 與記憶各自以 `bm25()` 排序，再合併成單一清單（分數越小越前面），
    * 同分以 key 的字典序決定，確保可重現。
    * `filter.rootIds` 未指定時搜尋所有 chunk 與未刪除的記憶；指定時只搜尋這些 root 的
-   * chunk（記憶沒有 root，因此不回傳；與向量查詢對 null root 的規則一致）。
+   * chunk（記憶沒有 root，因此預設不回傳；`filter.includeMemories: true` 可保留記憶）。
    */
   async searchKeyword(query: string, filter: SearchFilter, k: number): Promise<RankedHit[]> {
     if (k <= 0) return [];
@@ -1010,6 +1033,8 @@ export class SqliteMetadataStore implements MetadataStore {
 
     const scored: { key: string; score: number }[] = [];
     const rootIds = filter.rootIds;
+    // 預設規則：rootIds 未指定才含記憶；呼叫端可用 includeMemories 明確覆寫。
+    const includeMemories = filter.includeMemories ?? rootIds === undefined;
 
     if (rootIds === undefined || rootIds.length > 0) {
       const chunkSql =
@@ -1028,7 +1053,7 @@ export class SqliteMetadataStore implements MetadataStore {
       }
     }
 
-    if (rootIds === undefined) {
+    if (includeMemories) {
       const rows = selectRows(
         this.db,
         `select memories.id as id, bm25(memories_fts) as score

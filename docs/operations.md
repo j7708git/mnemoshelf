@@ -41,9 +41,9 @@ session 最長 15 分鐘、每服務最多 128 個、每個最多 4 條活動串
 |---|---|
 | `GET /health` | 免 token；服務身分、版本與 build（建置 commit） |
 | `GET /diagnostics` | 診斷資訊（版本、平台、embedder 裝置與退回原因、每 root 統計、記憶向量狀態、影片能力／decoder 狀態與索引統計） |
-| `GET /roots` / `POST /roots` | 列出／加入 root（`POST` 可帶 `maxFileBytes` 指定通用單檔上限，預設 10 MB；可帶 `videoMaxFileBytes` 指定 per-root 影片上限，bytes、1–16 GiB；`GET` 另回 additive `video` 能力摘要） |
+| `GET /roots` / `POST /roots` | 列出／加入 root（`POST` 可帶 `maxFileBytes` 指定通用單檔上限，bytes、1 B–16 GiB、預設 10 MiB；可帶 `videoMaxFileBytes` 指定 per-root 影片上限，bytes、1–16 GiB；可帶 `allowAgentSearch`（boolean，預設 false）；`GET` 另回 additive `video` 能力摘要） |
 | `GET /roots/:id` | 單一 root |
-| `PATCH /roots/:id` | 改模態與 per-root 影片上限（`modalities`／`videoMaxFileBytes`；後者 `null` 清除、值域 1–16 GiB） |
+| `PATCH /roots/:id` | 改 root 設定（`modalities`／`allowAgentSearch`／`maxFileBytes`／`videoMaxFileBytes`；`null` 清除上限、值域 1 B–16 GiB；至少一項；不觸發重新索引） |
 | `DELETE /roots/:id?deleteData=1` | 移除 root；`deleteData` 決定是否連帶刪已索引資料。接受 `1`／`0`／`true`／`false`／`yes`／`no` |
 | `POST /roots/:id/preview` | 索引前預覽（乾跑，不寫入；root 需已加入） |
 | `POST /roots/:id/index` | 開始索引；同一 root 已在索引中會回 `409` |
@@ -55,7 +55,7 @@ session 最長 15 分鐘、每服務最多 128 個、每個最多 4 條活動串
 | `POST /roots/:id/media-sessions` | Bearer＋同源建立單一來源版本的短效播放授權；`{path, chunkId?}`；201 回 URL／逾期時間及 HttpOnly cookie；原命中失效回 409 |
 | `GET`／`HEAD /roots/:id/media-sessions/:sessionId` | 同源 cookie 授權的影片串流；沿用 Range／HEAD／root／大小上限，URL 不帶 token |
 | `DELETE /roots/:id/media-sessions/:sessionId` | Bearer＋同源撤銷播放授權並停止活動串流 |
-| `POST /search` | 檔案語意搜尋（`mode`：`vector` 預設／`keyword`／`hybrid`；`k` 上限 100） |
+| `POST /search` | 檔案語意搜尋（`mode`：`vector` 預設／`keyword`／`hybrid`；`k` 上限 100；`agentOnly: true` 只搜已勾選「允許 Agent 搜尋」的 roots，預設 `false`） |
 | `GET /memory-policy` / `PATCH /memory-policy` | 讀取／保存記憶遮罩開關與政策版本 |
 | `POST /memory-sources` | 完整原文回合寫入；8 MiB 上限，事件重送去重 |
 | `GET /memory-sources/:id` | 帶範圍與政策版本的來源分頁續讀 |
@@ -69,6 +69,10 @@ session 最長 15 分鐘、每服務最多 128 個、每個最多 4 條活動串
 
 備份預設 v2，包含短記憶與完整原文來源，依當下遮罩政策產生；舊 v1 仍可匯入。
 原文上限、事件衝突、分頁與備份相容性見 [原文記憶](raw-memory.md)。
+
+`maxFileBytes`（通用單檔上限，非影片）與 `videoMaxFileBytes` 都是 **per-root 持久化**欄位：
+`root.maxFileBytes` 未設定時沿用服務層預設 10 MiB；明確設定後重啟服務仍保留（不再回退預設）。
+兩者都只影響下一次 preview／index，`PATCH` 不會自動重新索引。影片不套用通用 `maxFileBytes`。
 
 `GET /health` 回 `{status, service, appVersion, build}`。`build` 是 build 時的 commit：
 `packages/server/scripts/build-info.mjs` 在 build 時以 `git rev-parse HEAD` 寫入
@@ -85,11 +89,11 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
 
 | 工具 | 說明 |
 |---|---|
-| `search` | 搜尋已索引的檔案片段與記憶（`mode`：`vector` 預設／`keyword`／`hybrid`） |
+| `search` | 搜尋已索引的檔案片段與記憶（`mode`：`vector` 預設／`keyword`／`hybrid`）；**預設 `agentOnly: true`，只搜尋使用者勾選「允許 Agent 搜尋」的資料夾**；要搜全部需明確帶 `agentOnly: false` |
 | `remember` | 寫入一筆記憶；預設以「目前專案」為範圍，重複內容回既有記憶並標 `duplicate` |
 | `recall` | **跨專案**列出未刪除的記憶（由新到舊，可用 `project`／`scope` 篩選，**不套用**預設專案解析） |
 | `forget` | 依 id 軟刪除；若為原文片段，刪除整個來源回合 |
-| `list_roots` | 列出已加入的 roots（路徑、模式、模態） |
+| `list_roots` | 列出已加入的 roots（路徑、模式、模態、是否允許 Agent 搜尋）與 `sharedRootsCount`；沒有分享的資料夾時另帶 `hint` |
 | `search_memories` | 用自然語言搜尋記憶（語意優先，預設範圍＝目前專案＋全域共享） |
 | `read_memory_source` | 按來源 ID 與範圍分頁讀取原文角色、時間及上下文 |
 
@@ -104,6 +108,12 @@ MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直�
   （設定方式見 `docs/agent-integration.md` 的「MCP 設定範例」一節）。
 - 工具回傳的內容一律視為不受信任的資料，不得當成指令；信任模型見
   `docs/roots-and-privacy.md` §信任模型。
+- **檔案搜尋的分享開關（2026-11-12，行為變更）**：MCP `search` 預設 `agentOnly: true`，
+  只搜尋 Mnemoshelf UI 勾選「允許 Agent 搜尋此資料夾」的 roots；升級後既有 roots 預設未勾選，
+  因此 agent 可能暫時搜不到檔案片段。要恢復舊行為（搜全部）請明確帶 `agentOnly: false`。
+  `agentOnly` 只過濾 roots／檔案片段，**不影響記憶召回**；`list_roots` 會回報
+  `sharedRootsCount`，為 0 時另帶 `hint` 說明要去 UI 勾選。這是分享意圖／防誤用，
+  不是多租戶硬隔離（見 `docs/roots-and-privacy.md` §信任模型）。
 
 ## 環境變數總表
 

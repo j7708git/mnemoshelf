@@ -138,6 +138,7 @@ async function makeFixture(options: { inside?: string; outside?: string } = {}):
       respectGitignore: true,
       watch: false,
       createdAt: "2026-11-08T00:00:00.000Z",
+      allowAgentSearch: false,
     },
     linkSupported,
     swapped: false,

@@ -114,6 +114,15 @@ export interface UnifiedSearchOptions {
   mode?: SearchMode;
   /** 未指定（或空陣列以外的清單）時不過濾；指定時只搜尋這些 root（記憶因此不納入）。 */
   rootIds?: number[];
+  /**
+   * 只搜尋「允許 agent 搜尋」的 roots（`Root.allowAgentSearch === true`）。
+   *
+   * - Web UI 預設 `false`（搜全部）；MCP `search` 預設 `true`。
+   * - 與 `rootIds` 同時給＝**取交集**（agentOnly 是更嚴格的一層）。
+   * - **只過濾 roots／檔案 chunks，不影響 memories**：使用者沒有指定 `rootIds` 時，記憶仍照
+   *   keyword／hybrid 的既有規則納入；有指定 `rootIds` 時維持「記憶不納入」的既有語意。
+   */
+  agentOnly?: boolean;
   /** 預設 10，上限 100。 */
   k?: number;
 }
@@ -183,6 +192,7 @@ export function normalizeSearchOptions(options: UnifiedSearchOptions): {
   query: string;
   mode: SearchMode;
   rootIds: number[] | undefined;
+  agentOnly: boolean;
   k: number;
 } {
   const query = options.query;
@@ -206,12 +216,32 @@ export function normalizeSearchOptions(options: UnifiedSearchOptions): {
     rootIds = [...options.rootIds];
   }
 
+  // 只有 undefined（未提供）才套預設 false；null／字串等一律視為非法（不靜默當成 false）。
+  const agentOnly = options.agentOnly === undefined ? false : options.agentOnly;
+  if (typeof agentOnly !== "boolean") {
+    throw new ValidationError("agentOnly", "必須是布林值");
+  }
+
   const requested = options.k ?? DEFAULT_SEARCH_K;
   if (!Number.isInteger(requested) || requested <= 0) {
     throw new ValidationError("k", "必須是正整數");
   }
 
-  return { query, mode, rootIds, k: Math.min(requested, MAX_SEARCH_K) };
+  return { query, mode, rootIds, agentOnly, k: Math.min(requested, MAX_SEARCH_K) };
+}
+
+/**
+ * `agentOnly` 的有效 root 清單：只留 `allowAgentSearch === true` 的 roots。
+ *
+ * - 未帶 `rootIds`：回全部已勾選分享的 root id；沒有勾選時是**空陣列**（＝沒有可見 root，
+ *   與 `SearchFilter.rootIds` 的空陣列語意一致）。
+ * - 有帶 `rootIds`：取交集（agentOnly 是更嚴格的一層）。
+ */
+async function agentOnlyRootIds(store: MetadataStore, rootIds: number[] | undefined): Promise<number[]> {
+  const shared = (await store.listRoots()).filter((root) => root.allowAgentSearch).map((root) => root.id);
+  if (rootIds === undefined) return shared;
+  const sharedSet = new Set(shared);
+  return rootIds.filter((id) => sharedSet.has(id));
 }
 
 /**
@@ -225,10 +255,18 @@ export async function prepareUnifiedSearch(
   deps: UnifiedSearchDeps,
   options: UnifiedSearchOptions,
 ): Promise<PrepareMemoryPresentation<UnifiedSearchResult>> {
-  const { query, mode, rootIds, k } = normalizeSearchOptions(options);
-  const filter: SearchFilter = rootIds === undefined ? {} : { rootIds };
+  const { query, mode, rootIds, agentOnly, k } = normalizeSearchOptions(options);
+  // agentOnly 與 rootIds 在同一層過濾：agentOnly 先縮成「已勾選分享」的清單，再與 rootIds 取交集。
+  // 沒有勾選任何 root 時得到空陣列——`SearchFilter.rootIds: []` 的既有語意是「沒有可見 root」，
+  // chunk 路徑自然回空；記憶在 rootIds 有指定時本來就不納入（見檔頭與 storage-ports.md）。
+  const effectiveRootIds = agentOnly ? await agentOnlyRootIds(deps.store, rootIds) : rootIds;
+  const filter: SearchFilter = effectiveRootIds === undefined ? {} : { rootIds: effectiveRootIds };
+  // agentOnly 只縮小「檔案」範圍，不影響記憶：使用者沒有指定 rootIds 時仍納入記憶。
+  // （有指定 rootIds 時維持既有規則：記憶不納入。）
+  if (agentOnly && rootIds === undefined) filter.includeMemories = true;
 
-  const candidateLimit = mode === "keyword" && rootIds === undefined ? Math.min(k * 4, 500) : k;
+  const candidateLimit =
+    mode === "keyword" && effectiveRootIds === undefined ? Math.min(k * 4, 500) : k;
   const lists = await rankLists(deps, query, mode, filter, candidateLimit);
   const fused = fuseRanked(lists);
   const chunkRanks = new Map<number, FusedHit>();

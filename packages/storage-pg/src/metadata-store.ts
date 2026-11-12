@@ -83,8 +83,31 @@ function normalizeRootVideoMaxFileBytes(value: unknown): number | undefined {
   return value;
 }
 
+/**
+ * root 通用單檔上限的值域（與 core `ports/metadata-store.ts` 的 `normalizeRootMaxFileBytes` 同值）。
+ *
+ * 為什麼重複一份：storage-pg 只從 `@mnemoshelf/core` 的公開入口 import；兩個後端都必須
+ * 在沒有 core 執行期相依的情況下驗證，語意以 core 為準（見該函式的契約註解）。
+ */
+const MAX_FILE_BYTES_MIN = 1;
+const MAX_FILE_BYTES_MAX = 16 * 1024 * 1024 * 1024;
+
+/** 驗證 root 通用單檔上限；語意與 core 的 `normalizeRootMaxFileBytes` 完全相同。 */
+function normalizeRootMaxFileBytes(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < MAX_FILE_BYTES_MIN ||
+    value > MAX_FILE_BYTES_MAX
+  ) {
+    throw new TypeError("root 的單檔大小上限必須是 1–16 GiB 的整數（bytes）");
+  }
+  return value;
+}
+
 const ROOT_COLUMNS =
-  "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, video_max_file_bytes";
+  "id, path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, allow_agent_search, max_file_bytes, video_max_file_bytes";
 const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash, media_json";
 const MEMORY_COLUMNS =
   `id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at,
@@ -116,7 +139,12 @@ function rowToRoot(row: Record<string, unknown>): Root {
     respectGitignore: row.respect_gitignore === true,
     watch: row.watch === true,
     createdAt: String(row.created_at),
+    allowAgentSearch: row.allow_agent_search === true,
   };
+  // pg 的 bigint 以字串回傳（16 GiB > int4）：轉成 number；NULL → 不出現該鍵。
+  if (row.max_file_bytes !== null && row.max_file_bytes !== undefined) {
+    root.maxFileBytes = Number(row.max_file_bytes);
+  }
   // pg 的 bigint 以字串回傳（16 GiB > int4）：轉成 number；NULL → 不出現該鍵。
   if (row.video_max_file_bytes !== null && row.video_max_file_bytes !== undefined) {
     root.videoMaxFileBytes = Number(row.video_max_file_bytes);
@@ -260,8 +288,12 @@ function metadataSchemaSql(schema: string): string {
       respect_gitignore boolean not null default true,
       watch boolean not null default false,
       created_at text not null,
+      allow_agent_search boolean not null default false,
+      max_file_bytes bigint,
       video_max_file_bytes bigint
     );
+    alter table ${roots} add column if not exists allow_agent_search boolean not null default false;
+    alter table ${roots} add column if not exists max_file_bytes bigint;
     alter table ${roots} add column if not exists video_max_file_bytes bigint;
 
     create table if not exists ${chunks} (
@@ -609,11 +641,12 @@ export class PgMetadataStore implements MetadataStore {
   async addRoot(r: NewRoot): Promise<Root> {
     const createdAt = new Date().toISOString();
     // 驗證在寫入前（非法值不建立資料列）；null＝未設定，資料庫寫 NULL。
+    const maxFileBytes = normalizeRootMaxFileBytes(r.maxFileBytes) ?? null;
     const videoMaxFileBytes = normalizeRootVideoMaxFileBytes(r.videoMaxFileBytes) ?? null;
     try {
       await this.pool.query(
-        `insert into ${this.roots}(path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, video_max_file_bytes)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        `insert into ${this.roots}(path, mode, modalities, include_rules, exclude_rules, respect_gitignore, watch, created_at, allow_agent_search, max_file_bytes, video_max_file_bytes)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
         [
           r.path,
           r.mode,
@@ -623,6 +656,8 @@ export class PgMetadataStore implements MetadataStore {
           r.respectGitignore,
           r.watch,
           createdAt,
+          r.allowAgentSearch === true,
+          maxFileBytes,
           videoMaxFileBytes,
         ],
       );
@@ -653,19 +688,31 @@ export class PgMetadataStore implements MetadataStore {
    * 不必先 select 再 update（也避免兩個後端語意分岔）。
    */
   async updateRoot(id: number, patch: RootPatch): Promise<Root | null> {
-    // 兩個欄位都可能要改，先讀現值（roots 只有個位數筆）：省略欄位＝保留現值。
+    // 四個欄位都可能要改，先讀現值（roots 只有個位數筆）：省略欄位＝保留現值。
     const current = await this.pool.query(`select ${ROOT_COLUMNS} from ${this.roots} where id = $1`, [id]);
     if (current.rows.length === 0) return null;
     const existing = rowToRoot(current.rows[0]!);
 
+    const maxFileBytes =
+      patch.maxFileBytes === undefined
+        ? existing.maxFileBytes ?? null
+        : normalizeRootMaxFileBytes(patch.maxFileBytes) ?? null;
     const videoMaxFileBytes =
       patch.videoMaxFileBytes === undefined
         ? existing.videoMaxFileBytes ?? null
         : normalizeRootVideoMaxFileBytes(patch.videoMaxFileBytes) ?? null;
 
     const result = await this.pool.query(
-      `update ${this.roots} set modalities = $2, video_max_file_bytes = $3 where id = $1 returning ${ROOT_COLUMNS}`,
-      [id, JSON.stringify(patch.modalities ?? existing.modalities), videoMaxFileBytes],
+      `update ${this.roots}
+          set modalities = $2, allow_agent_search = $3, max_file_bytes = $4, video_max_file_bytes = $5
+        where id = $1 returning ${ROOT_COLUMNS}`,
+      [
+        id,
+        JSON.stringify(patch.modalities ?? existing.modalities),
+        patch.allowAgentSearch ?? existing.allowAgentSearch,
+        maxFileBytes,
+        videoMaxFileBytes,
+      ],
     );
     return result.rows.length === 0 ? null : rowToRoot(result.rows[0]!);
   }
@@ -1198,13 +1245,15 @@ export class PgMetadataStore implements MetadataStore {
     if (tokens.length === 0) return [];
 
     const rootIds = filter.rootIds;
-    if (rootIds !== undefined && rootIds.length === 0) return [];
+    // 預設規則：rootIds 未指定才含記憶；呼叫端可用 includeMemories 明確覆寫。
+    const includeMemories = filter.includeMemories ?? rootIds === undefined;
 
     const tsquery = tokens.map((_, index) => `plainto_tsquery('simple', $${index + 1})`).join(" || ");
     const scored: { key: string; score: number }[] = [];
 
     // chunk：指定 rootIds 時在 SQL 內過濾（先過濾再排序，避免先取前 k 再過濾而少給結果）。
-    {
+    // 空陣列＝沒有任何可見 root，連查都不必查；但仍可能要用 includeMemories 取記憶。
+    if (rootIds === undefined || rootIds.length > 0) {
       const params: unknown[] = [...tokens];
       let filterClause = "";
       if (rootIds !== undefined) {
@@ -1224,8 +1273,8 @@ export class PgMetadataStore implements MetadataStore {
       for (const row of result.rows) scored.push({ key: String(row.key), score: Number(row.score) });
     }
 
-    // 記憶：沒有 root，因此只有「未指定 rootIds」時才納入。
-    if (rootIds === undefined) {
+    // 記憶：沒有 root，因此預設只在「未指定 rootIds」時納入（可用 includeMemories 覆寫）。
+    if (includeMemories) {
       const params: unknown[] = [...tokens, k];
       const result = await this.pool.query(
         `with q as (select ${tsquery} as tsq)

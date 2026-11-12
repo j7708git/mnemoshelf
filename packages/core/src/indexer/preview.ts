@@ -21,8 +21,8 @@ export interface PreviewRootInput {
   /**
    * 影片單檔大小上限（bytes）；預設 `DEFAULT_VIDEO_MAX_FILE_BYTES`（512 MiB）。
    *
-   * 影片**不套用** `maxFileBytes`（通用 10 MiB 對影片太小）。per-root 持久化與 UI 入口屬
-   * C 階段；本輪只讓呼叫端能明確指定，預覽會把超出上限者記 `video-too-large` 顯示出來。
+   * 影片**不套用** `maxFileBytes`（通用 10 MiB 對影片太小）。per-root 持久化值由呼叫端
+   * 從 `Root.videoMaxFileBytes` 帶入；預覽會把超出上限者記 `video-too-large` 顯示出來。
    */
   videoMaxFileBytes?: number;
 }

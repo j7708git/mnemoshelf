@@ -63,6 +63,7 @@ export {
   MEMORY_SEARCH_MAX_K,
   normalizeMemoryLimit,
   normalizeChunkMedia,
+  normalizeRootMaxFileBytes,
   normalizeRootVideoMaxFileBytes,
   VIDEO_MAX_FILE_BYTES_MIN,
   VIDEO_MAX_FILE_BYTES_MAX,
