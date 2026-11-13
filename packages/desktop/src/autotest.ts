@@ -166,12 +166,16 @@ async function waitFor(
   }
 }
 
+/** 在頁面內依正規化後的可見文字尋找控制項的 JS 片段（供點擊與存在檢查共用）。 */
+function findControlExpression(selector: string, text: string): string {
+  // 改版後按鈕可能帶前置符號（例如「+ 加入」）；比對時去掉前置的 +／＋ 與空白，仍要求其餘文字完全相同。
+  return `[...document.querySelectorAll(${JSON.stringify(selector)})].find((node) => (node.textContent || "").trim().replace(/^[+＋]\\s*/, "") === ${JSON.stringify(text)})`;
+}
+
 /** 依可見文字點擊按鈕／連結（全字比對，取文件順序第一個）。 */
-function clickByTextExpression(text: string): string {
+export function clickByTextExpression(text: string): string {
   return `(() => {
-  const wanted = ${JSON.stringify(text)};
-  const nodes = [...document.querySelectorAll("button, a, [role=\\"button\\"]")];
-  const target = nodes.find((node) => (node.textContent || "").trim() === wanted);
+  const target = ${findControlExpression('button, a, [role="button"]', text)};
   if (!target) return false;
   target.click();
   return true;
@@ -179,8 +183,8 @@ function clickByTextExpression(text: string): string {
 }
 
 /** 畫面上有沒有一個文字完全等於 `text` 的按鈕。 */
-function buttonExistsExpression(text: string): string {
-  return `[...document.querySelectorAll("button")].some((node) => (node.textContent || "").trim() === ${JSON.stringify(text)})`;
+export function buttonExistsExpression(text: string): string {
+  return `(${findControlExpression("button", text)} !== undefined)`;
 }
 
 /** 讀出畫面上第一個 `role="alert"` 的文字（沒有時回 null）。 */
