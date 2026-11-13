@@ -727,7 +727,7 @@ MNEMOSHELF_RUNTIME_FILE="$HOME/.local/share/mnemoshelf/runtime.json" node rememb
 ### Codex
 
 - **手動使用工具**。在 App 的「連接 Agent → codex」複製 MCP 片段，併入 `~/.codex/config.toml`，重新啟動 Codex。`codex mcp list` 應顯示 `mnemoshelf`。若使用 Electron 執行檔作為 MCP 入口，請保留 `ELECTRON_RUN_AS_NODE = "1"`。
-- **自動召回（選配）**。在本機 Codex 工作階段使用 `UserPromptSubmit` hook。從原始碼建置腳本後可搭配已安裝的 v0.8.0 App，步驟見 [Codex 自動召回](codex-recall.md)。
+- **自動召回（選配）**。在本機 Codex 工作階段使用 `UserPromptSubmit` hook。從原始碼建置腳本後可搭配已安裝的 v0.9.0 App，步驟見 [Codex 自動召回](codex-recall.md)。
 
 兩種接法可一起使用。若只設定 MCP 工具，可在專案 `AGENTS.md` 說明何時主動呼叫 `remember` 或 `search_memories`。
 
