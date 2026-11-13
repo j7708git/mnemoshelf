@@ -213,7 +213,7 @@ export interface IndexRootOptions {
    * 影片單檔大小上限（bytes），預設 `DEFAULT_VIDEO_MAX_FILE_BYTES`（512 MiB）。
    *
    * 只套用影片（掃描與有界快照都用它）；通用 `maxFileBytes` 的 10 MiB 不套用影片。
-   * per-root 持久化與 UI 入口屬 C 階段，索引器只接受呼叫端明確給的值。
+   * per-root 持久化與 UI 設定由上層管理，索引器只接受呼叫端明確給的值。
    */
   videoMaxFileBytes?: number;
   /**

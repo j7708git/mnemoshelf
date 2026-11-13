@@ -52,7 +52,12 @@ describe("音訊 REST 產品流程", () => {
     const playback = await fetch(`${server!.instance.url}/roots/${id}/file?path=sample.wav`, { headers: { authorization: `Bearer ${TEST_TOKEN}` } });
     expect(playback.status).toBe(200);
     expect(playback.headers.get("content-type")).toContain("audio/wav");
-    expect(Buffer.from(await playback.arrayBuffer())).toEqual(wav(31.25));
+    const actualWav = Buffer.from(await playback.arrayBuffer());
+    const expectedWav = wav(31.25);
+    // 用 Buffer.equals 比對 1 MB 音訊緩衝區：避免 Vitest .toEqual() 逐元素展開
+    // 在多 worker 搶 CPU 時把事件迴圈阻塞數秒、進而與 keepAliveTimeout 競態。
+    expect(actualWav.length).toBe(expectedWav.length);
+    expect(actualWav.equals(expectedWav)).toBe(true);
     const rerun = await api(server!.instance, "POST", `/roots/${id}/index`);
     expect((rerun.body as IndexRootResult).skippedUnchanged).toBe(1);
     await api(server!.instance, "PATCH", `/roots/${id}`, { body: { modalities: [] } });
@@ -72,16 +77,20 @@ describe("音訊 REST 產品流程", () => {
 
   it("播放端點保留授權、root 邊界、格式與大小防線", async () => {
     const { id, dir } = await fixture(true);
-    const request = (relative: string, authenticated = true) => fetch(`${server!.instance.url}/roots/${id}/file?path=${encodeURIComponent(relative)}`, {
-      headers: authenticated ? { authorization: `Bearer ${TEST_TOKEN}` } : {},
-    });
-    expect((await request("sample.wav", false)).status).toBe(401);
-    expect((await request(path.join("..", "outside.wav"))).status).toBe(403);
-    expect((await request("unsupported.mp3")).status).toBe(415);
+    const requestStatus = async (relative: string, authenticated = true): Promise<number> => {
+      const response = await fetch(`${server!.instance.url}/roots/${id}/file?path=${encodeURIComponent(relative)}`, {
+        headers: authenticated ? { authorization: `Bearer ${TEST_TOKEN}` } : {},
+      });
+      await response.body?.cancel();
+      return response.status;
+    };
+    expect(await requestStatus("sample.wav", false)).toBe(401);
+    expect(await requestStatus(path.join("..", "outside.wav"))).toBe(403);
+    expect(await requestStatus("unsupported.mp3")).toBe(415);
     await fs.writeFile(path.join(dir, "bad.wav"), "broken WAV");
-    expect((await request("bad.wav")).status).toBe(415);
+    expect(await requestStatus("bad.wav")).toBe(415);
     const handle = await fs.open(path.join(dir, "large.wav"), "w");
     await handle.truncate(10 * 1024 * 1024 + 1); await handle.close();
-    expect((await request("large.wav")).status).toBe(413);
+    expect(await requestStatus("large.wav")).toBe(413);
   });
 });

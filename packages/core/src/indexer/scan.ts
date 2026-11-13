@@ -13,8 +13,8 @@ export const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
 /**
  * 影片單檔大小上限的預設值（bytes；512 MiB）。
  *
- * 為什麼分開：通用 10 MiB 預設對影片太小（幾秒的 1080p 就超過），而影片的實際限制要
- * per-root 持久化並在 UI 可見（C 階段）；本輪只提供**明確的 scan option**
+ * 為什麼分開：通用 10 MiB 預設對影片太小（幾秒的 1080p 就超過），而影片的實際限制由
+ * 上層 per-root 持久化並在 UI 設定；scan 層只接收**明確的 scan option**
  * （`ScanOptions.videoMaxFileBytes`），不改通用 `maxFileBytes` 的既有語意。
  * 超過此上限的影片在掃描階段記 `video-too-large`（可在預覽看到，讓使用者知道要調上限）。
  */
@@ -112,7 +112,7 @@ export interface ScanOptions {
    * 影片單檔大小上限（bytes），預設 `DEFAULT_VIDEO_MAX_FILE_BYTES`（512 MiB）。
    *
    * 只套用 `kind:"video"`；影片**不套用**通用 `maxFileBytes`（10 MiB 對影片太小）。
-   * 這是本輪的明確 scan option：per-root 持久化與 UI 入口屬 C 階段，不在 scan 層猜設定。
+   * 這是明確的 scan option：per-root 持久化與 UI 設定由上層管理，不在 scan 層猜設定。
    */
   videoMaxFileBytes?: number;
   /**
