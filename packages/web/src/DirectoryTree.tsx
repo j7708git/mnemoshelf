@@ -121,10 +121,10 @@ export function DirectoryTree({ rootId, refreshKey, selectedPath, onSelectFile }
   });
 
   return (
-    <div ref={parentRef} className="h-full overflow-auto rounded-lg border border-line bg-white">
+    <div ref={parentRef} className="h-full overflow-auto rounded-xl border border-line bg-surface">
       {state === "loading" && <p className="px-4 py-6 text-sm text-muted">正在載入目錄…</p>}
       {state === "error" && (
-        <p role="alert" className="px-4 py-6 text-sm text-red-600">
+        <p role="alert" className="px-4 py-6 text-sm text-danger">
           {error}
         </p>
       )}
@@ -155,8 +155,8 @@ export function DirectoryTree({ rootId, refreshKey, selectedPath, onSelectFile }
                   title={row.entry.path}
                   aria-expanded={isDir ? row.expanded : undefined}
                   onClick={() => (isDir ? toggleDir(row.entry.path) : onSelectFile(row.entry))}
-                  className={`flex h-full w-full items-center gap-2 pr-3 text-left text-sm hover:bg-surface ${
-                    isSelected ? "bg-surface font-medium text-ink" : "text-ink"
+                  className={`flex h-full w-full items-center gap-2 pr-3 text-left text-sm hover:bg-raised ${
+                    isSelected ? "bg-tint/60 font-medium text-brand" : "text-ink"
                   }`}
                   style={{ paddingLeft: `${8 + row.depth * 14}px` }}
                 >

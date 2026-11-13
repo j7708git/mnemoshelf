@@ -38,15 +38,15 @@ export function MemoryPolicySetting({
       {state.kind === "loading" && <p role="status" className="text-xs text-muted">讀取中…</p>}
       {state.kind === "saving" && <p role="status" className="text-xs text-muted">儲存中…</p>}
       {(state.kind === "unavailable" || state.kind === "error") && (
-        <p role="alert" className="text-xs text-red-600">{state.message}</p>
+        <p role="alert" className="text-xs text-danger">{state.message}</p>
       )}
       {state.kind === "error" && (
-        <button type="button" onClick={onRetry} className="rounded-md border border-line px-2.5 py-1 text-xs text-ink">
+        <button type="button" onClick={onRetry} className="rounded-lg border border-line bg-surface px-2.5 py-1 text-xs text-ink hover:bg-raised">
           重新讀取
         </button>
       )}
       {state.kind === "ready" && state.error !== null && (
-        <p role="alert" className="text-xs text-red-600">{state.error} 請再次切換以重試。</p>
+        <p role="alert" className="text-xs text-danger">{state.error} 請再次切換以重試。</p>
       )}
     </div>
   );

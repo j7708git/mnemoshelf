@@ -298,7 +298,7 @@ export function ExplorerPanel({ root, refreshKey, videoCapability }: ExplorerPan
       </div>
 
       {pollStalled && (
-        <p role="status" className="text-xs text-amber-700">
+        <p role="status" className="text-xs text-warn">
           無法確認本輪索引是否啟動（上方顯示的可能是上一輪結果），請稍後再試或再按「重新索引」。
         </p>
       )}
@@ -310,7 +310,7 @@ export function ExplorerPanel({ root, refreshKey, videoCapability }: ExplorerPan
           實際段數以索引時的 probe 為準。
         </p>
       ) : (
-        <p role="status" className="text-xs text-amber-700">
+        <p role="status" className="text-xs text-warn">
           這個資料夾已開啟影片，但目前無法索引影片：{videoState.reason ?? "影片能力不可用。"}（已有索引的內容仍可搜尋）
         </p>
       ))}
@@ -327,7 +327,7 @@ export function ExplorerPanel({ root, refreshKey, videoCapability }: ExplorerPan
 
         <div className="h-[60vh] min-h-0 overflow-auto">
           {selectedEntry === null ? (
-            <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center text-sm text-muted">
+            <div className="flex h-full items-center justify-center rounded-[20px] border border-dashed border-line bg-surface/65 px-6 text-center text-sm text-muted">
               從左側目錄樹選擇一個檔案來預覽（支援文字、圖片、WAV 音訊與影片；影片播放需桌面版）。
             </div>
           ) : (
@@ -340,7 +340,7 @@ export function ExplorerPanel({ root, refreshKey, videoCapability }: ExplorerPan
         <p className="text-xs text-muted">本次索引清除了 {status.result.removedFiles} 個已不存在檔案的索引資料。</p>
       )}
       {videoFailedText !== "" && (
-        <p className="text-xs text-amber-700">
+        <p className="text-xs text-warn">
           影片處理失敗（其餘檔案已完成）：{videoFailedText}。常見原因：解碼器不可用、編碼或音軌不支援、檔案損毀；
           修正後重新索引即可。
         </p>
@@ -349,7 +349,7 @@ export function ExplorerPanel({ root, refreshKey, videoCapability }: ExplorerPan
         <p className="text-xs text-muted">影片被跳過（不影響其他檔案）：{videoSkippedText}。</p>
       )}
       {otherFailedFiles.length > 0 && (
-        <p className="text-xs text-amber-700">
+        <p className="text-xs text-warn">
           有 {otherFailedFiles.length} 個檔案處理失敗（其餘檔案已完成）：
           {otherFailedFiles.map((file) => file.relPath).join("、")}
         </p>

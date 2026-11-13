@@ -44,13 +44,13 @@ export function BootstrapScreen({ state, token, busy, onRetry, onSkip }: Bootstr
   return (
     <div id="mnemoshelf-bootstrap" className="mx-auto flex w-full max-w-xl flex-1 flex-col justify-center gap-6 px-6 py-12">
       <div className="space-y-2">
-        <h1 className="text-2xl font-semibold text-ink">Mnemoshelf</h1>
+        <h1 className="font-serif text-2xl font-bold text-ink">Mnemoshelf</h1>
         <p className="text-sm text-muted">
           {failed ? "模型下載失敗。" : "首次啟動需要準備本機模型（約 300 MB），完成後即可離線使用。"}
         </p>
       </div>
 
-      <div className="space-y-2 rounded-lg border border-line bg-white p-4">
+      <div className="space-y-2 rounded-[20px] border border-line bg-surface p-4">
         <p className="text-sm text-ink">
           {phase === "checking" && "正在確認模型是否已下載…"}
           {phase === "downloading" && (state?.message ?? "正在下載模型…")}
@@ -67,7 +67,7 @@ export function BootstrapScreen({ state, token, busy, onRetry, onSkip }: Bootstr
           aria-valuenow={percent}
           aria-valuetext={`${percent}%`}
         >
-          <div className="h-full bg-ink transition-[width]" style={{ width: `${percent}%` }} />
+          <div className="h-full bg-brand transition-[width]" style={{ width: `${percent}%` }} />
         </div>
 
         <p
@@ -97,7 +97,7 @@ export function BootstrapScreen({ state, token, busy, onRetry, onSkip }: Bootstr
       </div>
 
       {token !== null && token.notice !== null && (
-        <p className="rounded-md border border-line bg-surface px-3 py-2 text-xs text-muted">{token.notice}</p>
+        <p className="rounded-lg border border-line bg-raised px-3 py-2 text-xs text-muted">{token.notice}</p>
       )}
 
       {failed && (
@@ -109,7 +109,7 @@ export function BootstrapScreen({ state, token, busy, onRetry, onSkip }: Bootstr
               type="button"
               onClick={onRetry}
               disabled={busy}
-              className="rounded-md bg-ink px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+              className="rounded-lg bg-brand px-3 py-2 text-sm font-medium text-on-brand disabled:opacity-40"
             >
               {busy ? "重試中…" : "重試下載"}
             </button>
@@ -117,7 +117,7 @@ export function BootstrapScreen({ state, token, busy, onRetry, onSkip }: Bootstr
               id="mnemoshelf-bootstrap-skip"
               type="button"
               onClick={onSkip}
-              className="rounded-md border border-line px-3 py-2 text-sm text-ink"
+              className="rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink hover:bg-raised"
             >
               先進入應用（索引時再試）
             </button>

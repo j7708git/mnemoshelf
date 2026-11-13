@@ -18,6 +18,7 @@ import {
   removeRoot,
   startIndex,
   updateRootModalities,
+  type BrowseAccessPolicy,
   type IndexStatus,
   type PollBaseline,
   type PollTrack,
@@ -26,6 +27,8 @@ import {
   type VideoCapability,
   type VideoPreviewEstimate,
 } from "./api";
+import { getDesktopFolderPicker, useDesktopBridge } from "./desktop";
+import { FolderPickerDialog } from "./FolderPickerDialog";
 import { formatBytes } from "./format";
 import { toggleModality } from "./audio";
 import { AudioModelStatus } from "./AudioModelStatus";
@@ -78,6 +81,8 @@ export interface AddRootFlowProps {
    * `null`＝服務未回報（舊版服務），同樣停用並說明。
    */
   videoCapability?: VideoCapability | null;
+  /** 已知的伺服器存取策略（供資料夾對話框先行展示放寬風險提醒）。 */
+  accessPolicy?: BrowseAccessPolicy | null;
 }
 
 type Step = "input" | "preview" | "preview-failed" | "indexing" | "cancelled" | "done" | "failed";
@@ -128,9 +133,15 @@ function skipSummary(skipped: RootPreview["skipped"]): { reason: string; count: 
   return [...counts.entries()].map(([reason, count]) => ({ reason, count }));
 }
 
-export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, videoCapability }: AddRootFlowProps) {
+export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, videoCapability, accessPolicy }: AddRootFlowProps) {
+  const desktopBridge = useDesktopBridge();
+  const desktopPicker = getDesktopFolderPicker(desktopBridge);
   const videoToggle = videoToggleState(videoCapability ?? null);
   const [pathInput, setPathInput] = useState("");
+  const [pathSource, setPathSource] = useState<"manual" | "desktop" | "browser">("manual");
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerBusy, setPickerBusy] = useState(false);
+  const [pickerError, setPickerError] = useState<string | null>(null);
   /**
    * 這個資料夾含照片嗎？（**預設關**：文字／程式碼照舊，照片索引較慢不要嚇到人）
    *
@@ -488,115 +499,209 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
     };
   }, [step, root]);
 
+  const handleBrowseClick = async (): Promise<void> => {
+    setPickerError(null);
+    if (desktopPicker !== null) {
+      setPickerBusy(true);
+      try {
+        const result = await desktopPicker.chooseDirectory();
+        if (!result.canceled && result.path !== null) {
+          setPathInput(result.path);
+          setPathSource("desktop");
+        }
+      } catch (err) {
+        setPickerError(err instanceof Error ? err.message : "無法開啟系統資料夾選擇器");
+      } finally {
+        setPickerBusy(false);
+      }
+      return;
+    }
+    setPickerOpen(true);
+  };
+
+  const activeStepperIndex =
+    step === "input" ? 1 : step === "preview" || step === "preview-failed" ? 2 : 3;
+
   return (
-    <section className="flex flex-col gap-4 rounded-lg border border-line bg-white p-5">
-      <div className="flex items-baseline justify-between gap-3">
-        <h2 className="text-base font-medium text-ink">加入資料夾</h2>
+    <section className="flex flex-col gap-5 rounded-[20px] border border-line bg-surface p-6 shadow-sm sm:p-7">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2 text-xs" aria-label="加入步驟">
+          <StepPill index={1} current={activeStepperIndex} label="選擇資料夾" />
+          <span className="text-muted" aria-hidden="true">→</span>
+          <StepPill index={2} current={activeStepperIndex} label="預覽統計" />
+          <span className="text-muted" aria-hidden="true">→</span>
+          <StepPill index={3} current={activeStepperIndex} label="開始索引" done={step === "done"} />
+        </div>
         {step === "input" && (
-          <button type="button" onClick={onCancel} className="text-sm text-muted underline">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded-lg border border-line bg-surface px-3 py-1 text-xs font-medium text-muted hover:bg-raised hover:text-ink"
+          >
             取消
           </button>
         )}
       </div>
 
+      <div>
+        <h2 className="font-serif text-[22px] font-bold tracking-tight text-ink">加入一個資料夾</h2>
+        <p className="mt-1 text-xs text-muted">
+          服務只會讀取這個資料夾；先瀏覽或貼上路徑並檢視統計，確認後才會開始索引。
+        </p>
+      </div>
+
       {step === "input" && (
-        <form onSubmit={(event) => void submitPath(event)} className="space-y-3">
-          <label htmlFor="add-root-path" className="block text-sm font-medium text-ink">
-            資料夾的完整路徑
-          </label>
-          <input
-            id="add-root-path"
-            value={pathInput}
-            onChange={(event) => setPathInput(event.target.value)}
-            placeholder="例如 ~/Documents/notes（貼上實際路徑）"
-            spellCheck={false}
-            className="w-full rounded-md border border-line bg-white px-3 py-2 font-mono text-sm text-ink outline-none focus:border-ink"
-          />
-          <p className="text-xs text-muted">
-            服務只會讀取這個資料夾；家目錄本身與檔案系統根目錄會被拒絕。加入後會先顯示統計，確認才開始索引。
-          </p>
-          <ImagesToggle checked={includeImages} onChange={setIncludeImages} />
-          <AudioToggle checked={includeAudio} disabled={busy} onChange={setIncludeAudio} />
-          <VideoToggle
-            checked={includeVideo}
-            disabled={busy || !videoToggle.enabled}
-            state={videoToggle}
-            onChange={setIncludeVideo}
-          />
-          <div className="space-y-1">
-            <label htmlFor="add-root-max-file-limit" className="block text-sm font-medium text-ink">
-              一般檔案單檔上限（MiB）
+        <form onSubmit={(event) => void submitPath(event)} className="space-y-5">
+          <div className="space-y-2">
+            <label htmlFor="add-root-path" className="block text-[13px] font-semibold text-ink">
+              資料夾路徑
             </label>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-col gap-2 sm:flex-row">
               <input
-                id="add-root-max-file-limit"
-                type="number"
-                min={MAX_FILE_LIMIT_MIN_MIB}
-                max={MAX_FILE_LIMIT_MAX_MIB}
-                step={1}
-                inputMode="numeric"
-                value={maxFileLimitMiB}
-                disabled={busy}
-                aria-invalid={!maxFileLimit.ok}
-                aria-describedby="add-root-max-file-limit-hint"
-                onChange={(event) => setMaxFileLimitMiB(event.target.value)}
-                className="w-32 rounded-md border border-line bg-white px-3 py-2 text-sm text-ink outline-none focus:border-ink disabled:opacity-40"
+                id="add-root-path"
+                value={pathInput}
+                onChange={(event) => {
+                  setPathInput(event.target.value);
+                  setPathSource("manual");
+                  setPickerError(null);
+                }}
+                placeholder="例如 ~/Documents/notes（按右側「瀏覽…」或直接貼上完整路徑）"
+                spellCheck={false}
+                className="min-w-0 flex-1 rounded-[12px] border border-line bg-bg/60 px-3.5 py-2.5 font-mono text-sm text-ink outline-none focus:border-brand focus:bg-surface"
               />
-              <span className="text-sm text-muted">MiB</span>
+              <button
+                type="button"
+                onClick={() => void handleBrowseClick()}
+                disabled={busy || pickerBusy}
+                className="inline-flex shrink-0 items-center justify-center gap-2 rounded-[12px] bg-brand px-4 py-2.5 text-sm font-semibold text-on-brand transition hover:opacity-95 disabled:opacity-40"
+              >
+                <span aria-hidden="true">📁</span>
+                <span>{pickerBusy ? "開啟中…" : "瀏覽…"}</span>
+              </button>
             </div>
-            <p id="add-root-max-file-limit-hint" className="text-xs text-muted">
-              預設 10 MiB（目前服務預設：{formatMaxFileLimitBytes(DEFAULT_MAX_FILE_BYTES)}）。
-              只套用非影片檔案，上限 16 GiB；超過這個大小的檔案會在掃描階段具名跳過。
-            </p>
-            {!maxFileLimit.ok && (
-              <p role="alert" className="text-xs text-red-600">
-                {maxFileLimit.message}
+            {pickerError !== null && (
+              <p role="alert" className="text-xs text-danger">
+                {pickerError}
               </p>
             )}
-          </div>
-          <div className="space-y-1">
-            <label htmlFor="add-root-video-limit" className="block text-sm font-medium text-ink">
-              影片單檔大小上限（MiB）
-            </label>
-            <div className="flex items-center gap-2">
-              <input
-                id="add-root-video-limit"
-                type="number"
-                min={VIDEO_LIMIT_MIN_MIB}
-                max={VIDEO_LIMIT_MAX_MIB}
-                step={1}
-                inputMode="numeric"
-                value={videoLimitMiB}
-                disabled={busy}
-                aria-invalid={!videoLimit.ok}
-                aria-describedby="add-root-video-limit-hint"
-                onChange={(event) => setVideoLimitMiB(event.target.value)}
-                className="w-32 rounded-md border border-line bg-white px-3 py-2 text-sm text-ink outline-none focus:border-ink disabled:opacity-40"
-              />
-              <span className="text-sm text-muted">MiB</span>
-            </div>
-            <p id="add-root-video-limit-hint" className="text-xs text-muted">
-              預設 512 MiB（目前服務預設：{formatVideoLimitBytes(videoCapability?.maxFileBytes ?? DEFAULT_VIDEO_MAX_FILE_BYTES)}）。
-              只套用影片；影片未開啟也可以先設定，上限 16 GiB。超過這個大小的影片會具名跳過。
+            <p className="text-xs text-muted">
+              {pathSource !== "manual" && pathInput.trim() !== "" ? (
+                <>
+                  <span className="font-semibold text-brand">✓ 可存取</span>
+                  <span>
+                    {" "}· {pathSource === "desktop" ? "已透過系統選擇器挑選" : "已透過資料夾瀏覽器挑選"} · 也可以直接貼上路徑（下一步仍會檢查權限與敏感路徑黑名單）。
+                  </span>
+                </>
+              ) : (
+                "也可以直接貼上路徑；家目錄本身與檔案系統根目錄會被拒絕。加入後會先顯示統計，確認才開始索引。"
+              )}
             </p>
-            {!videoLimit.ok && (
-              <p role="alert" className="text-xs text-red-600">
-                {videoLimit.message}
-              </p>
-            )}
           </div>
+
+          <div className="space-y-2">
+            <p className="text-[13px] font-semibold text-ink">索引媒體類型</p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <ImagesToggle checked={includeImages} disabled={busy} onChange={setIncludeImages} />
+              <AudioToggle checked={includeAudio} disabled={busy} onChange={setIncludeAudio} />
+              <VideoToggle
+                checked={includeVideo}
+                disabled={busy || !videoToggle.enabled}
+                state={videoToggle}
+                onChange={setIncludeVideo}
+              />
+            </div>
+          </div>
+
+          <details
+            open={!maxFileLimit.ok || !videoLimit.ok || undefined}
+            className="rounded-[14px] border border-line bg-bg/45 px-4 py-3"
+          >
+            <summary className="cursor-pointer select-none text-[13px] font-semibold text-ink">
+              進階：檔案大小上限
+            </summary>
+            <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div className="space-y-1">
+                <label htmlFor="add-root-max-file-limit" className="block text-xs font-medium text-ink">
+                  一般檔案單檔上限（MiB）
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="add-root-max-file-limit"
+                    type="number"
+                    min={MAX_FILE_LIMIT_MIN_MIB}
+                    max={MAX_FILE_LIMIT_MAX_MIB}
+                    step={1}
+                    inputMode="numeric"
+                    value={maxFileLimitMiB}
+                    disabled={busy}
+                    aria-invalid={!maxFileLimit.ok}
+                    aria-describedby="add-root-max-file-limit-hint"
+                    onChange={(event) => setMaxFileLimitMiB(event.target.value)}
+                    className="w-28 rounded-[10px] border border-line bg-surface px-3 py-1.5 text-sm text-ink outline-none focus:border-brand disabled:opacity-40"
+                  />
+                  <span className="text-xs text-muted">MiB</span>
+                </div>
+                <p id="add-root-max-file-limit-hint" className="text-xs text-muted">
+                  預設 10 MiB（目前服務預設：{formatMaxFileLimitBytes(DEFAULT_MAX_FILE_BYTES)}）。
+                  只套用非影片檔案，上限 16 GiB；超過這個大小的檔案會在掃描階段具名跳過。
+                </p>
+                {!maxFileLimit.ok && (
+                  <p role="alert" className="text-xs text-danger">
+                    {maxFileLimit.message}
+                  </p>
+                )}
+              </div>
+
+              <div className="space-y-1">
+                <label htmlFor="add-root-video-limit" className="block text-xs font-medium text-ink">
+                  影片單檔大小上限（MiB）
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="add-root-video-limit"
+                    type="number"
+                    min={VIDEO_LIMIT_MIN_MIB}
+                    max={VIDEO_LIMIT_MAX_MIB}
+                    step={1}
+                    inputMode="numeric"
+                    value={videoLimitMiB}
+                    disabled={busy}
+                    aria-invalid={!videoLimit.ok}
+                    aria-describedby="add-root-video-limit-hint"
+                    onChange={(event) => setVideoLimitMiB(event.target.value)}
+                    className="w-28 rounded-[10px] border border-line bg-surface px-3 py-1.5 text-sm text-ink outline-none focus:border-brand disabled:opacity-40"
+                  />
+                  <span className="text-xs text-muted">MiB</span>
+                </div>
+                <p id="add-root-video-limit-hint" className="text-xs text-muted">
+                  預設 512 MiB（目前服務預設：{formatVideoLimitBytes(videoCapability?.maxFileBytes ?? DEFAULT_VIDEO_MAX_FILE_BYTES)}）。
+                  只套用影片；影片未開啟也可以先設定，上限 16 GiB。超過這個大小的影片會具名跳過。
+                </p>
+                {!videoLimit.ok && (
+                  <p role="alert" className="text-xs text-danger">
+                    {videoLimit.message}
+                  </p>
+                )}
+              </div>
+            </div>
+          </details>
+
           {error !== null && (
-            <p role="alert" className="text-sm text-red-600">
+            <p role="alert" className="text-sm text-danger">
               {error}
             </p>
           )}
-          <button
-            type="submit"
-            disabled={busy || pathInput.trim() === ""}
-            className="rounded-md bg-ink px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
-          >
-            {busy ? "加入中…" : "加入並預覽"}
-          </button>
+
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4">
+            <span className="text-xs text-muted">預覽只統計檔案數，不會改動或上傳任何檔案</span>
+            <button
+              type="submit"
+              disabled={busy || pathInput.trim() === ""}
+              className="rounded-[12px] bg-brand px-5 py-2.5 text-sm font-semibold text-on-brand disabled:opacity-40"
+            >
+              {busy ? "加入中…" : "加入並預覽"}
+            </button>
+          </div>
         </form>
       )}
 
@@ -604,18 +709,20 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
         <div className="space-y-4">
           <p className="break-all font-mono text-xs text-muted">{root.path}</p>
 
-          <ImagesToggle
-            checked={includeImages}
-            disabled={busy}
-            onChange={(next) => void setImagesEnabled(next)}
-          />
-          <AudioToggle checked={includeAudio} disabled={busy} onChange={(next) => void setAudioEnabled(next)} />
-          <VideoToggle
-            checked={includeVideo}
-            disabled={busy || !videoToggle.enabled}
-            state={videoToggle}
-            onChange={(next) => void setVideoEnabled(next)}
-          />
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+            <ImagesToggle
+              checked={includeImages}
+              disabled={busy}
+              onChange={(next) => void setImagesEnabled(next)}
+            />
+            <AudioToggle checked={includeAudio} disabled={busy} onChange={(next) => void setAudioEnabled(next)} />
+            <VideoToggle
+              checked={includeVideo}
+              disabled={busy || !videoToggle.enabled}
+              state={videoToggle}
+              onChange={(next) => void setVideoEnabled(next)}
+            />
+          </div>
           <p className="text-xs text-muted">
             影片單檔上限：{formatVideoLimitBytes(effectiveVideoMaxFileBytes(root, videoCapability?.maxFileBytes))}
             {root.videoMaxFileBytes == null ? "（服務預設）" : ""}
@@ -685,24 +792,24 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
           )}
 
           {error !== null && (
-            <p role="alert" className="text-sm text-red-600">
+            <p role="alert" className="text-sm text-danger">
               {error}
             </p>
           )}
 
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <button
               type="button"
               onClick={() => void beginIndex()}
               disabled={preview.totalFiles === 0}
-              className="rounded-md bg-ink px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+              className="rounded-[12px] bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-40"
             >
               開始索引
             </button>
             <button
               type="button"
               onClick={() => void cancel()}
-              className="rounded-md border border-line px-3 py-2 text-sm text-ink"
+              className="rounded-[12px] border border-line bg-surface px-3.5 py-2 text-sm text-ink hover:bg-raised"
             >
               取消（移除這個資料夾）
             </button>
@@ -713,7 +820,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
       {step === "preview-failed" && root !== null && (
         <div className="space-y-3">
           <p className="break-all font-mono text-xs text-muted">{root.path}</p>
-          <p role="alert" className="text-sm text-red-600">
+          <p role="alert" className="text-sm text-danger">
             {error ?? "讀取預覽統計失敗"}
           </p>
           <div className="flex gap-2">
@@ -721,14 +828,14 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
               type="button"
               onClick={() => void loadPreview(root)}
               disabled={busy}
-              className="rounded-md bg-ink px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+              className="rounded-[12px] bg-brand px-4 py-2 text-sm font-semibold text-on-brand disabled:opacity-40"
             >
               {busy ? "重試中…" : "重試預覽"}
             </button>
             <button
               type="button"
               onClick={() => void cancel()}
-              className="rounded-md border border-line px-3 py-2 text-sm text-ink"
+              className="rounded-[12px] border border-line bg-surface px-3.5 py-2 text-sm text-ink hover:bg-raised"
             >
               取消（移除這個資料夾）
             </button>
@@ -742,7 +849,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
           {includeAudio && <AudioModelStatus active />}
           <ProgressBar status={status} />
           {error !== null && (
-            <p role="alert" className="text-sm text-red-600">
+            <p role="alert" className="text-sm text-danger">
               {error}
             </p>
           )}
@@ -750,7 +857,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
             type="button"
             onClick={() => void requestCancel()}
             disabled={cancelling}
-            className="rounded-md border border-line px-3 py-2 text-sm text-ink disabled:opacity-40"
+            className="rounded-[12px] border border-line bg-surface px-3.5 py-2 text-sm text-ink hover:bg-raised disabled:opacity-40"
           >
             {cancelling ? "取消中…" : "取消索引"}
           </button>
@@ -766,7 +873,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
               <button
                 type="button"
                 onClick={() => void beginIndex()}
-                className="rounded-md bg-ink px-3 py-2 text-sm font-medium text-white"
+                className="rounded-[12px] bg-brand px-4 py-2 text-sm font-semibold text-on-brand"
               >
                 重新索引
               </button>
@@ -774,7 +881,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
             <button
               type="button"
               onClick={onCancel}
-              className="rounded-md border border-line px-3 py-2 text-sm text-ink"
+              className="rounded-[12px] border border-line bg-surface px-3.5 py-2 text-sm text-ink hover:bg-raised"
             >
               關閉
             </button>
@@ -787,7 +894,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
           <p className="text-sm text-ink">索引完成，目錄樹已可使用。</p>
           {includeAudio && <AudioModelStatus />}
           {status?.state === "completed" && status.result !== null && describeVideoEntries(status.result.failedFiles) !== "" && (
-            <p className="text-xs text-amber-700">
+            <p className="text-xs text-warn">
               部分影片處理失敗（其餘檔案已完成）：{describeVideoEntries(status.result.failedFiles)}。
             </p>
           )}
@@ -798,11 +905,11 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
         <div className="space-y-3">
           {stalled ? (
             // stalled：可能只是註冊較慢，不當成最終失敗；用可恢復措辭（與 ExplorerPanel 對稱）。
-            <p role="status" className="text-sm text-amber-700">
+            <p role="status" className="text-sm text-warn">
               {error ?? "尚未偵測到索引啟動，請按「重試」再試一次。"}
             </p>
           ) : (
-            <p role="alert" className="text-sm text-red-600">
+            <p role="alert" className="text-sm text-danger">
               索引失敗：{error ?? "未知錯誤"}
             </p>
           )}
@@ -810,41 +917,136 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
             <button
               type="button"
               onClick={() => void beginIndex()}
-              className="rounded-md border border-line px-3 py-2 text-sm text-ink"
+              className="rounded-[12px] border border-line bg-surface px-3.5 py-2 text-sm text-ink hover:bg-raised"
             >
               重試
             </button>
           )}
         </div>
       )}
+
+      <FolderPickerDialog
+        open={pickerOpen}
+        initialPath={pathInput}
+        knownPolicy={accessPolicy}
+        onSelect={(chosenPath) => {
+          setPathInput(chosenPath);
+          setPathSource("browser");
+          setPickerOpen(false);
+          setPickerError(null);
+        }}
+        onClose={() => setPickerOpen(false)}
+      />
     </section>
+  );
+}
+
+function StepPill({
+  index,
+  current,
+  label,
+  done = false,
+}: {
+  index: number;
+  current: number;
+  label: string;
+  done?: boolean;
+}) {
+  const isCompleted = done || current > index;
+  const isActive = !done && current === index;
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 font-medium transition ${
+        isActive
+          ? "border-brand bg-tint text-brand font-semibold"
+          : isCompleted
+            ? "border-line bg-tint/45 text-brand"
+            : "border-line bg-raised/70 text-muted"
+      }`}
+    >
+      <span>{isCompleted ? "✓" : index}</span>
+      <span>{label}</span>
+    </span>
   );
 }
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-md border border-line bg-surface px-3 py-2">
+    <div className="rounded-[14px] border border-line bg-bg/60 px-3.5 py-2.5">
       <p className="text-xs text-muted">{label}</p>
-      <p className="mt-0.5 text-sm font-medium text-ink">{value}</p>
+      <p className="mt-0.5 font-serif text-base font-bold text-ink">{value}</p>
     </div>
   );
 }
 
-/**
- * 「這個資料夾含照片，一起索引」開關（加入前與預覽頁共用同一個控制項）。
- *
- * 標籤刻意用白話（不寫「image 模態」），並在同一行說明代價與「改完要重新索引才生效」。
- */
+/** 選項卡共用外觀（把原生 checkbox 包成可切換卡片＋開關膠囊，保留完整鍵盤與螢幕閱讀器語意）。 */
+function ModalityOptionCard({
+  icon,
+  title,
+  description,
+  checked,
+  disabled = false,
+  onChange,
+}: {
+  icon: string;
+  title: string;
+  description: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (next: boolean) => void;
+}) {
+  return (
+    <label
+      className={`flex flex-col justify-between gap-3 rounded-[14px] border p-3.5 transition ${
+        disabled
+          ? "cursor-not-allowed border-line bg-raised/65 opacity-60"
+          : checked
+            ? "cursor-pointer border-brand bg-tint/55"
+            : "cursor-pointer border-line bg-bg/45 hover:border-brand/50 hover:bg-raised/45"
+      }`}
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.checked)}
+        className="sr-only"
+      />
+      <div className="flex items-start justify-between gap-2">
+        <span className="flex items-center gap-2 text-sm font-semibold text-ink">
+          <span aria-hidden="true">{icon}</span>
+          <span>{title}</span>
+        </span>
+        <span
+          aria-hidden="true"
+          className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition ${
+            checked ? "bg-brand" : "bg-line"
+          }`}
+        >
+          <span
+            className={`inline-block h-3.5 w-3.5 rounded-full bg-surface shadow transition-transform ${
+              checked ? "translate-x-4.5" : "translate-x-1"
+            }`}
+          />
+        </span>
+      </div>
+      <span className="block text-xs leading-relaxed text-muted">{description}</span>
+    </label>
+  );
+}
+
 function AudioToggle({ checked, disabled, onChange }: {
   checked: boolean; disabled?: boolean; onChange: (next: boolean) => void;
 }) {
   return (
-    <label className="flex items-start gap-2 text-sm text-ink">
-      <input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} className="mt-0.5" />
-      <span>這個資料夾含音訊，一起索引
-        <span className="mt-0.5 block text-xs text-muted">支援 WAV（PCM16／float32、單／雙聲道），預設單檔最多 10 MiB、最長 10 分鐘。首次索引需下載音訊模型；檔案內容只在本機處理。預覽依檔名與大小統計，格式與時長於索引時確認。</span>
-      </span>
-    </label>
+    <ModalityOptionCard
+      icon="🎵"
+      title="這個資料夾含音訊，一起索引"
+      description="支援 WAV（PCM16／float32、單／雙聲道），預設單檔最多 10 MiB、最長 10 分鐘。首次索引需下載音訊模型；檔案內容只在本機處理。預覽依檔名與大小統計，格式與時長於索引時確認。"
+      checked={checked}
+      disabled={disabled}
+      onChange={onChange}
+    />
   );
 }
 
@@ -861,23 +1063,17 @@ function VideoToggle({ checked, disabled, state, onChange }: {
   onChange: (next: boolean) => void;
 }) {
   return (
-    <label className="flex items-start gap-2 text-sm text-ink">
-      <input
-        type="checkbox"
-        checked={checked}
-        disabled={disabled ?? !state.enabled}
-        onChange={(event) => onChange(event.target.checked)}
-        className="mt-0.5"
-      />
-      <span>
-        這個資料夾含影片（.mp4），一起索引
-        <span className="mt-0.5 block text-xs text-muted">
-          每 {VIDEO_SEGMENT_SECONDS} 秒抽 1 幀（短暫畫面可能被略過）；預覽不讀媒體，時長與段數待確認。
-          同時開啟「含音訊」才會索引影片的選定 AAC 音軌。{state.summary}
-          {state.reason !== null ? `（${state.reason}）` : ""}
-        </span>
-      </span>
-    </label>
+    <ModalityOptionCard
+      icon="🎬"
+      title="這個資料夾含影片（.mp4），一起索引"
+      description={
+        `每 ${VIDEO_SEGMENT_SECONDS} 秒抽 1 幀（短暫畫面可能被略過）；預覽不讀媒體，時長與段數待確認。同時開啟「含音訊」才會索引影片的選定 AAC 音軌。${state.summary}` +
+        (state.reason !== null ? `（${state.reason}）` : "")
+      }
+      checked={checked}
+      disabled={disabled ?? !state.enabled}
+      onChange={onChange}
+    />
   );
 }
 
@@ -894,7 +1090,7 @@ function VideoCandidates({ video, skipped, durationLimitSeconds, maxFileBytes }:
 }) {
   const videoSkipped = skipSummary(skipped.filter((item) => isVideoReason(item.reason)));
   return (
-    <div className="space-y-1 rounded-md border border-line bg-surface px-3 py-2 text-xs text-muted">
+    <div className="space-y-1 rounded-[14px] border border-line bg-bg/60 px-3.5 py-2.5 text-xs text-muted">
       <p className="text-sm font-medium text-ink">影片候選：{video.files} 支</p>
       <p>時長待確認：預覽只列舉與估算，不讀取媒體、不啟動 probe，也不由壓縮大小換算秒數。</p>
       <p>
@@ -935,21 +1131,14 @@ function ImagesToggle({
   onChange: (next: boolean) => void;
 }) {
   return (
-    <label className="flex items-start gap-2 text-sm text-ink">
-      <input
-        type="checkbox"
-        checked={checked}
-        disabled={disabled ?? false}
-        onChange={(event) => onChange(event.target.checked)}
-        className="mt-0.5"
-      />
-      <span>
-        這個資料夾含照片，一起索引
-        <span className="mt-0.5 block text-xs text-muted">
-          照片索引比文字慢很多（每張約數秒）。之後可以隨時關閉；改變設定後要重新索引才會生效。
-        </span>
-      </span>
-    </label>
+    <ModalityOptionCard
+      icon="🖼️"
+      title="這個資料夾含照片，一起索引"
+      description="照片索引比文字慢很多（每張約數秒）。之後可以隨時關閉；改變設定後要重新索引才會生效。"
+      checked={checked}
+      disabled={disabled ?? false}
+      onChange={onChange}
+    />
   );
 }
 
@@ -974,7 +1163,7 @@ function ProgressBar({ status }: { status: IndexStatus | null }) {
   return (
     <div className="space-y-1">
       <div className="h-2 w-full overflow-hidden rounded-full bg-line">
-        <div className="h-full bg-ink transition-[width]" style={{ width: `${percent}%` }} />
+        <div className="h-full bg-brand transition-[width]" style={{ width: `${percent}%` }} />
       </div>
       <p className="text-xs text-muted">
         {total > 0
@@ -982,7 +1171,7 @@ function ProgressBar({ status }: { status: IndexStatus | null }) {
           : "正在掃描檔案…"}
       </p>
       {progress !== null && progress.failed > 0 && (
-        <p className="text-xs text-amber-700">有 {progress.failed} 個檔案處理失敗，其餘仍會繼續。</p>
+        <p className="text-xs text-warn">有 {progress.failed} 個檔案處理失敗，其餘仍會繼續。</p>
       )}
     </div>
   );

@@ -23,13 +23,13 @@ export function TokenForm({ message, onSubmit }: TokenFormProps) {
   return (
     <div className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center gap-6 px-6">
       <div className="space-y-2">
-        <h1 className="text-2xl font-semibold text-ink">Mnemoshelf</h1>
+        <h1 className="font-serif text-2xl font-bold text-ink">Mnemoshelf</h1>
         <p className="text-sm text-muted">
           請貼上服務的存取 token。token 只保留在這個分頁的記憶體工作階段中，不會寫進網址或磁碟。
         </p>
       </div>
 
-      <form onSubmit={submit} className="space-y-3">
+      <form onSubmit={submit} className="space-y-3 rounded-[20px] border border-line bg-surface p-5 shadow-xs">
         <label htmlFor="mnemoshelf-token" className="block text-sm font-medium text-ink">
           存取 token
         </label>
@@ -42,17 +42,17 @@ export function TokenForm({ message, onSubmit }: TokenFormProps) {
           value={value}
           onChange={(event) => setValue(event.target.value)}
           placeholder="貼上 MNEMOSHELF_TOKEN"
-          className="w-full rounded-md border border-line bg-white px-3 py-2 font-mono text-sm text-ink outline-none focus:border-ink"
+          className="w-full rounded-[12px] border border-line bg-bg/60 px-3 py-2 font-mono text-sm text-ink outline-none focus:border-brand focus:bg-surface"
         />
         {message !== null && (
-          <p role="alert" className="text-sm text-red-600">
+          <p role="alert" className="text-sm text-danger">
             {message}
           </p>
         )}
         <button
           type="submit"
           disabled={value.trim() === ""}
-          className="w-full rounded-md bg-ink px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+          className="w-full rounded-[12px] bg-brand px-3 py-2 text-sm font-semibold text-on-brand disabled:opacity-40"
         >
           連線
         </button>

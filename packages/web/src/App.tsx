@@ -3,6 +3,7 @@ import {
   clearToken,
   downloadDiagnostics,
   fetchDiagnostics,
+  fetchHealth,
   fetchMemoryPolicy,
   fetchRoots,
   getToken,
@@ -15,11 +16,13 @@ import {
   updateMemoryPolicy,
   updateRootModalities,
   updateRootVideoMaxFileBytes,
+  type BrowseAccessPolicy,
   type DiagnosticsEmbedderRuntime,
   type MemoryPolicy,
   type Root,
   type VideoCapability,
 } from "./api";
+import { AccessPolicyRiskBanner } from "./AccessPolicyRiskBanner";
 import { AddRootFlow } from "./AddRootFlow";
 import { toggleModality } from "./audio";
 import { DEFAULT_VIDEO_MAX_FILE_BYTES } from "./media";
@@ -84,6 +87,9 @@ export function App() {
    * 與每個 root 自己的 `modalities.video` 無關：用來在**打開開關前**停用並顯示原因。
    */
   const [videoCapability, setVideoCapability] = useState<VideoCapability | null>(null);
+  /** 伺服器目前的存取／瀏覽策略摘要（用於風險警告與狀態標示）。 */
+  const [accessPolicy, setAccessPolicy] = useState<BrowseAccessPolicy | null>(null);
+  const [authRequired, setAuthRequired] = useState(true);
   /** 等待確認的「移除資料夾」（站內確認框，取代原生 confirm）。 */
   const [pendingRemoveRoot, setPendingRemoveRoot] = useState<Root | null>(null);
   const [removeRootBusy, setRemoveRootBusy] = useState(false);
@@ -281,15 +287,30 @@ export function App() {
     (bootstrap.phase === "downloading" || bootstrap.phase === "verifying" || bootstrap.phase === "failed");
   const bootstrapReady = !bootstrapBlocking || bootstrapSkipped;
 
-  // 掛載時若已有 token（同一分頁內重整）就直接載入，否則顯示 token 輸入。
+  // 掛載時檢查服務 `/health`：取得存取策略摘要，並在伺服器設定免 token 時自動連線；
+  // 一般安全預設（authRequired=true）仍需已有 token 或顯示 TokenForm。
   // 桌面模式則等模型就緒（UI 不需要 token）。
   useEffect(() => {
     if (!bootstrapReady) return;
-    if (desktop !== null) {
-      void load();
-      return;
-    }
-    if (getToken() !== null) void load();
+    let alive = true;
+    void fetchHealth()
+      .then((health) => {
+        if (!alive) return;
+        setAuthRequired(health.authRequired);
+        if (health.accessPolicy !== null) setAccessPolicy(health.accessPolicy);
+        if (desktop !== null || getToken() !== null || !health.authRequired) {
+          void load();
+        }
+      })
+      .catch(() => {
+        if (!alive) return;
+        if (desktop !== null || getToken() !== null) {
+          void load();
+        }
+      });
+    return () => {
+      alive = false;
+    };
   }, [bootstrapReady, desktop, load]);
 
   // 任何請求收到 401（例如 server 換了 token）→ apiFetch 派送全域事件，這裡切回貼 token 畫面。
@@ -523,7 +544,7 @@ export function App() {
   const bootstrapFailed = desktop !== null && bootstrap !== null && bootstrap.phase === "failed";
 
   return (
-    <div className="flex min-h-full flex-col bg-surface text-ink">
+    <div className="flex min-h-full flex-col bg-bg text-ink">
       {desktop !== null && !bootstrapReady && (
         <BootstrapScreen
           state={bootstrap}
@@ -542,22 +563,22 @@ export function App() {
 
       {bootstrapReady && state.kind === "error" && (
         <div className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center gap-4 px-6 text-center">
-          <p role="alert" className="text-sm text-red-600">
+          <p role="alert" className="text-sm text-danger">
             {state.message}
           </p>
           <div className="flex justify-center gap-2">
             <button
               type="button"
               onClick={() => void load()}
-              className="rounded-md bg-ink px-3 py-2 text-sm font-medium text-white"
+              className="rounded-[12px] bg-brand px-4 py-2 text-sm font-semibold text-on-brand"
             >
               重試
             </button>
-            {desktop === null && (
+            {desktop === null && authRequired && (
               <button
                 type="button"
                 onClick={forgetToken}
-                className="rounded-md border border-line px-3 py-2 text-sm font-medium text-ink"
+                className="rounded-[12px] border border-line bg-surface px-4 py-2 text-sm font-medium text-ink hover:bg-raised"
               >
                 重新輸入 token
               </button>
@@ -567,16 +588,37 @@ export function App() {
       )}
 
       {bootstrapReady && state.kind === "ready" && (
-        <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-8">
-          <header className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h1 className="text-xl font-semibold text-ink">Mnemoshelf</h1>
-              <p className="text-xs text-muted">已連線到本機服務（127.0.0.1）</p>
+        <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-5 py-6">
+          <header className="flex flex-wrap items-center justify-between gap-4 border-b border-line pb-4">
+            <div className="flex items-center gap-3">
+              <div
+                aria-hidden="true"
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-[11px] bg-brand text-base font-bold text-on-brand shadow-sm"
+              >
+                M
+              </div>
+              <div>
+                <h1 className="font-serif text-lg font-bold tracking-tight text-ink">Mnemoshelf</h1>
+                <p className="inline-flex items-center gap-1.5 text-xs text-muted">
+                  <span
+                    aria-hidden="true"
+                    className={`h-2 w-2 rounded-full ${
+                      accessPolicy?.relaxed ? "bg-warn" : "bg-brand"
+                    }`}
+                  />
+                  <span>
+                    {accessPolicy?.nonLoopbackBind
+                      ? `已連線（${accessPolicy.host}）`
+                      : "已連線到本機服務（127.0.0.1）"}
+                  </span>
+                </p>
+              </div>
             </div>
-            <div className="flex flex-wrap items-center gap-3">
+
+            <div className="flex flex-wrap items-center gap-2.5">
               <nav
                 aria-label="主要檢視"
-                className="inline-flex overflow-hidden rounded-md border border-line"
+                className="inline-flex rounded-[12px] border border-line bg-raised p-1"
               >
                 {(["explorer", "search", "memories", "agent-guide"] as const).map((item) => (
                   <button
@@ -587,8 +629,10 @@ export function App() {
                       setView(item);
                       if (item === "explorer") setMode("explorer");
                     }}
-                    className={`px-3 py-1.5 text-sm font-medium ${
-                      view === item ? "bg-ink text-white" : "bg-white text-ink"
+                    className={`rounded-[9px] px-3 py-1.5 text-xs font-semibold transition sm:text-sm ${
+                      view === item
+                        ? "bg-surface text-ink shadow-xs"
+                        : "text-muted hover:text-ink"
                     }`}
                   >
                     {NAV_LABEL[item]}
@@ -598,15 +642,20 @@ export function App() {
               <button
                 type="button"
                 onClick={() => setShowSettings((current) => !current)}
-                className="rounded-md border border-line px-3 py-1.5 text-sm text-ink"
+                aria-expanded={showSettings}
+                className={`rounded-[12px] border px-3.5 py-1.5 text-sm font-medium transition ${
+                  showSettings
+                    ? "border-brand bg-tint text-brand"
+                    : "border-line bg-surface text-ink hover:bg-raised"
+                }`}
               >
                 設定
               </button>
-              {desktop === null && (
+              {desktop === null && authRequired && (
                 <button
                   type="button"
                   onClick={forgetToken}
-                  className="rounded-md border border-line px-3 py-1.5 text-sm text-ink"
+                  className="rounded-[12px] border border-line bg-surface px-3.5 py-1.5 text-sm font-medium text-ink hover:bg-raised"
                 >
                   登出
                 </button>
@@ -614,8 +663,10 @@ export function App() {
             </div>
           </header>
 
+          <AccessPolicyRiskBanner policy={accessPolicy} />
+
           {bootstrapFailed && (
-            <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-line bg-white px-3 py-2">
+            <div role="status" className="flex flex-wrap items-center justify-between gap-3 rounded-[14px] border border-line bg-surface px-4 py-2.5">
               <p className="text-xs text-muted">
                 模型尚未下載完成：建立索引時會再試一次。{bootstrap?.lastError !== null && bootstrap?.lastError !== undefined ? `（${bootstrap.lastError.message}）` : ""}
               </p>
@@ -623,7 +674,7 @@ export function App() {
                 type="button"
                 onClick={() => void retryBootstrap()}
                 disabled={bootstrapBusy}
-                className="rounded-md border border-line px-2.5 py-1 text-xs text-ink disabled:opacity-40"
+                className="rounded-[10px] border border-line bg-bg px-3 py-1 text-xs font-medium text-ink hover:bg-raised disabled:opacity-40"
               >
                 {bootstrapBusy ? "重試中…" : "重試下載"}
               </button>
@@ -655,18 +706,18 @@ export function App() {
           )}
 
           {view === "explorer" && (
-            <div className="grid gap-6 lg:grid-cols-[300px_minmax(0,1fr)]">
+            <div className="grid gap-6 lg:grid-cols-[276px_minmax(0,1fr)]">
               <aside className="space-y-3">
                 <div className="flex items-center justify-between">
-                  <h2 className="text-base font-medium text-ink">
-                    資料夾<span className="ml-1 text-xs text-muted">（{state.roots.length}）</span>
+                  <h2 className="text-[11px] font-bold tracking-wider text-muted uppercase">
+                    已加入的資料夾<span className="ml-1 font-normal">（{state.roots.length}）</span>
                   </h2>
                   <button
                     type="button"
                     onClick={() => setMode("add-root")}
-                    className="rounded-md bg-ink px-2.5 py-1 text-xs font-medium text-white"
+                    className="rounded-[10px] bg-brand px-3 py-1 text-xs font-semibold text-on-brand"
                   >
-                    加入
+                    + 加入
                   </button>
                 </div>
                 <RootsList
@@ -687,7 +738,7 @@ export function App() {
                   defaultVideoMaxFileBytes={videoCapability?.maxFileBytes ?? DEFAULT_VIDEO_MAX_FILE_BYTES}
                 />
                 {rootsError !== null && (
-                  <p role="alert" className="text-xs text-red-600">
+                  <p role="alert" className="text-xs text-danger">
                     {rootsError}
                   </p>
                 )}
@@ -713,10 +764,19 @@ export function App() {
                       void refreshRoots();
                     }}
                     videoCapability={videoCapability}
+                    accessPolicy={accessPolicy}
                   />
                 ) : selectedRoot === null ? (
-                  <div className="flex h-[60vh] items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center">
-                    <p className="text-sm text-muted">請先加入一個資料夾。</p>
+                  <div className="flex h-[60vh] flex-col items-center justify-center gap-3 rounded-[20px] border border-dashed border-line bg-surface/65 px-6 text-center">
+                    <p className="font-serif text-base font-bold text-ink">尚未選取或加入資料夾</p>
+                    <p className="text-xs text-muted">點左側「+ 加入」或下方按鈕加入第一個資料夾，系統會先預覽檔案統計。</p>
+                    <button
+                      type="button"
+                      onClick={() => setMode("add-root")}
+                      className="mt-1 rounded-[12px] bg-brand px-4 py-2 text-sm font-semibold text-on-brand"
+                    >
+                      + 加入資料夾
+                    </button>
                   </div>
                 ) : (
                   <ExplorerPanel

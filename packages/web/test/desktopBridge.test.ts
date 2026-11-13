@@ -8,10 +8,11 @@ import { describe, expect, it } from "vitest";
 import type {
   DesktopBridge,
   DesktopBootstrapState,
+  DesktopFolderPickerBridge,
   DesktopSettingsState,
   DesktopUpdaterBridge,
 } from "../src/desktop";
-import { getDesktopUpdater } from "../src/desktop";
+import { getDesktopFolderPicker, getDesktopUpdater } from "../src/desktop";
 
 function fakeUpdater(): DesktopUpdaterBridge {
   const notCalled = async (): Promise<never> => {
@@ -29,7 +30,7 @@ function fakeUpdater(): DesktopUpdaterBridge {
   };
 }
 
-function fakeBridge(updater?: DesktopUpdaterBridge): DesktopBridge {
+function fakeBridge(updater?: DesktopUpdaterBridge, folderPicker?: DesktopFolderPickerBridge): DesktopBridge {
   return {
     kind: "mnemoshelf-desktop",
     apiVersion: 2,
@@ -47,6 +48,7 @@ function fakeBridge(updater?: DesktopUpdaterBridge): DesktopBridge {
       copyMcpConfig: async () => ({ copied: false, url: null, reason: null }),
     },
     ...(updater === undefined ? {} : { updater }),
+    ...(folderPicker === undefined ? {} : { folderPicker }),
   };
 }
 
@@ -68,5 +70,27 @@ describe("getDesktopUpdater", () => {
     const updater = fakeUpdater();
     const broken = { ...updater, onState: undefined } as unknown as DesktopUpdaterBridge;
     expect(getDesktopUpdater(fakeBridge(broken))).toBeNull();
+  });
+});
+
+describe("getDesktopFolderPicker", () => {
+  it("不在桌面殼裡時回 null", () => {
+    expect(getDesktopFolderPicker(null)).toBeNull();
+  });
+
+  it("舊殼（沒有 folderPicker 成員）回 null，不拋錯", () => {
+    expect(getDesktopFolderPicker(fakeBridge())).toBeNull();
+  });
+
+  it("完整 bridge 回傳同一個 folderPicker 物件", () => {
+    const picker: DesktopFolderPickerBridge = {
+      chooseDirectory: async () => ({ canceled: true, path: null }),
+    };
+    expect(getDesktopFolderPicker(fakeBridge(undefined, picker))).toBe(picker);
+  });
+
+  it("folderPicker 形狀不完整時視為不支援", () => {
+    const broken = {} as unknown as DesktopFolderPickerBridge;
+    expect(getDesktopFolderPicker(fakeBridge(undefined, broken))).toBeNull();
   });
 });

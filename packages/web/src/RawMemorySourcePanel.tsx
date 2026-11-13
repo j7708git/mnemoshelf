@@ -53,12 +53,12 @@ export function RawMemorySourcePanel({ id, scope, agent, project }: SourceAccess
   };
 
   return (
-    <section aria-label="原文回合來源" className="mt-2 space-y-2 rounded-md bg-surface px-3 py-2 text-xs text-muted">
+    <section aria-label="原文回合來源" className="mt-2 space-y-2 rounded-lg bg-raised px-3 py-2 text-xs text-muted">
       {request.restarted && <p role="status">記憶遮罩設定已變更，從開頭重新讀取。</p>}
       {state.kind === "loading" && <p role="status">正在讀取原文回合…</p>}
       {state.kind === "error" && (
         <>
-          <p role="alert" className="text-red-600">{state.message}</p>
+          <p role="alert" className="text-danger">{state.message}</p>
           <button type="button" className={SOURCE_BUTTON} onClick={() => load(null)}>從開頭重試</button>
         </>
       )}
@@ -120,7 +120,7 @@ export function RawMemorySourcePageContent({ page }: { page: MemorySourcePage })
       </dl>
       <ol className="space-y-2">
         {page.messages.map((message) => (
-          <li key={message.messageIndex} className="rounded-md border border-line bg-white px-3 py-2">
+          <li key={message.messageIndex} className="rounded-lg border border-line bg-surface px-3 py-2">
             <div className="flex flex-wrap gap-x-2">
               <span className="font-medium text-ink">{memorySourceRoleLabel(message.role)}・第 {message.messageIndex + 1} 則</span>
               <span>{message.occurredAt === null ? "對話時間未知" : formatDateTime(message.occurredAt)}</span>

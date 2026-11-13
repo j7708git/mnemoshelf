@@ -233,6 +233,17 @@ export interface DesktopAgentGuideBridge {
   copy(kind: string): Promise<DesktopAgentGuideCopyResult>;
 }
 
+/** 原生資料夾選擇器回傳結果（不含 token）。 */
+export interface DesktopFolderPickerResult {
+  canceled: boolean;
+  path: string | null;
+}
+
+/** 原生資料夾選擇器（Electron `dialog.showOpenDialog`）。 */
+export interface DesktopFolderPickerBridge {
+  chooseDirectory(): Promise<DesktopFolderPickerResult>;
+}
+
 /**
  * 更新相關的窄介面（desktop shell API v2 新增）。
  *
@@ -290,6 +301,13 @@ export interface DesktopBridge {
    * 不可直接呼叫（`getDesktopAgentGuide()` 會處理）。
    */
   agentGuide?: DesktopAgentGuideBridge;
+  /**
+   * 原生資料夾選擇對話框（選擇性新增）。
+   *
+   * **選擇性**：舊版 preload 沒有這個成員，renderer 要當成「不支援」，
+   * 並退回瀏覽器版資料夾選擇器（`getDesktopFolderPicker()` 會處理）。
+   */
+  folderPicker?: DesktopFolderPickerBridge;
   /**
    * 更新（v2 新增；Linux／Windows 為 App 內下載安裝，macOS 只檢查並開下載頁）。
    *
@@ -366,4 +384,19 @@ export function getDesktopAgentGuide(
   if (agentGuide === undefined || agentGuide === null) return null;
   if (typeof agentGuide.getState !== "function" || typeof agentGuide.copy !== "function") return null;
   return agentGuide;
+}
+
+/**
+ * 取得原生資料夾選擇器介面；不在桌面殼、或舊殼（沒有 folderPicker）時回 null。
+ *
+ * 舊殼搭配新 UI 時不能假設 `bridge.folderPicker` 一定存在，回 null 後由 UI 改開瀏覽器對話框。
+ */
+export function getDesktopFolderPicker(
+  bridge: DesktopBridge | null = getDesktopBridge(),
+): DesktopFolderPickerBridge | null {
+  if (bridge === null) return null;
+  const folderPicker = bridge.folderPicker;
+  if (folderPicker === undefined || folderPicker === null) return null;
+  if (typeof folderPicker.chooseDirectory !== "function") return null;
+  return folderPicker;
 }
