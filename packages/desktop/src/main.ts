@@ -18,7 +18,7 @@
  * onnxruntime-node／sharp）都是 N-API／Node-API，不需 `@electron/rebuild`；真正要處理的是
  * asar 解包（見 `electron-builder.yml` 的 `asarUnpack`）與 sharp 在 Linux 的 glib 風險。
  */
-import { BrowserWindow, Menu, Tray, app, clipboard, ipcMain, net, safeStorage, session, shell, type IpcMainInvokeEvent } from "electron";
+import { BrowserWindow, Menu, Tray, app, clipboard, dialog, ipcMain, net, safeStorage, session, shell, type IpcMainInvokeEvent } from "electron";
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, promises as fs } from "node:fs";
@@ -44,6 +44,7 @@ import {
   type DesktopAgentGuideCopyResult,
   type DesktopAgentGuideState,
   type DesktopAppInfo,
+  type DesktopFolderPickerResult,
   type DesktopSettingsState,
 } from "./desktop-api.js";
 import {
@@ -621,6 +622,16 @@ function registerIpcHandlers(): void {
   ipcMain.handle(DESKTOP_CHANNELS.updaterGetState, (event): UpdaterState => {
     assertTrustedSender(event);
     return currentUpdaterState();
+  });
+  ipcMain.handle(DESKTOP_CHANNELS.folderPickerChoose, async (event): Promise<DesktopFolderPickerResult> => {
+    assertTrustedSender(event);
+    const options = { title: "選擇資料夾", properties: ["openDirectory"] as Array<"openDirectory"> };
+    const result =
+      mainWindow !== null && !mainWindow.isDestroyed()
+        ? await dialog.showOpenDialog(mainWindow, options)
+        : await dialog.showOpenDialog(options);
+    const picked = result.canceled ? null : (result.filePaths[0] ?? null);
+    return { canceled: result.canceled || picked === null, path: picked };
   });
   ipcMain.handle(DESKTOP_CHANNELS.updaterCheck, async (event): Promise<UpdaterState> => {
     assertTrustedSender(event);
