@@ -1,6 +1,6 @@
 {
   "name": "@mnemoshelf/opencode-plugin",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "description": "Mnemoshelf 的 OpenCode v2 外掛：自動召回相關記憶與選用的回合原文擷取，不需摘要模型",
