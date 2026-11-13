@@ -342,15 +342,23 @@ const IMAGE_MIME: Record<string, string> = {
   ".ico": "image/x-icon",
 };
 
+export type ExtensionBucket =
+  | "junk"
+  | "image"
+  | "audio"
+  | "video"
+  | "binary"
+  | "code"
+  | "text"
+  | "unknown-default-text";
+
 /**
- * 由檔名推導種類；未知副檔名一律當文字（契約未明定，由本實作決定，見回報）。
- *
- * 系統／垃圾檔（`isJunkFile`）一律回 `binary`：呼叫端沿用既有的
- * `skipped: "unsupported-type"` 路徑，預覽與索引的行為因此一致。
+ * 細分檔名的副檔名歸屬（供乾跑格式統計與掃描層共用，不讀檔案內容）。
+ * 未知副檔名回傳 `"unknown-default-text"`，由 `classifyFile` 預設歸為 `"text"`。
  */
-export function classifyFile(fileName: string): ChunkKind | "binary" {
+export function classifyExtensionDetail(fileName: string): ExtensionBucket {
   const lower = fileName.toLowerCase();
-  if (isJunkFile(lower)) return "binary";
+  if (isJunkFile(lower)) return "junk";
   const ext = path.extname(lower);
   if (IMAGE_EXTS.has(ext)) return "image";
   if (AUDIO_EXTS.has(ext)) return "audio";
@@ -359,7 +367,20 @@ export function classifyFile(fileName: string): ChunkKind | "binary" {
   if (CODE_EXTS.has(ext)) return "code";
   if (TEXT_EXTS.has(ext)) return "text";
   if (CODE_FILENAMES.has(lower)) return "code";
-  return "text";
+  return "unknown-default-text";
+}
+
+/**
+ * 由檔名推導種類；未知副檔名一律當文字（契約未明定，由本實作決定，見回報）。
+ *
+ * 系統／垃圾檔（`isJunkFile`）一律回 `binary`：呼叫端沿用既有的
+ * `skipped: "unsupported-type"` 路徑，預覽與索引的行為因此一致。
+ */
+export function classifyFile(fileName: string): ChunkKind | "binary" {
+  const bucket = classifyExtensionDetail(fileName);
+  if (bucket === "junk" || bucket === "binary") return "binary";
+  if (bucket === "unknown-default-text") return "text";
+  return bucket;
 }
 
 /** 媒體檔的 MIME 型別；未知回傳 null。 */

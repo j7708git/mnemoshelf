@@ -26,3 +26,23 @@ RAW_MEMORY_PRODUCT=1 RAW_MEMORY_BACKEND=real RAW_MEMORY_SPLIT=tune pnpm --filter
 ```
 
 改用 `RAW_MEMORY_BACKEND=keyword` 可跑全文索引對照。完成調參後用 `RAW_MEMORY_SPLIT=holdout` 執行保留集。產品評測在隔離資料目錄啟動 loopback HTTP，實際呼叫來源寫入、分頁讀取、政策與召回 API，再使用 dsh、OpenCode 的實際封裝器。JSON 區分完整命中切塊、服務節錄與最終注入的證據，並列出向量工作狀態、容量與耗時。token 封裝比較透過外掛的字元上限搜尋合規輸出，維持相同的真正模型 token 預算。原型組改用評測專用的歷史擷取、排名與封裝，得以和產品版並行重跑。
+
+
+## Stage 3：40 題未見題庫、Naive RAG 對照與固定 Reader 評估
+
+- `unseen-fixture.ts`：獨立種子（`482913`）與 10 個全新合成專案，共 40 題未見題庫（30 題可答、10 題無答案拒答），不與 `tune`／`holdout` 共用題型或詞表。
+- `naive-rag.ts`：純原始對話切片基線（`User: ...\nAssistant: ...`，512 Unicode code points / 重疊 64、純向量 cosine top-4 `minScore=0`、同一 900 字元裝箱預算）。
+- `stage3-reader.ts` 與 `stage3-e2e.test.ts`：預設跳過；執行實測：
+
+```bash
+STAGE3_EVAL=1 RAW_MEMORY_BACKEND=real pnpm --filter @mnemoshelf/server exec vitest \
+  --config eval/raw-memory/vitest.config.ts run eval/raw-memory/stage3-e2e.test.ts
+```
+
+若要同時跑固定 OpenAI 相容 Reader 模型計算端到端回答／拒答準確率，額外設定：
+
+- `STAGE3_READER_BASE_URL`（例如 `http://127.0.0.1:8080/v1`）
+- `STAGE3_READER_MODEL`
+- `STAGE3_READER_API_KEY`（選填）
+
+未設定 `STAGE3_READER_*` 時，報告僅產出檢索裝箱對照指標，Reader 欄位明確標記 `NOT_RUN`。
