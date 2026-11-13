@@ -212,6 +212,7 @@ export {
   type VisualSegment,
 } from "./media/index.js";
 export {
+  classifyExtensionDetail,
   classifyFile,
   DEFAULT_MAX_FILE_BYTES,
   DEFAULT_VIDEO_MAX_FILE_BYTES,
@@ -220,6 +221,7 @@ export {
   mimeTypeFor,
   VIDEO_MAX_DURATION_SECONDS,
   walkRoot,
+  type ExtensionBucket,
   type ScanEntry,
   type ScanOptions,
   type ScanResult,
@@ -227,3 +229,20 @@ export {
   type SkippedEntry,
   type SkipReason,
 } from "./indexer/scan.js";
+export {
+  collectFormatStats,
+  detectUnknownHeaderKind,
+  formatStatsMarkdown,
+  probeMediaWithFfprobe,
+  SHARP_UNSUPPORTED_IMAGE_EXTS,
+  type DurationBucket,
+  type ExtensionStat,
+  type FormatStatsInput,
+  type FormatStatsOptions,
+  type FormatStatsReport,
+  type MediaContainerProbe,
+  type MediaProbeFn,
+  type MediaProfileStat,
+  type SkipReasonStat,
+  type UnknownHeaderKind,
+} from "./indexer/format-stats.js";
