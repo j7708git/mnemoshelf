@@ -179,7 +179,7 @@ describe("超限屬輸入類失敗：加速器裝置（dml／coreml）不觸發 
    */
   it("win32／auto（device＝dml）單筆超限：仍拋 input-too-long，device 不變且不退回 CPU", async () => {
     state.sequenceLength = MAX_INPUT_TOKENS + 1;
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: "unused" });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: "unused" });
     expect(embedder.runtimeStatus.device).toBe("dml");
 
     const error = await embedder.embedQuery("長文").catch((thrown: unknown) => thrown);

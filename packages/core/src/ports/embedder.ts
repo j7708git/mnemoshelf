@@ -130,6 +130,10 @@ export interface EmbedderRuntimeStatus {
   loaded: boolean;
   /** 曾從 GPU 退回 CPU 時的原因；未退回為 `null`。 */
   fallbackReason: EmbedderFallbackReason | null;
+  /** 單一推論視窗含 padding 的 token 預算。 */
+  batchTokenBudget?: number;
+  /** WebGPU 的實際載入與文字／圖片推論探測。 */
+  webgpuProbe?: { status: "pending" | "passed" | "failed"; reason?: string };
   /** 目前的批次視窗大小（一次送進模型的輸入數上限）。 */
   batchSize: number;
   /**

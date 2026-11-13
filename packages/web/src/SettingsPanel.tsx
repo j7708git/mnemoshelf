@@ -60,6 +60,7 @@ const DEVICE_LABELS: Record<string, string> = {
   cpu: "CPU",
   dml: "DirectML（GPU）",
   coreml: "CoreML（Mac GPU）",
+  webgpu: "WebGPU（GPU）",
 };
 
 /** 加速器自我測試結果的中文說明；沒有資料＝「未測試」。 */
@@ -81,9 +82,7 @@ export function selfTestSummary(selfTest: DiagnosticsEmbedderSelfTest | undefine
 /**
  * 執行裝置那一行的文字（沒有資料時明說「未測試」，不假裝有結果）。
  *
- * 只有 `auto` 才顯示「自動偵測」段：**手動指定**裝置時本來就不會跑自我測試，
- * 寫「未測試」會讓使用者以為有一場自動測試還沒跑完；Windows 的 DirectML 也是
- * 「每次直接試、失敗即退回」，沒有自我測試這回事。
+ * CoreML 的自我測試只屬於 `auto` 政策；明示 WebGPU 另有能力探測，不能混用結果。
  */
 export function describeEmbedderRuntime(
   runtime: DiagnosticsEmbedderRuntime | null | undefined,
@@ -95,14 +94,21 @@ export function describeEmbedderRuntime(
 
   const parts = [`目前裝置：${DEVICE_LABELS[runtime.device] ?? runtime.device}`];
   if (!runtime.loaded) parts.push("（模型尚未載入，顯示的是計畫裝置）");
-  if (runtime.requestedDevice !== "auto") {
-    // 明示模式（env／選項指定）：不存在「自動偵測的結果」，不要顯示「未測試」。
-    parts.push("｜（裝置為手動指定）");
+  if (runtime.requestedDevice === "webgpu") {
+    parts.push("｜要求裝置：WebGPU");
+    const probe = runtime.webgpuProbe;
+    const summary = probe?.status === "passed" ? "通過" : probe?.status === "failed" ? "失敗" : "尚未完成";
+    parts.push(`｜WebGPU 探測：${summary}${probe?.reason ? `（${probe.reason}）` : ""}`);
+    if (runtime.batchTokenBudget !== undefined) {
+      parts.push(`｜批次上限：${runtime.batchSize} 筆、${runtime.batchTokenBudget} tokens（含 padding）`);
+    }
+  } else if (runtime.requestedDevice !== "auto") {
+    parts.push(`｜設定裝置：${DEVICE_LABELS[runtime.requestedDevice] ?? runtime.requestedDevice}`);
   } else if (runtime.selfTest !== undefined || runtime.device === "coreml") {
     parts.push(`｜自動偵測：${selfTestSummary(runtime.selfTest)}`);
   }
   // 崩潰的說明已經在自我測試那一句裡（「曾造成行程結束」），不必再重複一次。
-  if (runtime.fallbackReason !== null && runtime.selfTest?.outcome !== "crashed") {
+  if (runtime.fallbackReason !== null && !(runtime.requestedDevice === "auto" && runtime.selfTest?.outcome === "crashed")) {
     parts.push(`｜${runtime.fallbackReason.message}`);
   }
   return parts.join("");

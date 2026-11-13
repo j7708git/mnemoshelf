@@ -45,6 +45,10 @@ pnpm --filter @mnemoshelf/desktop dist
 
 TypeScript／Node.js／pnpm；桌面殼是 Electron＋React，Web UI 用 Vite＋Tailwind。推論引擎為 ONNX Runtime（經 `@huggingface/transformers`，預設模型 EmbeddingGemma 2）；預設儲存 SQLite（FTS5＋sqlite-vec），另有 PostgreSQL＋pgvector 後端。縮圖用 `sharp`（內含 libvips）、靜態檔用 `sirv`、SQLite 驅動為 `better-sqlite3`。
 
+推論預設使用 CPU；macOS arm64 可明示 `MNEMOSHELF_EMBED_DEVICE=webgpu` 啟用可選 WebGPU。
+設定頁顯示實際裝置、能力探測與退回原因；音訊仍使用 CPU。啟用方式、批次限制與原生崩潰界線見
+[執行裝置操作說明](docs/operations.md#可選-webgpu)。
+
 架構圖見 [docs/architecture.html](docs/architecture.html)（以瀏覽器開啟）。
 
 | 套件 | 角色 |
@@ -79,7 +83,7 @@ TypeScript／Node.js／pnpm；桌面殼是 Electron＋React，Web UI 用 Vite＋
 | [docs/roots-and-privacy.md](docs/roots-and-privacy.md) | root 規則、路徑安全、機密遮罩、信任模型、資料刪除 |
 | [docs/raw-memory.md](docs/raw-memory.md) | 原文寫入、來源續讀、遮罩開關、生命週期與 v2 備份 |
 | [docs/storage-ports.md](docs/storage-ports.md) | 搜尋模式、記憶欄位與檢索、匯出／匯入、PostgreSQL 後端 |
-| [docs/embedder-contract.md](docs/embedder-contract.md) | embedder 能力宣告、執行裝置與退回、CoreML 風險 |
+| [docs/embedder-contract.md](docs/embedder-contract.md) | embedder 能力宣告、執行裝置、探測與退回 |
 | [docs/architecture.html](docs/architecture.html) | 架構圖（以瀏覽器開啟） |
 | [docs/harness-memory.html](docs/harness-memory.html) | agent 怎麼接上、記憶怎麼存與找回的白話圖解（以瀏覽器開啟） |
 

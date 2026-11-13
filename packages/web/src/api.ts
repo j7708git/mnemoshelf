@@ -1573,9 +1573,9 @@ export interface DiagnosticsEmbedderSelfTest {
 export interface DiagnosticsEmbedderRuntime {
   audioState?: "not-loaded" | "loading" | "ready" | "failed";
   audioRetryable?: boolean;
-  /** 要求／設定的裝置選項（`auto`／`cpu`／`dml`／`coreml`）。 */
+  /** 要求／設定的裝置選項（`cpu` 預設；另有 `auto`／`dml`／`coreml`／`webgpu`）。 */
   requestedDevice: string;
-  /** 目前使用的裝置（`cpu`／`dml`／`coreml`）；模型尚未載入時為計畫值。 */
+  /** 目前使用的裝置（`cpu`／`dml`／`coreml`／`webgpu`）；模型尚未載入時為計畫值。 */
   device: string;
   /** 模型是否已載入（true 代表 `device` 是實際使用的裝置）。 */
   loaded: boolean;
@@ -1583,7 +1583,11 @@ export interface DiagnosticsEmbedderRuntime {
   fallbackReason: { code: string; message: string } | null;
   /** 目前的批次視窗大小。 */
   batchSize: number;
-  /** 同一 session 是否只允許序列推論（DML／CoreML 為 true）。 */
+  /** 實際含 padding 的批次 token 預算；未提供表示沒有此裝置預算。 */
+  batchTokenBudget?: number;
+  /** WebGPU 的原生後端、模型載入及小型文字／圖片推論探測；與 CoreML selfTest 分開。 */
+  webgpuProbe?: { status: "pending" | "passed" | "failed"; reason?: string };
+  /** 同一 session 是否只允許序列推論（DML／CoreML／WebGPU 為 true）。 */
   serializedInference: boolean;
   /** DirectML adapter 索引（設定值，0＝預設顯示卡）；沒有 adapter 概念的實作為 `null`。 */
   dmlDeviceId: number | null;

@@ -306,7 +306,7 @@ function darwinEmbedder(options: { appVersion?: string; device?: "auto" | "corem
     cacheDir: CACHE_DIR,
     deviceDecisionPath: decisionPath,
     ...(options.appVersion === undefined ? {} : { appVersion: options.appVersion }),
-    ...(options.device === undefined ? {} : { device: options.device }),
+    device: options.device ?? "auto",
   });
   return { embedder, decisionPath };
 }
@@ -329,10 +329,10 @@ function restoreEnv(name: string, value: string | undefined): void {
 // ---------------------------------------------------------------------------
 
 describe("裝置選項解析（parseEmbedDeviceOption）", () => {
-  it("未設定、空字串或空白 → auto", () => {
-    expect(parseEmbedDeviceOption(undefined)).toBe("auto");
-    expect(parseEmbedDeviceOption("")).toBe("auto");
-    expect(parseEmbedDeviceOption("   ")).toBe("auto");
+  it("未設定、空字串或空白 → cpu", () => {
+    expect(parseEmbedDeviceOption(undefined)).toBe("cpu");
+    expect(parseEmbedDeviceOption("")).toBe("cpu");
+    expect(parseEmbedDeviceOption("   ")).toBe("cpu");
   });
 
   it("cpu／dml／coreml／auto 都接受（去空白、不分大小寫）", () => {
@@ -481,7 +481,7 @@ describe("退回原因訊息（summarizeFailure）", () => {
 
 describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", () => {
   it("auto 在 Windows：以 dml 載入（帶 dml EP），runtimeStatus 反映裝置與視窗", async () => {
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
 
     // 載入前：計畫裝置即可讀取。
     const before: EmbedderRuntimeStatus = embedder.runtimeStatus;
@@ -494,6 +494,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
       loaded: false,
       fallbackReason: null,
       batchSize: DML_BATCH_SIZE,
+      batchTokenBudget: 8192,
       serializedInference: true,
       dmlDeviceId: DEFAULT_DML_DEVICE_ID,
     });
@@ -525,7 +526,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
 
   it("dml 載入失敗：自動退回 cpu、記錄原因、嵌入照常完成（不中斷）", async () => {
     mocks.behavior.loadFailsOnDml = true;
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
 
     const vectors = await embedder.embedDocuments(documents(3));
 
@@ -549,7 +550,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
 
   it("dml 首次使用（推論）失敗：退回 cpu 並重試同一視窗", async () => {
     mocks.behavior.inferenceFailsOnDml = true;
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
 
     const vectors = await embedder.embedDocuments(documents(4));
 
@@ -564,7 +565,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
 
   it("取消（AbortError）不算裝置失敗：不退回、原樣拋出", async () => {
     mocks.behavior.inferenceAbortsOnDml = true;
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
 
     await expect(embedder.embedDocuments(documents(2))).rejects.toThrow("嵌入已取消（模擬）");
 
@@ -577,7 +578,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
   });
 
   it("已中止的 signal：在載入模型前就拋出，不算退回", async () => {
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
     const controller = new AbortController();
     controller.abort(new Error("索引已取消"));
 
@@ -653,7 +654,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
   });
 
   it("批次視窗依裝置：dml 32（32＋8）、cpu 16（16＋16＋8）", async () => {
-    const dml = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const dml = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
     const dmlVectors = await dml.embedDocuments(documents(40));
     expect(dmlVectors).toHaveLength(40);
     expect(mocks.windows).toEqual([32, 8]);
@@ -669,7 +670,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
 
   it("MNEMOSHELF_EMBED_DML_DEVICE_ID：指定獨顯時帶進 dml EP，且診斷欄位看得到", async () => {
     process.env[EMBED_DML_DEVICE_ID_ENV] = "1";
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
 
     // 載入前就能從 runtimeStatus 讀出設定值（診斷用）。
     expect(embedder.runtimeStatus.dmlDeviceId).toBe(1);
@@ -687,7 +688,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
   });
 
   it("MNEMOSHELF_EMBED_DML_DEVICE_ID：未設定時為 0，且預設值進 dml EP", async () => {
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
     await embedder.embedDocuments(documents(1));
     expect(embedder.runtimeStatus.dmlDeviceId).toBe(DEFAULT_DML_DEVICE_ID);
     expect(mocks.modelOptions[0]!.session_options).toEqual({
@@ -715,7 +716,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
   it("退回 CPU 後 dmlDeviceId 仍是設定值（診斷看得出原本要用的卡）", async () => {
     mocks.behavior.loadFailsOnDml = true;
     process.env[EMBED_DML_DEVICE_ID_ENV] = "2";
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
 
     await embedder.embedDocuments(documents(1));
 
@@ -739,7 +740,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
 
   it("dml 推論失敗若發生在查詢／探測路徑，也會退回 CPU 且不中斷", async () => {
     mocks.behavior.inferenceFailsOnDml = true;
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
 
     // 查詢路徑（embedQuery → embedText）：退回後仍回得出向量。
     const vector = await embedder.embedQuery("查詢文字");
@@ -757,7 +758,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
 
   it("退回後的重試會以 CPU 的視窗大小重新切窗（窗序列不含退回後的 32）", async () => {
     mocks.behavior.inferenceFailsOnDml = true;
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
 
     const vectors = await embedder.embedDocuments(documents(40));
 
@@ -781,7 +782,7 @@ describe("TransformersEmbedder 裝置選擇與自動退回（mock 模型）", ()
 describe("圖片解碼／輸入類失敗：不退回 CPU（mock 模型）", () => {
   it("dml 下的解碼失敗：不退回、以 EmbedderInputError 分類、core 認得", async () => {
     mocks.behavior.imageDecodeFails = true;
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
 
     const error = await embedder.embedImage({ bytes: Uint8Array.from([1, 2, 3]) }).then(
       () => null,
@@ -804,7 +805,7 @@ describe("圖片解碼／輸入類失敗：不退回 CPU（mock 模型）", () =
 
   it("對照組：dml 下的**推論**錯誤（圖片路徑）仍會退回 CPU 並重試", async () => {
     mocks.behavior.inferenceFailsOnDml = true;
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
 
     const vector = await embedder.embedImage({ bytes: Uint8Array.from([1, 2, 3]) });
 
@@ -834,7 +835,7 @@ describe("圖片解碼／輸入類失敗：不退回 CPU（mock 模型）", () =
 
   it("解碼階段被取消（AbortError）：原樣拋出、不算輸入錯誤、也不退回", async () => {
     mocks.behavior.imageDecodeAborts = true;
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
 
     const error = await embedder.embedImage({ bytes: Uint8Array.from([1, 2, 3]) }).then(
       () => null,
@@ -856,7 +857,7 @@ describe("圖片解碼／輸入類失敗：不退回 CPU（mock 模型）", () =
  */
 describe("serializedInference 的內部互斥（同一實例的推論不重疊）", () => {
   it("兩路併發 embedDocuments → maxInflight = 1，且先到先跑（FIFO）", async () => {
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
     const release = holdModel();
 
     const first = embedder.embedDocuments(documents(2));
@@ -879,7 +880,7 @@ describe("serializedInference 的內部互斥（同一實例的推論不重疊�
   });
 
   it("等待中被 abort → 直接拒絕、不執行，且不卡住後面的呼叫", async () => {
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
     const release = holdModel();
 
     const first = embedder.embedDocuments(documents(1));
@@ -907,7 +908,7 @@ describe("serializedInference 的內部互斥（同一實例的推論不重疊�
   });
 
   it("執行中的呼叫不受影響：它跑到一半才被 abort 的是等待者", async () => {
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
     const release = holdModel();
 
     // 執行中的這一路自帶 signal（但不 abort），等待者才是被 abort 的那一個。
@@ -945,7 +946,7 @@ describe("serializedInference 的內部互斥（同一實例的推論不重疊�
   });
 
   it("embedImage 也走同一把鎖（與 embedDocuments 不重疊）", async () => {
-    const embedder = new TransformersEmbedder({ platform: "win32", cacheDir: CACHE_DIR });
+    const embedder = new TransformersEmbedder({ platform: "win32", device: "auto", cacheDir: CACHE_DIR });
     const release = holdModel();
 
     const first = embedder.embedDocuments(documents(1));
@@ -1116,6 +1117,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
     // 需要「重新建構」才能讀到剛寫下的記錄（建構子同步讀快取）。
     const second = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1149,6 +1151,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1187,6 +1190,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1232,6 +1236,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1256,6 +1261,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1282,6 +1288,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1357,6 +1364,7 @@ describe("auto 在 macOS：CoreML 自我測試與決定快取（mock 模型）",
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1386,6 +1394,7 @@ describe("非 macOS／非 Windows 平台：不碰 CoreML，也不碰裝置決定
     const decisionPath = join(dir, "device-decision.json");
     const embedder = new TransformersEmbedder({
       platform: "linux",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
     });
@@ -1426,6 +1435,7 @@ describe("非 macOS／非 Windows 平台：不碰 CoreML，也不碰裝置決定
     const decisionPath = join(dir, "device-decision.json");
     const embedder = new TransformersEmbedder({
       platform: "win32",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
     });
@@ -1471,6 +1481,7 @@ describe("auto 在 macOS：載入期護欄與疑似崩潰的容忍", () => {
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1520,6 +1531,7 @@ describe("auto 在 macOS：載入期護欄與疑似崩潰的容忍", () => {
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1565,6 +1577,7 @@ describe("auto 在 macOS：載入期護欄與疑似崩潰的容忍", () => {
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1609,6 +1622,7 @@ describe("auto 在 macOS：載入期護欄與疑似崩潰的容忍", () => {
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1644,6 +1658,7 @@ describe("auto 在 macOS：載入期護欄與疑似崩潰的容忍", () => {
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1665,6 +1680,7 @@ describe("auto 在 macOS：載入期護欄與疑似崩潰的容忍", () => {
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1698,6 +1714,7 @@ describe("auto 在 macOS：載入期護欄與疑似崩潰的容忍", () => {
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: join(blocker, "device-decision.json"),
       appVersion: "1.0.0",
@@ -1732,6 +1749,7 @@ describe("auto 在 macOS：載入期護欄與疑似崩潰的容忍", () => {
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",
@@ -1785,6 +1803,7 @@ describe("auto 在 macOS：載入期護欄與疑似崩潰的容忍", () => {
 
     const embedder = new TransformersEmbedder({
       platform: "darwin",
+      device: "auto",
       cacheDir: CACHE_DIR,
       deviceDecisionPath: decisionPath,
       appVersion: "1.0.0",

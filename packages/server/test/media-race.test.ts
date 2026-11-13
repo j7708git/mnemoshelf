@@ -100,7 +100,8 @@ function patchFs(name: "open" | "stat" | "lstat", replacement: unknown): void {
 }
 
 async function makeFixture(options: { inside?: string; outside?: string } = {}): Promise<RaceFixture> {
-  const parent = await fs.mkdtemp(path.join(os.tmpdir(), "mnemoshelf-media-race-"));
+  // macOS 的 tmpdir 可經 symlink 進入；先固定真實父目錄，讓注入比對與產品 realpath 一致。
+  const parent = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "mnemoshelf-media-race-")));
   const rootDir = path.join(parent, "root");
   const insideDir = path.join(rootDir, "inside");
   const sourceDir = path.join(rootDir, "source");
