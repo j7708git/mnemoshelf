@@ -24,6 +24,7 @@ const CHANNELS = {
   settingsCopyMcpConfig: "mnemoshelf:settings:copy-mcp-config",
   agentGuideGetState: "mnemoshelf:agent-guide:get-state",
   agentGuideCopy: "mnemoshelf:agent-guide:copy",
+  folderPickerChoose: "mnemoshelf:folder-picker:choose",
   updaterGetState: "mnemoshelf:updater:get-state",
   updaterCheck: "mnemoshelf:updater:check",
   updaterDownload: "mnemoshelf:updater:download",
@@ -62,6 +63,9 @@ const api = {
     getState: () => ipcRenderer.invoke(CHANNELS.agentGuideGetState),
     // IPC 參數不信任型別：main 會再驗一次白名單；這裡只把非字串轉成空字串。
     copy: (kind: unknown) => ipcRenderer.invoke(CHANNELS.agentGuideCopy, typeof kind === "string" ? kind : ""),
+  },
+  folderPicker: {
+    chooseDirectory: () => ipcRenderer.invoke(CHANNELS.folderPickerChoose),
   },
   updater: {
     getState: () => ipcRenderer.invoke(CHANNELS.updaterGetState),

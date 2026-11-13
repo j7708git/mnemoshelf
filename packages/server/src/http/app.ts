@@ -84,7 +84,7 @@ import {
   type RootPreview,
   VIDEO_MAX_DURATION_SECONDS,
 } from "@mnemoshelf/core";
-import { LOOPBACK_HOST } from "../config.js";
+import { isLoopbackBindHost, LOOPBACK_HOST, type BrowseScope } from "../config.js";
 import type { EmbedderSchedulingStatus } from "../worker-embedder.js";
 import {
   FileTooLargeError,
@@ -112,6 +112,11 @@ import {
   type TextPreview,
 } from "./explorer.js";
 import { requireLocalHost, requireLoopback, requireToken } from "./auth.js";
+import {
+  browseDirectories,
+  summarizeAccessPolicy,
+  type BrowseAccessPolicy,
+} from "./folder-browser.js";
 import { buildMediaResponse, MediaSourceChangedError, sendStreamResult, type StreamRouteResult } from "./media.js";
 import { MediaSessions, MediaOriginError, requireMediaOrigin } from "./media-sessions.js";
 import { prepareUnifiedSearch, type SearchMode } from "../search.js";
@@ -202,7 +207,16 @@ const VIDEO_INDEX_REASONS: ReadonlySet<string> = new Set([
  * 只有這些前綴會進 API 路由（要 token）；其餘路徑才可能由靜態檔／SPA fallback 服務。
  * 這個分界必須與 `dispatch` 的 `switch (segments[0])` 一致。
  */
-export const API_PATH_PREFIXES: readonly string[] = ["health", "roots", "search", "memories", "memory-policy", "memory-sources", "diagnostics"];
+export const API_PATH_PREFIXES: readonly string[] = [
+  "health",
+  "fs",
+  "roots",
+  "search",
+  "memories",
+  "memory-policy",
+  "memory-sources",
+  "diagnostics",
+];
 
 /** 靜態檔回應的 CSP（UI 與 API 同源；`<img>` 走 blob/data，故放行 blob: 與 data:）。 */
 export const STATIC_CSP = [
@@ -671,6 +685,17 @@ export interface RestAppDeps {
    * `root.videoMaxFileBytes ?? 這個預設`，preview、indexer 有界快照與播放端點都用生效值。
    */
   videoMaxFileBytes?: number;
+  /**
+   * 存取與資料夾瀏覽策略（預設全部採用最嚴格設定：loopback + 必帶 token + homeDir 範圍 + 黑名單啟用）。
+   * 由 `createServer` 依使用者設定注入，不在 REST 層寫死。
+   */
+  accessPolicy?: {
+    host?: string;
+    allowAnonymous?: boolean;
+    browseScope?: BrowseScope;
+    browseRoots?: readonly string[];
+    browseRespectBlacklist?: boolean;
+  };
 }
 
 export interface RestApp {
@@ -1277,6 +1302,17 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   });
 
   const homeDir = deps.homeDir ?? homedir();
+  const bindHost = deps.accessPolicy?.host ?? LOOPBACK_HOST;
+  const allowAnonymous = deps.accessPolicy?.allowAnonymous ?? false;
+  const browseScope: BrowseScope = deps.accessPolicy?.browseScope ?? "home";
+  const browseRoots = deps.accessPolicy?.browseRoots ?? [];
+  const browseRespectBlacklist = deps.accessPolicy?.browseRespectBlacklist ?? true;
+  const accessPolicySummary: BrowseAccessPolicy = summarizeAccessPolicy({
+    host: bindHost,
+    allowAnonymous,
+    browseScope,
+    browseRespectBlacklist,
+  });
 
   // ---------------------------------------------------------------------------
   // 影片能力（decoder＋embedder）：三種狀態一次算清楚，供 preview／index／diagnostics 共用。
@@ -2572,22 +2608,45 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const method = (request.method ?? "GET").toUpperCase();
 
     if (method === "GET" && segments.length === 1 && segments[0] === "health") {
-      // 免 token；只放服務身分、版本與 build marker，沒有任何機密。
+      // 免 token；只放服務身分、版本、build marker 與不含敏感資訊的存取策略摘要。
       sendJson(response, 200, {
         status: "ok",
         service: SERVICE_NAME,
         appVersion: APP_VERSION,
         build: BUILD_COMMIT,
+        authRequired: !allowAnonymous,
+        accessPolicy: accessPolicySummary,
       });
       return;
     }
 
-    // 僅精確的播放 session GET/HEAD 以同源 cookie 授權，其他 API 仍必須帶 Bearer。
+    // 僅精確的播放 session GET/HEAD 以同源 cookie 授權（或使用者明確放寬匿名存取），其他 API 仍必須帶 Bearer。
     const sessionRead = segments.length === 4 && segments[0] === "roots" && segments[2] === "media-sessions" && (method === "GET" || method === "HEAD");
-    if (!sessionRead) requireToken(request, deps.token);
+    if (!sessionRead && !allowAnonymous) requireToken(request, deps.token);
 
     let result: RouteResult;
     switch (segments[0]) {
+      case "fs": {
+        if (segments.length === 2 && segments[1] === "browse") {
+          if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
+          const body = await browseDirectories(url.searchParams.get("path"), {
+            homeDir,
+            host: bindHost,
+            allowAnonymous,
+            browseScope,
+            browseRoots,
+            browseRespectBlacklist,
+          });
+          result = { status: 200, body };
+          break;
+        }
+        if (segments.length === 2 && segments[1] === "policy") {
+          if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
+          result = { status: 200, body: { policy: accessPolicySummary } };
+          break;
+        }
+        throw new NotFoundError("路徑");
+      }
       case "roots":
         result = await routeRoots(request, method, segments, url);
         break;
@@ -2652,8 +2711,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const task = (async (): Promise<void> => {
       let memoryRequest = false;
       try {
-        requireLoopback(request);
-        requireLocalHost(request);
+        if (isLoopbackBindHost(bindHost)) {
+          requireLoopback(request);
+          requireLocalHost(request);
+        }
         const { url, segments } = parseRequestTarget(request);
         if (isApiPath(segments)) {
           memoryRequest = ["memories", "memory-policy", "memory-sources", "search"].includes(segments[0]!);

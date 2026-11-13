@@ -105,16 +105,16 @@ function RecallResults({ result }: { result: MemoryRecallResult }) {
     <div className="space-y-2">
       {trustNotice}
       {degradedNotice}
-      <ul className="space-y-2">
+        <ul className="space-y-2">
         {result.hits.map((hit) => (
-          <li key={hit.id} className="rounded-md border border-line bg-white px-3 py-2">
+          <li key={hit.id} className="rounded-xl border border-line bg-surface px-3 py-2">
             <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
-              <span className="rounded bg-surface px-1.5 py-0.5">
+              <span className="rounded bg-raised px-1.5 py-0.5">
                 {memoryOriginLabel(hit)}{hit.role == null ? "" : `・${memorySourceRoleLabel(hit.role)}`}
                 {hit.sourceId == null ? `・${MEMORY_KIND_LABEL[hit.kind]}` : ""}
               </span>
-              <span className="rounded bg-surface px-1.5 py-0.5">範圍 {MEMORY_SCOPE_LABEL[hit.scope]}</span>
-              <span className="rounded bg-surface px-1.5 py-0.5">專案 {hit.project ?? "全域"}</span>
+              <span className="rounded bg-raised px-1.5 py-0.5">範圍 {MEMORY_SCOPE_LABEL[hit.scope]}</span>
+              <span className="rounded bg-raised px-1.5 py-0.5">專案 {hit.project ?? "全域"}</span>
               <span>來源 {hit.source === "semantic" ? "語意" : "關鍵字"}</span>
               <span>分數 {hit.score.toFixed(3)}</span>
               <span>#{hit.id}</span>
@@ -528,13 +528,13 @@ export function MemoriesPanel() {
   if (state.kind === "error") {
     return (
       <div className="space-y-3">
-        <p role="alert" className="rounded-lg border border-line bg-white px-4 py-3 text-sm text-red-600">
+        <p role="alert" className="rounded-xl border border-danger/30 bg-danger-bg px-4 py-3 text-sm text-danger">
           {state.message}
         </p>
         <button
           type="button"
           onClick={() => void load()}
-          className="rounded-md border border-line px-3 py-1.5 text-sm text-ink"
+          className="rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-ink hover:bg-raised"
         >
           重試
         </button>
@@ -595,7 +595,7 @@ export function MemoriesPanel() {
             type="button"
             disabled={backupBusy}
             onClick={() => void exportBackup()}
-            className="rounded-md border border-line px-3 py-1.5 text-sm text-ink disabled:opacity-40"
+            className="rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-ink hover:bg-raised disabled:opacity-40"
           >
             匯出備份
           </button>
@@ -603,7 +603,7 @@ export function MemoriesPanel() {
             type="button"
             disabled={backupBusy}
             onClick={chooseImportFile}
-            className="rounded-md border border-line px-3 py-1.5 text-sm text-ink disabled:opacity-40"
+            className="rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-ink hover:bg-raised disabled:opacity-40"
           >
             {backupBusy ? "處理中…" : "匯入備份"}
           </button>
@@ -611,7 +611,7 @@ export function MemoriesPanel() {
             type="button"
             disabled={backupBusy}
             onClick={() => void load()}
-            className="rounded-md border border-line px-3 py-1.5 text-sm text-ink disabled:opacity-40"
+            className="rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-ink hover:bg-raised disabled:opacity-40"
           >
             重新載入
           </button>
@@ -619,7 +619,7 @@ export function MemoriesPanel() {
       </div>
 
       {importPreview !== null && (
-        <div className="space-y-2 rounded-lg border border-line bg-white/70 px-4 py-3">
+        <div className="space-y-2 rounded-[20px] border border-line bg-surface px-4 py-3">
           <div className="flex flex-wrap items-baseline gap-2">
             <h3 className="text-sm font-medium text-ink">匯入預覽（尚未寫入）</h3>
             <span className="break-all text-[11px] text-muted">{importPreview.fileName}</span>
@@ -631,7 +631,7 @@ export function MemoriesPanel() {
           </p>
           {importPreview.result.invalid.length > 0 ? (
             <div className="space-y-1">
-              <p className="text-xs text-red-600">
+              <p className="text-xs text-danger">
                 有 {importPreview.result.invalid.length} 行不合法（整批不會寫入；最多顯示前 5 筆）：
               </p>
               <ul className="space-y-0.5 text-[11px] text-muted">
@@ -653,7 +653,7 @@ export function MemoriesPanel() {
                 type="button"
                 disabled={backupBusy}
                 onClick={() => void confirmImport()}
-                className="rounded-md bg-ink px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
+                className="rounded-lg bg-brand px-3 py-1.5 text-sm font-medium text-on-brand disabled:opacity-40"
               >
                 {backupBusy ? "匯入中…" : "確認匯入"}
               </button>
@@ -667,7 +667,7 @@ export function MemoriesPanel() {
                 setActionError(null);
                 setMessage(null);
               }}
-              className="rounded-md border border-line px-3 py-1.5 text-sm text-ink disabled:opacity-40"
+              className="rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-ink hover:bg-raised disabled:opacity-40"
             >
               取消
             </button>
@@ -675,7 +675,7 @@ export function MemoriesPanel() {
         </div>
       )}
 
-      <div className="space-y-2 rounded-lg border border-line bg-white/70 px-4 py-3">
+      <div className="space-y-2 rounded-[20px] border border-line bg-surface px-4 py-3">
         <div className="flex flex-wrap items-baseline gap-2">
           <h3 className="text-sm font-medium text-ink">搜尋記憶</h3>
           <span className="text-[11px] text-muted">
@@ -693,7 +693,7 @@ export function MemoriesPanel() {
             aria-label="搜尋記憶"
             placeholder="用自然語言找記憶…"
             maxLength={2000}
-            className="min-w-[14rem] flex-1 rounded-md border border-line bg-white px-3 py-1.5 text-sm text-ink outline-none focus:border-ink"
+            className="min-w-[14rem] flex-1 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-ink outline-none focus:border-brand"
           />
           <label className="flex items-center gap-1.5 text-xs text-muted">
             <input
@@ -707,13 +707,13 @@ export function MemoriesPanel() {
             type="button"
             disabled={recallState.kind === "loading"}
             onClick={() => void runRecall()}
-            className="rounded-md bg-ink px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
+            className="rounded-lg bg-brand px-3 py-1.5 text-sm font-medium text-on-brand disabled:opacity-40"
           >
             {recallState.kind === "loading" ? "搜尋中…" : "搜尋"}
           </button>
         </div>
         {recallState.kind === "error" && (
-          <p role="alert" className="text-xs text-red-600">
+          <p role="alert" className="text-xs text-danger">
             {recallState.message}
           </p>
         )}
@@ -728,7 +728,7 @@ export function MemoriesPanel() {
               aria-label="依專案篩選"
               value={projectFilter}
               onChange={(event) => setProjectFilter(event.target.value)}
-              className="rounded-md border border-line bg-white px-2 py-1 text-xs text-ink"
+              className="rounded-lg border border-line bg-surface px-2 py-1 text-xs text-ink"
             >
               <option value={ALL_PROJECTS}>全部專案</option>
               {availableProjects.map((project) => (
@@ -744,7 +744,7 @@ export function MemoriesPanel() {
               aria-label="依來源篩選"
               value={originFilter}
               onChange={(event) => setOriginFilter(event.target.value as OriginFilter)}
-              className="rounded-md border border-line bg-white px-2 py-1 text-xs text-ink"
+              className="rounded-lg border border-line bg-surface px-2 py-1 text-xs text-ink"
             >
               <option value="all">全部</option>
               <option value="auto">只看自動寫入</option>
@@ -756,7 +756,7 @@ export function MemoriesPanel() {
               aria-label="依範圍篩選"
               value={scopeFilter}
               onChange={(event) => setScopeFilter(event.target.value as ScopeFilter)}
-              className="rounded-md border border-line bg-white px-2 py-1 text-xs text-ink"
+              className="rounded-lg border border-line bg-surface px-2 py-1 text-xs text-ink"
             >
               <option value="all">全部範圍</option>
               <option value="global">全域</option>
@@ -781,20 +781,20 @@ export function MemoriesPanel() {
       )}
 
       {message !== null && (
-        <p className="rounded-lg border border-line bg-white px-4 py-2 text-sm text-ink">{message}</p>
+        <p className="rounded-xl border border-line bg-surface px-4 py-2 text-sm text-ink">{message}</p>
       )}
       {actionError !== null && (
-        <p role="alert" className="rounded-lg border border-line bg-white px-4 py-2 text-sm text-red-600">
+        <p role="alert" className="rounded-xl border border-danger/30 bg-danger-bg px-4 py-2 text-sm text-danger">
           {actionError}
         </p>
       )}
 
       {state.memories.length === 0 ? (
-        <div className="flex h-[40vh] items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center text-sm text-muted">
+        <div className="flex h-[40vh] items-center justify-center rounded-[20px] border border-dashed border-line bg-surface/70 px-6 text-center text-sm text-muted">
           尚無記憶。AI agent 透過 remember 寫入的共享記憶會出現在這裡。
         </div>
       ) : filteredMemories.length === 0 ? (
-        <div className="flex h-[30vh] items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center text-sm text-muted">
+        <div className="flex h-[30vh] items-center justify-center rounded-[20px] border border-dashed border-line bg-surface/70 px-6 text-center text-sm text-muted">
           沒有符合目前篩選條件的記憶。
         </div>
       ) : (
@@ -807,25 +807,25 @@ export function MemoriesPanel() {
             return (
               <li
                 key={memory.id}
-                className={`rounded-lg border px-4 py-3 ${
-                  memory.pinned ? "border-ink bg-white" : "border-line bg-white/70"
+                className={`rounded-[20px] border px-4 py-3 ${
+                  memory.pinned ? "border-brand bg-surface" : "border-line bg-surface"
                 }`}
               >
                 <div className="flex flex-wrap items-center gap-2">
                   {memory.pinned && (
-                    <span className="rounded bg-ink px-1.5 py-0.5 text-[11px] font-medium text-white">已釘選</span>
+                    <span className="rounded bg-brand px-1.5 py-0.5 text-[11px] font-medium text-on-brand">已釘選</span>
                   )}
-                  <span className="rounded bg-surface px-1.5 py-0.5 text-[11px] text-muted">
+                  <span className="rounded bg-raised px-1.5 py-0.5 text-[11px] text-muted">
                     {memoryOriginLabel(memory)}{raw ? "" : `・${MEMORY_KIND_LABEL[memory.kind]}`}
                   </span>
-                  <span className="rounded bg-surface px-1.5 py-0.5 text-[11px] text-muted">
+                  <span className="rounded bg-raised px-1.5 py-0.5 text-[11px] text-muted">
                     範圍 {MEMORY_SCOPE_LABEL[memory.scope]}
                   </span>
-                  <span className="rounded bg-surface px-1.5 py-0.5 text-[11px] text-muted">
+                  <span className="rounded bg-raised px-1.5 py-0.5 text-[11px] text-muted">
                     專案 {memory.project ?? "全域"}
                   </span>
                   <span
-                    className="max-w-full break-all rounded bg-surface px-1.5 py-0.5 text-[11px] text-muted"
+                    className="max-w-full break-all rounded bg-raised px-1.5 py-0.5 text-[11px] text-muted"
                     title={memory.agent}
                   >
                     寫入者 {memory.agent}
@@ -833,7 +833,7 @@ export function MemoriesPanel() {
                   </span>
                   {memory.sourceSession !== null && (
                     <span
-                      className="rounded bg-surface px-1.5 py-0.5 text-[11px] text-muted"
+                      className="rounded bg-raised px-1.5 py-0.5 text-[11px] text-muted"
                       title={memory.sourceSession}
                     >
                       session {shortenSourceId(memory.sourceSession)}
@@ -850,7 +850,7 @@ export function MemoriesPanel() {
                       onChange={(event) => setDraft(event.target.value)}
                       rows={3}
                       aria-label="編輯記憶內容"
-                      className="w-full rounded-md border border-line bg-white px-3 py-2 text-sm text-ink outline-none focus:border-ink"
+                      className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink outline-none focus:border-brand"
                     />
                     <p className="text-[11px] text-muted">
                       儲存會建立新版本（agent／種類／範圍沿用）並把這一版標記為已取代。
@@ -860,7 +860,7 @@ export function MemoriesPanel() {
                         type="button"
                         disabled={busy}
                         onClick={() => void saveEdit(memory)}
-                        className="rounded-md bg-ink px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
+                        className="rounded-lg bg-brand px-3 py-1.5 text-sm font-medium text-on-brand disabled:opacity-40"
                       >
                         儲存新版本
                       </button>
@@ -930,7 +930,7 @@ export function MemoriesPanel() {
                           setShareTargets((previous) => ({ ...previous, [memory.id]: event.target.value }))
                         }
                         disabled={busy || availableProjects.length === 0}
-                        className="rounded-md border border-line bg-white px-2 py-1 text-xs text-ink disabled:opacity-40"
+                        className="rounded-lg border border-line bg-surface px-2 py-1 text-xs text-ink disabled:opacity-40"
                       >
                         {availableProjects.length === 0 ? (
                           <option value="">沒有可選專案</option>
@@ -956,7 +956,7 @@ export function MemoriesPanel() {
                     type="button"
                     disabled={busy}
                     onClick={() => remove(memory)}
-                    className="rounded-md border border-line px-2.5 py-1 text-xs text-muted hover:text-red-600 disabled:opacity-40"
+                    className="rounded-lg border border-line px-2.5 py-1 text-xs text-muted hover:text-danger disabled:opacity-40"
                   >
                     刪除
                   </button>
@@ -964,7 +964,7 @@ export function MemoriesPanel() {
                     type="button"
                     disabled={busy}
                     onClick={() => purge(memory)}
-                    className="rounded-md border border-line px-2.5 py-1 text-xs text-red-600 hover:bg-red-50 disabled:opacity-40"
+                    className="rounded-lg border border-line px-2.5 py-1 text-xs text-danger hover:bg-danger-bg disabled:opacity-40"
                     title="真的從資料庫刪除（無法復原；不做安全抹除）"
                   >
                     永久刪除
@@ -975,7 +975,7 @@ export function MemoriesPanel() {
                   <RawMemorySourcePanel id={memory.sourceId} agent={memory.agent} scope={memory.scope} project={memory.project} />
                 )}
                 {showSource && !raw && (
-                  <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-md bg-surface px-3 py-2 text-xs text-muted">
+                  <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-lg bg-raised px-3 py-2 text-xs text-muted">
                     <dt>寫入者</dt>
                     <dd className="break-all text-ink">
                       {memory.agent}

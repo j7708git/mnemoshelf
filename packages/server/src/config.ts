@@ -44,8 +44,22 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { MissingMcpConfigError, MissingTokenError, ValidationError } from "./errors.js";
 
-/** 服務綁定的位址：只綁 loopback，永遠不可設定成 0.0.0.0。 */
+/** 預設綁定的位址：loopback（可由使用者透過 `MNEMOSHELF_HOST` 覆寫並承擔對外風險）。 */
 export const LOOPBACK_HOST = "127.0.0.1";
+
+/** 瀏覽資料夾的預設範圍：`home` 限制在家目錄、`custom` 限自訂目錄、`unrestricted` 不限範圍。 */
+export type BrowseScope = "home" | "custom" | "unrestricted";
+
+/** 判斷監聽位址是否屬於本機 loopback。 */
+export function isLoopbackBindHost(host: string): boolean {
+  const normalized = host.trim().toLowerCase();
+  return (
+    normalized === "127.0.0.1" ||
+    normalized === "::1" ||
+    normalized === "localhost" ||
+    normalized.startsWith("127.")
+  );
+}
 
 /**
  * 影片單檔大小上限的預設值（bytes；512 MiB）。
@@ -144,6 +158,16 @@ export interface ServerConfig {
    * 10 MiB 不套用影片。per-root 持久化與 UI 入口屬 C2，本輪只有行程層預設值。
    */
   videoMaxFileBytes: number;
+  /** 監聽位址（`MNEMOSHELF_HOST`，預設 `127.0.0.1`）。非 loopback 會放寬連線來源檢查，風險由使用者承擔。 */
+  host: string;
+  /** 是否允許匿名免 token 存取（`MNEMOSHELF_ALLOW_ANONYMOUS=on|off`，預設 `off`）。 */
+  allowAnonymous: boolean;
+  /** 瀏覽資料夾端點的範圍（`MNEMOSHELF_BROWSE_SCOPE=home|custom|unrestricted`，預設 `home`）。 */
+  browseScope: BrowseScope;
+  /** `browseScope === "custom"` 時允許瀏覽的根目錄清單（`MNEMOSHELF_BROWSE_ROOTS`，以 `path.delimiter` 分隔）。 */
+  browseRoots: string[];
+  /** 瀏覽資料夾是否套用敏感路徑黑名單（`MNEMOSHELF_BROWSE_RESPECT_BLACKLIST=on|off`，預設 `on`）。 */
+  browseRespectBlacklist: boolean;
 }
 
 /**
@@ -226,10 +250,53 @@ export function resolveVideoMaxFileBytes(env: NodeJS.ProcessEnv): number {
   return parsed;
 }
 
-/** 從環境變數讀出設定；缺少 token 時丟 `MissingTokenError`。 */
+function parseOnOff(env: NodeJS.ProcessEnv, key: string, defaultValue: boolean): boolean {
+  const setting = env[key];
+  if (setting === undefined || setting.trim() === "") return defaultValue;
+  const normalized = setting.trim().toLowerCase();
+  if (normalized !== "on" && normalized !== "off") {
+    throw new ValidationError(key, "必須是 on 或 off");
+  }
+  return normalized === "on";
+}
+
+/** 從環境變數讀出設定；非匿名模式下缺少 token 時丟 `MissingTokenError`。 */
 export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
-  const token = env.MNEMOSHELF_TOKEN;
-  if (token === undefined || token.trim() === "") throw new MissingTokenError();
+  const allowAnonymous = parseOnOff(env, "MNEMOSHELF_ALLOW_ANONYMOUS", false);
+  const rawToken = env.MNEMOSHELF_TOKEN;
+  const token = rawToken !== undefined && rawToken.trim() !== "" ? rawToken : "";
+  if (!allowAnonymous && token === "") throw new MissingTokenError();
+
+  const hostSetting = env.MNEMOSHELF_HOST;
+  const host = hostSetting !== undefined && hostSetting.trim() !== "" ? hostSetting.trim() : LOOPBACK_HOST;
+  if (/\s/.test(host)) {
+    throw new ValidationError("MNEMOSHELF_HOST", "不得包含空白字元");
+  }
+
+  const scopeSetting = env.MNEMOSHELF_BROWSE_SCOPE;
+  let browseScope: BrowseScope = "home";
+  if (scopeSetting !== undefined && scopeSetting.trim() !== "") {
+    const normalized = scopeSetting.trim().toLowerCase();
+    if (normalized !== "home" && normalized !== "custom" && normalized !== "unrestricted") {
+      throw new ValidationError("MNEMOSHELF_BROWSE_SCOPE", "必須是 home、custom 或 unrestricted");
+    }
+    browseScope = normalized;
+  }
+
+  const browseRootsSetting = env.MNEMOSHELF_BROWSE_ROOTS;
+  const browseRoots =
+    browseRootsSetting !== undefined && browseRootsSetting.trim() !== ""
+      ? browseRootsSetting
+          .split(path.delimiter)
+          .map((item) => item.trim())
+          .filter((item) => item !== "")
+          .map((item) => path.resolve(item))
+      : [];
+  if (browseScope === "custom" && browseRoots.length === 0) {
+    throw new ValidationError("MNEMOSHELF_BROWSE_ROOTS", "當 MNEMOSHELF_BROWSE_SCOPE=custom 時必須至少指定一個目錄");
+  }
+
+  const browseRespectBlacklist = parseOnOff(env, "MNEMOSHELF_BROWSE_RESPECT_BLACKLIST", true);
 
   const dataDirSetting = env.MNEMOSHELF_DATA_DIR;
   const dataDir =
@@ -312,6 +379,11 @@ export function loadServerConfig(env: NodeJS.ProcessEnv = process.env): ServerCo
     runtimeFile,
     mediaDecoder,
     videoMaxFileBytes,
+    host,
+    allowAnonymous,
+    browseScope,
+    browseRoots,
+    browseRespectBlacklist,
   };
 }
 

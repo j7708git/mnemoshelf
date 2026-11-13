@@ -1,11 +1,125 @@
 @import "tailwindcss";
 
-/* design tokens：Tailwind v4 的 CSS-first 設定（此卡只做骨架，尚未做 dark/light 雙主題）。 */
-@theme {
-  --color-surface: oklch(98% 0.004 250);
-  --color-ink: oklch(24% 0.02 260);
-  --color-muted: oklch(52% 0.02 260);
-  --color-line: oklch(88% 0.01 260);
+/*
+ * A+C 暖紙感與森林綠雙主題 token：
+ * 依 modern-web-guidance（dark-mode）採用 `color-scheme: light dark` 與 CSS `light-dark()`，
+ * 讓瀏覽器原生控制項（捲軸、checkbox、dialog backdrop）與介面色票同步切換。
+ */
+:root {
+  color-scheme: light dark;
+
+  --theme-bg-light: oklch(96.5% 0.015 85);
+  --theme-bg-dark: oklch(19% 0.012 70);
+  --theme-surface-light: oklch(99% 0.008 85);
+  --theme-surface-dark: oklch(24% 0.014 70);
+  --theme-raised-light: oklch(93% 0.02 85);
+  --theme-raised-dark: oklch(29% 0.016 70);
+  --theme-ink-light: oklch(27% 0.03 60);
+  --theme-ink-dark: oklch(94% 0.012 85);
+  --theme-muted-light: oklch(52% 0.03 70);
+  --theme-muted-dark: oklch(72% 0.02 80);
+  --theme-line-light: oklch(88% 0.02 80);
+  --theme-line-dark: oklch(34% 0.015 70);
+  --theme-brand-light: oklch(48% 0.1 160);
+  --theme-brand-dark: oklch(76% 0.13 160);
+  --theme-on-brand-light: #ffffff;
+  --theme-on-brand-dark: oklch(20% 0.04 160);
+  --theme-tint-light: oklch(93% 0.04 150);
+  --theme-tint-dark: oklch(31% 0.05 160);
+
+  --theme-danger-light: oklch(50% 0.19 25);
+  --theme-danger-dark: oklch(76% 0.16 25);
+  --theme-danger-bg-light: oklch(96% 0.025 25);
+  --theme-danger-bg-dark: oklch(27% 0.045 25);
+  --theme-danger-line-light: oklch(84% 0.08 25);
+  --theme-danger-line-dark: oklch(48% 0.09 25);
+
+  --theme-warn-light: oklch(48% 0.13 65);
+  --theme-warn-dark: oklch(82% 0.12 75);
+  --theme-warn-bg-light: oklch(95% 0.035 80);
+  --theme-warn-bg-dark: oklch(28% 0.045 70);
+  --theme-warn-line-light: oklch(83% 0.085 75);
+  --theme-warn-line-dark: oklch(48% 0.09 75);
+
+  --theme-bg: light-dark(var(--theme-bg-light), var(--theme-bg-dark));
+  --theme-surface: light-dark(var(--theme-surface-light), var(--theme-surface-dark));
+  --theme-raised: light-dark(var(--theme-raised-light), var(--theme-raised-dark));
+  --theme-ink: light-dark(var(--theme-ink-light), var(--theme-ink-dark));
+  --theme-muted: light-dark(var(--theme-muted-light), var(--theme-muted-dark));
+  --theme-line: light-dark(var(--theme-line-light), var(--theme-line-dark));
+  --theme-brand: light-dark(var(--theme-brand-light), var(--theme-brand-dark));
+  --theme-on-brand: light-dark(var(--theme-on-brand-light), var(--theme-on-brand-dark));
+  --theme-tint: light-dark(var(--theme-tint-light), var(--theme-tint-dark));
+  --theme-danger: light-dark(var(--theme-danger-light), var(--theme-danger-dark));
+  --theme-danger-bg: light-dark(var(--theme-danger-bg-light), var(--theme-danger-bg-dark));
+  --theme-danger-line: light-dark(var(--theme-danger-line-light), var(--theme-danger-line-dark));
+  --theme-warn: light-dark(var(--theme-warn-light), var(--theme-warn-dark));
+  --theme-warn-bg: light-dark(var(--theme-warn-bg-light), var(--theme-warn-bg-dark));
+  --theme-warn-line: light-dark(var(--theme-warn-line-light), var(--theme-warn-line-dark));
+
+  accent-color: var(--theme-brand);
+}
+
+/* 舊版瀏覽器若尚未支援 light-dark()，以 prefers-color-scheme fallback 保底。 */
+@supports not (color: light-dark(red, blue)) {
+  :root {
+    --theme-bg: var(--theme-bg-light);
+    --theme-surface: var(--theme-surface-light);
+    --theme-raised: var(--theme-raised-light);
+    --theme-ink: var(--theme-ink-light);
+    --theme-muted: var(--theme-muted-light);
+    --theme-line: var(--theme-line-light);
+    --theme-brand: var(--theme-brand-light);
+    --theme-on-brand: var(--theme-on-brand-light);
+    --theme-tint: var(--theme-tint-light);
+    --theme-danger: var(--theme-danger-light);
+    --theme-danger-bg: var(--theme-danger-bg-light);
+    --theme-danger-line: var(--theme-danger-line-light);
+    --theme-warn: var(--theme-warn-light);
+    --theme-warn-bg: var(--theme-warn-bg-light);
+    --theme-warn-line: var(--theme-warn-line-light);
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --theme-bg: var(--theme-bg-dark);
+      --theme-surface: var(--theme-surface-dark);
+      --theme-raised: var(--theme-raised-dark);
+      --theme-ink: var(--theme-ink-dark);
+      --theme-muted: var(--theme-muted-dark);
+      --theme-line: var(--theme-line-dark);
+      --theme-brand: var(--theme-brand-dark);
+      --theme-on-brand: var(--theme-on-brand-dark);
+      --theme-tint: var(--theme-tint-dark);
+      --theme-danger: var(--theme-danger-dark);
+      --theme-danger-bg: var(--theme-danger-bg-dark);
+      --theme-danger-line: var(--theme-danger-line-dark);
+      --theme-warn: var(--theme-warn-dark);
+      --theme-warn-bg: var(--theme-warn-bg-dark);
+      --theme-warn-line: var(--theme-warn-line-dark);
+    }
+  }
+}
+
+@theme inline {
+  --color-bg: var(--theme-bg);
+  --color-surface: var(--theme-surface);
+  --color-raised: var(--theme-raised);
+  --color-ink: var(--theme-ink);
+  --color-muted: var(--theme-muted);
+  --color-line: var(--theme-line);
+  --color-brand: var(--theme-brand);
+  --color-on-brand: var(--theme-on-brand);
+  --color-tint: var(--theme-tint);
+  --color-danger: var(--theme-danger);
+  --color-danger-bg: var(--theme-danger-bg);
+  --color-danger-line: var(--theme-danger-line);
+  --color-warn: var(--theme-warn);
+  --color-warn-bg: var(--theme-warn-bg);
+  --color-warn-line: var(--theme-warn-line);
+
+  --font-serif: "Songti TC", "Noto Serif TC", Georgia, serif;
+  --radius-card: 20px;
 }
 
 html,
@@ -16,6 +130,55 @@ body,
 
 body {
   margin: 0;
+  background-color: var(--theme-bg);
+  color: var(--theme-ink);
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang TC", "Noto Sans TC", sans-serif;
+}
+
+/*
+ * 原生 <dialog>（見 modern-web-guidance dialog 指南）：
+ * - 不無條件設 display，讓關閉狀態由瀏覽器 UA stylesheet 隱藏。
+ * - modal 狀態加 overscroll-behavior: contain，避免觸控／滾輪穿透背景頁面。
+ */
+dialog.mnemo-dialog {
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--theme-line);
+  border-radius: 20px;
+  background-color: var(--theme-surface);
+  color: var(--theme-ink);
+  box-shadow: 0 24px 60px oklch(15% 0.02 60 / 0.28);
+  max-width: min(44rem, calc(100vw - 2rem));
+  max-height: min(85dvh, 42rem);
+}
+
+dialog.mnemo-dialog-compact {
+  max-width: min(28rem, calc(100vw - 2rem));
+}
+
+dialog.mnemo-dialog:modal {
+  overscroll-behavior: contain;
+}
+
+dialog.mnemo-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+dialog.mnemo-dialog::backdrop {
+  background-color: oklch(18% 0.015 70 / 0.45);
+  overflow: hidden;
+  overscroll-behavior: contain;
+}
+
+/* 一般焦點可見度（keyboard focus-visible） */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+select:focus-visible,
+summary:focus-visible {
+  outline: 2px solid var(--theme-brand);
+  outline-offset: 2px;
 }
 
 /*

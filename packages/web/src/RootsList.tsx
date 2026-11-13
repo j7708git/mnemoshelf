@@ -156,24 +156,24 @@ export function RootsList({
   };
   if (roots.length === 0) {
     return (
-      <div className="rounded-lg border border-dashed border-line bg-white/60 px-4 py-8 text-center">
+      <div className="rounded-[16px] border border-dashed border-line bg-surface/70 px-4 py-8 text-center">
         <p className="text-sm font-medium text-ink">尚未加入任何資料夾</p>
-        <p className="mt-2 text-xs text-muted">按「加入」選擇一個資料夾，加入後會先顯示統計。</p>
+        <p className="mt-2 text-xs text-muted">按「+ 加入」選擇一個資料夾，加入後會先顯示統計。</p>
       </div>
     );
   }
 
   return (
     <>
-      <ul className="space-y-2">
+      <ul className="space-y-2.5">
         {roots.map((serverRoot) => {
           const root = viewRoot(serverRoot);
           const selected = root.id === selectedRootId;
           return (
             <li key={root.id}>
               <div
-                className={`rounded-lg border px-3 py-2 ${
-                  selected ? "border-ink bg-white" : "border-line bg-white/70"
+                className={`rounded-[16px] border px-3.5 py-2.5 transition ${
+                  selected ? "border-brand bg-tint/45 shadow-xs" : "border-line bg-surface/85 hover:bg-surface"
                 }`}
               >
                 <div className="flex items-baseline justify-between gap-2">
@@ -184,13 +184,13 @@ export function RootsList({
                     className="min-w-0 flex-1 text-left"
                     title={root.path}
                   >
-                    <span className="block truncate text-sm font-medium text-ink">{basename(root.path)}</span>
+                    <span className="block truncate text-sm font-semibold text-ink">{basename(root.path)}</span>
                     <span className="mt-0.5 block break-all font-mono text-xs text-muted">{root.path}</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => onRemove(root)}
-                    className="shrink-0 rounded-md border border-line px-2 py-0.5 text-xs text-muted hover:text-red-600"
+                    className="shrink-0 rounded-lg border border-line bg-surface px-2 py-0.5 text-xs text-muted hover:text-danger"
                   >
                     移除
                   </button>
@@ -283,7 +283,7 @@ export function RootsList({
         })}
       </ul>
       {actionError !== null && (
-        <p role="alert" className="mt-2 text-xs text-red-600">
+        <p role="alert" className="mt-2 text-xs text-danger">
           {actionError}
         </p>
       )}
@@ -351,13 +351,13 @@ function VideoLimitEditor({
             setDraft(event.target.value);
             setSubmitError(null);
           }}
-          className="w-20 rounded-md border border-line bg-white px-2 py-0.5 text-xs text-ink outline-none focus:border-ink disabled:opacity-40"
+          className="w-20 rounded-lg border border-line bg-bg/60 px-2 py-0.5 text-xs text-ink outline-none focus:border-brand disabled:opacity-40"
         />
         <span className="text-xs text-muted">MiB</span>
         <button
           type="submit"
           disabled={busy || draft.trim() === ""}
-          className="rounded-md border border-line px-2 py-0.5 text-xs text-ink disabled:opacity-40"
+          className="rounded-lg border border-line bg-surface px-2 py-0.5 text-xs text-ink hover:bg-raised disabled:opacity-40"
           title="只套用影片；不會自動重新索引既有的文字／圖片內容"
         >
           {busy ? "儲存中…" : "儲存"}
@@ -367,7 +367,7 @@ function VideoLimitEditor({
             type="button"
             disabled={busy}
             onClick={() => onSave(root, null)}
-            className="rounded-md border border-line px-2 py-0.5 text-xs text-muted disabled:opacity-40"
+            className="rounded-lg border border-line bg-surface px-2 py-0.5 text-xs text-muted hover:bg-raised disabled:opacity-40"
             title="清除這個資料夾的設定，回到服務預設上限"
           >
             恢復預設
@@ -375,7 +375,7 @@ function VideoLimitEditor({
         )}
       </div>
       {visibleError !== null && (
-        <p role="alert" className="text-xs text-red-600">
+        <p role="alert" className="text-xs text-danger">
           {visibleError}
         </p>
       )}
@@ -517,13 +517,13 @@ function MaxFileLimitEditor({
             setDraft(event.target.value);
             setSubmitError(null);
           }}
-          className="w-20 rounded-md border border-line bg-white px-2 py-0.5 text-xs text-ink outline-none focus:border-ink disabled:opacity-40"
+          className="w-20 rounded-lg border border-line bg-bg/60 px-2 py-0.5 text-xs text-ink outline-none focus:border-brand disabled:opacity-40"
         />
         <span className="text-xs text-muted">MiB</span>
         <button
           type="submit"
           disabled={busy || draft.trim() === ""}
-          className="rounded-md border border-line px-2 py-0.5 text-xs text-ink disabled:opacity-40"
+          className="rounded-lg border border-line bg-surface px-2 py-0.5 text-xs text-ink hover:bg-raised disabled:opacity-40"
           title="只套用非影片檔案；不會自動重新索引既有內容"
         >
           {busy ? "儲存中…" : "儲存"}
@@ -533,7 +533,7 @@ function MaxFileLimitEditor({
             type="button"
             disabled={busy}
             onClick={() => onSave(root, null)}
-            className="rounded-md border border-line px-2 py-0.5 text-xs text-muted disabled:opacity-40"
+            className="rounded-lg border border-line bg-surface px-2 py-0.5 text-xs text-muted hover:bg-raised disabled:opacity-40"
             title="清除這個資料夾的設定，回到服務預設上限"
           >
             恢復預設
@@ -542,7 +542,7 @@ function MaxFileLimitEditor({
       </div>
       <p className="text-xs text-muted">只套用非影片檔案；影片另用影片上限。</p>
       {visibleError !== null && (
-        <p role="alert" className="text-xs text-red-600">
+        <p role="alert" className="text-xs text-danger">
           {visibleError}
         </p>
       )}

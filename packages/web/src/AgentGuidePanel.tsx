@@ -140,7 +140,7 @@ export function AgentGuidePanel() {
               setNotice(null);
             }}
             className={`${TAB_CLASS} ${
-              tab === item.id ? "border-ink bg-ink text-white" : "border-line bg-white text-ink"
+              tab === item.id ? "border-brand bg-brand text-on-brand" : "border-line bg-surface text-ink hover:bg-raised"
             }`}
           >
             {item.label}
@@ -149,7 +149,7 @@ export function AgentGuidePanel() {
       </div>
 
       <div role="tabpanel" className="space-y-4">
-        <div className="flex flex-wrap items-center gap-3 rounded-md border border-line bg-white px-3 py-2">
+        <div className="flex flex-wrap items-center gap-3 rounded-xl border border-line bg-surface px-3 py-2">
           <p id="mnemoshelf-agent-guide-detection" role="status" className="text-sm text-ink">
             {detectionLine}
           </p>
@@ -175,7 +175,7 @@ export function AgentGuidePanel() {
         )}
 
         <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
-          <div className="min-w-0 space-y-2 rounded-lg border border-line bg-white p-4">
+          <div className="min-w-0 space-y-2 rounded-[20px] border border-line bg-surface p-4">
             <h3 className="text-sm font-medium text-ink">步驟</h3>
             <ol className="list-decimal space-y-2 pl-5 text-sm text-ink">
               {stepsFor(tab).map((step, index) => (
@@ -191,7 +191,7 @@ export function AgentGuidePanel() {
                 type="button"
                 onClick={() => void copy(installCardKind(tab))}
                 disabled={copyDisabled}
-                className="rounded-md bg-ink px-3 py-1.5 text-sm font-medium text-white disabled:opacity-40"
+                className="rounded-lg bg-brand px-3 py-1.5 text-sm font-medium text-on-brand disabled:opacity-40"
               >
                 {pendingKind === installCardKind(tab) ? "複製中…" : "複製安裝指令卡"}
               </button>
@@ -208,7 +208,7 @@ export function AgentGuidePanel() {
             {snippetsFor(tab).map((snippet, index) => {
               const blocked = load.kind === "ready" ? load.state.copy.blocked[snippet.kind] : undefined;
               return (
-                <div key={snippet.kind} className="min-w-0 space-y-2 rounded-lg border border-line bg-white p-4">
+                <div key={snippet.kind} className="min-w-0 space-y-2 rounded-[20px] border border-line bg-surface p-4">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <h3 className="text-sm font-medium text-ink">{snippet.label}</h3>
                     <button

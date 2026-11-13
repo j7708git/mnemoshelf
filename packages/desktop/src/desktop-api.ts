@@ -27,6 +27,7 @@ export const DESKTOP_CHANNELS = {
   settingsCopyMcpConfig: "mnemoshelf:settings:copy-mcp-config",
   agentGuideGetState: "mnemoshelf:agent-guide:get-state",
   agentGuideCopy: "mnemoshelf:agent-guide:copy",
+  folderPickerChoose: "mnemoshelf:folder-picker:choose",
   updaterGetState: "mnemoshelf:updater:get-state",
   updaterCheck: "mnemoshelf:updater:check",
   updaterDownload: "mnemoshelf:updater:download",
@@ -123,6 +124,17 @@ export interface DesktopAgentGuideBridge {
   copy(kind: string): Promise<DesktopAgentGuideCopyResult>;
 }
 
+/** 原生資料夾選擇器回傳結果（不含 token）。 */
+export interface DesktopFolderPickerResult {
+  canceled: boolean;
+  path: string | null;
+}
+
+/** 原生資料夾選擇器（Electron `dialog.showOpenDialog`）。 */
+export interface DesktopFolderPickerBridge {
+  chooseDirectory(): Promise<DesktopFolderPickerResult>;
+}
+
 /** renderer 看到的 desktop API（`window.mnemoshelfDesktop`）。 */
 export interface DesktopBridge {
   kind: "mnemoshelf-desktop";
@@ -165,6 +177,12 @@ export interface DesktopBridge {
    * **選擇性**：v2 的 preload 沒有這個成員，renderer 要當成「不支援」。
    */
   agentGuide?: DesktopAgentGuideBridge;
+  /**
+   * 原生資料夾選擇對話框（選擇性新增，不變更 apiVersion）。
+   *
+   * **選擇性**：舊版 preload 沒有這個成員，renderer 要當成「不支援」並退回瀏覽器版對話框。
+   */
+  folderPicker?: DesktopFolderPickerBridge;
   /**
    * 更新（Linux／Windows 為 App 內下載安裝；macOS 只檢查並開啟下載頁）。
    *

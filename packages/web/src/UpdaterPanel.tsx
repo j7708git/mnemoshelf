@@ -52,9 +52,9 @@ const RELEASES_PAGE = "https://github.com/j7708git/mnemoshelf/releases/latest";
 let sessionDeferredVersion: string | null = null;
 
 const PRIMARY_CLASS =
-  "updater-action min-w-40 rounded-md bg-ink px-3 py-2 text-sm font-medium text-white disabled:opacity-40";
+  "updater-action min-w-40 rounded-lg bg-brand px-3 py-2 text-sm font-medium text-on-brand disabled:opacity-40";
 const SECONDARY_CLASS =
-  "updater-action min-w-40 rounded-md border border-line px-3 py-2 text-sm font-medium text-ink disabled:opacity-40";
+  "updater-action min-w-40 rounded-lg border border-line bg-surface px-3 py-2 text-sm font-medium text-ink hover:bg-raised disabled:opacity-40";
 
 function Spinner(): ReactNode {
   return (
@@ -514,7 +514,7 @@ export function UpdaterPanel({ currentVersion = null }: UpdaterPanelProps) {
                 className="h-2 w-full overflow-hidden rounded-full bg-line"
                 data-testid="updater-progressbar"
               >
-                <div className="h-full bg-ink transition-[width] duration-150" style={{ width: `${percent}%` }} />
+                <div className="h-full bg-brand transition-[width] duration-150" style={{ width: `${percent}%` }} />
               </div>
               <p className="mt-1 text-xs text-muted" data-testid="updater-progress-text">
                 {progressSummary(progress)}
@@ -531,7 +531,7 @@ export function UpdaterPanel({ currentVersion = null }: UpdaterPanelProps) {
       )}
 
       {actionError !== null && (
-        <p role="alert" className="text-xs text-red-600">
+        <p role="alert" className="text-xs text-danger">
           {actionError}
         </p>
       )}
@@ -545,14 +545,14 @@ export function UpdaterPanel({ currentVersion = null }: UpdaterPanelProps) {
         <div className="space-y-1">
           <h4 className="text-xs font-medium text-ink">更新內容</h4>
           {/* 純文字顯示：React 會跳脫 HTML；不要用 dangerouslySetInnerHTML（XSS）。 */}
-          <div className="updater-notes rounded-md border border-line bg-surface px-3 py-2 text-xs text-muted" data-testid="updater-notes">
+          <div className="updater-notes rounded-lg border border-line bg-raised px-3 py-2 text-xs text-muted" data-testid="updater-notes">
             {state.releaseNotes}
           </div>
         </div>
       )}
 
       {mode === "manual" && (
-        <div className="rounded-md border border-line bg-surface px-3 py-2 text-xs text-muted" data-testid="updater-macos-help">
+        <div className="rounded-lg border border-line bg-raised px-3 py-2 text-xs text-muted" data-testid="updater-macos-help">
           <p className="font-medium text-ink">macOS 目前不支援 App 內自動安裝</p>
           <p className="mt-1">按「開啟下載頁」下載 .dmg 後手動安裝：</p>
           <ol className="mt-1 list-decimal space-y-1 pl-5">
@@ -569,7 +569,7 @@ export function UpdaterPanel({ currentVersion = null }: UpdaterPanelProps) {
       )}
 
       {unsupported && (
-        <div className="rounded-md border border-line bg-surface px-3 py-2 text-xs text-muted" data-testid="updater-manual-help">
+        <div className="rounded-lg border border-line bg-raised px-3 py-2 text-xs text-muted" data-testid="updater-manual-help">
           <p>{readOnly ? "此位置無法自動更新，手動更新方式：" : "此安裝形式不支援應用程式內更新。手動更新方式："}</p>
           <p className="mt-1">
             到 GitHub Releases 下載新版本的安裝檔，關閉應用程式後覆蓋安裝；Linux AppImage 請下載新的

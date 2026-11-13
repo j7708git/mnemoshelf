@@ -328,6 +328,20 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
   記憶內容**仍是不受信任的資料**，不得當成指令。
 - `minScore`（0..1）只過濾語意結果；`k` 預設 10，**大於 100 會靜默夾到 100**（不是 `400`）。
 
+## 瀏覽資料夾（僅列名稱）
+
+為了讓使用者在瀏覽器或桌面介面加入 root 時不用手動輸入完整路徑，Mnemoshelf 提供**使用者觸發**的目錄名稱瀏覽能力（`GET /fs/browse`，及查詢目前存取策略的 `GET /fs/policy` 與 `/health` 中的策略摘要）：
+
+- **不等於加入 root，也不讀檔案內容**：瀏覽目錄只列出一層子資料夾名稱（回傳資料夾名稱與路徑），不列出一般檔案、不讀取任何檔案內容、不寫入資料庫，也不會自動建立索引或 root。只有在使用者按下「瀏覽…」或於對話框內點擊路徑導覽時才會發送請求，不做背景預載，也不記錄瀏覽歷史。
+- **桌面原生選擇器**：在 Electron 桌面版優先呼叫原生 `dialog.showOpenDialog({ properties: ['openDirectory'] })`（透過 `window.mnemoshelfDesktop.folderPicker?.chooseDirectory()`，preload 零外部相依、不暴露 token）；若舊版 preload 未提供此介面，renderer 自動視為不支援並退回網頁版瀏覽對話框。無論透過桌面選擇器或網頁對話框選取路徑，送出加入時仍須通過完整的 root 路徑與權限驗證。
+- **預設保護（可由使用者設定覆寫）**：在未額外設定的情況下，伺服器採取保守預設值——只綁定本機 `127.0.0.1`、所有 API（含 `/fs/browse` 與 `/fs/policy`）皆須 Bearer token、瀏覽範圍限縮於使用者家目錄底下，並套用與系統排除一致的敏感路徑黑名單（隱藏／拒絕 `.ssh`、`.gnupg`、金鑰／憑證／帳號系統目錄等）。
+- **這些限制皆可由使用者自行覆寫，非寫死限制**：使用者可透過環境變數放寬預設邊界，風險由使用者自行承擔：
+  - `MNEMOSHELF_HOST`：覆寫綁定位址（預設 `127.0.0.1`；設定為非 loopback 位址時須了解區域網路或外部連線風險）。
+  - `MNEMOSHELF_ALLOW_ANONYMOUS`：設為 `1`／`true` 時停用 Bearer token 驗證，允許匿名呼叫 API 與瀏覽資料夾。
+  - `MNEMOSHELF_BROWSE_SCOPE` 與 `MNEMOSHELF_BROWSE_ROOTS`：預設 `home`（家目錄底下）；可設為 `custom` 搭配允許前綴清單（以作業系統路徑分隔符分隔），或設為 `unrestricted` 放寬至整個檔案系統。
+  - `MNEMOSHELF_BROWSE_RESPECT_BLACKLIST`：預設 `true`；設為 `false` 時不再過濾敏感目錄黑名單。
+- **UI 風險提示**：只要偵測到任何一項預設限制被放寬（非 loopback 綁定、允許匿名、瀏覽範圍超出家目錄或關閉黑名單），`/health` 與 `/fs/policy` 會標示 `relaxed: true`，Web UI 會在頂部與瀏覽對話框內明確顯示風險警告橫幅及放寬項目。
+
 ## 移除 root
 
 移除 root 時詢問是否同時刪除它的所有向量、中繼資料與衍生記憶；選擇刪除則必須真的刪除。

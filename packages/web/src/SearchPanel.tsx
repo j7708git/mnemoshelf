@@ -81,10 +81,10 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
         <p className="mt-0.5 text-xs text-muted">查詢已索引的檔案與共享記憶；記憶只會出現在含關鍵字的模式。</p>
       </div>
 
-      <form onSubmit={submit} className="space-y-3 rounded-lg border border-line bg-white/70 p-4">
+      <form onSubmit={submit} className="space-y-3 rounded-[20px] border border-line bg-surface p-4">
         <div className="flex flex-wrap items-center gap-2">
           <span className="text-xs text-muted">模式</span>
-          <div role="group" aria-label="搜尋模式" className="inline-flex overflow-hidden rounded-md border border-line">
+          <div role="group" aria-label="搜尋模式" className="inline-flex overflow-hidden rounded-lg border border-line">
             {SEARCH_MODES.map((option) => (
               <button
                 key={option}
@@ -92,7 +92,7 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
                 aria-pressed={mode === option}
                 onClick={() => setMode(option)}
                 className={`px-3 py-1.5 text-xs font-medium ${
-                  mode === option ? "bg-ink text-white" : "bg-white text-ink"
+                  mode === option ? "bg-brand text-on-brand" : "bg-surface text-ink hover:bg-raised"
                 }`}
               >
                 {MODE_LABEL[option]}
@@ -109,12 +109,12 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
             value={query}
             onChange={(event) => setQuery(event.target.value)}
             placeholder="輸入查詢字串，例如：儲存介面 的設計"
-            className="min-w-0 flex-1 rounded-md border border-line bg-white px-3 py-2 text-sm text-ink outline-none focus:border-ink"
+            className="min-w-0 flex-1 rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink outline-none focus:border-brand"
           />
           <button
             type="submit"
             disabled={state.kind === "loading"}
-            className="shrink-0 rounded-md bg-ink px-4 py-2 text-sm font-medium text-white disabled:opacity-40"
+            className="shrink-0 rounded-lg bg-brand px-4 py-2 text-sm font-medium text-on-brand disabled:opacity-40"
           >
             {state.kind === "loading" ? "搜尋中…" : "搜尋"}
           </button>
@@ -122,13 +122,13 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
       </form>
 
       {state.kind === "idle" && (
-        <div className="flex h-[40vh] items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center text-sm text-muted">
+        <div className="flex h-[40vh] items-center justify-center rounded-[20px] border border-dashed border-line bg-surface/70 px-6 text-center text-sm text-muted">
           輸入查詢字串後按「搜尋」。預設為混合模式（hybrid），會同時列出檔案與記憶。
         </div>
       )}
 
       {state.kind === "error" && (
-        <p role="alert" className="rounded-lg border border-line bg-white px-4 py-3 text-sm text-red-600">
+        <p role="alert" className="rounded-xl border border-danger/30 bg-danger-bg px-4 py-3 text-sm text-danger">
           {state.message}
         </p>
       )}
@@ -140,7 +140,7 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
               共 {state.hits.length} 筆結果（模式：{MODE_LABEL[state.effectiveMode]}）
             </p>
             {state.hits.length === 0 ? (
-              <div className="flex h-[40vh] items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center text-sm text-muted">
+              <div className="flex h-[40vh] items-center justify-center rounded-[20px] border border-dashed border-line bg-surface/70 px-6 text-center text-sm text-muted">
                 找不到符合的結果。試試其他關鍵字，或換一種搜尋模式。
               </div>
             ) : (
@@ -152,12 +152,12 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
                         type="button"
                         onClick={() => setSelected({ entry: entryForChunk(hit), rootId: hit.rootId, key: hit.key, media: hit.media })}
                         aria-current={selected?.key === hit.key ? "true" : undefined}
-                        className={`w-full rounded-lg border px-3 py-2 text-left ${
-                          selected?.key === hit.key ? "border-ink bg-white" : "border-line bg-white/70"
+                        className={`w-full rounded-xl border px-3 py-2 text-left transition ${
+                          selected?.key === hit.key ? "border-brand bg-tint/40" : "border-line bg-surface hover:bg-raised"
                         }`}
                       >
                         <div className="flex items-center justify-between gap-2">
-                          <span className="rounded bg-surface px-1.5 py-0.5 text-[11px] font-medium text-muted">
+                          <span className="rounded bg-raised px-1.5 py-0.5 text-[11px] font-medium text-muted">
                             {hit.media === undefined ? `檔案・${hit.kind}` : mediaTrackLabel(hit.media)}
                           </span>
                           <span className="shrink-0 text-[11px] text-muted">
@@ -183,9 +183,9 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
                         </p>
                       </button>
                     ) : (
-                      <div className="rounded-lg border border-line bg-white/70 px-3 py-2">
+                      <div className="rounded-xl border border-line bg-surface px-3 py-2">
                         <div className="flex items-center justify-between gap-2">
-                          <span className="rounded bg-surface px-1.5 py-0.5 text-[11px] font-medium text-muted">
+                          <span className="rounded bg-raised px-1.5 py-0.5 text-[11px] font-medium text-muted">
                             {memoryOriginLabel(hit)}{hit.role == null ? "" : `・${memorySourceRoleLabel(hit.role)}`}
                             {hit.sourceId == null ? `・${MEMORY_KIND_LABEL[hit.kind]}` : ""}
                           </span>
@@ -226,7 +226,7 @@ export function SearchPanel({ roots, onOpenMemories }: SearchPanelProps) {
 
           <div className="h-[60vh] min-h-0 overflow-auto">
             {selected === null ? (
-              <div className="flex h-full items-center justify-center rounded-lg border border-dashed border-line bg-white/60 px-6 text-center text-sm text-muted">
+              <div className="flex h-full items-center justify-center rounded-[20px] border border-dashed border-line bg-surface/70 px-6 text-center text-sm text-muted">
                 點選左側的檔案結果即可在這裡預覽（支援文字、圖片、WAV 音訊與影片）。
               </div>
             ) : (

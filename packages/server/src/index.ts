@@ -9,6 +9,7 @@
  */
 import { promises as fs } from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import {
   FfmpegMediaDecoder,
   openDatabase,
@@ -26,6 +27,7 @@ import {
   INDEX_RATE_BETWEEN_FILES_MS,
   LOOPBACK_HOST,
   loadServerConfig,
+  type BrowseScope,
   type ServerConfig,
 } from "./config.js";
 import { APP_VERSION, createRestApp, type RestApp } from "./http/app.js";
@@ -55,8 +57,18 @@ export interface CreateServerOptions {
    * 未提供且環境變數也未設定時，服務不建立 decoder（影片能力 `disabled`）。
    */
   decoder?: MediaDecoder;
-  /** 「過寬 root」判定的家目錄基準；預設 `os.homedir()`。 */
+  /** 「過寬 root」與預設瀏覽範圍的家目錄基準；預設 `os.homedir()`。 */
   homeDir?: string;
+  /** 覆寫 `MNEMOSHELF_HOST`（預設 `127.0.0.1`）。 */
+  host?: string;
+  /** 覆寫 `MNEMOSHELF_ALLOW_ANONYMOUS`（預設 `false`）。 */
+  allowAnonymous?: boolean;
+  /** 覆寫 `MNEMOSHELF_BROWSE_SCOPE`（預設 `"home"`）。 */
+  browseScope?: BrowseScope;
+  /** 覆寫 `MNEMOSHELF_BROWSE_ROOTS`。 */
+  browseRoots?: string[];
+  /** 覆寫 `MNEMOSHELF_BROWSE_RESPECT_BLACKLIST`（預設 `true`）。 */
+  browseRespectBlacklist?: boolean;
   /**
    * 記憶嵌入 worker 的調校（卡 B1；測試可把重試延遲設 0）。
    * `store`／`embedder` 由 `createServer` 自己注入，這裡只接受調校欄位。
@@ -124,12 +136,12 @@ async function restrictDataPermissions(dataDir: string, dbPath: string): Promise
   await chmod(`${dbPath}-shm`, 0o600, true);
 }
 
-/** 監聽指定的 loopback 埠。 */
-async function listen(server: http.Server, port: number): Promise<number> {
+/** 監聽指定的位址與埠（預設 loopback `127.0.0.1`）。 */
+async function listen(server: http.Server, port: number, host: string): Promise<number> {
   await new Promise<void>((resolve, reject) => {
     const onError = (error: Error): void => reject(error);
     server.once("error", onError);
-    server.listen(port, LOOPBACK_HOST, () => {
+    server.listen(port, host, () => {
       server.off("error", onError);
       resolve();
     });
@@ -229,6 +241,13 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
   if (options.dataDir !== undefined) env.MNEMOSHELF_DATA_DIR = options.dataDir;
   if (options.port !== undefined) env.MNEMOSHELF_PORT = String(options.port);
   if (options.webDir !== undefined) env.MNEMOSHELF_WEB_DIR = options.webDir;
+  if (options.host !== undefined) env.MNEMOSHELF_HOST = options.host;
+  if (options.allowAnonymous !== undefined) env.MNEMOSHELF_ALLOW_ANONYMOUS = options.allowAnonymous ? "on" : "off";
+  if (options.browseScope !== undefined) env.MNEMOSHELF_BROWSE_SCOPE = options.browseScope;
+  if (options.browseRoots !== undefined) env.MNEMOSHELF_BROWSE_ROOTS = options.browseRoots.join(path.delimiter);
+  if (options.browseRespectBlacklist !== undefined) {
+    env.MNEMOSHELF_BROWSE_RESPECT_BLACKLIST = options.browseRespectBlacklist ? "on" : "off";
+  }
   // 設定只有一處驗證來源（loadServerConfig）；覆寫值也走同一條路徑。
   const config: ServerConfig = loadServerConfig(env);
 
@@ -320,10 +339,20 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     ...(INDEX_RATE_BETWEEN_FILES_MS[config.indexRate] > 0
       ? { indexThrottle: { betweenFilesMs: INDEX_RATE_BETWEEN_FILES_MS[config.indexRate] } }
       : {}),
+    accessPolicy: {
+      host: config.host,
+      allowAnonymous: config.allowAnonymous,
+      browseScope: config.browseScope,
+      browseRoots: config.browseRoots,
+      browseRespectBlacklist: config.browseRespectBlacklist,
+    },
   });
 
   const server = http.createServer(app.handler);
-  const port = await listen(server, config.port);
+  const port = await listen(server, config.port, config.host);
+  const urlHost = config.host === "0.0.0.0" || config.host === "::" ? LOOPBACK_HOST : config.host;
+  const formattedHost = urlHost.includes(":") && !urlHost.startsWith("[") ? `[${urlHost}]` : urlHost;
+  const serverUrl = `http://${formattedHost}:${port}`;
 
   // 監聽成功後才啟動背景回填（啟動失敗時不留背景工作）。
   memoryEmbedder.start();
@@ -338,7 +367,7 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
    */
   try {
     if (discovery.enabled) {
-      await discovery.write({ url: `http://${LOOPBACK_HOST}:${port}`, token: config.token });
+      await discovery.write({ url: serverUrl, token: config.token });
     }
     await options.afterStart?.();
   } catch (error) {
@@ -372,9 +401,9 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
   let closed = false;
   return {
     server,
-    host: LOOPBACK_HOST,
+    host: config.host,
     port,
-    url: `http://${LOOPBACK_HOST}:${port}`,
+    url: serverUrl,
     config,
     store,
     vec,
@@ -550,6 +579,20 @@ export {
   STATIC_CSP,
   toHttpError,
 } from "./http/app.js";
+export {
+  browseDirectories,
+  summarizeAccessPolicy,
+} from "./http/folder-browser.js";
+export type {
+  BrowseAccessPolicy,
+  BrowseBreadcrumbSegment,
+  BrowseDirectoriesResponse,
+  BrowseDirectoryItem,
+  BrowseQuickLocation,
+  FolderBrowseOptions,
+} from "./http/folder-browser.js";
+export type { BrowseScope } from "./config.js";
+export { isLoopbackBindHost } from "./config.js";
 export {
   MEDIA_CACHE_CONTROL,
   MEDIA_CONTENT_TYPE,

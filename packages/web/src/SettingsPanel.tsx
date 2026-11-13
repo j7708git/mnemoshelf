@@ -148,7 +148,7 @@ export function SettingsPanel({
   };
 
   return (
-    <section id="mnemoshelf-settings" aria-label="設定" className="space-y-4 rounded-lg border border-line bg-white p-5">
+    <section id="mnemoshelf-settings" aria-label="設定" className="space-y-4 rounded-[20px] border border-line bg-surface p-5">
       <div className="flex items-baseline justify-between gap-3">
         <h2 className="text-base font-medium text-ink">設定</h2>
         <button type="button" onClick={onClose} className="text-sm text-muted underline">
@@ -260,7 +260,7 @@ export function SettingsPanel({
                 <code>MNEMOSHELF_URL</code> 與 <code>MNEMOSHELF_TOKEN</code> 連線（或使用解壓後的版本）。
               </p>
               {agentDiscovery.error !== null && (
-                <p role="alert" className="text-sm text-red-600">
+                <p role="alert" className="text-sm text-danger">
                   {agentDiscovery.error}
                 </p>
               )}
@@ -309,7 +309,7 @@ export function SettingsPanel({
             type="button"
             onClick={onExportDiagnostics}
             disabled={diagnosticsBusy}
-            className="rounded-md bg-ink px-3 py-2 text-sm font-medium text-white disabled:opacity-40"
+            className="rounded-lg bg-brand px-3 py-2 text-sm font-medium text-on-brand disabled:opacity-40"
           >
             {diagnosticsBusy ? "匯出中…" : "匯出診斷資訊"}
           </button>
@@ -320,14 +320,14 @@ export function SettingsPanel({
           )}
         </div>
         {diagnosticsError !== null && (
-          <p role="alert" className="text-sm text-red-600">
+          <p role="alert" className="text-sm text-danger">
             {diagnosticsError}
           </p>
         )}
       </div>
 
       {error !== null && (
-        <p role="alert" className="text-sm text-red-600">
+        <p role="alert" className="text-sm text-danger">
           {error}
         </p>
       )}

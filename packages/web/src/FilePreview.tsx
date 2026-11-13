@@ -47,7 +47,7 @@ export function FilePreview({ rootId, entry, media, sourceChunkId }: { rootId: n
   }
   if (entry.kind === "audio") return <AudioFilePreview rootId={rootId} entry={entry} media={media} />;
   return (
-    <div className="rounded-lg border border-line bg-white px-4 py-6 text-sm text-muted">
+    <div className="rounded-xl border border-line bg-surface px-4 py-6 text-sm text-muted">
       <p className="font-medium text-ink">{entry.name}</p>
       <p className="mt-2">此型別（{entry.kind}）不支援預覽。</p>
       {entry.size !== null && <p className="mt-1">大小：{formatBytes(entry.size)}</p>}
@@ -75,10 +75,10 @@ function AudioFilePreview({ rootId, entry, media }: { rootId: number; entry: Dir
   const seek = (): void => {
     if (player.current !== null && media !== undefined) player.current.currentTime = media.startSeconds;
   };
-  return <div className="space-y-3 rounded-lg border border-line bg-white p-4">
+  return <div className="space-y-3 rounded-xl border border-line bg-surface p-4">
     <p className="break-all font-medium text-ink">{entry.path}</p>
     {media !== undefined && <p className="text-sm text-muted">命中片段：{formatMediaSpan(media.startSeconds, media.endSeconds)}</p>}
-    {error !== null && <p role="alert" className="text-sm text-red-600">{error}</p>}
+    {error !== null && <p role="alert" className="text-sm text-danger">{error}</p>}
     {url === null && error === null && <p className="text-sm text-muted">正在載入音訊…</p>}
     {url !== null && <>
       <audio ref={player} controls preload="metadata" src={url} onLoadedMetadata={seek}
@@ -192,7 +192,7 @@ function VideoFilePreview({ rootId, entry, media, sourceChunkId }: { rootId: num
       .finally(() => { if (generation === playbackGeneration.current) setProbing(false); });
   };
 
-  return <div className="space-y-3 rounded-lg border border-line bg-white p-4">
+  return <div className="space-y-3 rounded-xl border border-line bg-surface p-4">
     <p className="break-all font-medium text-ink">{entry.path}</p>
     {media !== undefined && (
       <p className="text-sm text-ink">
@@ -203,7 +203,7 @@ function VideoFilePreview({ rootId, entry, media, sourceChunkId }: { rootId: num
     {media?.track === "video-audio" && (
       <p className="text-xs text-muted">這個命中的是影片的選定音軌（{media.streamIndex === undefined ? "stream 未知" : `stream ${media.streamIndex}`}）。</p>
     )}
-    {error !== null && <p role="alert" className="text-sm text-red-600">{error}</p>}
+    {error !== null && <p role="alert" className="text-sm text-danger">{error}</p>}
     {probing && <p role="status" className="text-sm text-muted">正在確認播放失敗的原因…</p>}
 
     {session === null && error === null && <p role="status">正在驗證影片來源與播放授權…</p>}
@@ -269,7 +269,7 @@ function TextFilePreview({ rootId, entry }: { rootId: number; entry: DirEntry })
   if (state.kind === "loading") return <p className="text-sm text-muted">正在載入檔案…</p>;
   if (state.kind === "error") {
     return (
-      <p role="alert" className="text-sm text-red-600">
+      <p role="alert" className="text-sm text-danger">
         {state.message}
       </p>
     );
@@ -284,11 +284,11 @@ function TextFilePreview({ rootId, entry }: { rootId: number; entry: DirEntry })
         <span className="shrink-0 text-xs text-muted">大小：{formatBytes(state.body.size)}</span>
       </div>
       {state.body.truncated && (
-        <p className="rounded-md border border-line bg-surface px-3 py-2 text-xs text-muted">
+        <p className="rounded-lg border border-line bg-raised px-3 py-2 text-xs text-muted">
           檔案過大，只顯示前 {formatBytes(utf8Encoder.encode(state.body.content).length)}（內容已截斷）。
         </p>
       )}
-      <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-line bg-white p-3 text-xs leading-relaxed text-ink">
+      <pre className="min-h-0 flex-1 overflow-auto whitespace-pre-wrap break-words rounded-xl border border-line bg-surface p-3 text-xs leading-relaxed text-ink">
         {state.body.content}
       </pre>
     </div>
@@ -349,12 +349,12 @@ function ImageFilePreview({ rootId, entry }: { rootId: number; entry: DirEntry }
 
       {state.kind === "loading" && <p className="text-sm text-muted">正在載入圖片…</p>}
       {state.kind === "error" && (
-        <p role="alert" className="text-sm text-red-600">
+        <p role="alert" className="text-sm text-danger">
           {state.message}
         </p>
       )}
       {state.kind === "ready" && url !== null && (
-        <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto rounded-lg border border-line bg-white p-3">
+        <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto rounded-xl border border-line bg-surface p-3">
           <img src={url} alt={entry.name} className="max-h-[60vh] max-w-full object-contain" />
         </div>
       )}

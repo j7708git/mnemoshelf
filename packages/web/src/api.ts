@@ -204,6 +204,115 @@ export async function fetchRoots(): Promise<RootsResponse> {
   return { roots: body.roots as Root[], video: isVideoCapability(body.video) ? body.video : null };
 }
 
+/** 瀏覽與連線存取策略摘要（server `/health` 與 `/fs/browse` 回傳）。 */
+export interface BrowseAccessPolicy {
+  host: string;
+  nonLoopbackBind: boolean;
+  allowAnonymous: boolean;
+  browseScope: "home" | "custom" | "unrestricted";
+  respectBlacklist: boolean;
+  relaxed: boolean;
+}
+
+/** `/health` 回應摘要（免 token）。 */
+export interface HealthResponse {
+  status: string;
+  service: string;
+  appVersion?: string;
+  authRequired: boolean;
+  accessPolicy: BrowseAccessPolicy | null;
+}
+
+/** 檢查 `/health`（免 token），取得認證需求與存取策略狀態。 */
+export async function fetchHealth(): Promise<HealthResponse> {
+  let response: Response;
+  try {
+    response = await fetch("/health", { cache: "no-store" });
+  } catch {
+    throw new NetworkError();
+  }
+  if (!response.ok) {
+    throw new Error(`無法讀取服務狀態（HTTP ${response.status}）`);
+  }
+  const body = (await response.json()) as {
+    status?: unknown;
+    service?: unknown;
+    appVersion?: unknown;
+    authRequired?: unknown;
+    accessPolicy?: unknown;
+  };
+  const policy = isBrowseAccessPolicy(body.accessPolicy) ? body.accessPolicy : null;
+  return {
+    status: typeof body.status === "string" ? body.status : "ok",
+    service: typeof body.service === "string" ? body.service : "mnemoshelf",
+    ...(typeof body.appVersion === "string" ? { appVersion: body.appVersion } : {}),
+    authRequired: body.authRequired !== false,
+    accessPolicy: policy,
+  };
+}
+
+function isBrowseAccessPolicy(value: unknown): value is BrowseAccessPolicy {
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.host === "string" &&
+    typeof record.nonLoopbackBind === "boolean" &&
+    typeof record.allowAnonymous === "boolean" &&
+    (record.browseScope === "home" || record.browseScope === "custom" || record.browseScope === "unrestricted") &&
+    typeof record.respectBlacklist === "boolean" &&
+    typeof record.relaxed === "boolean"
+  );
+}
+
+/** 瀏覽資料夾清單項目（僅目錄名稱與路徑）。 */
+export interface BrowseDirectoryItem {
+  name: string;
+  path: string;
+}
+
+export interface BrowseQuickLocation {
+  id: string;
+  label: string;
+  path: string;
+}
+
+export interface BrowseBreadcrumbSegment {
+  label: string;
+  path: string;
+}
+
+export interface BrowseDirectoriesResponse {
+  currentPath: string;
+  parentPath: string | null;
+  breadcrumbs: BrowseBreadcrumbSegment[];
+  directories: BrowseDirectoryItem[];
+  quickLocations: BrowseQuickLocation[];
+  policy: BrowseAccessPolicy;
+}
+
+/**
+ * 列出指定資料夾底下的**子資料夾名稱**（`GET /fs/browse`）。
+ * 只在使用者明確開啟「瀏覽…」或切換資料夾時呼叫，不做背景預載。
+ */
+export async function browseDirectories(targetPath?: string): Promise<BrowseDirectoriesResponse> {
+  const query = targetPath !== undefined && targetPath.trim() !== "" ? `?path=${encodeURIComponent(targetPath)}` : "";
+  const response = await apiFetch(`/fs/browse${query}`, { cache: "no-store" });
+  if (!response.ok) {
+    throw new Error(await readErrorMessage(response, "無法列出資料夾內容"));
+  }
+  const body = (await response.json()) as Partial<BrowseDirectoriesResponse>;
+  if (
+    typeof body.currentPath !== "string" ||
+    !Array.isArray(body.directories) ||
+    !Array.isArray(body.quickLocations) ||
+    !Array.isArray(body.breadcrumbs) ||
+    !isBrowseAccessPolicy(body.policy)
+  ) {
+    throw new Error("資料夾瀏覽回應格式不正確");
+  }
+  return body as BrowseDirectoriesResponse;
+}
+
 /** 讀取 roots 清單（只要清單的呼叫端用；需要影片能力請用 `fetchRoots`）。 */
 export async function listRoots(): Promise<Root[]> {
   return (await fetchRoots()).roots;

@@ -162,6 +162,8 @@ export async function startTestServer(
     memoryEmbedding?: Pick<MemoryEmbeddingWorkerOptions, "batchSize" | "retryAttempts" | "retryDelayMs">;
     /** 沿用既有資料目錄（重啟情境測試）；省略時建立新的暫存目錄。 */
     dataDir?: string;
+    /** 測試覆寫匿名存取（預設 false）。 */
+    allowAnonymous?: boolean;
   } = {},
 ): Promise<TestServer> {
   const ownsDataDir = options.dataDir === undefined;
@@ -173,6 +175,7 @@ export async function startTestServer(
     port: 0,
     embedder: options.embedder ?? new FakeEmbedder(),
     homeDir: options.homeDir ?? os.homedir(),
+    ...(options.allowAnonymous === undefined ? {} : { allowAnonymous: options.allowAnonymous }),
     ...(options.decoder === undefined ? {} : { decoder: options.decoder }),
     ...(options.webDir === undefined ? {} : { webDir: options.webDir }),
     ...(options.memoryEmbedding === undefined ? {} : { memoryEmbedding: options.memoryEmbedding }),
