@@ -49,6 +49,18 @@ Mnemoshelf 桌面版會從本專案的 GitHub Release 檢查新版本。**Linux 
 更新後版本 `0.5.1 → 0.5.2`；版本、資料庫檔位元組、roots、token 與更新前備份都保留。
 0.5.2 是依賴安全修補，行為與 0.5.1 相同。同樣是 Linux x64 的實證，不代表其他平台已驗證。
 
+### v0.9.0 的變更與升級注意
+
+2026-11-13 的 v0.9.0 新增加入資料夾的「瀏覽…」選擇器（桌面版為系統原生選擇器，瀏覽器版為對話框）、
+`GET /fs/browse`／`GET /fs/policy` 端點，以及暖色淺／深雙主題的 Web UI 改版：
+
+- **資料庫相容**：沒有資料庫結構變更，v0.8.0 既有資料與 Roots 設定可直接沿用。
+- **新的存取策略設定**：列目錄端點預設只綁 `127.0.0.1`、需要 token、範圍限家目錄並套用黑名單；
+  使用者可用 `MNEMOSHELF_HOST`、`MNEMOSHELF_ALLOW_ANONYMOUS`、`MNEMOSHELF_BROWSE_SCOPE`、
+  `MNEMOSHELF_BROWSE_ROOTS`、`MNEMOSHELF_BROWSE_RESPECT_BLACKLIST` 放寬，放寬後風險由使用者承擔。
+  細節見 [roots-and-privacy.md](roots-and-privacy.md)。
+- **驗證範圍**：Electron 視窗內的原生選擇器尚未實機驗證（僅有 IPC 契約測試），失敗時會退回網頁對話框。
+
 ### v0.8.0 的變更與升級注意
 
 2026-11-13 的 v0.8.0 新增 Roots 分享勾選與通用單檔上限持久化、macOS Apple Silicon 可選

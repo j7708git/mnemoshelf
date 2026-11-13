@@ -2,7 +2,7 @@
 
 本機桌面應用程式：把自己挑選的資料夾變成可語意搜尋的知識庫，並讓多個 AI agent 共用同一份記憶。
 
-> **狀態**：最新釋出 **v0.8.0**（[GitHub Releases](https://github.com/j7708git/mnemoshelf/releases)）。本版延續 v0.7.0 的原文記憶與音訊／影片分軌索引，新增 **Roots 分享勾選與通用單檔上限持久化**（依檔案／圖片／音訊／影片設定跨重啟保留，見 [docs/roots-and-privacy.md](docs/roots-and-privacy.md)）、**macOS Apple Silicon 可選 WebGPU 嵌入加速**（CPU 仍為預設；提供能力探測、失敗永久回退 CPU 與批次上限護欄），以及離線只讀的混合格式統計探測與 Stage 3 未見題庫／Naive RAG 檢索對照評估工具。**App 內更新已在 Linux AppImage 實證到 0.5.2**（0.5.0→0.5.1→0.5.2）；0.6.0 起的更新流程尚未實機驗證，≤ 0.4.1 仍須先手動安裝 0.5.0。平台限制：**macOS 只檢查並開啟下載頁**（ad-hoc 簽章、未公證，不自動安裝）；**Windows NSIS 未簽章，更新流程未實機驗證**。支援矩陣、備份與回滾見 [docs/updates.md](docs/updates.md)；harness 接入契約見 [docs/agent-integration.md](docs/agent-integration.md)。授權 [MIT](LICENSE)。
+> **狀態**：最新釋出 **v0.9.0**（[GitHub Releases](https://github.com/j7708git/mnemoshelf/releases)）。本版新增**加入資料夾的「瀏覽…」選擇器**（桌面版用系統原生選擇器，瀏覽器版用對話框；列目錄端點的存取策略可由使用者設定，見 [docs/roots-and-privacy.md](docs/roots-and-privacy.md)）與**暖色淺／深雙主題的 Web UI 改版**；延續 v0.8.0 的 **Roots 分享勾選與通用單檔上限持久化**（依檔案／圖片／音訊／影片設定跨重啟保留，見 [docs/roots-and-privacy.md](docs/roots-and-privacy.md)）、**macOS Apple Silicon 可選 WebGPU 嵌入加速**（CPU 仍為預設；提供能力探測、失敗永久回退 CPU 與批次上限護欄），以及離線只讀的混合格式統計探測與 Stage 3 未見題庫／Naive RAG 檢索對照評估工具。**App 內更新已在 Linux AppImage 實證到 0.5.2**（0.5.0→0.5.1→0.5.2）；0.6.0 起的更新流程尚未實機驗證，≤ 0.4.1 仍須先手動安裝 0.5.0。平台限制：**macOS 只檢查並開啟下載頁**（ad-hoc 簽章、未公證，不自動安裝）；**Windows NSIS 未簽章，更新流程未實機驗證**。支援矩陣、備份與回滾見 [docs/updates.md](docs/updates.md)；harness 接入契約見 [docs/agent-integration.md](docs/agent-integration.md)。授權 [MIT](LICENSE)。
 
 ## 這是什麼
 
