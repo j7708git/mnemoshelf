@@ -26,6 +26,22 @@ export interface Root {
   /** ISO 8601 時間字串。 */
   createdAt: string;
   /**
+   * 是否允許 agent 搜尋這個 root 的檔案片段（MCP `search` 等入口的預設範圍）。
+   *
+   * - 資料庫欄位 `allow_agent_search`：not null default 0；既有 roots 升級後一律 `false`。
+   * - 這是**分享意圖／防誤用**，不是安全邊界：持有同一組 token 的程式仍是本機 owner 全權
+   *   （見 `docs/roots-and-privacy.md` §信任模型）。
+   */
+  allowAgentSearch: boolean;
+  /**
+   * 通用單檔大小上限（bytes；**不套用影片**）。**選填**，未設定時由呼叫端沿用服務層預設
+   * （10 MiB）。
+   *
+   * - 值域是整數 1–16 GiB（由 `normalizeRootMaxFileBytes` 驗證）。
+   * - 舊資料列為 NULL 時**不出現**這個鍵（不得補 10 MiB：預設值屬呼叫端語意）。
+   */
+  maxFileBytes?: number;
+  /**
    * 影片單檔大小上限（bytes）；**選填**，未設定時由呼叫端沿用行程層預設
    * （`MNEMOSHELF_VIDEO_MAX_FILE_BYTES`，再退回 512 MiB）。
    *
@@ -37,22 +53,37 @@ export interface Root {
 }
 
 /** 新增 root 時的輸入（id 與 createdAt 由儲存層產生）。 */
-export type NewRoot = Omit<Root, "id" | "createdAt">;
+export type NewRoot = Omit<Root, "id" | "createdAt" | "allowAgentSearch"> & {
+  /**
+   * 是否允許 agent 搜尋；**選填**，省略＝`false`（DB 欄位 default 0）。
+   *
+   * 讓既有呼叫端不必為新增欄位全面改寫；新入口（REST）仍會明帶使用者的選擇。
+   */
+  allowAgentSearch?: boolean;
+};
 
 /**
  * 更新既有 root 時**可變更**的欄位（`MetadataStore.updateRoot`）。
  *
- * 為什麼只有 `modalities` 與 `videoMaxFileBytes`：`path`／`mode` 改變等同換一個 root
- * （索引內容、清理語意都會變），應以「移除再加入」處理；`include`／`exclude`／
- * `respectGitignore` 目前沒有 UI／REST 入口，尚未定義變更語意。欄位未提供（`undefined`）
- * ＝該欄位不變。
+ * 為什麼只有 `modalities`、`allowAgentSearch`、`maxFileBytes` 與 `videoMaxFileBytes`：
+ * `path`／`mode` 改變等同換一個 root（索引內容、清理語意都會變），應以「移除再加入」處理；
+ * `include`／`exclude`／`respectGitignore` 目前沒有 UI／REST 入口，尚未定義變更語意。
+ * 欄位未提供（`undefined`）＝該欄位不變。
  *
  * - 變更模態**不會**動任何既有 chunk／向量：要重新索引才會生效（見 `indexRoot` 的清理語意）。
+ * - `allowAgentSearch`：`true`／`false`＝設定分享意圖；只影響之後的 agent 搜尋範圍，
+ *   不動既有索引，也不需要重新索引。
+ * - `maxFileBytes`：`number`＝設定新上限；`null`＝清除設定（回到服務層預設 10 MiB）；
+ *   `undefined`＝不改。變更只影響下一次 preview／index，不動既有索引。
  * - `videoMaxFileBytes`：`number`＝設定新上限；`null`＝清除設定（回到行程層預設）；
  *   `undefined`＝不改。變更只影響下一次 preview／index 與播放端點，不動既有索引。
  */
 export interface RootPatch {
   modalities?: Modality[];
+  /** 是否允許 agent 搜尋這個 root（分享意圖；不是安全邊界）。 */
+  allowAgentSearch?: boolean;
+  /** 通用單檔大小上限（bytes）；`null` 表示清除設定。值域見 `normalizeRootMaxFileBytes`。 */
+  maxFileBytes?: number | null;
   /** 影片單檔大小上限（bytes）；`null` 表示清除設定。值域見 `normalizeRootVideoMaxFileBytes`。 */
   videoMaxFileBytes?: number | null;
 }
@@ -209,6 +240,16 @@ export interface MemoryPatch {
 /** 查詢過濾條件。未指定 rootIds 表示不過濾。 */
 export interface SearchFilter {
   rootIds?: number[];
+  /**
+   * 是否納入記憶（只有 `searchKeyword` 會回記憶；向量索引本身不含記憶）。
+   *
+   * - `undefined`（預設）：依既有規則——未指定 `rootIds` 時納入；指定了 `rootIds`
+   *   （含空陣列）時**不納入**（記憶沒有 root）。
+   * - `true`：即使指定了 `rootIds` 也納入記憶；chunk 仍只搜指定（或空）roots。
+   *   給「只縮小檔案搜尋範圍、不影響記憶」的呼叫端使用（例如 `/search` 的 `agentOnly`）。
+   * - `false`：一律不納入記憶。
+   */
+  includeMemories?: boolean;
 }
 
 /** 排名結果的一項。key 為 `c:<chunkId>` 或 `m:<memoryId>`；rank 從 1 起算。 */

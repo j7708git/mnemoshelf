@@ -1,6 +1,8 @@
 import { useState } from "react";
 import type { Root, VideoCapability } from "./api";
+import { updateRootAgentSearch, updateRootMaxFileBytes } from "./api";
 import {
+  BYTES_PER_MIB,
   DEFAULT_VIDEO_MAX_FILE_BYTES,
   effectiveVideoMaxFileBytes,
   formatVideoLimitBytes,
@@ -93,6 +95,65 @@ export function RootsList({
 }: RootsListProps) {
   const videoToggle = videoToggleState(videoCapability ?? null);
   const videoEnabled = (root: Root): boolean => root.modalities.includes("video");
+  /**
+   * 本輪剛寫入成功的 root（`PATCH /roots/:id` 的回應）。
+   *
+   * 為什麼放在元件內：分享開關與通用上限是清單自己的設定，寫入後立即可見，不依賴父層重抓；
+   * 父層之後若回傳一致的值，就以父層的資料為準（見 `viewRoot`）。
+   */
+  const [overrides, setOverrides] = useState<Record<number, Root>>({});
+  /**
+   * 進行中的寫入請求集合，key 為 `"<rootId>:<field>"`。
+   *
+   * 為什麼是集合而不是單一 slot：不同 root／欄位的請求可以並行，單一 slot 只記得
+   * 最後開始的那個；若它先完成就會把仍在飛行的另一個一起清掉，讓控制項提前恢復可用。
+   */
+  const busyKey = (rootId: number, field: "agent" | "max"): string => `${rootId}:${field}`;
+  const [busyKeys, setBusyKeys] = useState<Record<string, true>>({});
+  const isBusy = (rootId: number, field: "agent" | "max"): boolean => busyKeys[busyKey(rootId, field)] === true;
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  /** 伺服器已同步（父層刷新後的值與 override 一致）就丟棄 override，避免畫面停在舊值。 */
+  const viewRoot = (root: Root): Root => {
+    const override = overrides[root.id];
+    if (override === undefined) return root;
+    if (override.allowAgentSearch === root.allowAgentSearch && override.maxFileBytes === root.maxFileBytes) return root;
+    // 只覆寫這兩個欄位：override 是整份 PATCH 回應，其他欄位仍以父層最新資料為準。
+    return { ...root, allowAgentSearch: override.allowAgentSearch, maxFileBytes: override.maxFileBytes };
+  };
+
+  const runUpdate = async (
+    root: Root,
+    field: "agent" | "max",
+    action: () => Promise<Root>,
+    fallbackMessage: string,
+  ): Promise<void> => {
+    const key = busyKey(root.id, field);
+    setBusyKeys((previous) => ({ ...previous, [key]: true }));
+    setActionError(null);
+    try {
+      const updated = await action();
+      setOverrides((previous) => ({ ...previous, [updated.id]: updated }));
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : fallbackMessage);
+    } finally {
+      // 只刪自己的 key：不同 root／欄位的請求並行時，先完成的不該把另一個仍在進行的 busy 清掉。
+      setBusyKeys((previous) => {
+        if (previous[key] !== true) return previous;
+        const next = { ...previous };
+        delete next[key];
+        return next;
+      });
+    }
+  };
+
+  const toggleAgentSearch = (root: Root, enabled: boolean): void => {
+    void runUpdate(root, "agent", () => updateRootAgentSearch(root.id, enabled), "更新 Agent 搜尋設定失敗");
+  };
+
+  const saveMaxFileBytes = (root: Root, bytes: number | null): void => {
+    void runUpdate(root, "max", () => updateRootMaxFileBytes(root.id, bytes), "更新單檔上限失敗");
+  };
   if (roots.length === 0) {
     return (
       <div className="rounded-lg border border-dashed border-line bg-white/60 px-4 py-8 text-center">
@@ -103,96 +164,130 @@ export function RootsList({
   }
 
   return (
-    <ul className="space-y-2">
-      {roots.map((root) => {
-        const selected = root.id === selectedRootId;
-        return (
-          <li key={root.id}>
-            <div
-              className={`rounded-lg border px-3 py-2 ${
-                selected ? "border-ink bg-white" : "border-line bg-white/70"
-              }`}
-            >
-              <div className="flex items-baseline justify-between gap-2">
-                <button
-                  type="button"
-                  onClick={() => onSelect(root)}
-                  aria-current={selected ? "true" : undefined}
-                  className="min-w-0 flex-1 text-left"
-                  title={root.path}
-                >
-                  <span className="block truncate text-sm font-medium text-ink">{basename(root.path)}</span>
-                  <span className="mt-0.5 block break-all font-mono text-xs text-muted">{root.path}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onRemove(root)}
-                  className="shrink-0 rounded-md border border-line px-2 py-0.5 text-xs text-muted hover:text-red-600"
-                >
-                  移除
-                </button>
-              </div>
-              <p className="mt-1 text-xs text-muted">
-                {MODE_LABEL[root.mode]}　模態：
-                {root.modalities.map((modality) => MODALITY_LABEL[modality] ?? modality).join("、") || "（無）"}
-              </p>
-              {onToggleImages !== undefined && root.mode === "index" && (
-                <label className="mt-1 flex items-center gap-1.5 text-xs text-ink">
-                  <input
-                    type="checkbox"
-                    checked={imagesEnabled(root)}
-                    disabled={imagesBusyRootId === root.id}
-                    onChange={(event) => onToggleImages(root, event.target.checked)}
-                    // 點開關不該同時把這個資料夾選取起來（外層是可點的按鈕區塊）。
-                    onClick={(event) => event.stopPropagation()}
-                  />
-                  含照片（一起索引）
-                  <span className="text-muted" title="改變設定後要重新索引才會生效">
-                    （重新索引後生效）
-                  </span>
-                </label>
-              )}
-              {onToggleAudio !== undefined && root.mode === "index" && (
-                <label className="mt-1 flex items-center gap-1.5 text-xs text-ink">
-                  <input type="checkbox" checked={root.modalities.includes("audio")}
-                    disabled={imagesBusyRootId === root.id}
-                    onChange={(event) => onToggleAudio(root, event.target.checked)} />
-                  含音訊 WAV（重新索引後生效）
-                </label>
-              )}
-              {onToggleVideo !== undefined && root.mode === "index" && (
+    <>
+      <ul className="space-y-2">
+        {roots.map((serverRoot) => {
+          const root = viewRoot(serverRoot);
+          const selected = root.id === selectedRootId;
+          return (
+            <li key={root.id}>
+              <div
+                className={`rounded-lg border px-3 py-2 ${
+                  selected ? "border-ink bg-white" : "border-line bg-white/70"
+                }`}
+              >
+                <div className="flex items-baseline justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => onSelect(root)}
+                    aria-current={selected ? "true" : undefined}
+                    className="min-w-0 flex-1 text-left"
+                    title={root.path}
+                  >
+                    <span className="block truncate text-sm font-medium text-ink">{basename(root.path)}</span>
+                    <span className="mt-0.5 block break-all font-mono text-xs text-muted">{root.path}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onRemove(root)}
+                    className="shrink-0 rounded-md border border-line px-2 py-0.5 text-xs text-muted hover:text-red-600"
+                  >
+                    移除
+                  </button>
+                </div>
+                <p className="mt-1 text-xs text-muted">
+                  {MODE_LABEL[root.mode]}　模態：
+                  {root.modalities.map((modality) => MODALITY_LABEL[modality] ?? modality).join("、") || "（無）"}
+                </p>
                 <label className="mt-1 flex items-start gap-1.5 text-xs text-ink">
                   <input
                     type="checkbox"
                     className="mt-0.5"
-                    checked={videoEnabled(root)}
-                    disabled={imagesBusyRootId === root.id || !videoToggle.enabled}
-                    onChange={(event) => onToggleVideo(root, event.target.checked)}
+                    checked={root.allowAgentSearch === true}
+                    disabled={isBusy(root.id, "agent")}
+                    onChange={(event) => toggleAgentSearch(root, event.target.checked)}
+                    // 點開關不該同時把這個資料夾選取起來（外層是可點的按鈕區塊）。
+                    onClick={(event) => event.stopPropagation()}
                   />
                   <span>
-                    含影片 .mp4（重新索引後生效）
+                    允許 Agent 搜尋此資料夾
                     <span className="mt-0.5 block text-xs text-muted">
-                      {videoToggle.enabled
-                        ? "每 4 秒抽 1 幀；時長上限 600 秒、單檔上限依服務設定。音訊另需勾「含音訊」。"
-                        : videoToggle.reason ?? "影片能力不可用。"}
+                      只影響 agent（MCP 等）的檔案搜尋範圍；這是分享意圖與防誤用，不是多租戶硬隔離
+                      ——持有同一組 token 的程式仍是本機 owner 全權。
                     </span>
                   </span>
                 </label>
-              )}
-              {onSetVideoMaxFileBytes !== undefined && root.mode === "index" && (
-                <VideoLimitEditor
-                  root={root}
-                  fallbackBytes={defaultVideoMaxFileBytes ?? DEFAULT_VIDEO_MAX_FILE_BYTES}
-                  busy={videoLimitBusyRootId === root.id}
-                  onSave={onSetVideoMaxFileBytes}
-                />
-              )}
-              <p className="text-xs text-muted">加入時間：{formatDate(root.createdAt)}</p>
-            </div>
-          </li>
-        );
-      })}
-    </ul>
+                {onToggleImages !== undefined && root.mode === "index" && (
+                  <label className="mt-1 flex items-center gap-1.5 text-xs text-ink">
+                    <input
+                      type="checkbox"
+                      checked={imagesEnabled(root)}
+                      disabled={imagesBusyRootId === root.id}
+                      onChange={(event) => onToggleImages(root, event.target.checked)}
+                      // 點開關不該同時把這個資料夾選取起來（外層是可點的按鈕區塊）。
+                      onClick={(event) => event.stopPropagation()}
+                    />
+                    含照片（一起索引）
+                    <span className="text-muted" title="改變設定後要重新索引才會生效">
+                      （重新索引後生效）
+                    </span>
+                  </label>
+                )}
+                {onToggleAudio !== undefined && root.mode === "index" && (
+                  <label className="mt-1 flex items-center gap-1.5 text-xs text-ink">
+                    <input type="checkbox" checked={root.modalities.includes("audio")}
+                      disabled={imagesBusyRootId === root.id}
+                      onChange={(event) => onToggleAudio(root, event.target.checked)} />
+                    含音訊 WAV（重新索引後生效）
+                  </label>
+                )}
+                {onToggleVideo !== undefined && root.mode === "index" && (
+                  <label className="mt-1 flex items-start gap-1.5 text-xs text-ink">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5"
+                      checked={videoEnabled(root)}
+                      disabled={imagesBusyRootId === root.id || !videoToggle.enabled}
+                      onChange={(event) => onToggleVideo(root, event.target.checked)}
+                    />
+                    <span>
+                      含影片 .mp4（重新索引後生效）
+                      <span className="mt-0.5 block text-xs text-muted">
+                        {videoToggle.enabled
+                          ? "每 4 秒抽 1 幀；時長上限 600 秒、單檔上限依服務設定。音訊另需勾「含音訊」。"
+                          : videoToggle.reason ?? "影片能力不可用。"}
+                      </span>
+                    </span>
+                  </label>
+                )}
+                {onSetVideoMaxFileBytes !== undefined && root.mode === "index" && (
+                  <VideoLimitEditor
+                    root={root}
+                    fallbackBytes={defaultVideoMaxFileBytes ?? DEFAULT_VIDEO_MAX_FILE_BYTES}
+                    busy={videoLimitBusyRootId === root.id}
+                    onSave={onSetVideoMaxFileBytes}
+                  />
+                )}
+                {root.mode === "index" && (
+                  <MaxFileLimitEditor
+                    root={root}
+                    fallbackBytes={DEFAULT_MAX_FILE_BYTES}
+                    busy={isBusy(root.id, "max")}
+                    onSave={saveMaxFileBytes}
+                  />
+                )}
+                <p className="text-xs text-muted">加入時間：{formatDate(root.createdAt)}</p>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+      {actionError !== null && (
+        <p role="alert" className="mt-2 text-xs text-red-600">
+          {actionError}
+        </p>
+      )}
+    </>
   );
 }
 /**
@@ -279,6 +374,173 @@ function VideoLimitEditor({
           </button>
         )}
       </div>
+      {visibleError !== null && (
+        <p role="alert" className="text-xs text-red-600">
+          {visibleError}
+        </p>
+      )}
+    </form>
+  );
+}
+
+/** 通用單檔大小上限的服務層預設（bytes；與 core 的 `DEFAULT_MAX_FILE_BYTES` 一致）。 */
+export const DEFAULT_MAX_FILE_BYTES = 10 * 1024 * 1024;
+
+/** 通用上限的契約上限（bytes；16 GiB）。 */
+export const MAX_FILE_LIMIT_MAX_BYTES = 16 * 1024 * BYTES_PER_MIB;
+
+/** UI 輸入單位（整數 MiB）的上下界；輸入下限是 1 MiB（API 另有 1 byte 的邊界）。 */
+export const MAX_FILE_LIMIT_MIN_MIB = 1;
+export const MAX_FILE_LIMIT_MAX_MIB = MAX_FILE_LIMIT_MAX_BYTES / BYTES_PER_MIB;
+
+/** `parseMaxFileLimitMiB` 的結果：成功時帶換算後的 bytes。 */
+export type MaxFileLimitParseResult =
+  | { ok: true; bytes: number }
+  | { ok: false; message: string };
+
+/**
+ * 解析使用者輸入的「一般檔案單檔大小上限（MiB）」。
+ *
+ * 契約（與 server／storage 相同）：bytes 範圍 1 B–16 GiB；UI 以**整數 MiB** 輸入
+ * （1–16384）。只接受十進位正整數字串：空字串、負數、小數、千分位、單位字尾都給可讀錯誤，
+ * 由呼叫端阻擋送出（不默默四捨五入或截斷）。
+ */
+export function parseMaxFileLimitMiB(text: string): MaxFileLimitParseResult {
+  const trimmed = text.trim();
+  if (trimmed === "") return { ok: false, message: "請輸入一般檔案單檔大小上限（MiB）。" };
+  if (!/^\d+$/.test(trimmed)) return { ok: false, message: "請輸入正整數（MiB），例如 10。" };
+  const mib = Number(trimmed);
+  if (!Number.isSafeInteger(mib) || mib < MAX_FILE_LIMIT_MIN_MIB) {
+    return { ok: false, message: `上限至少 ${MAX_FILE_LIMIT_MIN_MIB} MiB。` };
+  }
+  if (mib > MAX_FILE_LIMIT_MAX_MIB) {
+    return { ok: false, message: `上限最多 16 GiB（${MAX_FILE_LIMIT_MAX_MIB} MiB）。` };
+  }
+  const bytes = mib * BYTES_PER_MIB;
+  if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > MAX_FILE_LIMIT_MAX_BYTES) {
+    return { ok: false, message: "上限超出允許範圍（1 byte–16 GiB）。" };
+  }
+  return { ok: true, bytes };
+}
+
+/**
+ * 通用上限位元組的顯示（格式與影片上限相同：整數 MiB、非整數保留兩位小數、
+ * 小於 1 MiB 直接顯示 bytes）。
+ */
+export function formatMaxFileLimitBytes(bytes: number): string {
+  return formatVideoLimitBytes(bytes);
+}
+
+/**
+ * 這個 root 實際生效的通用單檔大小上限（bytes）。
+ *
+ * 優先序：root 自己的 `maxFileBytes` → 服務層預設（固定 10 MiB）。非法值（非正數）
+ * 一律視為未設定，不讓壞資料變成 0 上限。
+ */
+export function effectiveMaxFileBytes(
+  root: { maxFileBytes?: number | null },
+  fallbackBytes: number | undefined,
+): number {
+  const own = root.maxFileBytes;
+  if (typeof own === "number" && Number.isFinite(own) && own > 0) return Math.trunc(own);
+  if (typeof fallbackBytes === "number" && Number.isFinite(fallbackBytes) && fallbackBytes > 0) {
+    return Math.trunc(fallbackBytes);
+  }
+  return DEFAULT_MAX_FILE_BYTES;
+}
+
+/** 通用上限編輯欄位的預設值（整數 MiB 字串）；非整數 MiB 的值四捨五入到兩位小數。 */
+export function maxFileLimitMiBDefault(fallbackBytes: number | undefined): string {
+  const bytes = effectiveMaxFileBytes({ maxFileBytes: null }, fallbackBytes);
+  const mib = bytes / BYTES_PER_MIB;
+  return Number.isInteger(mib) ? String(mib) : String(Number(mib.toFixed(2)));
+}
+
+/**
+ * 單一 root 的**通用**單檔大小上限編輯器（單位 MiB；送出時換算成 bytes）。
+ *
+ * - 顯示目前生效值（root 設定 → 服務預設 10 MiB）；未設定時標「服務預設」。
+ * - 輸入為整數 MiB（1–16384）；不合法時即時顯示原因並阻擋送出，不默默截斷。
+ * - 只影響之後的 preview／index（非影片檔案），不會自動重新索引既有內容。
+ */
+function MaxFileLimitEditor({
+  root,
+  fallbackBytes,
+  busy,
+  onSave,
+}: {
+  root: Root;
+  fallbackBytes: number;
+  busy: boolean;
+  onSave: (root: Root, bytes: number | null) => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const parsed = parseMaxFileLimitMiB(draft);
+  const effective = effectiveMaxFileBytes(root, fallbackBytes);
+  const inputId = `root-max-file-limit-${root.id}`;
+  const visibleError = submitError ?? (draft.trim() !== "" && !parsed.ok ? parsed.message : null);
+
+  const submit = (event: React.FormEvent<HTMLFormElement>): void => {
+    event.preventDefault();
+    if (!parsed.ok) {
+      setSubmitError(parsed.message);
+      return;
+    }
+    setSubmitError(null);
+    onSave(root, parsed.bytes);
+  };
+
+  return (
+    <form onSubmit={submit} className="mt-1 space-y-1">
+      <p className="text-xs text-muted">
+        一般檔案單檔上限：<span className="font-medium text-ink">{formatMaxFileLimitBytes(effective)}</span>
+        {root.maxFileBytes == null ? "（服務預設）" : ""}
+      </p>
+      <div className="flex flex-wrap items-center gap-1.5">
+        <label htmlFor={inputId} className="text-xs text-muted">
+          設為
+        </label>
+        <input
+          id={inputId}
+          type="number"
+          min={MAX_FILE_LIMIT_MIN_MIB}
+          max={MAX_FILE_LIMIT_MAX_MIB}
+          step={1}
+          inputMode="numeric"
+          value={draft}
+          placeholder={maxFileLimitMiBDefault(fallbackBytes)}
+          disabled={busy}
+          aria-label="一般檔案單檔上限（MiB）"
+          aria-invalid={visibleError !== null}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            setSubmitError(null);
+          }}
+          className="w-20 rounded-md border border-line bg-white px-2 py-0.5 text-xs text-ink outline-none focus:border-ink disabled:opacity-40"
+        />
+        <span className="text-xs text-muted">MiB</span>
+        <button
+          type="submit"
+          disabled={busy || draft.trim() === ""}
+          className="rounded-md border border-line px-2 py-0.5 text-xs text-ink disabled:opacity-40"
+          title="只套用非影片檔案；不會自動重新索引既有內容"
+        >
+          {busy ? "儲存中…" : "儲存"}
+        </button>
+        {root.maxFileBytes !== undefined && (
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => onSave(root, null)}
+            className="rounded-md border border-line px-2 py-0.5 text-xs text-muted disabled:opacity-40"
+            title="清除這個資料夾的設定，回到服務預設上限"
+          >
+            恢復預設
+          </button>
+        )}
+      </div>
+      <p className="text-xs text-muted">只套用非影片檔案；影片另用影片上限。</p>
       {visibleError !== null && (
         <p role="alert" className="text-xs text-red-600">
           {visibleError}

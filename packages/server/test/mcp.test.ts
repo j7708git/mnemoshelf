@@ -125,6 +125,7 @@ describe("MCP stdio 入口", () => {
     }
     const search = tools.tools.find((tool) => tool.name === "search")!;
     expect(Object.keys((search.inputSchema.properties ?? {}) as Record<string, unknown>).sort()).toEqual([
+      "agentOnly",
       "k",
       "mode",
       "query",
@@ -209,16 +210,20 @@ describe("MCP stdio 入口", () => {
     const dir = await makeFixtureRoot();
     dirs.push(dir);
     const created = await api(rest.instance, "POST", "/roots", {
-      body: { path: dir, modalities: ["text", "code", "image"] },
+      body: { path: dir, modalities: ["text", "code", "image"], allowAgentSearch: true },
     });
     const root = created.body as { id: number };
     await api(rest.instance, "POST", `/roots/${root.id}/index`);
 
     const rootsResult = await mcp.client.callTool({ name: "list_roots", arguments: {} });
     expect(rootsResult.isError).toBeFalsy();
-    const roots = jsonOf<{ roots: { id: number; path: string }[] }>(rootsResult);
+    const roots = jsonOf<{ roots: { id: number; path: string; allowAgentSearch: boolean }[]; sharedRootsCount: number }>(
+      rootsResult,
+    );
     expect(roots.roots).toHaveLength(1);
     expect(roots.roots[0]!.id).toBe(root.id);
+    expect(roots.roots[0]!.allowAgentSearch).toBe(true);
+    expect(roots.sharedRootsCount).toBe(1);
 
     const searchResult = await mcp.client.callTool({ name: "search", arguments: { query: NOTE_TOKEN, mode: "hybrid" } });
     expect(searchResult.isError).toBeFalsy();
@@ -229,6 +234,70 @@ describe("MCP stdio 入口", () => {
     expect(chunk.rootId).toBe(root.id);
     expect(typeof chunk.relPath).toBe("string");
     expect(hits.hits.map((hit) => hit.rank)).toEqual(hits.hits.map((_hit, index) => index + 1));
+  });
+
+  it("MCP search 預設只搜分享的 roots；agentOnly: false 才搜全部；list_roots 標示分享狀態", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+
+    const sharedDir = await makeFixtureRoot();
+    dirs.push(sharedDir);
+    const hiddenDir = await makeFixtureRoot();
+    dirs.push(hiddenDir);
+    const shared = await api(rest.instance, "POST", "/roots", {
+      body: { path: sharedDir, modalities: ["text", "code"], allowAgentSearch: true },
+    });
+    const hidden = await api(rest.instance, "POST", "/roots", {
+      body: { path: hiddenDir, modalities: ["text", "code"] },
+    });
+    const sharedId = (shared.body as { id: number }).id;
+    const hiddenId = (hidden.body as { id: number }).id;
+    await api(rest.instance, "POST", `/roots/${sharedId}/index`);
+    await api(rest.instance, "POST", `/roots/${hiddenId}/index`);
+
+    // 預設（未帶 agentOnly）＝只回分享的 root 的 chunks。
+    const defaultSearch = await mcp.client.callTool({ name: "search", arguments: { query: NOTE_TOKEN, mode: "keyword" } });
+    expect(defaultSearch.isError).toBeFalsy();
+    const defaultBody = jsonOf<{ sharedRootsCount: number; hits: { type: string; rootId?: number }[] }>(defaultSearch);
+    expect(defaultBody.sharedRootsCount).toBe(1);
+    const defaultChunkRoots = defaultBody.hits.filter((hit) => hit.type === "chunk").map((hit) => hit.rootId);
+    expect(defaultChunkRoots.length).toBeGreaterThan(0);
+    expect(new Set(defaultChunkRoots)).toEqual(new Set([sharedId]));
+
+    // 明確帶 false＝舊版行為（搜全部，含未分享的 root）。
+    const all = await mcp.client.callTool({
+      name: "search",
+      arguments: { query: NOTE_TOKEN, mode: "keyword", agentOnly: false },
+    });
+    const allBody = jsonOf<{ sharedRootsCount?: number; hits: { type: string; rootId?: number }[] }>(all);
+    expect(allBody.sharedRootsCount).toBeUndefined();
+    const allChunkRoots = allBody.hits.filter((hit) => hit.type === "chunk").map((hit) => hit.rootId);
+    expect(new Set(allChunkRoots)).toEqual(new Set([sharedId, hiddenId]));
+  });
+
+  it("沒有任何分享的 root：search／list_roots 回 sharedRootsCount: 0 與友善提示", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+
+    const dir = await makeFixtureRoot();
+    dirs.push(dir);
+    await api(rest.instance, "POST", "/roots", { body: { path: dir, modalities: ["text", "code"] } });
+
+    const listed = await mcp.client.callTool({ name: "list_roots", arguments: {} });
+    const listing = jsonOf<{ roots: { allowAgentSearch: boolean }[]; sharedRootsCount: number; hint?: string }>(listed);
+    expect(listing.roots).toHaveLength(1);
+    expect(listing.roots[0]!.allowAgentSearch).toBe(false);
+    expect(listing.sharedRootsCount).toBe(0);
+    expect(listing.hint).toContain("允許 Agent 搜尋");
+
+    const searched = await mcp.client.callTool({ name: "search", arguments: { query: NOTE_TOKEN, mode: "keyword" } });
+    expect(searched.isError).toBeFalsy();
+    const result = jsonOf<{ sharedRootsCount: number; hint?: string; hits: unknown[] }>(searched);
+    expect(result.sharedRootsCount).toBe(0);
+    expect(result.hint).toContain("允許 Agent 搜尋");
+    expect(result.hits).toEqual([]);
   });
 
   it("remember → search 找回同一筆（agent 取自 MCP 客戶端名稱）→ forget 後搜不到", async () => {

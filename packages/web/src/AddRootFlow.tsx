@@ -30,6 +30,14 @@ import { formatBytes } from "./format";
 import { toggleModality } from "./audio";
 import { AudioModelStatus } from "./AudioModelStatus";
 import {
+  DEFAULT_MAX_FILE_BYTES,
+  MAX_FILE_LIMIT_MAX_MIB,
+  MAX_FILE_LIMIT_MIN_MIB,
+  formatMaxFileLimitBytes,
+  maxFileLimitMiBDefault,
+  parseMaxFileLimitMiB,
+} from "./RootsList";
+import {
   DEFAULT_VIDEO_MAX_FILE_BYTES,
   describeVideoEntries,
   effectiveVideoMaxFileBytes,
@@ -141,6 +149,14 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
   const [videoLimitMiB, setVideoLimitMiB] = useState<string>(() => videoLimitMiBDefault(videoCapability?.maxFileBytes));
   /** 目前輸入的解析結果；不合法時阻擋送出並顯示原因（不默默截斷）。 */
   const videoLimit = parseVideoLimitMiB(videoLimitMiB);
+  /**
+   * 通用單檔大小上限（UI 輸入單位：整數 MiB；送出時換算成 bytes）。
+   *
+   * 預設沿用服務層預設 10 MiB；只套用非影片檔案（影片另有自己的上限）。
+   * 值會在 root 建立時一併寫入（契約：POST /roots 的 `maxFileBytes`）。
+   */
+  const [maxFileLimitMiB, setMaxFileLimitMiB] = useState<string>(() => maxFileLimitMiBDefault(DEFAULT_MAX_FILE_BYTES));
+  const maxFileLimit = parseMaxFileLimitMiB(maxFileLimitMiB);
   const [step, setStep] = useState<Step>("input");
   const [root, setRoot] = useState<Root | null>(null);
   const [preview, setPreview] = useState<RootPreview | null>(null);
@@ -284,6 +300,10 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
       setError(videoLimit.message);
       return;
     }
+    if (!maxFileLimit.ok) {
+      setError(maxFileLimit.message);
+      return;
+    }
     setError(null);
     setBusy(true);
     let created: Root | null = null;
@@ -297,6 +317,7 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
           includeVideo && videoToggle.enabled,
         ),
         // 一律明帶這個 root 的上限（bytes）；範圍與換算已在 UI 端驗證。
+        maxFileBytes: maxFileLimit.bytes,
         videoMaxFileBytes: videoLimit.bytes,
       });
     } catch (submitError) {
@@ -502,6 +523,37 @@ export function AddRootFlow({ onCancel, onDone, onRootCreated, onRootChanged, vi
             state={videoToggle}
             onChange={setIncludeVideo}
           />
+          <div className="space-y-1">
+            <label htmlFor="add-root-max-file-limit" className="block text-sm font-medium text-ink">
+              一般檔案單檔上限（MiB）
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                id="add-root-max-file-limit"
+                type="number"
+                min={MAX_FILE_LIMIT_MIN_MIB}
+                max={MAX_FILE_LIMIT_MAX_MIB}
+                step={1}
+                inputMode="numeric"
+                value={maxFileLimitMiB}
+                disabled={busy}
+                aria-invalid={!maxFileLimit.ok}
+                aria-describedby="add-root-max-file-limit-hint"
+                onChange={(event) => setMaxFileLimitMiB(event.target.value)}
+                className="w-32 rounded-md border border-line bg-white px-3 py-2 text-sm text-ink outline-none focus:border-ink disabled:opacity-40"
+              />
+              <span className="text-sm text-muted">MiB</span>
+            </div>
+            <p id="add-root-max-file-limit-hint" className="text-xs text-muted">
+              預設 10 MiB（目前服務預設：{formatMaxFileLimitBytes(DEFAULT_MAX_FILE_BYTES)}）。
+              只套用非影片檔案，上限 16 GiB；超過這個大小的檔案會在掃描階段具名跳過。
+            </p>
+            {!maxFileLimit.ok && (
+              <p role="alert" className="text-xs text-red-600">
+                {maxFileLimit.message}
+              </p>
+            )}
+          </div>
           <div className="space-y-1">
             <label htmlFor="add-root-video-limit" className="block text-sm font-medium text-ink">
               影片單檔大小上限（MiB）

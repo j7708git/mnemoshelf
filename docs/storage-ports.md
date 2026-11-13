@@ -23,6 +23,12 @@ MetadataStore 新增政策讀寫、來源新增／查重／讀取／列舉／範
 > 2026-10-16 新增 §root 設定的更新：`MetadataStore.updateRoot(id, patch)` 與 `RootPatch`
 > 型別（目前僅 `modalities`）——兩後端皆實作、通過同一組契約測試。
 >
+> 2026-11-12 擴充 §root 設定的更新：`RootPatch` 新增 `allowAgentSearch`（分享意圖；預設
+> `false`）與 `maxFileBytes`（通用單檔上限；nullable，未設定沿用服務層 10 MiB）；
+> `Root.allowAgentSearch` 為 required boolean，`Root.maxFileBytes` 選填。SQLite migration
+> `0009_root_agent_search_and_max_file_bytes` 與 PostgreSQL schema 同步；另新增
+> `SearchFilter.includeMemories`（讓呼叫端只縮小檔案範圍、仍保留記憶）。
+>
 > 2026-10-18 新增 §記憶的範圍更新：`MetadataStore.updateMemory(id, patch)` 與
 > `MemoryPatch` 型別（僅 `scope`／`project`）——兩後端皆實作、通過同一組契約測試；
 > 既有的記憶方法（新增、釘選、軟刪除、列舉、關鍵字搜尋）與排序語意不變。
@@ -103,6 +109,21 @@ keyword 路把 vector 路原本正確的命中壓了下去（RRF 讓兩路等權
 **`hybrid` 與 `keyword` 保留不刪**：兩者仍是正式模式，明確帶 `mode` 即照舊可用；RRF 實作保留在應用層
 （見 §設計規則 1）。需要固定行為的呼叫端請一律明確帶 `mode`。**記憶只進 keyword 那一路**，因此預設
 `vector` 不含記憶命中；要搜尋記憶請帶 `mode: "keyword"` 或 `"hybrid"`。
+
+### `SearchFilter.includeMemories`（2026-11-12）
+
+`SearchFilter` 除 `rootIds` 外另有一個選填的 `includeMemories`，只影響
+`MetadataStore.searchKeyword` 的記憶名次（向量索引本身不含記憶）：
+
+| 值 | 語意 |
+|---|---|
+| `undefined`（預設） | 既有規則：未指定 `rootIds` 時納入記憶；指定了 `rootIds`（含空陣列）時不納入 |
+| `true` | 即使指定了 `rootIds`（含空陣列）也納入記憶；chunk 仍只搜指定（或空）roots |
+| `false` | 一律不納入記憶 |
+
+用途：`POST /search` 的 `agentOnly` 只縮小檔案搜尋範圍、不影響記憶召回，因此伺服器在
+`agentOnly: true` 且使用者未指定 `rootIds` 時會帶 `includeMemories: true`；使用者有指定
+`rootIds` 時維持「記憶不納入」的既有語意。兩個後端以同一組契約測試驗證此欄位。
 
 ## 音訊片段與增量索引
 
@@ -314,12 +335,17 @@ root 建立之後只有一部分設定可變更；`MetadataStore.updateRoot(id, 
 
 | 方法 | 語意 |
 |---|---|
-| `MetadataStore.updateRoot(id, patch)` | 更新 `RootPatch`（`modalities` 與 `videoMaxFileBytes`）；回傳**更新後**的 `Root` |
+| `MetadataStore.updateRoot(id, patch)` | 更新 `RootPatch`（`modalities`、`allowAgentSearch`、`maxFileBytes` 與 `videoMaxFileBytes`）；回傳**更新後**的 `Root` |
 
-- **目前可改 `modalities` 與 `videoMaxFileBytes`。** `videoMaxFileBytes` 是 bytes、整數
-  1–16 GiB；`null` 表示清除設定（回到服務層預設），`undefined` 表示不變。`path`／`mode`
-  變更等同換一個 root（索引內容與清理語意都會變），應以「移除再加入」處理；
-  `include`／`exclude`／`respectGitignore` 尚無變更語意，故不在 `RootPatch`。
+- **目前可改 `modalities`、`allowAgentSearch`、`maxFileBytes` 與 `videoMaxFileBytes`。**
+  - `allowAgentSearch`：boolean，預設 `false`；只影響之後 agent 的搜尋範圍，不動既有索引。
+  - `maxFileBytes`：bytes、整數 1 B–16 GiB；`null` 表示清除設定（回到服務層預設 10 MiB），
+    `undefined` 表示不變。驗證走 `normalizeRootMaxFileBytes`（與 `Root.maxFileBytes` 相同，
+    未設定時讀回**不出現**該鍵）。
+  - `videoMaxFileBytes`：bytes、整數 1–16 GiB；`null` 表示清除設定（回到服務層預設），
+    `undefined` 表示不變。
+  - `path`／`mode` 變更等同換一個 root（索引內容與清理語意都會變），應以「移除再加入」處理；
+    `include`／`exclude`／`respectGitignore` 尚無變更語意，故不在 `RootPatch`。
 - **冪等**：同樣的 patch 重複套用結果相同；`patch` 未提供的欄位＝該欄位不變。空陣列 `[]` 是合法值
   （＝全部模態關閉，與 `addRoot` 接受空陣列一致），與「未提供該欄位」不同。
 - **回傳更新後的 `Root`**，呼叫端不必再讀一次；`getRoot` 與 `listRoots` 也都反映新值。
@@ -332,9 +358,11 @@ root 建立之後只有一部分設定可變更；`MetadataStore.updateRoot(id, 
   既有索引與衍生資料需重建（`removeRoot(id, true)` 會連 chunks 一起刪掉）。
 - 契約測試（`@mnemoshelf/core/testing` 的 `runMetadataStoreContract`）涵蓋：更新並回傳
   （不可變欄位原樣保留）、冪等與關閉模態、`patch` 未提供欄位、不存在的 id，以及
-  `videoMaxFileBytes` 的設定／讀回／清除／1–16 GiB 邊界與非法值不改資料。SQLite 與 PostgreSQL
-  兩個後端都必須通過同一組測試；SQLite migration `0008_root_video_max_file_bytes` 為 nullable、
-  冪等，舊 row 讀回時不補鍵。
+  `allowAgentSearch` 的預設／更新、`maxFileBytes` 與 `videoMaxFileBytes` 的
+  設定／讀回／清除／1 B–16 GiB 邊界與非法值不改資料。SQLite 與 PostgreSQL
+  兩個後端都必須通過同一組測試；SQLite migration `0008_root_video_max_file_bytes` 與
+  `0009_root_agent_search_and_max_file_bytes` 為 nullable／default false、冪等，
+  舊 row 讀回時不補鍵、既有 root 的 `allowAgentSearch` 一律 `false`。
 
 ## 記憶的範圍更新（2026-10-18）
 

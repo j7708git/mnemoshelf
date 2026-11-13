@@ -345,6 +345,8 @@ describe("影片索引與搜尋（decoder 可用＋embedder 支援）", () => {
     server = await startTestServer({ embedder: new FakeEmbedder({ video: true }), decoder });
     const rootId = await addRoot(await makeVideoRoot(), ["video"]);
     await api(server.instance, "POST", `/roots/${rootId}/index`);
+    // MCP search 預設 agentOnly: true：這個測試要驗 media 轉發，先把 root 標成允許 agent 搜尋。
+    await api(server.instance, "PATCH", `/roots/${rootId}`, { body: { allowAgentSearch: true } });
 
     const clientToServer = new PassThrough();
     const serverToClient = new PassThrough();

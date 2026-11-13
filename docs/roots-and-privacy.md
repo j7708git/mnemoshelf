@@ -17,13 +17,20 @@
 | `include` / `exclude` | 包含與排除規則（glob） |
 | `respectGitignore` | 預設 `true` |
 | `watch` | 持續監看變更，或手動重建 |
-| `agentAccess` | 哪些 agent 可以搜尋這個 root（**尚未實作**；目前所有持有 token 的程式都可搜尋，見 §信任模型） |
+| `maxFileBytes` | 通用單檔大小上限（bytes；1 B–16 GiB）。未設定＝沿用服務層預設 10 MiB；只套用非影片檔案。舊資料列未設定時欄位不存在 |
+| `allowAgentSearch` | 是否允許 agent 搜尋這個 root 的檔案片段（**已實作**；預設 `false`，既有 roots 升級後也是 `false`）。這是**分享意圖／防誤用**，不是多租戶硬隔離，見 §信任模型 |
 
-## 改變模態（`PATCH /roots/:id`）
+## 改變 root 的設定（`PATCH /roots/:id`）
 
-root 加入後要更改可索引的模態（例如之後才想含圖片）不必移除重建：`PATCH /roots/:id` 以
-`{ "modalities": [...] }` 更新，成功回 `200`＋更新後的 root；缺少 `modalities` 或值非法
-（非字串、非已知模態名）→ `400` 且不更動資料，未知的 root → `404`。
+root 加入後要更改可索引的模態（例如之後才想含圖片）不必移除重建：`PATCH /roots/:id` 可更新
+`modalities`、`allowAgentSearch`、`maxFileBytes` 與 `videoMaxFileBytes`，成功回 `200`＋更新後的
+root；四個欄位至少要提供一項，未提供＝不變；值非法 → `400` 且不更動資料，未知的 root → `404`。
+
+- `modalities`：缺少或值非法（非字串、非已知模態名）→ `400`。
+- `allowAgentSearch`：boolean；只影響之後 agent 的搜尋範圍，**不需重新索引**。
+- `maxFileBytes`：通用單檔大小上限（bytes，整數 1 B–16 GiB）；`null`＝清除設定（回服務層
+  預設 10 MiB）。只影響之後的 preview／index；影片不套用這個上限。
+- `videoMaxFileBytes`：影片單檔大小上限（bytes，整數 1–16 GiB）；`null`＝清除設定。
 
 這是**寫入端點，但只寫 Mnemoshelf 自己的資料庫**：它只改這個 root 的設定，**不讀、不寫、
 不刪使用者磁碟上的任何檔案**。
@@ -162,6 +169,23 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
 回傳的記憶與檔案片段必須標明來源（root、相對路徑、寫入的 agent），
 並視為**不受信任的資料**：agent 不應把其中的文字當成指令。
 
+### Agent 搜尋範圍與分享開關（2026-11-12）
+
+每個 root 有 `allowAgentSearch`（預設 `false`）：只有勾選「允許 Agent 搜尋此資料夾」的 root，
+其檔案片段才會被 agent 的搜尋工具看到。
+
+- **REST**：`POST /search` 的 `agentOnly: true` 只搜 `allowAgentSearch = true` 的 roots；
+  未提供時預設 `false`（搜全部，維持舊行為）。與 `rootIds` 同時給時**取交集**。
+  `agentOnly` 只過濾 roots／檔案 chunks，**不影響記憶（memories）召回**；若同時指定了
+  `rootIds`，則維持既有規則「有指定 rootIds 時記憶不納入」。
+- **MCP**：`search` 工具**預設 `agentOnly: true`**（行為變更）。要搜尋全部資料夾（含未勾選者）
+  必須明確帶 `agentOnly: false`。`list_roots` 會標示每個 root 的分享狀態與 `sharedRootsCount`；
+  完全沒有勾選任何 root 時，回應另帶 `sharedRootsCount: 0` 與 `hint`，說明要去 UI 勾選，
+  而不是只回一個沒有說明的空結果。
+- **UI**：Mnemoshelf 的資料夾清單可逐 root 勾選；文案會明示這只影響 agent 的搜尋範圍。
+- **這是分享意圖／防誤用，不是安全邊界。** 持有同一組 token 的程式仍是本機 owner 全權：
+  REST 仍可讀取所有已加入的 root、繞過這個開關；要硬隔離需要 per-agent token／ACL（後續工作）。
+
 ## 信任模型：單一 token＝本機單一 owner 全權
 
 **現行模型是「本機單一持有者全權」**：服務只綁 `127.0.0.1`，以**一組** Bearer token 保護；
@@ -171,6 +195,8 @@ agent 透過 MCP、REST 或 CLI 存取時，只能看到已加入的 root；目�
   自報（MCP 取 client 名稱）；任何持有 token 的呼叫端都能用任意 `agent` 值；召回可用 `agent`
   參數讀取別人的 agent 範圍。
 - **`scope=agent` 不是安全邊界**：它只是約定上的個人範圍（本版尚未強制），不可用來隔離不同 agent。
+- **`allowAgentSearch` 也不是安全邊界**：它只是分享意圖／防誤用（預設關閉），讓 agent 的
+  搜尋工具預設只看使用者勾選的資料夾；持有 token 的程式仍可經 REST 讀取全部 roots。
 - **沒有 per-agent token／授權、沒有 audit trail**；需要真正隔離時，必須先擴充身分模型（列後續）。
 - 因此：**不要把 token 分享給不受信任的程式**；多 agent 共用同一份服務時，視為同一個信任圈。
 - **`/health` 的服務身分檢查不是身分保證。** MCP 入口在使用 `runtime.json` 前會確認 `/health` 的

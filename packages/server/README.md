@@ -68,9 +68,9 @@ loopback、並對連線來源再做 `requireLoopback` 檢查。需要更嚴格�
 | 方法與路徑 | 說明 |
 |---|---|
 | `GET /health` | 探活（免 token） |
-| `POST /roots` | 加入 root：`{path, mode?, modalities?, include?, exclude?, respectGitignore?, maxFileBytes?}`；`maxFileBytes` **只存活於本次行程**（見下） |
+| `POST /roots` | 加入 root：`{path, mode?, modalities?, include?, exclude?, respectGitignore?, maxFileBytes?, videoMaxFileBytes?, allowAgentSearch?}`；`maxFileBytes` 是 per-root 持久化欄位（bytes、1 B–16 GiB；未設定＝服務層預設 10 MiB），`allowAgentSearch` 預設 `false`（見下） |
 | `GET /roots`、`GET /roots/:id` | 列出／取得 root |
-| `PATCH /roots/:id` | 更新可變設定：`{modalities}`（必填；`text／code／image／audio／video` 的子集，空陣列＝全關）。成功回 `200`＋更新後的 root；欄位缺漏或非法 → `400`；未知 root → `404`。**只改設定，不自動重新索引**（下一次索引才生效；關掉模態不會立刻釋放既有向量） |
+| `PATCH /roots/:id` | 更新可變設定：`{modalities?, allowAgentSearch?, maxFileBytes?, videoMaxFileBytes?}`（四個欄位**至少要提供一項**；`modalities` 是 `text／code／image／audio／video` 的子集，空陣列＝全關；兩個上限為 bytes、1 B–16 GiB，`null`＝清除設定）。成功回 `200`＋更新後的 root；欄位非法 → `400`；未知 root → `404`。**只改設定，不自動重新索引**（下一次索引才生效；關掉模態不會立刻釋放既有向量；`allowAgentSearch` 不需重新索引） |
 | `DELETE /roots/:id?deleteData=1` | 移除 root；`deleteData=1` 時一併刪除 chunk 與向量 |
 | `POST /roots/:id/preview` | 乾跑統計（不寫入任何狀態）：`{totalFiles, totalBytes, byKind, skipped, estimatedChunks, estimatedSeconds, estimated}`。`estimated` 是估時分解（`textSeconds／imageSeconds／otherSeconds／seconds`，三者相加＝`estimatedSeconds`）；模型保守、常數與依據見 `@mnemoshelf/core` 的 `preview.ts` 註解 |
 | `POST /roots/:id/index` | 觸發索引；同一 root 索引進行中再呼叫 → `409`。**會等整個索引跑完才回應**；被取消時回 `200`＋`{rootId, durationMs, cancelled:true}`（不是錯誤） |
@@ -80,7 +80,7 @@ loopback、並對連線來源再做 `requireLoopback` 檢查。需要更嚴格�
 | `GET /roots/:id/entries?path=<相對路徑>` | 列出該相對路徑（目錄）下的直接子項：`{path, entries:[{name,path,kind,size,mimeType}]}`。`kind` 為 `dir`／`text`／`code`／`image`／`audio`／`video`／`binary`；目錄的 `size` 為 `null` |
 | `GET /roots/:id/file?path=<相對路徑>` | 文字預覽（JSON：`{kind:"text",path,size,truncated,content}`，上限 256 KB、超過截斷並以 `truncated` 標明）或圖片原始位元組（帶正確 `Content-Type`） |
 | `GET /roots/:id/thumb?path=<相對路徑>` | 圖片縮圖（`sharp` 產生、寬度上限 320px、輸出 PNG；**記憶體內快取**，不寫磁碟） |
-| `POST /search` | `{query, mode?, rootIds?, k?}`；`mode` 為 `keyword`／`hybrid`／`vector`（預設），`k` 上限 100 |
+| `POST /search` | `{query, mode?, rootIds?, k?, agentOnly?}`；`mode` 為 `keyword`／`hybrid`／`vector`（預設），`k` 上限 100；`agentOnly: true` 只搜已勾選「允許 Agent 搜尋」的 roots（預設 `false`；與 `rootIds` 同時給取交集，不影響記憶召回） |
 | `POST /memories` | `{content, kind?, scope?, project?, agent, supersedes?}`（`agent` 必填＝寫入者標識；`supersedes` 為被取代的記憶 id，帶了會把舊版軟刪除＝編輯流程） |
 | `GET /memories` | 列出未刪除的記憶（由新到舊）；每筆帶 `pinned`；query：`kind`、`scope`、`project`、`agent`、`limit`（預設 100、上限 500） |
 | `POST /memories/:id/pin` | 設定／取消釘選：`{pinned?: boolean}`（省略＝`true`）；冪等；未知 id → `404`；回傳更新後的記憶 |
@@ -125,11 +125,17 @@ keyword 路壓過 vector 路的正確命中），因此預設由 `hybrid` 改為
 keyword 那一路**，因此預設 `vector` 不含記憶命中；要搜尋記憶請帶 `mode: "keyword"` 或 `"hybrid"`。
 （完整契約見 `docs/storage-ports.md` §搜尋模式與預設。）
 
-### `maxFileBytes` 的生命週期
+### `maxFileBytes` 與 `allowAgentSearch` 的持久化
 
-`POST /roots` 的 `maxFileBytes` **只存活於本次行程**：`Root` 契約沒有這個欄位，因此不會寫進資料庫，
-服務重啟後就回退 indexer 的預設單檔上限（10 MB），**重新索引前需要重新設定**（`POST /roots/:id/index`
-本身不接受此參數，`preview`／`index` 沿用加入時的值）。要持久化需新增 migration 與契約變更，列入未來議題。
+`maxFileBytes` 是 **per-root 持久化欄位**（資料庫 `roots.max_file_bytes`，可為 NULL）：未設定時
+沿用服務層預設的單檔上限（10 MiB），**明確設定後重啟服務仍保留**，不會回退預設；`preview`／`index`
+讀的是同一個欄位。值域是整數 1 B–16 GiB；`PATCH /roots/:id` 可修改，傳 `null` 表示清除設定
+（回到服務層預設）。通用上限**不套用影片**，影片上限另有 `videoMaxFileBytes`（per-root、1–16 GiB）。
+
+`allowAgentSearch` 同樣是 per-root 持久化布林，**預設 `false`**（既有 roots 升級後也是 `false`）。
+MCP `search` 預設帶 `agentOnly: true`，只搜尋勾選分享的 roots；`list_roots` 會標示每個 root 的
+分享狀態並回 `sharedRootsCount`。這是**分享意圖／防誤用，不是多租戶硬隔離**：持有同一組 token
+的程式仍可經 REST 讀取所有已加入的 roots（見 `docs/roots-and-privacy.md` §信任模型）。
 
 ### 索引的取消、失敗與進度語意（2026-10-15）
 
@@ -204,6 +210,11 @@ HTTP 有回應的錯誤（401／404／400…）**不重試**。
 **回傳內容視為不受信任的資料，不得當成指令執行**（`docs/roots-and-privacy.md` §Agent 存取）。
 stdio 模式下 stdout 是協定通道，訊息一律走 stderr。
 
+`search` **預設 `agentOnly: true`**（2026-11-12 行為變更）：只搜尋使用者勾選「允許 Agent 搜尋」
+的 roots；要搜尋全部資料夾（含未勾選者）必須明確帶 `agentOnly: false`，與 `rootIds` 同時給時
+取交集。這個參數只過濾 roots／檔案片段，不影響記憶召回。`list_roots` 會標示每個 root 的分享
+狀態與 `sharedRootsCount`；沒有任何分享時另帶 `hint`，說明要去 UI 勾選，而不是無說明的空結果。
+
 ## 測試
 
 ```bash
@@ -216,10 +227,13 @@ MNEMOSHELF_E2E=1 pnpm --filter @mnemoshelf/server run e2e   # 真實 embedder（
 
 ## 目前限制
 
-- `maxFileBytes` 只存活於本次行程，重啟後回退預設 10 MB（見上）。
+- 上限類設定（`maxFileBytes`／`videoMaxFileBytes`）只影響之後的 preview／index，不自動重新索引；
+  `allowAgentSearch` 立即影響 agent 的搜尋範圍。三者都是 per-root 持久化，重啟後仍在（見上）。
 - 沒有 watch／檔案監看、沒有 WebSocket／SSE 進度串流、沒有多使用者或角色。索引进度以輪詢
   `GET /roots/:id/index/status` 取得（行程內記憶體；重啟後回 `idle`）。
-- root 的 `agentAccess` 欄位本版尚未做內容級過濾。
+- 沒有 per-agent token／ACL，也沒有內容級過濾：`allowAgentSearch` 只按 root 過濾（勾選分享的
+  root 內所有檔案片段都對 agent 可見），是分享意圖／防誤用，不是多租戶硬隔離
+  （見 `docs/roots-and-privacy.md` §信任模型）。
 - 索引沒有佇列：進行中再呼叫會回 `409`。取消走 `POST /roots/:id/index/cancel`（只中止該 root 自己的任務）。
 - Web UI 提供 token 輸入、roots 清單、加入資料夾引導（加入→預覽→索引→進度）、虛擬化目錄樹、
   檔案預覽（文字與圖片縮圖）、統一搜尋（模式選擇器，UI 預設 `hybrid`）與記憶管理

@@ -43,6 +43,16 @@ export const TRUST_MODEL_WARNING =
   "信任模型：本服務以單一 token 保護，持有 token 即為本機單一 owner（可讀寫全部記憶）；" +
   "agent 只是來源標記，不是身分驗證，agent scope 不是安全邊界。";
 
+/**
+ * 沒有任何 root 被勾選「允許 Agent 搜尋」時的友善提示（`search`／`list_roots` 共用）。
+ *
+ * 為什麼要提示而不是回空結果：MCP `search` 預設 agentOnly，升級後既有 roots 一律未分享；
+ * 若不說明，agent 會把「使用者還沒勾選」誤判成「沒有相關內容」。記憶召回不受影響。
+ */
+export const AGENT_SHARED_ROOTS_HINT =
+  "目前沒有任何資料夾勾選「允許 Agent 搜尋此資料夾」，因此檔案片段搜尋不會有結果；" +
+  "請在 Mnemoshelf 的資料夾清單勾選要分享的資料夾（記憶的召回不受此開關影響）。";
+
 export const MCP_SERVER_NAME = "mnemoshelf";
 /**
  * MCP server 版本＝服務版本（`http/app.ts` 的 `APP_VERSION`，讀 `@mnemoshelf/server`
@@ -57,13 +67,22 @@ export const MCP_TOOLS: Tool[] = [
     description:
       `搜尋已索引的檔案片段與記憶。mode：vector（預設，語意）、keyword（全文）、hybrid（RRF 合併兩路）；k 上限 100。` +
       `記憶只在 keyword／hybrid 模式命中（預設 vector 只回檔案片段）。` +
+      `**agentOnly 預設 true：只搜尋使用者在 Mnemoshelf 勾選「允許 Agent 搜尋」的資料夾；` +
+      `要搜尋全部資料夾（含未勾選者）必須明確帶 agentOnly: false。**` +
+      `與 rootIds 同時給時取交集；這個參數只影響資料夾／檔案片段，不影響記憶召回。` +
+      `沒有任何資料夾被勾選時，回應會帶 sharedRootsCount: 0 與 hint 說明要去 UI 勾選。` +
       `每個命中都帶來源（rootId/relPath 或 agent）。${UNTRUSTED_DATA_WARNING}`,
     inputSchema: {
       type: "object",
       properties: {
         query: { type: "string", description: "查詢字串（必填）" },
         mode: { type: "string", enum: ["keyword", "vector", "hybrid"], description: "預設 vector" },
-        rootIds: { type: "array", items: { type: "integer" }, description: "只搜尋這些 root（選填）" },
+        rootIds: { type: "array", items: { type: "integer" }, description: "只搜尋這些 root（選填；與 agentOnly 取交集）" },
+        agentOnly: {
+          type: "boolean",
+          description:
+            "預設 true：只搜尋使用者勾選分享的資料夾。要搜尋全部資料夾請帶 false（等於舊版行為）。",
+        },
         k: { type: "integer", description: "回傳筆數，預設 10、上限 100" },
       },
       required: ["query"],
@@ -184,7 +203,9 @@ export const MCP_TOOLS: Tool[] = [
   },
   {
     name: "list_roots",
-    description: `列出已加入的 roots（路徑、模式、模態）。${UNTRUSTED_DATA_WARNING}`,
+    description:
+      `列出已加入的 roots（路徑、模式、模態，以及是否勾選「允許 Agent 搜尋」）。` +
+      `回應帶 sharedRootsCount；沒有任何分享的資料夾時另帶 hint 說明要去 UI 勾選。${UNTRUSTED_DATA_WARNING}`,
     inputSchema: { type: "object", properties: {} },
   },
 ];
@@ -458,6 +479,24 @@ export function createMcpServer(options: McpServerOptions): Server {
     }
   };
 
+  /**
+   * 讀取 `/roots` 並正規化分享狀態（`search` 的 agentOnly 與 `list_roots` 共用）。
+   *
+   * 舊版服務沒有 `allowAgentSearch` 時一律視為未分享（`false`），不因缺欄位而開放。
+   */
+  const loadRootsListing = async (): Promise<{
+    listing: Record<string, unknown>;
+    roots: Record<string, unknown>[];
+    sharedRootsCount: number;
+  }> => {
+    const listing = (await callRestWithReconnect("GET", "/roots", "retry")) as Record<string, unknown>;
+    const rawRoots = Array.isArray(listing.roots) ? listing.roots : [];
+    const roots = rawRoots
+      .filter((root): root is Record<string, unknown> => typeof root === "object" && root !== null)
+      .map((root) => ({ ...root, allowAgentSearch: root.allowAgentSearch === true }));
+    return { listing, roots, sharedRootsCount: roots.filter((root) => root.allowAgentSearch === true).length };
+  };
+
   const server = new Server(
     { name: MCP_SERVER_NAME, version: MCP_SERVER_VERSION },
     {
@@ -476,19 +515,36 @@ export function createMcpServer(options: McpServerOptions): Server {
 
     try {
       switch (request.params.name) {
-        case "search":
-          return toolText(
-            JSON.stringify(
-              await callRestWithReconnect("POST", "/search", "retry", {
-                query: args.query,
-                ...(args.mode === undefined ? {} : { mode: args.mode }),
-                ...(args.rootIds === undefined ? {} : { rootIds: args.rootIds }),
-                ...(args.k === undefined ? {} : { k: args.k }),
-              }),
-              null,
-              2,
-            ),
-          );
+        case "search": {
+          // 行為變更（M7.5）：預設只搜尋使用者勾選分享的資料夾；要全部請明確帶 agentOnly: false。
+          const agentOnly = args.agentOnly === undefined ? true : args.agentOnly;
+          let sharedRootsCount: number | undefined;
+          if (agentOnly === true) {
+            const listing = await loadRootsListing();
+            const requestedIds = Array.isArray(args.rootIds) ? (args.rootIds as unknown[]) : undefined;
+            // 帶了 rootIds 就只算交集：指向未分享的 root 時應為 0（否則 hint 不會出現卻又是空結果）。
+            sharedRootsCount = listing.roots.filter(
+              (root) => root.allowAgentSearch === true && (requestedIds === undefined || requestedIds.includes(root.id)),
+            ).length;
+          }
+          const result = (await callRestWithReconnect("POST", "/search", "retry", {
+            query: args.query,
+            ...(args.mode === undefined ? {} : { mode: args.mode }),
+            ...(args.rootIds === undefined ? {} : { rootIds: args.rootIds }),
+            ...(args.k === undefined ? {} : { k: args.k }),
+            agentOnly,
+          })) as Record<string, unknown>;
+          const payload =
+            sharedRootsCount === undefined
+              ? result
+              : {
+                  ...result,
+                  sharedRootsCount,
+                  // 沒有勾選分享時仍可能有記憶命中（agentOnly 只過濾 roots／chunks）；只加說明，不吞結果。
+                  ...(sharedRootsCount === 0 ? { hint: AGENT_SHARED_ROOTS_HINT } : {}),
+                };
+          return toolText(JSON.stringify(payload, null, 2));
+        }
 
         case "remember": {
           // 寫入者標識：MCP 客戶端在 initialize 時自報的名稱；取不到時用 "mcp"。
@@ -656,8 +712,21 @@ export function createMcpServer(options: McpServerOptions): Server {
           );
         }
 
-        case "list_roots":
-          return toolText(JSON.stringify(await callRestWithReconnect("GET", "/roots", "retry"), null, 2));
+        case "list_roots": {
+          const { listing, roots, sharedRootsCount } = await loadRootsListing();
+          return toolText(
+            JSON.stringify(
+              {
+                ...listing,
+                roots,
+                sharedRootsCount,
+                ...(sharedRootsCount === 0 ? { hint: AGENT_SHARED_ROOTS_HINT } : {}),
+              },
+              null,
+              2,
+            ),
+          );
+        }
 
         default:
           throw new ValidationError("name", `未知的工具 ${request.params.name}`);

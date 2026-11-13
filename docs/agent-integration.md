@@ -194,6 +194,23 @@ MCP 入口的連線來源有兩條，**先環境變數、後連線資訊檔**：
 HTTP 有回應但狀態碼是錯誤（401／404／400…）**不會**重試：那是服務端的答案，重試只會多打一次 API。
 重新驗證若失敗，工具回應會帶上對應的失敗代碼。
 
+### 檔案搜尋（roots）的分享開關（2026-11-12，行為變更）
+
+Mnemoshelf 的每個資料夾（root）都有「允許 Agent 搜尋此資料夾」開關，**預設關閉**；
+既有 roots 升級後也是關閉。這是分享意圖／防誤用，**不是多租戶硬隔離**：
+只要持有同一組 token，任何程式仍可經 REST 讀取所有已加入的 roots（見
+`docs/roots-and-privacy.md` §信任模型）。
+
+- **MCP `search` 預設 `agentOnly: true`**：只搜尋已勾選分享的 roots。升級後如果 agent
+  突然搜不到檔案片段，先請使用者到 Mnemoshelf 的資料夾清單勾選要分享的資料夾。
+- 要恢復舊行為（搜全部資料夾）可明確帶 `agentOnly: false`；與 `rootIds` 同時給時取交集。
+- `agentOnly` 只過濾 roots／檔案片段，**不影響記憶召回**；同時指定 `rootIds` 時沿用既有規則
+  「記憶不納入」。
+- `list_roots` 會標示每個 root 的 `allowAgentSearch` 並回 `sharedRootsCount`；沒有任何分享時
+  另帶 `hint`，說明要去 UI 勾選，不是無說明的空結果。
+- REST `POST /search` 的 `agentOnly` 預設 `false`（Web UI 搜全部）；這個參數只影響該次請求，
+  不會改動 root 設定。改設定請用 `PATCH /roots/:id` 的 `allowAgentSearch`。
+
 **只用環境變數連線的人**（`MNEMOSHELF_URL` 與 `MNEMOSHELF_TOKEN` 都設定）：重解析時仍是同一組
 環境變數，**不會**改讀 `runtime.json`，所以服務換埠後**仍須更新環境變數或重啟 agent**
 （環境變數是使用者明確指定的連線，入口不會自行改讀其他來源）。使用 `runtime.json` 的使用者

@@ -500,6 +500,38 @@ export function normalizeRootVideoMaxFileBytes(value: unknown): number | undefin
 }
 
 /**
+ * root 的通用單檔大小上限（`Root.maxFileBytes`）最小值（bytes）。
+ *
+ * 與影片上限分開命名，但值域相同（1 B–16 GiB）：兩者都是 per-root 持久化設定，
+ * 預設值屬呼叫端（server 的 10 MiB）語意。
+ */
+export const MAX_FILE_BYTES_MIN = 1;
+
+/** root 的通用單檔大小上限最大值（16 GiB）。 */
+export const MAX_FILE_BYTES_MAX = 16 * 1024 * 1024 * 1024;
+
+/**
+ * 驗證並正規化 root 的**通用**單檔大小上限（bytes；不套用影片）。
+ *
+ * 這是兩後端（SQLite／PostgreSQL）與呼叫端共用的**唯一**驗證入口（不得各自解讀）：
+ * - `undefined`／`null` → `undefined`（未設定；呼叫端沿用服務層預設 10 MiB，不寫入資料庫）；
+ * - 整數且落在 1–16 GiB → 原值；
+ * - 其他（0／負數／小數／NaN／Infinity／超過 16 GiB／非數字）→ 拋 `TypeError`。
+ */
+export function normalizeRootMaxFileBytes(value: unknown): number | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (
+    typeof value !== "number" ||
+    !Number.isSafeInteger(value) ||
+    value < MAX_FILE_BYTES_MIN ||
+    value > MAX_FILE_BYTES_MAX
+  ) {
+    throw new TypeError("root 的單檔大小上限必須是 1–16 GiB 的整數（bytes）");
+  }
+  return value;
+}
+
+/**
  * 中繼資料儲存介面（預設實作為 SQLite）。
  * 職責：roots、檔案 chunk 文字、記憶、遷移。
  * 全文檢索的斷詞方式屬於實作細節，不得洩漏到介面。
@@ -523,21 +555,28 @@ export interface MetadataStore {
   /**
    * 新增 root。
    *
-   * `r.videoMaxFileBytes` 選填：有值時必須通過 `normalizeRootVideoMaxFileBytes`
-   * （1–16 GiB 整數），未提供／`null` 時資料庫寫 NULL；讀回時該鍵不出現。
+   * `r.allowAgentSearch` 選填（省略＝`false`）。`r.maxFileBytes` 選填：有值時必須通過
+   * `normalizeRootMaxFileBytes`（1–16 GiB 整數），未提供／`null` 時資料庫寫 NULL；
+   * 讀回時該鍵不出現。`r.videoMaxFileBytes` 選填：有值時必須通過
+   * `normalizeRootVideoMaxFileBytes`（1–16 GiB 整數），未提供／`null` 時資料庫寫 NULL；
+   * 讀回時該鍵不出現。
    */
   addRoot(r: NewRoot): Promise<Root>;
   getRoot(id: number): Promise<Root | null>;
   listRoots(): Promise<Root[]>;
 
   /**
-   * 更新 root 的可變設定（見 `RootPatch`；`modalities` 與 `videoMaxFileBytes`）。
+   * 更新 root 的可變設定（見 `RootPatch`；`modalities`、`allowAgentSearch`、
+   * `maxFileBytes` 與 `videoMaxFileBytes`）。
    *
    * - 回傳**更新後**的 root，讓呼叫端不必再讀一次；
    * - id 不存在時回 `null`（呼叫端據此回 404；本方法自己不拋錯，
    *   與 `setMemoryPinned` 對不存在 id 的「不拋錯」風格一致）；
    * - 只改設定，**不動**任何 chunk／向量：模態要在下一次 `indexRoot` 才會生效
    *   （關掉模態不會立刻釋放既有向量，重新索引時才由清理迴圈清掉）。
+   * - `allowAgentSearch`：只影響之後的 agent 搜尋範圍，不動既有索引。
+   * - `maxFileBytes`：`number`＝設定（驗證同上）、`null`＝清除（寫 NULL）、
+   *   `undefined`＝不改；只影響之後的 preview／index，不動既有索引。
    * - `videoMaxFileBytes`：`number`＝設定（驗證同上）、`null`＝清除（寫 NULL）、
    *   `undefined`＝不改；只影響之後的 preview／index／播放，不動既有索引。
    */
@@ -727,6 +766,11 @@ export interface MetadataStore {
    */
   listMemoriesForExport(): Promise<Memory[]>;
 
-  /** 關鍵字搜尋 chunk 文字與未刪除的記憶，回傳排名清單。 */
+  /**
+   * 關鍵字搜尋 chunk 文字與未刪除的記憶，回傳排名清單。
+   *
+   * `filter.includeMemories` 的語意見 `SearchFilter`：未指定時沿用「有 `rootIds` 就不含記憶」
+   * 的既有規則；`true` 可讓呼叫端只縮小 chunk 的 root 範圍、仍保留記憶。
+   */
   searchKeyword(query: string, filter: SearchFilter, k: number): Promise<RankedHit[]>;
 }

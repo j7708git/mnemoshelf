@@ -474,6 +474,8 @@ export async function walkRoot(root: ScanRoot, options: ScanOptions = {}): Promi
     respectGitignore: root.respectGitignore,
     watch: false,
     createdAt: "",
+    // 路徑守衛不涉及 agent 分享；dummy root 一律 false（欄位為 required 的契約值）。
+    allowAgentSearch: false,
   };
   const gitignore = root.respectGitignore ? await loadGitignore(rootAbs) : null;
 
