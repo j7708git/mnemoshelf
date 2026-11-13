@@ -78,6 +78,7 @@ TypeScript／Node.js／pnpm；桌面殼是 Electron＋React，Web UI 用 Vite＋
 | [docs/operations.md](docs/operations.md) | REST 端點速查、MCP 工具、環境變數總表、索引排隊與取消 |
 | [docs/opencode-plugin.md](docs/opencode-plugin.md) | OpenCode／OpenChamber 外掛：安裝（連接 Agent 頁提供可複製片段）、召回行為、原文擷取 |
 | [docs/agent-integration.md](docs/agent-integration.md) | 連接 Agent 頁面的接入指引、`runtime.json` 連線資訊檔與 MCP 設定片段（入口會自動讀檔，不必手動貼 token）、各 harness 召回契約 |
+| [docs/hook-integration.md](docs/hook-integration.md) | 通用 Agent Hook 接入指南：三步複製貼上範本（Antigravity／Codex／通用）、事件欄位對照表與降級契約 |
 | [docs/codex-recall.md](docs/codex-recall.md) | 從原始碼啟用 Codex 自動召回、查詢範圍與排查方式 |
 | [docs/updates.md](docs/updates.md) | App 內更新：支援矩陣、更新前備份、還原與手動回滾、平台限制 |
 | [docs/roots-and-privacy.md](docs/roots-and-privacy.md) | root 規則、路徑安全、機密遮罩、信任模型、資料刪除 |
