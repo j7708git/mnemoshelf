@@ -11,7 +11,7 @@
 ## 啟用與確認
 
 1. 讓 Mnemoshelf App 保持執行。在設定的「Agent 連線資訊」確認連線資訊檔可用，記下顯示的 `runtime.json` 絕對路徑。
-2. 在包含此腳本的 Mnemoshelf 原始碼目錄，用 Node.js 22.14 以上執行 `pnpm install --frozen-lockfile` 和 `pnpm --filter '@mnemoshelf/server...' build`。腳本位於 `packages/server/dist/scripts/codex-recall.js`，可搭配已安裝的 v0.9.0 App。
+2. 在包含此腳本的 Mnemoshelf 原始碼目錄，用 Node.js 22.14 以上執行 `pnpm install --frozen-lockfile` 和 `pnpm --filter '@mnemoshelf/server...' build`。腳本位於 `packages/server/dist/scripts/codex-recall.js`，可搭配已安裝的 v0.9.1 App。
 3. 在要啟用的專案中，將下列設定合併到 `.codex/hooks.json`。若已有 `hooks.UserPromptSubmit`，在陣列內新增一組，保留其他 hook。要跨專案啟用才使用 `~/.codex/hooks.json`，同一專案只設一份以避免重複查詢。
 
 下列範例使用 macOS／Linux shell。將三個括號內的值換成 `runtime.json`、Node.js 執行檔及腳本的絕對路徑。Codex 從介面啟動時可能讀不到終端機的 `PATH`，可先用 `command -v node` 查 Node.js 路徑。
