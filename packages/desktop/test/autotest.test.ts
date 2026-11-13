@@ -11,7 +11,13 @@ vi.mock("electron", () => ({
   Tray: class {},
 }));
 
-import { ALL_SCENARIOS, OPT_IN_SCENARIOS, parseScenarios } from "../src/autotest.js";
+import {
+  ALL_SCENARIOS,
+  OPT_IN_SCENARIOS,
+  buttonExistsExpression,
+  clickByTextExpression,
+  parseScenarios,
+} from "../src/autotest.js";
 
 describe("parseScenarios", () => {
   it("空字串與 all 都展開成全部（不含 opt-in 情境）", () => {
@@ -41,5 +47,34 @@ describe("parseScenarios", () => {
   it("不認得的情境丟錯，訊息列出可用的情境", () => {
     expect(() => parseScenarios("nope")).toThrowError(/不認得的情境：nope/);
     expect(() => parseScenarios("nope")).toThrowError(/hidden/);
+  });
+});
+
+describe("control text matching expressions", () => {
+  function runWithFakeDocument(textContents: string[], expr: string) {
+    const clicked: string[] = [];
+    const nodes = textContents.map((textContent) => ({
+      textContent,
+      click: () => clicked.push(textContent),
+    }));
+    const fn = new Function("document", `return (${expr});`);
+    const result = fn({ querySelectorAll: () => nodes });
+    return { result, clicked };
+  }
+
+  it("clickByTextExpression 容許前置 +／＋ 與空白且不誤點其他按鈕", () => {
+    const res1 = runWithFakeDocument(["+ 加入資料夾", "+ 加入"], clickByTextExpression("加入"));
+    expect(res1.result).toBe(true);
+    expect(res1.clicked).toEqual(["+ 加入"]);
+
+    const res2 = runWithFakeDocument(["加入並預覽"], clickByTextExpression("加入"));
+    expect(res2.result).toBe(false);
+    expect(res2.clicked).toEqual([]);
+  });
+
+  it("buttonExistsExpression 同樣容許前置 +／＋ 與空白", () => {
+    expect(runWithFakeDocument(["+ 加入"], buttonExistsExpression("加入")).result).toBe(true);
+    expect(runWithFakeDocument(["＋ 加入"], buttonExistsExpression("加入")).result).toBe(true);
+    expect(runWithFakeDocument(["+ 加入資料夾"], buttonExistsExpression("加入")).result).toBe(false);
   });
 });
