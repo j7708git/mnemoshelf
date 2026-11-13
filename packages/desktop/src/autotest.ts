@@ -171,7 +171,9 @@ function clickByTextExpression(text: string): string {
   return `(() => {
   const wanted = ${JSON.stringify(text)};
   const nodes = [...document.querySelectorAll("button, a, [role=\\"button\\"]")];
-  const target = nodes.find((node) => (node.textContent || "").trim() === wanted);
+  // 改版後按鈕可能帶前置符號（例如「+ 加入」）；比對時去掉前置的 +／＋ 與空白，仍要求其餘文字完全相同。
+  const normalize = (value) => (value || "").trim().replace(/^[+＋]\\s*/, "");
+  const target = nodes.find((node) => normalize(node.textContent) === wanted);
   if (!target) return false;
   target.click();
   return true;
