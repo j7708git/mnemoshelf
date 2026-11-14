@@ -324,10 +324,10 @@ export async function captureTurn(options: CaptureTurnOptions): Promise<CaptureT
     .map((m) => ({
       sourceMessage: clampMetadata(m.messageId),
       role: m.role,
-      content: sanitizeRawText(m.content).trim(),
+      content: sanitizeRawText(m.content),
       occurredAt: m.occurredAt,
     }))
-    .filter((m) => m.sourceMessage !== "" && m.content !== "");
+    .filter((m) => m.sourceMessage !== "" && m.content.trim() !== "");
 
   if (validMessages.length === 0) return { status: "skipped" };
 
@@ -382,8 +382,12 @@ export async function captureTurn(options: CaptureTurnOptions): Promise<CaptureT
     if (response.status === 200 || response.status === 201) {
       const data = asRecord(await response.json().catch(() => null));
       const source = asRecord(data?.source);
-      const sourceId = typeof source?.id === "number" ? source.id : null;
-      return { status: "saved", sourceId, duplicate: response.status === 200 || Boolean(data?.duplicate) };
+      const sourceId = source?.id;
+      if (data?.saved !== true || typeof data.duplicate !== "boolean" ||
+          typeof sourceId !== "number" || !Number.isSafeInteger(sourceId) || sourceId <= 0) {
+        return { status: "offline" };
+      }
+      return { status: "saved", sourceId, duplicate: data.duplicate };
     }
     if (response.status === 409) return { status: "conflict" };
     if (response.status === 400 || response.status === 413) return { status: "rejected" };
