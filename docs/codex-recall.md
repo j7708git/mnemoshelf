@@ -46,7 +46,7 @@
 }
 ```
 
-開啟新的本機 Codex CLI 工作階段，信任專案，使用 `/hooks` 審查兩條命令。只需要召回時省略 `Stop`。用一輪合成對話確認原文保存，再以相關提示確認召回；用戶層設定也可在 Mnemoshelf「連接 Agent」頁重新偵測，但該頁只辨識設定文字，不能證明 hook 曾執行。
+開啟新的本機 Codex 工作階段並信任專案；CLI 使用 `/hooks`，桌面版使用「Review hooks」或「Settings → Hooks」審查兩條命令。只需要召回時省略 `Stop`。用一輪合成對話確認原文保存，再開另一段對話、以不含答案的相關提示確認召回；用戶層設定也可在 Mnemoshelf「連接 Agent」頁重新偵測，但該頁只辨識設定文字，不能證明 hook 曾執行。
 
 **全域化指設定跨專案生效，不會把專案記憶變成全域共享。** Hook 仍以每次事件的 `cwd` 資料夾名稱作為 `project`；`MNEMOSHELF_PROJECT` 可明確覆寫。有專案時查該專案＋global，無法判定專案時只查 global；擷取同樣沿用此專案解析。兩個同名資料夾需另設不同專案名稱。
 
@@ -72,6 +72,8 @@ Adapter 只讀 `Stop.transcript_path` 指定的 JSONL，且真實路徑必須落
 
 Stop 觸發時 `task_complete` 尚未寫入；Adapter 以最後一則可見回答核對 `last_assistant_message`，確保回答已完整 flush。該欄只作核對，不用來補造遺漏訊息。缺少使用者文字、最後回答、必要 ID，或格式未知／破損時整輪略過。
 
+桌面 `create_thread` 工具建立對話時，起始派工內容可能記為 `FunctionCallOutput`，並未產生 `UserMessage`。這類只有工具輸入的回合不保存；驗證一般聊天時須從桌面輸入框送出使用者訊息，不能把派工工具當成等價輸入。
+
 `sourceSession`、`sourceTurn`、`sourceMessage` 分別沿用 session、turn 與 item ID，寫入者為 `codex/turn`。同輪重觸發先查本機游標；只有服務明確回覆 `saved: true` 和有效來源 ID 才確認。游標位於 `$CODEX_HOME/mnemoshelf/capture-cursors`，每個事件一個原子檔，只含事件 hash 與保存標記，不存原文或 token。不同回合即使文字相同也各自保存；並行觸發或游標遺失由服務端事件等冪去重。
 
 ## 降級、重試與排查
@@ -96,6 +98,8 @@ macOS 桌面應用程式內附 CLI 位於 `/Applications/ChatGPT.app/Contents/Re
 
 同一內附 CLI 搭配執行中的 Mnemoshelf v0.9.1，已以合成對話完成兩個 hook 的端到端冒煙測試：保存與讀回可見文字、重觸發去重、下一輪模型請求收到召回，以及測試來源硬刪除。這是本機服務與命令 hook 的驗證，不代表已替使用者啟用全域設定。
 
+macOS 桌面版亦已使用正式全域設定與正常 hook 信任完成一般聊天驗證：從輸入框在同一專案建立兩段獨立對話，兩輪的 user／assistant 共四則原文均逐字一致；第二段提問未包含答案、沒有工具呼叫，但收到第一段來源的 `<memory-context>` 並正確回答。第二段保存內容只有可見 user／assistant，未重複保存注入記憶。驗證時 transcript 的 originator 為 `Codex Desktop`、內附版本為上述 `0.167.0-alpha.4.1`。
+
 實際 Stop stdin 欄位是 `session_id`、`turn_id`、`transcript_path`、`cwd`、`hook_event_name`、`model`、`permission_mode`、`stop_hook_active`、`last_assistant_message`；其中 transcript 路徑與最後回答的 schema 允許 null，Adapter 遇到 null 會略過。
 
-官方明示 [transcript 格式不是穩定介面](https://learn.chatgpt.com/docs/hooks#common-input-fields)。此 Adapter 依上述版本的完成項目格式實作；升級後應先重做合成 smoke。這些證據是內附 CLI 的實際生命週期，尚不等於桌面聊天 UI 已安裝並信任此 hook。Windows 命令的 `commandWindows`、Linux、遠端／雲端、fork、壓縮與恢復舊 transcript 尚未實機驗證。
+官方明示 [transcript 格式不是穩定介面](https://learn.chatgpt.com/docs/hooks#common-input-fields)。此 Adapter 依上述版本的完成項目格式實作；升級後應先重做合成 smoke。已開啟聊天的設定熱重載、Windows 命令的 `commandWindows`、Linux、遠端／雲端、fork、壓縮與恢復舊 transcript 尚未實機驗證。
