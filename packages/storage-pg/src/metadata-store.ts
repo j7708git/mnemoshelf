@@ -1,5 +1,9 @@
 import {
   DuplicateRootError,
+  buildMemoryLibrarySql,
+  readMemoryLibraryRows,
+  type MemoryLibraryFilter,
+  type MemoryLibraryPage,
   MemorySourceConflictError,
   assertMemoryEmbeddingCursor,
   assertMemoryEmbeddingFailure,
@@ -1173,6 +1177,12 @@ export class PgMetadataStore implements MetadataStore {
       params,
     );
     return result.rows.map(rowToMemory);
+  }
+
+  async listMemoryLibrary(filter: MemoryLibraryFilter = {}): Promise<MemoryLibraryPage> {
+    const query = buildMemoryLibrarySql(filter, "postgres", { memories: this.memories, sources: this.sources });
+    const result = await this.pool.query(query.sql, query.params);
+    return readMemoryLibraryRows(result.rows, query.filter, rowToMemory);
   }
 
   /**

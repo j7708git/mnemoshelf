@@ -1317,6 +1317,57 @@ export async function listMemories(): Promise<Memory[]> {
   return body.memories as Memory[];
 }
 
+/** 管理清單以完整回合／短記憶為單位；代表列保留既有操作所需的記憶 id。 */
+export interface MemoryLibraryEntry {
+  type: "source" | "memory";
+  id: number;
+  memory: Memory;
+  chunkCount: number;
+}
+
+export interface MemoryLibraryPage {
+  entries: MemoryLibraryEntry[];
+  total: number;
+  counts: { sources: number; memories: number };
+  facets: { projects: string[]; writers: string[]; hasUnassigned: boolean };
+  nextCursor: string | null;
+}
+
+export interface MemoryLibraryQuery {
+  project?: string;
+  unassigned?: boolean;
+  writer?: string;
+  type?: "source" | "memory";
+  query?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+/** 所有條件由服務端合併後分頁；選單來自全庫，不能從當頁推導。 */
+export async function listMemoryLibrary(input: MemoryLibraryQuery = {}, signal?: AbortSignal): Promise<MemoryLibraryPage> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(input)) {
+    if (value !== undefined) params.set(key, String(value));
+  }
+  const response = await apiFetch(`/memory-library?${params}`, { cache: "no-store", signal });
+  if (!response.ok) throw new Error(await readErrorMessage(response, "讀取記憶清單失敗"));
+  const page = await response.json() as MemoryLibraryPage;
+  const count = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
+  const names = (value: unknown): value is string[] => Array.isArray(value) && value.every((name) => typeof name === "string");
+  if (page === null || typeof page !== "object" || !Array.isArray(page.entries) ||
+    !count(page.total) || !count(page.counts?.sources) || !count(page.counts?.memories) ||
+    page.total !== page.counts.sources + page.counts.memories ||
+    !names(page.facets?.projects) || !names(page.facets?.writers) || typeof page.facets?.hasUnassigned !== "boolean" ||
+    (page.nextCursor !== null && typeof page.nextCursor !== "string") ||
+    page.entries.some((entry) => entry === null || typeof entry !== "object" ||
+      !["source", "memory"].includes(entry.type) || !count(entry.id) || entry.id === 0 ||
+      !count(entry.chunkCount) || entry.chunkCount === 0 || !count(entry.memory?.id) ||
+      entry.memory.id === 0 || typeof entry.memory.content !== "string" || typeof entry.memory.agent !== "string")) {
+    throw new Error("本機服務回傳的記憶清單格式不正確。");
+  }
+  return page;
+}
+
 /**
  * `POST /memories` 的回應（卡 C2 的 additive 欄位；`Memory` 本身的欄位不變）。
  *
@@ -1588,12 +1639,13 @@ export async function searchMemories(input: {
   kind?: MemoryKind;
   k?: number;
   minScore?: number;
-}): Promise<MemoryRecallResult> {
+}, signal?: AbortSignal): Promise<MemoryRecallResult> {
   const response = await apiFetch("/memories/search", {
     method: "POST",
     cache: "no-store",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(input),
+    signal,
   });
   if (!response.ok) throw new Error(await readErrorMessage(response, "搜尋記憶失敗"));
   return (await response.json()) as MemoryRecallResult;

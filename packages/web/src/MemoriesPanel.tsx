@@ -1,138 +1,21 @@
-/**
- * 記憶管理畫面：列表（釘選標示、釘選優先排序）、釘選／取消、編輯（走 supersedes 語意——
- * 產生新版本並取代舊版）、刪除（軟刪除，需確認）、永久刪除（硬刪除，二次確認）、看來源，
- * 以及專案／範圍篩選與共享開關。
- *
- * 記憶由 AI agent 透過 `remember` 寫入，這個畫面是管理面：不直接改動既有列，
- * 「編輯」一律建立新版本並把舊版標記軟刪除（`POST /memories` 帶 `supersedes`）。
- * 共享開關只允許 `project` ↔ `global`（`PATCH /memories/:id`）；此 UI 不提供 `agent` 範圍切換，
- * REST `PATCH` 仍可設定。
- *
- * 寫入去重（卡 C2）：若 `POST /memories` 回 `200`＋`duplicate: true`，代表已有完全相同內容的
- * 記憶；這裡只提示既有 id，**不新增卡片**。
- */
-import { useCallback, useEffect, useRef, useState, type ChangeEvent } from "react";
+/** 記憶管理以完整回合／短記憶分頁；管理條件與語意召回情境各自保存。 */
+import { useRef, useState, type ChangeEvent } from "react";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { RawMemorySourceDisclosure, RawMemorySourcePanel } from "./RawMemorySourcePanel";
+import { RawMemorySourcePanel } from "./RawMemorySourcePanel";
 import {
   addMemory,
   deleteMemory,
   downloadMemoriesExport,
   importMemories,
-  listMemories,
   MemoryImportError,
   pinMemory,
-  searchMemories,
   updateMemory,
   type Memory,
   type MemoryImportResult,
-  type MemoryRecallResult,
-  type MemoryScope,
 } from "./api";
-import { formatDateTime, MEMORY_KIND_LABEL, MEMORY_SCOPE_LABEL, memoryOriginLabel, memorySourceRoleLabel, shortenSourceId } from "./format";
-
-type LoadState =
-  | { kind: "loading" }
-  | { kind: "ready"; memories: Memory[] }
-  | { kind: "error"; message: string };
-
-/** 記憶搜尋的狀態（與列表的載入狀態分開，搜尋失敗不影響列表）。 */
-type RecallState =
-  | { kind: "idle" }
-  | { kind: "loading" }
-  | { kind: "error"; message: string }
-  | { kind: "ready"; result: MemoryRecallResult };
-
-/** 篩選值：`"all"` 表示不過濾。 */
-type ScopeFilter = MemoryScope | "all";
-const ALL_PROJECTS = "all";
-
-/**
- * 來源篩選（D4a）：`all`＝全部、`auto`＝只看自動寫入。
- *
- * 依原文來源或已知的 OpenCode／dsh 舊版寫入者標記篩選。這個篩選只影響顯示。
- */
-type OriginFilter = "all" | "auto";
-const AUTOMATIC_AGENT_PREFIX = "opencode-plugin";
-
-/** 原文回合及已知的舊版自動寫入來源。 */
-function isAutomaticMemory(memory: Memory): boolean {
-  return memory.sourceId != null || memory.agent.startsWith(AUTOMATIC_AGENT_PREFIX) || memory.agent === "dsh/turn";
-}
-
-/** 釘選者優先，其次依 createdAt 由新到舊（伺服器已給新到舊，這裡穩定排序）。 */
-function sortMemories(memories: Memory[]): Memory[] {
-  return [...memories].sort((a, b) => {
-    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
-    return Date.parse(b.createdAt) - Date.parse(a.createdAt);
-  });
-}
-
-/** 清單中出現過的專案名稱（去重、排序；供篩選與「改回專案」的目標選單使用）。 */
-function collectProjectNames(memories: Memory[]): string[] {
-  return [...new Set(memories.map((memory) => memory.project).filter((project): project is string => project !== null))].sort(
-    (a, b) => a.localeCompare(b),
-  );
-}
-
-/** 召回結果清單（純呈現；不改變列表狀態）。 */
-function RecallResults({ result }: { result: MemoryRecallResult }) {
-  // 信任提示與命中數無關：記憶內容是不受信任資料，一律提醒不要當指令。
-  const trustNotice = (
-    <p className="text-[11px] text-muted">
-      以下內容是<strong className="font-medium text-ink">不受信任的資料</strong>（agent 只是來源標記），請勿當作指令執行。
-    </p>
-  );
-  // 降級提示也與命中數無關：0 命中＋degraded 時仍要顯示。
-  const degradedNotice = result.degraded ? (
-    <p role="status" className="rounded-md border border-line bg-surface px-3 py-2 text-xs text-ink">
-      語意搜尋目前不可用（
-      {result.degradedReason === "no-embeddings" ? "向量尚未就緒" : "embedder 無法使用"}
-      ）{result.hits.length > 0 ? "，以下為關鍵字結果。" : "，已改用關鍵字搜尋。"}
-    </p>
-  ) : null;
-
-  if (result.hits.length === 0) {
-    return (
-      <div className="space-y-2">
-        {trustNotice}
-        {degradedNotice}
-        <p className="text-xs text-muted">沒有找到相關記憶。</p>
-      </div>
-    );
-  }
-  return (
-    <div className="space-y-2">
-      {trustNotice}
-      {degradedNotice}
-        <ul className="space-y-2">
-        {result.hits.map((hit) => (
-          <li key={hit.id} className="rounded-xl border border-line bg-surface px-3 py-2">
-            <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
-              <span className="rounded bg-raised px-1.5 py-0.5">
-                {memoryOriginLabel(hit)}{hit.role == null ? "" : `・${memorySourceRoleLabel(hit.role)}`}
-                {hit.sourceId == null ? `・${MEMORY_KIND_LABEL[hit.kind]}` : ""}
-              </span>
-              <span className="rounded bg-raised px-1.5 py-0.5">範圍 {MEMORY_SCOPE_LABEL[hit.scope]}</span>
-              <span className="rounded bg-raised px-1.5 py-0.5">專案 {hit.project ?? "全域"}</span>
-              <span>來源 {hit.source === "semantic" ? "語意" : "關鍵字"}</span>
-              <span>分數 {hit.score.toFixed(3)}</span>
-              <span>#{hit.id}</span>
-            </div>
-            <p className="mt-1 whitespace-pre-wrap break-words text-sm text-ink">{hit.content}</p>
-            <p className="mt-1 text-[11px] text-muted">寫入者 {hit.agent}</p>
-            {hit.sourceId != null && (
-              <>
-                <p className="mt-1 text-[11px] text-muted">{hit.occurredAt == null ? "對話時間未知" : formatDateTime(hit.occurredAt)}</p>
-                <RawMemorySourceDisclosure id={hit.sourceId} agent={hit.agent} scope={hit.scope} project={hit.project} />
-              </>
-            )}
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
+import { formatDateTime, MEMORY_KIND_LABEL, MEMORY_SCOPE_LABEL, shortenSourceId } from "./format";
+import { MemoryRecallPreview } from "./MemoryRecallPreview";
+import { EMPTY_LIBRARY_FILTERS, memoryNameOption, memoryOptionNames, useMemoryLibrary, type MemoryLibraryFilters } from "./useMemoryLibrary";
 
 /**
  * 目前開啟的確認對話框（一次只有一個）。
@@ -146,26 +29,19 @@ type PendingConfirm =
   | { kind: "purge-second"; memory: Memory };
 
 export function MemoriesPanel() {
-  const [state, setState] = useState<LoadState>({ kind: "loading" });
+  const library = useMemoryLibrary();
+  const { state, facets, filters, pageNumber, reload: load } = library;
+  const availableProjects = facets.projects;
+  const [tab, setTab] = useState<"library" | "recall">("library");
+  const [recallRevision, setRecallRevision] = useState(0);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   const [sourceId, setSourceId] = useState<number | null>(null);
   const [busyId, setBusyId] = useState<number | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  /** 範圍篩選（`all`＝全部）。 */
-  const [scopeFilter, setScopeFilter] = useState<ScopeFilter>("all");
-  /** 專案篩選（`all`＝全部專案；其餘為專案名稱）。 */
-  const [projectFilter, setProjectFilter] = useState<string>(ALL_PROJECTS);
-  /** 來源篩選（D4a；`all`＝全部、`auto`＝只看自動寫入）。 */
-  const [originFilter, setOriginFilter] = useState<OriginFilter>("all");
-  /** 每筆「改回專案」目前選定的目標專案（未選時用清單第一個可選專案）。 */
+  /** 舊版範圍設定暫放次要操作；不與管理篩選共用。 */
   const [shareTargets, setShareTargets] = useState<Record<number, string>>({});
-  /** 記憶搜尋（卡 B2）：查詢字串、「找全部專案」與結果狀態。 */
-  const [recallQuery, setRecallQuery] = useState("");
-  const [recallAllProjects, setRecallAllProjects] = useState(false);
-  const [recallState, setRecallState] = useState<RecallState>({ kind: "idle" });
-  const recallRequest = useRef(0);
   /** 備份匯出／匯入進行中（期間兩個按鈕都禁用，避免重複觸發）。 */
   const [backupBusy, setBackupBusy] = useState(false);
   /** 確認對話框（取代原生 confirm）與其送出中的狀態。 */
@@ -179,26 +55,13 @@ export function MemoriesPanel() {
   } | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
-  /** 清單中出現過的專案名稱（供篩選與共享開關的目標選單）。 */
-  const availableProjects = state.kind === "ready" ? collectProjectNames(state.memories) : [];
+  const clearRecall = (): void => setRecallRevision((previous) => previous + 1);
 
-  const clearRecall = (): void => {
-    recallRequest.current += 1;
-    setRecallState({ kind: "idle" });
+  const changeFilters = (patch: Partial<MemoryLibraryFilters>): void => {
+    setSourceId(null);
+    setEditingId(null);
+    library.changeFilters(patch);
   };
-
-  const load = useCallback(async (): Promise<void> => {
-    setState({ kind: "loading" });
-    try {
-      setState({ kind: "ready", memories: sortMemories(await listMemories()) });
-    } catch (error) {
-      setState({ kind: "error", message: error instanceof Error ? error.message : "讀取記憶清單失敗。" });
-    }
-  }, []);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
 
   const run = async (id: number, action: () => Promise<void>, success: string): Promise<void> => {
     setBusyId(id);
@@ -208,7 +71,7 @@ export function MemoriesPanel() {
       await action();
       clearRecall();
       setMessage(success);
-      await load();
+      load();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "操作失敗。");
     } finally {
@@ -259,44 +122,6 @@ export function MemoriesPanel() {
     );
   };
 
-  /**
-   * 執行記憶搜尋（沿用列表的專案／範圍篩選值＋「找全部專案」勾選）。
-   *
-   * 範圍不明確時（沒選專案、沒勾找全部、範圍又不是全域）先在前端提示，
-   * 不送出伺服器必定 400 的請求；`agent` 範圍在 UI 沒有身分可用，故不支援（直接提示）。
-   */
-  const runRecall = async (): Promise<void> => {
-    const request = ++recallRequest.current;
-    const query = recallQuery.trim();
-    if (query === "") {
-      setRecallState({ kind: "error", message: "請輸入查詢字串。" });
-      return;
-    }
-    if (scopeFilter === "agent") {
-      setRecallState({ kind: "error", message: "UI 搜尋不支援 agent 範圍（agent 範圍需由 agent 明確指定）。" });
-      return;
-    }
-    if (!recallAllProjects && projectFilter === ALL_PROJECTS && scopeFilter !== "global") {
-      setRecallState({ kind: "error", message: "請選擇專案、勾選「找全部專案」，或把範圍設為全域。" });
-      return;
-    }
-    setRecallState({ kind: "loading" });
-    try {
-      const result = await searchMemories({
-        query,
-        ...(recallAllProjects ? { includeAllProjects: true } : {}),
-        ...(!recallAllProjects && projectFilter !== ALL_PROJECTS ? { project: projectFilter } : {}),
-        ...(scopeFilter !== "all" ? { scope: scopeFilter } : {}),
-        k: 10,
-      });
-      if (request === recallRequest.current) setRecallState({ kind: "ready", result });
-    } catch (error) {
-      if (request === recallRequest.current) {
-        setRecallState({ kind: "error", message: error instanceof Error ? error.message : "搜尋記憶失敗。" });
-      }
-    }
-  };
-
   const startEdit = (memory: Memory): void => {
     setEditingId(memory.id);
     setDraft(memory.content);
@@ -333,7 +158,7 @@ export function MemoriesPanel() {
       setEditingId(null);
       setDraft("");
       clearRecall();
-      await load();
+      load();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "儲存記憶失敗。");
     } finally {
@@ -354,7 +179,7 @@ export function MemoriesPanel() {
       clearRecall();
       setMessage(success);
       setPendingConfirm(null);
-      await load();
+      load();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "操作失敗。");
       setPendingConfirm(null);
@@ -514,7 +339,8 @@ export function MemoriesPanel() {
         `已匯入備份：新增 ${result.created} 筆、重複跳過 ${result.duplicates} 筆、內容遮罩 ${result.redacted} 筆。`,
       );
       setImportPreview(null);
-      await load();
+      clearRecall();
+      load();
     } catch (error) {
       setActionError(error instanceof Error ? error.message : "匯入記憶備份失敗。");
     } finally {
@@ -522,65 +348,12 @@ export function MemoriesPanel() {
     }
   };
 
-  if (state.kind === "loading") {
-    return <p className="text-sm text-muted">正在載入記憶清單…</p>;
-  }
-  if (state.kind === "error") {
-    return (
-      <div className="space-y-3">
-        <p role="alert" className="rounded-xl border border-danger/30 bg-danger-bg px-4 py-3 text-sm text-danger">
-          {state.message}
-        </p>
-        <button
-          type="button"
-          onClick={() => void load()}
-          className="rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-ink hover:bg-raised"
-        >
-          重試
-        </button>
-      </div>
-    );
-  }
-
-  // 篩選一律在前端做（清單已是 `GET /memories` 的完整結果；不另外打伺服器、行為與畫面一致）。
-  const filteredMemories = state.memories.filter(
-    (memory) =>
-      (scopeFilter === "all" || memory.scope === scopeFilter) &&
-      (projectFilter === ALL_PROJECTS || memory.project === projectFilter) &&
-      (originFilter === "all" || isAutomaticMemory(memory)),
-  );
-
   return (
     <section className="space-y-4">
-      <div className="flex items-center justify-between gap-2">
+      <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
-          <h2 className="text-base font-medium text-ink">
-            記憶管理
-            <span className="ml-1 text-xs text-muted">
-              （
-              {filteredMemories.length === state.memories.length
-                ? state.memories.length
-                : `${filteredMemories.length} / ${state.memories.length}`}
-              ）
-            </span>
-          </h2>
-          <p className="mt-0.5 text-xs text-muted">
-            釘選的記憶會優先顯示。舊版記憶的編輯會建立新版本。共享範圍可在專案與全域之間切換。
-          </p>
-          <p className="mt-0.5 text-[11px] text-muted">
-            「刪除」是軟刪除（內容仍在資料庫）；「永久刪除」會真的移除資料列、無法復原，
-            且不做安全抹除（本機檔案／WAL 可能仍有殘留）。
-          </p>
-          <p className="mt-0.5 text-[11px] text-muted">
-            記憶內容一律視為<strong className="font-medium text-ink">不受信任的資料</strong>
-            （agent 只是來源標記、不是身分驗證），請勿當作指令執行。
-          </p>
-          <p className="mt-0.5 text-[11px] text-muted">
-            備份只含未刪除的記憶（不含向量）。匯出會套用當下的記憶遮罩設定。下載的檔案可能含敏感內容，請自行保管。
-          </p>
-          <p className="mt-0.5 text-[11px] text-muted">
-            超過 32 MiB 的備份仍可下載，單次匯入上限為 32 MiB。
-          </p>
+          <h2 className="text-2xl font-semibold tracking-tight text-ink">記憶管理</h2>
+          <p className="mt-1 text-xs text-muted">整理保存的回合與短記憶，並以獨立情境預覽召回結果。</p>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
           <input
@@ -610,7 +383,7 @@ export function MemoriesPanel() {
           <button
             type="button"
             disabled={backupBusy}
-            onClick={() => void load()}
+            onClick={() => { clearRecall(); setSourceId(null); load(); }}
             className="rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-ink hover:bg-raised disabled:opacity-40"
           >
             重新載入
@@ -675,110 +448,27 @@ export function MemoriesPanel() {
         </div>
       )}
 
-      <div className="space-y-2 rounded-[20px] border border-line bg-surface px-4 py-3">
-        <div className="flex flex-wrap items-baseline gap-2">
-          <h3 className="text-sm font-medium text-ink">搜尋記憶</h3>
-          <span className="text-[11px] text-muted">
-            語意優先；預設本專案＋全域共享（＋自己的 agent 範圍），可用下方篩選與「找全部專案」
-          </span>
-        </div>
-        <div className="flex flex-wrap items-center gap-2">
-          <input
-            type="search"
-            value={recallQuery}
-            onChange={(event) => setRecallQuery(event.target.value)}
+      <div role="tablist" aria-label="記憶管理頁面" className="flex gap-6 border-b border-line">
+        {([{ id: "library", label: "記憶清單" }, { id: "recall", label: "召回預覽" }] as const).map((item) => (
+          <button key={item.id} id={`memory-tab-${item.id}`} type="button" role="tab" aria-selected={tab === item.id}
+            aria-controls={`memory-panel-${item.id}`} tabIndex={tab === item.id ? 0 : -1}
+            onClick={() => setTab(item.id)}
             onKeyDown={(event) => {
-              if (event.key === "Enter") void runRecall();
+              if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+              event.preventDefault();
+              const next = tab === "library" ? "recall" : "library";
+              setTab(next);
+              document.getElementById(`memory-tab-${next}`)?.focus();
             }}
-            aria-label="搜尋記憶"
-            placeholder="用自然語言找記憶…"
-            maxLength={2000}
-            className="min-w-[14rem] flex-1 rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-ink outline-none focus:border-brand"
-          />
-          <label className="flex items-center gap-1.5 text-xs text-muted">
-            <input
-              type="checkbox"
-              checked={recallAllProjects}
-              onChange={(event) => setRecallAllProjects(event.target.checked)}
-            />
-            找全部專案
-          </label>
-          <button
-            type="button"
-            disabled={recallState.kind === "loading"}
-            onClick={() => void runRecall()}
-            className="rounded-lg bg-brand px-3 py-1.5 text-sm font-medium text-on-brand disabled:opacity-40"
-          >
-            {recallState.kind === "loading" ? "搜尋中…" : "搜尋"}
+            className={`border-b-2 px-0 py-3 text-sm ${tab === item.id ? "border-brand font-medium text-brand" : "border-transparent text-muted hover:text-ink"}`}>
+            {item.label}
           </button>
-        </div>
-        {recallState.kind === "error" && (
-          <p role="alert" className="text-xs text-danger">
-            {recallState.message}
-          </p>
-        )}
-        {recallState.kind === "ready" && <RecallResults result={recallState.result} />}
+        ))}
       </div>
 
-      {state.memories.length > 0 && (
-        <div className="flex flex-wrap items-center gap-3 text-xs text-muted">
-          <label className="flex items-center gap-1.5">
-            專案
-            <select
-              aria-label="依專案篩選"
-              value={projectFilter}
-              onChange={(event) => setProjectFilter(event.target.value)}
-              className="rounded-lg border border-line bg-surface px-2 py-1 text-xs text-ink"
-            >
-              <option value={ALL_PROJECTS}>全部專案</option>
-              {availableProjects.map((project) => (
-                <option key={project} value={project}>
-                  {project}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label className="flex items-center gap-1.5">
-            來源
-            <select
-              aria-label="依來源篩選"
-              value={originFilter}
-              onChange={(event) => setOriginFilter(event.target.value as OriginFilter)}
-              className="rounded-lg border border-line bg-surface px-2 py-1 text-xs text-ink"
-            >
-              <option value="all">全部</option>
-              <option value="auto">只看自動寫入</option>
-            </select>
-          </label>
-          <label className="flex items-center gap-1.5">
-            範圍
-            <select
-              aria-label="依範圍篩選"
-              value={scopeFilter}
-              onChange={(event) => setScopeFilter(event.target.value as ScopeFilter)}
-              className="rounded-lg border border-line bg-surface px-2 py-1 text-xs text-ink"
-            >
-              <option value="all">全部範圍</option>
-              <option value="global">全域</option>
-              <option value="project">專案</option>
-              <option value="agent">agent</option>
-            </select>
-          </label>
-          {(scopeFilter !== "all" || projectFilter !== ALL_PROJECTS || originFilter !== "all") && (
-            <button
-              type="button"
-              onClick={() => {
-                setScopeFilter("all");
-                setProjectFilter(ALL_PROJECTS);
-                setOriginFilter("all");
-              }}
-              className="rounded-md border border-line px-2 py-1 text-xs text-ink"
-            >
-              清除篩選
-            </button>
-          )}
-        </div>
-      )}
+      <div id="memory-panel-recall" role="tabpanel" aria-labelledby="memory-tab-recall" hidden={tab !== "recall"}>
+        <MemoryRecallPreview projects={availableProjects} writers={facets.writers} revision={recallRevision} />
+      </div>
 
       {message !== null && (
         <p className="rounded-xl border border-line bg-surface px-4 py-2 text-sm text-ink">{message}</p>
@@ -789,25 +479,70 @@ export function MemoriesPanel() {
         </p>
       )}
 
-      {state.memories.length === 0 ? (
-        <div className="flex h-[40vh] items-center justify-center rounded-[20px] border border-dashed border-line bg-surface/70 px-6 text-center text-sm text-muted">
-          尚無記憶。AI agent 透過 remember 寫入的共享記憶會出現在這裡。
+      <div id="memory-panel-library" role="tabpanel" aria-labelledby="memory-tab-library" hidden={tab !== "library"} className="space-y-4">
+        <div className="space-y-4 rounded-2xl border border-line bg-surface p-4">
+          <div className="grid gap-3 sm:grid-cols-3">
+            <label className="space-y-1 text-xs text-muted">
+              <span>歸屬專案</span>
+              <select aria-label="依專案篩選" value={filters.project} onChange={(event) => changeFilters({ project: event.target.value })}
+                className="w-full min-w-0 rounded-lg border border-line bg-bg px-3 py-2 text-sm text-ink">
+                <option value="all">全部專案</option>
+                {(facets.hasUnassigned || filters.project === "unassigned") && <option value="unassigned">未指定專案</option>}
+                {memoryOptionNames(availableProjects, filters.project).map((project) => <option key={project} value={memoryNameOption(project)}>{project}</option>)}
+              </select>
+            </label>
+            <label className="space-y-1 text-xs text-muted">
+              <span>寫入者</span>
+              <select aria-label="依寫入者篩選" value={filters.writer} onChange={(event) => changeFilters({ writer: event.target.value })}
+                className="w-full min-w-0 rounded-lg border border-line bg-bg px-3 py-2 text-sm text-ink">
+                <option value="all">全部寫入者</option>
+                {memoryOptionNames(facets.writers, filters.writer).map((writer) => <option key={writer} value={memoryNameOption(writer)}>{writer}</option>)}
+              </select>
+            </label>
+            <label className="space-y-1 text-xs text-muted">
+              <span>記憶形式</span>
+              <select aria-label="依記憶形式篩選" value={filters.type} onChange={(event) => changeFilters({ type: event.target.value as MemoryLibraryFilters["type"] })}
+                className="w-full min-w-0 rounded-lg border border-line bg-bg px-3 py-2 text-sm text-ink">
+                <option value="all">全部形式</option><option value="source">原文回合</option><option value="memory">短記憶</option>
+              </select>
+            </label>
+          </div>
+          <div className="flex flex-wrap items-center gap-3">
+            <input type="search" aria-label="篩選記憶內容" value={filters.query} maxLength={2000} placeholder="包含文字…"
+              onChange={(event) => changeFilters({ query: event.target.value })}
+              className="min-w-0 flex-1 rounded-lg border border-line bg-bg px-3 py-2 text-sm text-ink outline-none focus:border-brand" />
+            <button type="button" onClick={() => changeFilters(EMPTY_LIBRARY_FILTERS)}
+              className="rounded-lg px-3 py-2 text-xs text-muted hover:bg-raised hover:text-ink">清除篩選</button>
+          </div>
+          <p className="text-[11px] text-muted">所有條件同時符合才顯示；選單涵蓋整個記憶庫。文字篩選比對實際內容，語意搜尋請使用「召回預覽」。</p>
         </div>
-      ) : filteredMemories.length === 0 ? (
-        <div className="flex h-[30vh] items-center justify-center rounded-[20px] border border-dashed border-line bg-surface/70 px-6 text-center text-sm text-muted">
-          沒有符合目前篩選條件的記憶。
-        </div>
-      ) : (
+
+        {state.kind === "loading" && <p role="status" className="py-8 text-center text-sm text-muted">正在載入記憶清單…</p>}
+        {state.kind === "error" && <div className="space-y-2">
+          <p role="alert" className="rounded-xl border border-danger/30 bg-danger-bg px-4 py-3 text-sm text-danger">{state.message}</p>
+          <button type="button" onClick={load} className="rounded-lg border border-line px-3 py-2 text-sm text-ink">重新載入第一頁</button>
+        </div>}
+        {state.kind === "ready" && <>
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted" aria-live="polite">
+            <p>符合 {state.page.total} 項 · {state.page.counts.sources} 個回合、{state.page.counts.memories} 則短記憶</p>
+            <p>釘選優先 · 由新到舊</p>
+          </div>
+          {state.page.entries.length === 0 ? (
+            <div className="flex min-h-40 items-center justify-center rounded-2xl border border-dashed border-line bg-surface/70 px-6 text-center text-sm text-muted">
+              沒有符合目前條件的記憶。可清除篩選，查看其他回合與短記憶。
+            </div>
+          ) : (
         <ul className="space-y-3">
-          {filteredMemories.map((memory) => {
-            const raw = memory.sourceId != null;
+          {state.page.entries.map((entry) => {
+            const memory = entry.memory;
+            const raw = entry.type === "source";
             const editing = !raw && editingId === memory.id;
             const showSource = sourceId === memory.id;
             const busy = busyId === memory.id;
             return (
               <li
-                key={memory.id}
-                className={`rounded-[20px] border px-4 py-3 ${
+                key={`${entry.type}:${entry.id}`}
+                className={`rounded-2xl border px-4 py-4 ${
                   memory.pinned ? "border-brand bg-surface" : "border-line bg-surface"
                 }`}
               >
@@ -816,20 +551,19 @@ export function MemoriesPanel() {
                     <span className="rounded bg-brand px-1.5 py-0.5 text-[11px] font-medium text-on-brand">已釘選</span>
                   )}
                   <span className="rounded bg-raised px-1.5 py-0.5 text-[11px] text-muted">
-                    {memoryOriginLabel(memory)}{raw ? "" : `・${MEMORY_KIND_LABEL[memory.kind]}`}
+                    {raw ? `原文回合 · ${entry.chunkCount} 個檢索片段` : `短記憶 · ${MEMORY_KIND_LABEL[memory.kind]}`}
                   </span>
                   <span className="rounded bg-raised px-1.5 py-0.5 text-[11px] text-muted">
-                    範圍 {MEMORY_SCOPE_LABEL[memory.scope]}
+                    用途 {MEMORY_SCOPE_LABEL[memory.scope]}
                   </span>
                   <span className="rounded bg-raised px-1.5 py-0.5 text-[11px] text-muted">
-                    專案 {memory.project ?? "全域"}
+                    歸屬專案 {memory.project ?? "未指定"}
                   </span>
                   <span
                     className="max-w-full break-all rounded bg-raised px-1.5 py-0.5 text-[11px] text-muted"
                     title={memory.agent}
                   >
                     寫入者 {memory.agent}
-                    {isAutomaticMemory(memory) ? "（自動）" : ""}
                   </span>
                   {memory.sourceSession !== null && (
                     <span
@@ -839,7 +573,7 @@ export function MemoriesPanel() {
                       session {shortenSourceId(memory.sourceSession)}
                     </span>
                   )}
-                  <span className="text-[11px] text-muted">#{memory.id}</span>
+                  <span className="text-[11px] text-muted">{raw ? "回合" : "記憶"} #{entry.id}</span>
                   <span className="ml-auto text-[11px] text-muted">{formatDateTime(memory.createdAt)}</span>
                 </div>
 
@@ -877,9 +611,9 @@ export function MemoriesPanel() {
                     </div>
                   </div>
                 ) : (
-                  <p className="mt-2 whitespace-pre-wrap break-words text-sm text-ink">{memory.content}</p>
+                  <p className={`mt-3 whitespace-pre-wrap break-words text-sm leading-relaxed text-ink ${raw ? "line-clamp-3" : ""}`}>{memory.content}</p>
                 )}
-                {raw && <p className="mt-2 text-[11px] text-muted">釘選、變更範圍與刪除皆套用整個原文回合。</p>}
+                {raw && <p className="mt-2 text-[11px] text-muted">此處顯示回合節錄；釘選與刪除皆套用整個回合。</p>}
 
                 <div className="mt-2 flex flex-wrap gap-2">
                   <button
@@ -908,6 +642,28 @@ export function MemoriesPanel() {
                   >
                     {showSource ? "收起來源" : raw ? "查看原文回合" : "看來源"}
                   </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => remove(memory)}
+                    className="rounded-lg border border-line px-2.5 py-1 text-xs text-muted hover:text-danger disabled:opacity-40"
+                  >
+                    刪除
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => purge(memory)}
+                    className="rounded-lg border border-line px-2.5 py-1 text-xs text-danger hover:bg-danger-bg disabled:opacity-40"
+                    title="真的從資料庫刪除（無法復原；不做安全抹除）"
+                  >
+                    永久刪除
+                  </button>
+                </div>
+
+                <details className="mt-3 text-xs text-muted">
+                  <summary className="cursor-pointer">其他設定</summary>
+                  <div className="mt-2 flex flex-wrap items-center gap-2">
                   {memory.scope === "agent" ? (
                     <span className="rounded-md border border-line px-2.5 py-1 text-xs text-muted">
                       agent 範圍
@@ -952,34 +708,18 @@ export function MemoriesPanel() {
                       </button>
                     </>
                   )}
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => remove(memory)}
-                    className="rounded-lg border border-line px-2.5 py-1 text-xs text-muted hover:text-danger disabled:opacity-40"
-                  >
-                    刪除
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => purge(memory)}
-                    className="rounded-lg border border-line px-2.5 py-1 text-xs text-danger hover:bg-danger-bg disabled:opacity-40"
-                    title="真的從資料庫刪除（無法復原；不做安全抹除）"
-                  >
-                    永久刪除
-                  </button>
-                </div>
+                  </div>
+                  <p className="mt-2 text-[11px]">舊版範圍設定會影響召回；原文回合的變更套用所有片段。</p>
+                </details>
 
-                {showSource && memory.sourceId != null && (
-                  <RawMemorySourcePanel id={memory.sourceId} agent={memory.agent} scope={memory.scope} project={memory.project} />
+                {showSource && raw && (
+                  <RawMemorySourcePanel id={entry.id} agent={memory.agent} scope={memory.scope} project={memory.project} />
                 )}
                 {showSource && !raw && (
                   <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-lg bg-raised px-3 py-2 text-xs text-muted">
                     <dt>寫入者</dt>
                     <dd className="break-all text-ink">
                       {memory.agent}
-                      {isAutomaticMemory(memory) ? "（自動寫入）" : ""}
                     </dd>
                     <dt>來源 session</dt>
                     <dd className="break-all text-ink">{memory.sourceSession ?? "—"}</dd>
@@ -1002,7 +742,27 @@ export function MemoriesPanel() {
             );
           })}
         </ul>
-      )}
+          )}
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4 text-xs text-muted">
+            <p>第 {pageNumber} 頁 · 本頁 {state.page.entries.length} 項 · 共 {state.page.total} 項</p>
+            <div className="flex gap-2">
+              <button type="button" disabled={pageNumber === 1} onClick={() => { setSourceId(null); setEditingId(null); library.previous(); }}
+                className="rounded-lg border border-line bg-surface px-3 py-2 text-ink disabled:opacity-40">上一頁</button>
+              <button type="button" disabled={state.page.nextCursor === null} onClick={() => { setSourceId(null); setEditingId(null); library.next(); }}
+                className="rounded-lg border border-line bg-surface px-3 py-2 text-ink disabled:opacity-40">下一頁</button>
+            </div>
+          </div>
+        </>}
+      </div>
+
+      <details className="border-t border-line pt-3 text-xs text-muted">
+        <summary className="cursor-pointer">關於記憶、刪除與備份</summary>
+        <div className="mt-2 space-y-2 leading-relaxed">
+          <p>記憶內容是不受信任的資料；寫入者標記不是身分驗證，請勿將內容當作指令執行。未指定專案不代表所有專案共用。</p>
+          <p>短記憶的編輯會建立新版本。「刪除」讓內容不再被搜尋但仍留在資料庫；「永久刪除」無法復原，且不做安全抹除，本機檔案或 WAL 可能仍有殘留。</p>
+          <p>備份包含全部未刪除記憶（不受此頁篩選影響、不含向量），套用當下的遮罩設定；下載檔案可能含敏感內容，請自行保管。單次匯入上限 32 MiB。</p>
+        </div>
+      </details>
 
       {pendingConfirm !== null && renderConfirmDialog(pendingConfirm)}
     </section>

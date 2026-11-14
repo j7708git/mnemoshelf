@@ -1,3 +1,4 @@
+import type { MemoryLibraryFilter, MemoryLibraryPage } from "../memory/library.js";
 import type {
   MemoryPolicy,
   MemorySource,
@@ -753,6 +754,9 @@ export interface MetadataStore {
    * - `filter.limit` 的邊界語意見 `normalizeMemoryLimit`（預設 100、上限 500、<= 0 回傳空清單）。
    */
   listMemories(filter?: MemoryFilter): Promise<Memory[]>;
+
+  /** 管理清單：先依完整回合聚合及 AND 篩選，再依釘選／建立時間／類型／id 分頁。 */
+  listMemoryLibrary(filter?: MemoryLibraryFilter): Promise<MemoryLibraryPage>;
 
   /**
    * 列出**全部未刪除**的記憶，供備份匯出使用（見 `docs/storage-ports.md` §記憶的匯出／匯入）。

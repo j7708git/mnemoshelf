@@ -57,6 +57,7 @@ import {
   MEMORY_SCOPES,
   type Memory,
   type MemoryKind,
+  type MemoryLibraryFilter,
   type MemoryPatch,
   type MemoryPolicy,
   MemorySourceConflictError,
@@ -66,6 +67,7 @@ import {
   type MetadataStore,
   type Modality,
   normalizeMemoryPatch,
+  normalizeMemoryLibraryFilter,
   normalizeMemorySourceScope,
   normalizeRootMaxFileBytes,
   normalizeRootVideoMaxFileBytes,
@@ -148,6 +150,7 @@ import {
   loadCurrentMemoryPresentations,
   loadMemoryPresentations,
   memoryContentView,
+  metadataView,
   type PrepareMemoryPresentation,
 } from "../memory-policy.js";
 import {
@@ -213,6 +216,7 @@ export const API_PATH_PREFIXES: readonly string[] = [
   "roots",
   "search",
   "memories",
+  "memory-library",
   "memory-policy",
   "memory-sources",
   "diagnostics",
@@ -2212,6 +2216,54 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     };
   };
 
+  /** `GET /memory-library`：完整管理查詢與召回條件分離，原文先聚合再分頁。 */
+  const listMemoryLibrary = async (url: URL): Promise<RouteResult> => {
+    const params = url.searchParams;
+    const unassigned = params.get("unassigned");
+    if (unassigned !== null && unassigned !== "true" && unassigned !== "false") {
+      throw new ValidationError("unassigned", "必須是 true 或 false");
+    }
+    const filter: MemoryLibraryFilter = {};
+    for (const key of ["project", "writer", "query", "cursor"] as const) {
+      const value = params.get(key);
+      if (value !== null) filter[key] = value;
+    }
+    const type = optionalEnumParam(params.get("type"), ["source", "memory"] as const, "type");
+    const limit = queryLimit(params.get("limit"));
+    if (type !== undefined) filter.type = type;
+    if (limit !== undefined) filter.limit = limit;
+    if (unassigned !== null) filter.unassigned = unassigned === "true";
+    try {
+      normalizeMemoryLibraryFilter(filter);
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+      throw new ValidationError("filter", error.message);
+    }
+    return {
+      preparePolicyResponse: async () => {
+        const page = await deps.store.listMemoryLibrary(filter);
+        const presentations = await loadMemoryPresentations(deps.store, page.entries.map(({ memory }) => memory));
+        return (policy) => {
+          const present = createMemoryPresenter(policy);
+          const memories = new Map(presentations.map((entry) => [entry.memory.id, present(entry)]));
+          return { status: 200, body: {
+            ...page,
+            entries: page.entries.flatMap((entry) => {
+              const memory = memories.get(entry.memory.id);
+              return memory == null ? [] : [{ ...entry, memory }];
+            }),
+            facets: { ...page.facets,
+              projects: [...new Set(page.facets.projects.map((value) => metadataView(value)))],
+              writers: [...new Set(page.facets.writers.map((value) => metadataView(value)))],
+            },
+            untrusted: true,
+            policyVersion: policy.version,
+          } };
+        };
+      },
+    };
+  };
+
   /**
    * `GET /memories`：列出未刪除的記憶（由新到舊）。
    *
@@ -2658,6 +2710,11 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       case "memories":
         result = await routeMemories(request, method, segments, url);
         break;
+      case "memory-library":
+        if (segments.length !== 1) throw new NotFoundError("路徑");
+        if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
+        result = await listMemoryLibrary(url);
+        break;
       case "memory-policy":
         result = await routeMemoryPolicy(request, method, segments);
         break;
@@ -2717,7 +2774,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         }
         const { url, segments } = parseRequestTarget(request);
         if (isApiPath(segments)) {
-          memoryRequest = ["memories", "memory-policy", "memory-sources", "search"].includes(segments[0]!);
+          memoryRequest = ["memories", "memory-library", "memory-policy", "memory-sources", "search"].includes(segments[0]!);
           await dispatch(request, response, url, segments);
         } else {
           await serveWeb(request, response, url);

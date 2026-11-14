@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe } from "vitest";
 import { Pool } from "pg";
-import { runMemorySourceStoreContract, runMetadataStoreContract } from "@mnemoshelf/core/testing";
+import { runMemoryLibraryContract, runMemorySourceStoreContract, runMetadataStoreContract } from "@mnemoshelf/core/testing";
 import { PgMetadataStore } from "../src/index.js";
 import { createFreshSchema, PG_ENABLED, startPgContainer, type StartedPgContainer } from "./helpers.js";
 
@@ -55,5 +55,11 @@ describe.skipIf(!PG_ENABLED)("PostgreSQL MetadataStore（需 MNEMOSHELF_PG=1）"
           for each row execute function "${schema}".fail_policy_update()`);
       },
     };
+  });
+
+  runMemoryLibraryContract("postgres", async () => {
+    if (pool === undefined) throw new Error("連線池尚未初始化（beforeAll 未執行）");
+    const schema = await createFreshSchema(pool);
+    return new PgMetadataStore(pool, { schema });
   });
 });

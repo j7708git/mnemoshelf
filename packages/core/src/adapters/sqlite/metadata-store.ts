@@ -1,5 +1,6 @@
 import { DuplicateRootError } from "../../errors.js";
 import { memoryContentHash } from "../../memory/content-normalize.js";
+import { buildMemoryLibrarySql, readMemoryLibraryRows, type MemoryLibraryFilter, type MemoryLibraryPage } from "../../memory/library.js";
 import {
   assertMemorySourceChunks,
   MemorySourceConflictError,
@@ -1003,6 +1004,12 @@ export class SqliteMetadataStore implements MetadataStore {
       ...params,
       limit,
     ).map(rowToMemory);
+  }
+
+  async listMemoryLibrary(filter: MemoryLibraryFilter = {}): Promise<MemoryLibraryPage> {
+    const query = buildMemoryLibrarySql(filter, "sqlite", { memories: "memories", sources: "memory_sources" });
+    const rows = selectRows(this.db, query.sql, ...query.params);
+    return readMemoryLibraryRows(rows, query.filter, rowToMemory);
   }
 
   /**
