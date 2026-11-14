@@ -2,7 +2,7 @@
 
 本機桌面應用程式：把自己挑選的資料夾變成可語意搜尋的知識庫，並讓多個 AI agent 共用同一份記憶。
 
-> **狀態**：最新釋出 **v0.9.1**（[GitHub Releases](https://github.com/j7708git/mnemoshelf/releases)）。本版新增**加入資料夾的「瀏覽…」選擇器**（桌面版用系統原生選擇器，瀏覽器版用對話框；列目錄端點的存取策略可由使用者設定，見 [docs/roots-and-privacy.md](docs/roots-and-privacy.md)）與**暖色淺／深雙主題的 Web UI 改版**；延續 v0.8.0 的 **Roots 分享勾選與通用單檔上限持久化**（依檔案／圖片／音訊／影片設定跨重啟保留，見 [docs/roots-and-privacy.md](docs/roots-and-privacy.md)）、**macOS Apple Silicon 可選 WebGPU 嵌入加速**（CPU 仍為預設；提供能力探測、失敗永久回退 CPU 與批次上限護欄），以及離線只讀的混合格式統計探測與 Stage 3 未見題庫／Naive RAG 檢索對照評估工具。**App 內更新已在 Linux AppImage 實證到 0.5.2**（0.5.0→0.5.1→0.5.2）；0.6.0 起的更新流程尚未實機驗證，≤ 0.4.1 仍須先手動安裝 0.5.0。平台限制：**macOS 只檢查並開啟下載頁**（ad-hoc 簽章、未公證，不自動安裝）；**Windows NSIS 未簽章，更新流程未實機驗證**。支援矩陣、備份與回滾見 [docs/updates.md](docs/updates.md)；harness 接入契約見 [docs/agent-integration.md](docs/agent-integration.md)。授權 [MIT](LICENSE)。
+> **狀態**：最新釋出 **v0.9.2**（[GitHub Releases](https://github.com/j7708git/mnemoshelf/releases)）。本版修復記憶清單分頁與篩選一致性，新增保留來源與歸屬的專案／寫入者召回規則，並提供 Codex Stop 原文保存、Antigravity Adapter 與共用 Hook 接入。資料庫會向前升級，既有內容與用途保留；更新前請先備份，升級與回滾方式見 [docs/updates.md](docs/updates.md)。**App 內更新已在 Linux AppImage 實證到 0.5.2**；較新版本的更新流程尚未實機驗證。macOS 只檢查並開啟下載頁（ad-hoc 簽章、未公證），Windows NSIS 未簽章。完整本版說明見 [v0.9.2 發版說明](docs/releases/v0.9.2.md)。授權 [MIT](LICENSE)。
 
 ## 這是什麼
 
@@ -82,7 +82,7 @@ TypeScript／Node.js／pnpm；桌面殼是 Electron＋React，Web UI 用 Vite＋
 | [docs/codex-recall.md](docs/codex-recall.md) | 從原始碼啟用 Codex 自動召回、查詢範圍與排查方式 |
 | [docs/updates.md](docs/updates.md) | App 內更新：支援矩陣、更新前備份、還原與手動回滾、平台限制 |
 | [docs/roots-and-privacy.md](docs/roots-and-privacy.md) | root 規則、路徑安全、機密遮罩、信任模型、資料刪除 |
-| [docs/raw-memory.md](docs/raw-memory.md) | 原文寫入、來源續讀、遮罩開關、生命週期與 v2 備份 |
+| [docs/raw-memory.md](docs/raw-memory.md) | 原文寫入、來源續讀、遮罩開關、生命週期與 v3 備份 |
 | [docs/storage-ports.md](docs/storage-ports.md) | 搜尋模式、記憶欄位與檢索、匯出／匯入、PostgreSQL 後端 |
 | [docs/embedder-contract.md](docs/embedder-contract.md) | embedder 能力宣告、執行裝置、探測與退回 |
 | [docs/architecture.html](docs/architecture.html) | 架構圖（以瀏覽器開啟） |

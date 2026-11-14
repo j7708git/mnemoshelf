@@ -53,8 +53,8 @@ pnpm --filter @mnemoshelf/desktop run dist:win     # Windows x64：NSIS 安裝�
 | Windows x64 | `windows-latest` | `Mnemoshelf-<版本>-win-x64.exe`（NSIS 安裝程式） |
 
 > Linux 產物名稱中的 x64 在 AppImage 會寫成 `x86_64`、在 tar.gz 寫成 `x64`
-> （electron-builder 對不同 target 的架構正規化不同）。上表的 Linux 名稱是實測結果；
-> macOS／Windows 的產物名稱依同一套命名規則（尚未在實機產出）。
+> （electron-builder 對不同 target 的架構正規化不同）。四個平台的名稱均依 CI 產物核對；
+> 安裝包成功產出不代表每個平台的安裝、更新與使用流程都已實機驗證。
 
 安裝檔裡也帶著 **MCP 入口**，讓採用 `mcpServers` JSON 設定的 MCP client（Claude Code、Cursor、
 Cline 等）連上本機服務：入口在
