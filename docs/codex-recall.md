@@ -47,3 +47,8 @@
 沒有相關記憶、模型冷啟動、服務離線、查詢降級或逾時，都會略過注入，提示仍可照常送出。先確認 App 執行中、連線資訊檔存在、記憶的專案範圍相符，再用語意搜尋暖機後重試。要停用時，從 `hooks.json` 移除這一組設定，然後開啟新的 Codex 工作階段。
 
 此範例適用於本機 CLI 的命令 hook。Windows 的命令需依實際 shell 設定 `commandWindows`，目前未驗證。不同 Codex 宿主是否執行本機 hook，請參考 [OpenAI 的 hook 文件](https://learn.chatgpt.com/docs/hooks)。
+
+## 宿主環境實查與能力邊界（macOS ChatGPT Desktop）
+
+- **內附 CLI 位置**：若系統 `PATH` 上沒有獨立的 `codex` 指令，macOS 的 ChatGPT 桌面應用程式通常內附於 `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`（實查版本 `codex-cli 0.167.0-alpha.4.1`），並支援專案或使用者層的 `.codex/hooks.json` `UserPromptSubmit` 事件。
+- **能力邊界**：目前僅提供 `UserPromptSubmit` 自動召回；由於尚未在本機實測 Codex `Stop` hook 與其 transcript 擷取契約，腳本**不自動保存**對話原文。若需要將對話知識寫入記憶庫，請於對話中主動指示模型呼叫 MCP `remember` 工具，或改用已支援回合原文保存的 Antigravity／OpenCode／dsh 外掛。
