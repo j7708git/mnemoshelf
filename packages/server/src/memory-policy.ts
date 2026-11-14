@@ -1,3 +1,4 @@
+import { organizationOf } from "./memory-organization.js";
 import {
   mapMaskedRange,
   maskSecrets,
@@ -169,7 +170,7 @@ export async function loadMemoryPresentations(
     const source = sources.get(memory.sourceId);
     if (source == null || source.deletedAt !== null || source.chunkVersion !== memory.chunkVersion) return [];
     // 片段查詢後可能已被移到其他 scope，使用目前的來源判斷可見範圍。
-    return [{ memory: { ...memory, scope: source.scope, project: source.project }, source }];
+    return [{ memory: { ...memory, ...organizationOf(source), scope: source.scope, project: source.project }, source }];
   });
 }
 
@@ -191,6 +192,8 @@ export function createMemoryPresenter(policy: MemoryPolicy) {
   return ({ memory, source }: MemoryPresentation, snippet?: SnippetOptions): MemoryView | null => {
     const metadata = {
       agent: metadataView(memory.agent),
+      originProject: metadataView(memory.originProject),
+      assignedProject: metadataView(memory.assignedProject),
       project: metadataView(memory.project),
       sourceSession: metadataView(memory.sourceSession),
       sourceMessage: metadataView(memory.sourceMessage),

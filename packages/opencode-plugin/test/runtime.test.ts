@@ -183,7 +183,7 @@ async function setup(
     cleanup,
     fetchCalls,
     searchCalls: () => fetchCalls.filter((call) => call.url.endsWith("/memories/search")),
-    listCalls: () => fetchCalls.filter((call) => call.url.includes("/memories?")),
+    listCalls: () => fetchCalls.filter((call) => call.url.includes("/memories/recent?")),
   };
 }
 
@@ -215,6 +215,7 @@ describe("context hook 召回", () => {
     expect(harness.searchCalls()).toHaveLength(1);
     expect(harness.searchCalls()[0].url).toBe("http://127.0.0.1:43117/memories/search");
     expect(harness.searchCalls()[0].body).toEqual({
+      agent: "opencode-plugin/raw-turn",
       query: FIRST_QUERY,
       project: "mnemoshelf",
       k: 8,
@@ -238,6 +239,7 @@ describe("context hook 召回", () => {
 
     expect(harness.searchCalls()).toHaveLength(1);
     expect(harness.searchCalls()[0].body).toEqual({
+      agent: "opencode-plugin/raw-turn",
       query: FIRST_QUERY,
       scope: "global",
       k: 8,
@@ -615,7 +617,7 @@ describe("最近回合紀錄召回", () => {
     const lists = harness.listCalls();
     expect(lists).toHaveLength(1);
     expect(lists[0].url).toBe(
-      "http://127.0.0.1:43117/memories?scope=project&project=mnemoshelf&agent=opencode-plugin%2Fturn&limit=3",
+      "http://127.0.0.1:43117/memories/recent?scope=project&project=mnemoshelf&writer=opencode-plugin%2Fturn&agent=opencode-plugin%2Fraw-turn&limit=3",
     );
     expect(lists[0].authorization).toBe("Bearer test-token-value");
     expect(lists[0].body).toEqual({});
@@ -649,7 +651,7 @@ describe("最近回合紀錄召回", () => {
     expect(lists).toHaveLength(1);
     expect(lists[0].url).toContain("scope=global");
     expect(lists[0].url).not.toContain("project=");
-    expect(lists[0].url).toContain("agent=opencode-plugin%2Fturn");
+    expect(lists[0].url).toContain("writer=opencode-plugin%2Fturn");
     expect(lists[0].url).toContain("limit=3");
   });
 
@@ -1090,6 +1092,7 @@ describe("指令", () => {
 
     expect(harness.searchCalls()).toHaveLength(1);
     expect(harness.searchCalls()[0].body).toEqual({
+      agent: "opencode-plugin/raw-turn",
       query: "向量表 決定",
       includeAllProjects: true,
       k: 8,
@@ -1162,7 +1165,7 @@ describe("原文片段與政策確認", () => {
   it("舊服務無可靠政策時不注入；搜尋期間切換則重新查詢，不混用舊 recent 內容", async () => {
     let version = 1;
     const harness = await setup({}, async (input) => {
-      if (String(input).includes("/memories?")) {
+      if (String(input).includes("/memories/recent?")) {
         return jsonResponse({ policyVersion: 1, memories: [{ id: 90, content: "不混用舊回合", createdAt: "2026-01-01" }] });
       }
       const resultVersion = version;
@@ -1194,7 +1197,7 @@ describe("原文片段與政策確認", () => {
     const anchor = "這裡是服務定位的精確答案";
     const context = "前置字元".repeat(20) + anchor + "文脈😀".repeat(50);
     const harness = await setup({ softChars: 580, maxFactChars: 40 }, async (input) =>
-      String(input).includes("/memories?")
+      String(input).includes("/memories/recent?")
         ? jsonResponse({ memories: [{ id: 91, content: "舊回合".repeat(200), createdAt: "2026-01-01" }] })
         : jsonResponse({
           hits: [
@@ -1213,4 +1216,19 @@ describe("原文片段與政策確認", () => {
     expect(output).toContain("[source id=8]\n  user:");
     await harness.cleanup();
   });
+});
+
+it("召回政策版本改變會清除同回合快取，遮罩版本不變也重新查詢", async () => {
+  let recallVersion = 1;
+  const harness = await setup({ recentTurns: 0 }, async () => jsonResponse({
+    policyVersion: 1, recallVersion,
+    hits: recallVersion === 1 ? memoryHits().hits : [],
+  }), undefined, ENV, {}, () => jsonResponse({ maskSecrets: true, version: 1, recallVersion }));
+  const run = async () => { const event = userEvent(FIRST_QUERY, "same-recall-version"); await harness.handler(event); return latestText(event); };
+  expect(await run()).toContain("memory-context");
+  expect(await run()).toContain("memory-context");
+  expect(harness.searchCalls()).toHaveLength(1);
+  recallVersion = 2;
+  expect(await run()).not.toContain("memory-context");
+  expect(harness.searchCalls()).toHaveLength(2);
 });

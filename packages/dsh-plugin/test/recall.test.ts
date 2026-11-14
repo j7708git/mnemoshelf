@@ -127,6 +127,7 @@ describe("searchMemories", () => {
     expect(calls[0]?.url).toBe("http://127.0.0.1:12345/memories/search");
     const body = JSON.parse(String(calls[0]?.init?.body));
     expect(body).toEqual({
+      agent: "dsh/turn",
       query: "召回 timeout 是多少",
       project: "mnemoshelf",
       k: 8,
@@ -371,4 +372,13 @@ it("同一來源兩段證據的排序可勝過較前的單一候選，仍最多�
   expect(result.block).toContain("助理確認固定臂已卡扣。");
   expect(result.block).not.toContain("單一候選。");
   expect(result.block.match(/source id=/g)).toHaveLength(4);
+});
+
+it("召回政策在查詢後改變，遮罩版本相同也不能注入舊結果", async () => {
+  let calls = 0;
+  const fetchImpl: typeof fetch = async (url) => String(url).endsWith("/memory-policy")
+    ? jsonResponse({ maskSecrets: true, version: 1, recallVersion: ++calls })
+    : jsonResponse({ policyVersion: 1, recallVersion: 1, degraded: false, hits: [hit("禁止注入的過期政策結果")] });
+  const result = await recallForMessages({ messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "之前討論的召回政策" }] }], connection: CONNECTION, project: "alpha", fetchImpl });
+  expect(result).toMatchObject({ block: "", skip: "policy-changed" });
 });

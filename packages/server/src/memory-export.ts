@@ -7,15 +7,21 @@ import {
   type MemoryScope,
   type MemoryPolicy,
   type MemorySource,
+  type MemoryOrganization,
+  type MemoryRecallSettings,
+  type MemoryRecallRule,
+  type MemoryExportRecord as StoredMemoryExportRecord,
 } from "@mnemoshelf/core";
+import { organizationOf, parseOrganizationSnapshot, parseRecallRule } from "./memory-organization.js";
 import { ValidationError } from "./errors.js";
 import { maskSecrets } from "./secret-masking.js";
-import { memoryContentView } from "./memory-policy.js";
-import { parseSourceWriteRequest, prepareMemorySource, sourceBackupView } from "./memory-source.js";
+import { memoryContentView, metadataView } from "./memory-policy.js";
+import { parseSourceWriteRequest, prepareMemorySource, sourceBackupView, sourceMetadata } from "./memory-source.js";
 
 /** 舊版扁平記憶備份的格式版本。 */
 export const MEMORY_EXPORT_SCHEMA_VERSION = 1;
 export const RAW_MEMORY_EXPORT_SCHEMA_VERSION = 2;
+export const ORGANIZED_MEMORY_EXPORT_SCHEMA_VERSION = 3;
 /** 匯出回應的 content-type（NDJSON）。 */
 export const MEMORY_EXPORT_CONTENT_TYPE = "application/x-ndjson; charset=utf-8";
 /** 匯入請求主體上限（32 MiB）；超過回 413。 */
@@ -48,6 +54,8 @@ export interface MemoryExportRecord {
 
 /** 通過格式驗證、等待寫入的一筆匯入資料（`content` 已是遮罩後內容）。 */
 export interface MemoryImportEntry {
+  dedupe: { scope: MemoryScope; project: string | null };
+  organization: MemoryOrganization;
   /** 來源行號（從 1 起算，含被忽略的空行）。 */
   line: number;
   content: string;
@@ -71,6 +79,7 @@ export interface MemoryImportLineError {
 
 /** `planMemoryImport` 的結果；不含任何寫入動作。 */
 export interface MemoryImportPlan {
+  rules?: MemoryRecallRule[];
   /** 非空行的總數（空白行忽略、不計入）。 */
   total: number;
   /** 通過驗證的資料列。 */
@@ -87,6 +96,9 @@ export interface MemoryImportPlan {
 
 /** `POST /memories/import` 的回應（成功或 dry-run；400 時另含 `error`）。 */
 export interface MemoryImportResponse {
+  rules?: { mode: "preserve" | "replace"; available: number; availableInBackup: boolean; replaced: boolean; revision: number };
+  partial?: boolean;
+  failed?: number;
   dryRun: boolean;
   total: number;
   valid: number;
@@ -307,6 +319,8 @@ function parseImportLine(record: unknown, line: number, policy: MemoryPolicy): M
     sourceMessage,
     pinned,
     redacted: masked.redacted,
+    dedupe: { scope, project },
+    organization: { originProject: null, assignedProject: project, recallPolicy: scope, recallPolicySource: "legacy", recallRuleId: null, recallRuleRevision: null },
   };
 }
 
@@ -328,6 +342,7 @@ export function planMemoryImport(
   let total = 0;
   let invalidCount = 0;
   let redacted = 0;
+  let rules: MemoryRecallRule[] | undefined;
 
   for (let index = 0; index < lines.length; index += 1) {
     const raw = lines[index]!.endsWith("\r") ? lines[index]!.slice(0, -1) : lines[index]!;
@@ -345,7 +360,30 @@ export function planMemoryImport(
       continue;
     }
     try {
-      if (isRecord(parsed) && parsed.schemaVersion === RAW_MEMORY_EXPORT_SCHEMA_VERSION) {
+      let organization: MemoryOrganization | undefined;
+      let dedupe: MemoryImportEntry["dedupe"] | undefined;
+      if (isRecord(parsed) && parsed.schemaVersion === ORGANIZED_MEMORY_EXPORT_SCHEMA_VERSION) {
+        if (parsed.type === "settings") {
+          if (rules !== undefined || !Array.isArray(parsed.rules)) lineError("v3 規則設定只能有一列");
+          rules = parsed.rules.map((rule: unknown) => parseRecallRule(rule));
+          const ids = new Set(rules.map((rule) => rule.id));
+          const selectors = new Set(rules.map((rule) => JSON.stringify([rule.project ?? null, rule.writer ?? null])));
+          if (ids.size !== rules.length || selectors.size !== rules.length) lineError("規則 id 或 selector 重複");
+          total -= 1;
+          continue;
+        }
+        organization = parseOrganizationSnapshot(parsed.organization);
+        if (parsed.type === "memory") {
+          if (!isRecord(parsed.dedupe)) lineError("v3 memory 必須保留 dedupe scope/project");
+          const scope = parsed.dedupe.scope;
+          const project = parsed.dedupe.project;
+          if (!MEMORY_SCOPES.includes(scope as MemoryScope)) lineError("dedupe.scope 不合法");
+          if (scope === "project") { requireImportString(project, "dedupe.project", MAX_MEMORY_METADATA_CHARS); if (maskSecrets(project as string).redacted) lineError("dedupe.project 不得含機密"); }
+          else if (project !== null) lineError("dedupe.project 在非 project 範圍必須是 null");
+          dedupe = { scope: scope as MemoryScope, project: typeof project === "string" ? project.trim() : null };
+        }
+      }
+      if (isRecord(parsed) && (parsed.schemaVersion === RAW_MEMORY_EXPORT_SCHEMA_VERSION || parsed.schemaVersion === ORGANIZED_MEMORY_EXPORT_SCHEMA_VERSION)) {
         if (parsed.type === "source") {
           if (typeof parsed.createdAt !== "string" || !Number.isFinite(Date.parse(parsed.createdAt))) {
             lineError("createdAt 必須是有效的 ISO 8601 時間");
@@ -354,6 +392,7 @@ export function planMemoryImport(
             lineError("pinned 必須是布林值");
           }
           const source = prepareMemorySource(parseSourceWriteRequest(parsed.source), policy);
+          source.input.organization = organization ?? { originProject: null, assignedProject: source.input.project, recallPolicy: source.input.scope, recallPolicySource: "legacy", recallRuleId: null, recallRuleRevision: null };
           sources.push({ ...source, pinned: parsed.pinned ?? false });
           if (source.redactedCount > 0) redacted += 1;
           continue;
@@ -362,6 +401,8 @@ export function planMemoryImport(
         parsed = parsed.memory;
       }
       const entry = parseImportLine(parsed, line, policy);
+      if (organization !== undefined) entry.organization = organization;
+      if (dedupe !== undefined) entry.dedupe = dedupe;
       entries.push(entry);
       if (entry.redacted) redacted += 1;
     } catch (error) {
@@ -372,12 +413,16 @@ export function planMemoryImport(
     }
   }
 
-  return { total, entries, sources, invalid, invalidCount, redacted };
+  return { total, entries, sources, invalid, invalidCount, redacted, ...(rules === undefined ? {} : { rules }) };
 }
 
-/** 去重 key（與儲存層 `addMemoryUnlessDuplicate` 相同的四個維度；`project` null-safe）。 */
-function duplicateKey(memory: Pick<Memory, "content" | "scope" | "project" | "agent">): string {
-  return [memoryContentHash(memory.content), memory.scope, memory.project ?? "\u0000", memory.agent].join("\u0000");
+/** 匯入去重採原始 scope/project、寫入者、歸屬與內容 hash；兩種專案欄位皆 null-safe。 */
+type DedupeRecord = Pick<Memory, "content" | "scope" | "project" | "agent"> & { assignedProject?: string | null; organization?: MemoryOrganization; dedupe?: MemoryImportEntry["dedupe"]; dedupeScope?: MemoryScope; dedupeProject?: string | null };
+function duplicateKey(memory: DedupeRecord): string {
+  const scope = memory.dedupe?.scope ?? memory.dedupeScope ?? memory.scope;
+  const project = memory.dedupe !== undefined ? memory.dedupe.project : memory.dedupeScope !== undefined ? memory.dedupeProject : memory.project;
+  const assigned = memory.organization !== undefined ? memory.organization.assignedProject : memory.assignedProject === undefined ? memory.project : memory.assignedProject;
+  return [memoryContentHash(memory.content), scope, project ?? "\u0000", memory.agent, assigned ?? "\u0000"].join("\u0000");
 }
 
 /**
@@ -389,8 +434,8 @@ function duplicateKey(memory: Pick<Memory, "content" | "scope" | "project" | "ag
  * 正式匯入不採信這個估算，而是用 `addMemoryUnlessDuplicate` 的實際結果計數。
  */
 export function countImportDuplicates(
-  entries: readonly Pick<MemoryImportEntry, "content" | "scope" | "project" | "agent">[],
-  existing: readonly Pick<Memory, "content" | "scope" | "project" | "agent" | "deletedAt">[],
+  entries: readonly DedupeRecord[],
+  existing: readonly (DedupeRecord & Pick<Memory, "deletedAt">)[],
 ): number {
   const seen = new Set<string>();
   for (const memory of existing) {
@@ -404,4 +449,19 @@ export function countImportDuplicates(
     else seen.add(key);
   }
   return duplicates;
+}
+
+/** v3 保留組織與規則快照；不包含內部 hash、已刪除歷史或 tombstone。 */
+export function serializeOrganizedMemoriesExport(
+  memories: readonly StoredMemoryExportRecord[], sources: readonly (MemorySource & { pinned: boolean })[], policy: MemoryPolicy,
+  settings: MemoryRecallSettings,
+): Buffer {
+  const schemaVersion = ORGANIZED_MEMORY_EXPORT_SCHEMA_VERSION;
+  const rows: unknown[] = [{ schemaVersion, type: "settings", rules: settings.rules }];
+  for (const memory of memories) {
+    const { schemaVersion: _version, ...fields } = memoryExportRecord(memory);
+    rows.push({ schemaVersion, type: "memory", memory: fields, organization: organizationOf(memory), dedupe: { scope: memory.dedupeScope, project: metadataView(memory.dedupeProject) } });
+  }
+  for (const source of sources) rows.push({ schemaVersion, type: "source", source: sourceBackupView(source, policy), organization: organizationOf(sourceMetadata(source)), createdAt: source.createdAt, pinned: source.pinned });
+  return Buffer.from(rows.map((row) => JSON.stringify(row)).join("\n") + "\n", "utf8");
 }

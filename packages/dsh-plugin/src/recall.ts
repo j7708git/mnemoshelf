@@ -8,6 +8,7 @@
  * - 區塊含標記總長 ≤ 900 字元；超預算從最後一筆開始丟，不留半截圍籬。
  */
 import {
+  TURN_AGENT,
   MAX_BLOCK_CHARS,
   MAX_QUERY_CHARS,
   RECALL_K,
@@ -60,7 +61,7 @@ export function isHumanMessage(message: MessageLike): boolean {
 export type SearchFailureReason = "timeout" | "network" | "http" | "bad-response";
 
 export type SearchMemoriesResult =
-  | { ok: true; hits: RecallHitLike[]; degraded: boolean; policyVersion?: number }
+  | { ok: true; hits: RecallHitLike[]; degraded: boolean; policyVersion?: number; recallVersion?: number }
   | { ok: false; reason: SearchFailureReason; status?: number };
 
 /**
@@ -91,7 +92,7 @@ export async function searchMemories(input: {
         accept: "application/json",
         authorization: `Bearer ${input.connection.token}`,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, agent: TURN_AGENT }),
       redirect: "error",
       signal: controller.signal,
     });
@@ -111,6 +112,7 @@ export async function searchMemories(input: {
       hits: record.hits as RecallHitLike[],
       degraded: record.degraded === true,
       ...(isPositiveId(record.policyVersion) ? { policyVersion: record.policyVersion } : {}),
+      ...(typeof record.recallVersion === "number" && Number.isSafeInteger(record.recallVersion) && record.recallVersion >= 0 ? { recallVersion: record.recallVersion } : {}),
     };
   } catch {
     return { ok: false, reason: controller.signal.aborted ? "timeout" : "network" };
@@ -280,13 +282,13 @@ export async function recallForMessages(input: {
   let confirmed = await readPolicy();
   if (remaining() <= 0) return timedOut();
   if (!confirmed.ok) return { block: "", skip: confirmed.reason, hits: 0, chars: 0 };
-  if (result.policyVersion !== confirmed.policy.version) {
+  if ((result.policyVersion !== confirmed.policy.version || result.recallVersion !== confirmed.policy.recallVersion)) {
     result = await search();
     if (remaining() <= 0) return timedOut();
     if (!result.ok) return { block: "", skip: result.reason, hits: 0, chars: 0 };
     confirmed = await readPolicy();
     if (remaining() <= 0) return timedOut();
-    if (!confirmed.ok || result.policyVersion !== confirmed.policy.version) {
+    if (!confirmed.ok || (result.policyVersion !== confirmed.policy.version || result.recallVersion !== confirmed.policy.recallVersion)) {
       return { block: "", skip: confirmed.ok ? "policy-changed" : confirmed.reason, hits: 0, chars: 0 };
     }
   }

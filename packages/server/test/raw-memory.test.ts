@@ -59,7 +59,7 @@ async function setMask(instance: MnemoshelfServer, maskSecrets: boolean) {
 
 type Page = {
   messages: Array<MemorySourceMessage & { messageIndex: number; start: number; end: number; totalChars: number }>;
-  next: { messageIndex: number; offset: number; policyVersion: number } | null;
+  next: { messageIndex: number; offset: number; policyVersion: number; recallVersion: number } | null;
   indexState: { total: number };
   policyVersion: number;
   untrusted: true;
@@ -117,17 +117,17 @@ it("以 UTF-16 安全分頁逐字還原長回合、空訊息、emoji 與 CRLF，
       reassembled.set(slice.messageIndex, (reassembled.get(slice.messageIndex) ?? "") + slice.content);
     }
     if (page.next === null) break;
-    const { messageIndex, offset, policyVersion } = page.next;
-    page = await read(instance, sourceId, `project=rain-lab&messageIndex=${messageIndex}&offset=${offset}&policyVersion=${policyVersion}`);
+    const { messageIndex, offset, policyVersion, recallVersion } = page.next;
+    page = await read(instance, sourceId, `project=rain-lab&messageIndex=${messageIndex}&offset=${offset}&policyVersion=${policyVersion}&recallVersion=${recallVersion}`);
   }
   expect([...reassembled.values()]).toEqual(payload.messages.map(({ content }) => content));
 });
 
 it("跨片段機密在所有讀取出口遮罩，原文與嵌入資料不因政策改寫", async () => {
   const instance = await start();
-  expect((await api(instance, "GET", "/memory-policy")).body).toEqual({ maskSecrets: true, version: 1 });
-  expect((await setMask(instance, false)).body).toEqual({ maskSecrets: false, version: 2 });
-  expect((await setMask(instance, false)).body).toEqual({ maskSecrets: false, version: 2 });
+  expect((await api(instance, "GET", "/memory-policy")).body).toMatchObject({ maskSecrets: true, version: 1 });
+  expect((await setMask(instance, false)).body).toMatchObject({ maskSecrets: false, version: 2 });
+  expect((await setMask(instance, false)).body).toMatchObject({ maskSecrets: false, version: 2 });
   const secretFront = "fixture-prefix".repeat(27);
   const secretTail = "fixture-fragment".repeat(27);
   const assigned = ["password", ' = "', secretFront, " ", secretTail, '"'].join("");
@@ -140,7 +140,7 @@ it("跨片段機密在所有讀取出口遮罩，原文與嵌入資料不因政�
   const before = await read(instance, saved.source.id, "project=rain-lab&maxChars=950");
   expect(before.next).not.toBeNull();
 
-  expect((await setMask(instance, true)).body).toEqual({ maskSecrets: true, version: 3 });
+  expect((await setMask(instance, true)).body).toMatchObject({ maskSecrets: true, version: 3 });
   const stale = before.next!;
   expect(await api(instance, "GET", `/memory-sources/${saved.source.id}?project=rain-lab&messageIndex=${stale.messageIndex}&offset=${stale.offset}&policyVersion=${stale.policyVersion}`))
     .toMatchObject({ status: 409, body: { error: "policy-changed" } });
@@ -151,7 +151,7 @@ it("跨片段機密在所有讀取出口遮罩，原文與嵌入資料不因政�
   const slices = await read(instance, saved.source.id, "project=rain-lab&maxChars=940");
   const maskedNext = slices.next!;
   const following = await read(instance, saved.source.id,
-    `project=rain-lab&messageIndex=${maskedNext.messageIndex}&offset=${maskedNext.offset}&policyVersion=3`);
+    `project=rain-lab&messageIndex=${maskedNext.messageIndex}&offset=${maskedNext.offset}&policyVersion=3&recallVersion=${maskedNext.recallVersion}`);
   expect(slices.messages[0]!.content + following.messages[0]!.content).toBe(full);
 
   const pin = await api(instance, "POST", `/memories/${saved.memoryIds[1]}/pin`);
@@ -196,7 +196,7 @@ it("輸出前重讀在搜尋期間切換的政策，設定失敗不變更已保�
   const pending = api(instance, "POST", "/search", { body: { mode: "keyword", query: "pendingquery" } });
   try {
     await entered.promise;
-    expect((await setMask(instance, true)).body).toEqual({ maskSecrets: true, version: 3 });
+    expect((await setMask(instance, true)).body).toMatchObject({ maskSecrets: true, version: 3 });
   } finally {
     release.resolve();
   }
@@ -206,7 +206,7 @@ it("輸出前重讀在搜尋期間切換的政策，設定失敗不變更已保�
   expect(JSON.stringify(search.body)).not.toContain(synthetic);
   vi.spyOn(instance.store, "setMemoryPolicy").mockRejectedValueOnce(new Error("模擬設定寫入失敗"));
   expect((await setMask(instance, false)).status).toBe(500);
-  expect((await api(instance, "GET", "/memory-policy")).body).toEqual({ maskSecrets: true, version: 3 });
+  expect((await api(instance, "GET", "/memory-policy")).body).toMatchObject({ maskSecrets: true, version: 3 });
 });
 
 it("找到長原文中段與尾段，回傳命中節錄、原座標，並限制同來源占用名額", async () => {
@@ -399,7 +399,7 @@ it("透過舊片段生命週期操作整來源，政策有效的游標仍要重�
     status: 200, body: { deleted: true, hard: true },
   });
   expect(await api(instance, "POST", "/memory-sources", { body: payload })).toMatchObject({ status: 409 });
-  expect(await backup(instance)).toBe("");
+  expect(JSON.parse(await backup(instance))).toMatchObject({ schemaVersion: 3, type: "settings", rules: [] });
 });
 
 it("拒絕 8 MiB 超限、非法 Unicode 或未允許的角色，且不留下來源", async () => {
@@ -415,7 +415,7 @@ it("拒絕 8 MiB 超限、非法 Unicode 或未允許的角色，且不留下來
   expect(await instance.store.listMemoriesForExport()).toEqual([]);
 });
 
-it("v2 備份保存來源關係，重複匯入去重且預檢衝突時全批未寫入", async () => {
+it("v3 備份保存來源關係，重複匯入去重且預檢衝突時全批未寫入", async () => {
   const original = await start();
   const target = await start();
   const payload = event({ messages: [
@@ -426,10 +426,10 @@ it("v2 備份保存來源關係，重複匯入去重且預檢衝突時全批未�
   expect((await api(original, "POST", "/memories", { body: { agent: "legacy", content: "舊記憶" } })).status).toBe(201);
   expect((await api(original, "GET", "/memories/export?schemaVersion=1")).status).toBe(409);
   const file = await backup(original);
-  const rows = file.trim().split("\n").map((line) => JSON.parse(line));
+  const rows = file.trim().split("\n").map((line) => JSON.parse(line)).filter((row) => row.type !== "settings");
   expect(rows).toHaveLength(2);
-  expect(rows[0]).toMatchObject({ schemaVersion: 2, type: "memory", memory: { content: "舊記憶" } });
-  expect(rows[1]).toMatchObject({ schemaVersion: 2, type: "source", source: payload });
+  expect(rows[0]).toMatchObject({ schemaVersion: 3, type: "memory", memory: { content: "舊記憶" } });
+  expect(rows[1]).toMatchObject({ schemaVersion: 3, type: "source", source: payload });
   expect(file).not.toContain("requestHash");
   expect(file).not.toContain("memoryIds");
 
@@ -454,7 +454,7 @@ it("v2 備份保存來源關係，重複匯入去重且預檢衝突時全批未�
   expect(await backup(target)).not.toContain("不應新增");
 });
 
-it.each([true, false])("v2 備份還原到空庫後保留原文整回合的釘選狀態（pinned=%s）", async (pinned) => {
+it.each([true, false])("v3 備份還原到空庫後保留原文整回合的釘選狀態（pinned=%s）", async (pinned) => {
   const original = await start();
   const target = await start();
   const saved = await write(original, event({ messages: [
@@ -468,7 +468,7 @@ it.each([true, false])("v2 備份還原到空庫後保留原文整回合的釘�
   expect((await original.store.listMemorySourceChunks(saved.source.id)).every((memory) => memory.pinned === pinned)).toBe(true);
 
   const file = await backup(original);
-  expect(JSON.parse(file)).toMatchObject({ schemaVersion: 2, type: "source", pinned });
+  expect(JSON.parse(file.trim().split("\n")[1]!)).toMatchObject({ schemaVersion: 3, type: "source", pinned });
   expect(await restore(target, file, true)).toMatchObject({ status: 200, body: { created: 0, wouldCreate: 1 } });
   expect(await target.store.listMemoriesForExport()).toEqual([]);
   expect(await target.store.listMemorySourcesForExport()).toEqual([]);
@@ -485,7 +485,7 @@ it.each([true, false])("v2 備份還原到空庫後保留原文整回合的釘�
     expect((await target.store.listMemorySourceChunks(source!.id)).map((memory) => memory.pinned))
       .toEqual(saved.memoryIds.map(() => !pinned));
   }
-  expect(JSON.parse(await backup(target))).toMatchObject({ pinned: !pinned });
+  expect(JSON.parse((await backup(target)).trim().split("\n")[1]!)).toMatchObject({ pinned: !pinned });
 });
 
 it("舊 v2 來源備份未帶 pinned 時仍可預檢及還原，預設整回合未釘選", async () => {
@@ -591,13 +591,13 @@ it("政策設定重啟後仍保留，拒絕額外欄位", async () => {
   expect((await api(server.instance, "PATCH", "/memory-policy", {
     body: { maskSecrets: false, unexpected: true },
   })).status).toBe(400);
-  expect((await setMask(server.instance, false)).body).toEqual({ maskSecrets: false, version: 2 });
+  expect((await setMask(server.instance, false)).body).toMatchObject({ maskSecrets: false, version: 2 });
   await server.instance.close();
   const restarted = await createServer({
     env: {}, token: TEST_TOKEN, dataDir: server.dataDir, port: 0, embedder: new FakeEmbedder(),
   });
   try {
-    expect((await api(restarted, "GET", "/memory-policy")).body).toEqual({ maskSecrets: false, version: 2 });
+    expect((await api(restarted, "GET", "/memory-policy")).body).toMatchObject({ maskSecrets: false, version: 2 });
   } finally {
     await restarted.close();
   }
@@ -688,5 +688,5 @@ it.each([recallSearch, unifiedKeywordSearch])("排名取到舊版記憶後先完
   } finally {
     releaseRanking.resolve();
   }
-  expect(await pending).toMatchObject({ status: 200, body: { hits: [] } });
+  expect(await pending).toMatchObject({ status: 409, body: { error: "policy-changed" } });
 });

@@ -1,3 +1,5 @@
+import type { MemoryLibraryFilter, MemoryLibraryPage } from "../memory/library.js";
+import type { MemoryOrganizationPatch, MemoryRecallRule, MemoryRecallRulePreview, MemoryRecallSettings, MemoryRecallRuleWriteOptions, MemoryRecallRuleWriteResult } from "../memory/organization.js";
 import type {
   MemoryPolicy,
   MemorySource,
@@ -12,6 +14,7 @@ import type {
   ChunkMediaContainer,
   ChunkMediaTrack,
   Memory,
+  MemoryExportRecord,
   MemoryEmbeddingState,
   MemoryKind,
   MemoryPatch,
@@ -298,6 +301,7 @@ export interface MemorySearchBucket {
 export interface MemorySearchFilter {
   buckets?: MemorySearchBucket[];
   kind?: MemoryKind;
+  writer?: string;
 }
 
 /** 驗證並正規化後的 bucket（`project` 省略＝所有專案）。 */
@@ -312,6 +316,7 @@ export interface NormalizedMemorySearchFilter {
   /** 未提供＝`undefined`；空陣列＝沒有可見範圍。 */
   buckets: NormalizedMemorySearchBucket[] | undefined;
   kind: MemoryKind | undefined;
+  writer: string | undefined;
 }
 
 /**
@@ -326,8 +331,10 @@ export function normalizeMemorySearchFilter(filter: MemorySearchFilter = {}): No
     throw new TypeError("MemorySearchFilter 必須是物件");
   }
   const kind = filter.kind;
+  const writer = filter.writer;
+  if (writer !== undefined && (typeof writer !== "string" || writer.trim() === "" || writer.length > 200 || writer.includes("\0"))) throw new TypeError("writer 必須是非空文字");
   const rawBuckets = filter.buckets;
-  if (rawBuckets === undefined) return { buckets: undefined, kind };
+  if (rawBuckets === undefined) return { buckets: undefined, kind, writer };
   if (!Array.isArray(rawBuckets)) throw new TypeError("MemorySearchFilter.buckets 必須是陣列");
 
   return {
@@ -362,6 +369,7 @@ export function normalizeMemorySearchFilter(filter: MemorySearchFilter = {}): No
       return { scope: "agent", agent: record.agent };
     }),
     kind,
+    writer,
   };
 }
 
@@ -618,7 +626,7 @@ export interface MetadataStore {
   addMemory(m: NewMemory): Promise<Memory>;
 
   /**
-   * 寫入記憶，但**先做精確去重**：同一 key（內容 hash＋`scope`＋`project`＋`agent`）已有
+   * 寫入記憶，但**先做精確去重**：同一 key（內容 hash＋原請求 scope/project＋agent＋assignedProject）已有
    * 未刪除（`deletedAt == null`）的記憶時，不新增、回傳既有列與 `duplicate: true`；
    * 否則與 `addMemory` 相同地新增（含 FTS 維護、`content_hash`、`supersedes` 軟刪除、
    * `pinned` 預設 `false`）並回 `duplicate: false`。
@@ -626,8 +634,8 @@ export interface MetadataStore {
    * - **key 的內容部分**＝`memoryContentHash(m.content)`（Unicode NFC、trim、連續空白收斂；
    *   不轉大小寫、不動標點）。呼叫端（REST）傳入的是**遮罩後**內容，因此「憑證不同但遮罩後
    *   同文」視為重複。
-   * - `project` 以 SQL 的 null-safe 比較（`is`／`coalesce`），不會因 null 比較漏判；
-   *   非 `project` scope 的 `project` 一律是 `null`。
+   * - 原請求 scope/project 保存在內部 dedupe 欄，不隨後續用途改動；備份復原可用
+   *   `restoreDedupe` 保留此身分。project／assignedProject 以 null-safe 比較。
    * - **競態**：檢查與新增在同一個交易／單一 SQL 敘述內完成（本專案是單一寫入者；
    *   PostgreSQL 的實作以 `insert … where not exists` 語意對齊）。
    * - **已軟刪除者不計入**：軟刪除後可以再新增一筆相同內容；`duplicate` 的既有列一定是
@@ -647,6 +655,7 @@ export interface MetadataStore {
    * - `scope in ('global','agent')` 但 `project` 非 null → `project = null`；
    * - `scope = 'project'` 但 `project` 為 null／空字串（trim 後）→ `scope = 'global'`
    *   且 `project = null`（無法猜專案）。
+   * - 相容投影修復時同步更新 recallPolicy 與去重維度；來源仍未知，不猜補 originProject。
    *
    * 其他合法列不動；不清除、不合併任何記憶內容。回傳**實際更新**的列數（第二次呼叫為 0）。
    */
@@ -754,6 +763,16 @@ export interface MetadataStore {
    */
   listMemories(filter?: MemoryFilter): Promise<Memory[]>;
 
+  /** 管理清單：先依完整回合聚合及 AND 篩選，再依釘選／建立時間／類型／id 分頁。 */
+  listMemoryLibrary(filter?: MemoryLibraryFilter): Promise<MemoryLibraryPage>;
+  getMemoryRecallSettings(): Promise<MemoryRecallSettings>;
+  previewMemoryRecallRule(rule: MemoryRecallRule): Promise<MemoryRecallRulePreview>;
+  upsertMemoryRecallRule(rule: MemoryRecallRule, options: MemoryRecallRuleWriteOptions): Promise<MemoryRecallRuleWriteResult>;
+  deleteMemoryRecallRule(id: string, expectedRevision: number): Promise<MemoryRecallSettings>;
+  replaceMemoryRecallRules(rules: MemoryRecallRule[], options: { expectedRevision: number }): Promise<MemoryRecallSettings>;
+  updateMemoryOrganization(type: "source" | "memory", id: number, patch: MemoryOrganizationPatch): Promise<Memory | MemorySource | null>;
+  listMemoriesForRecall(filter?: MemorySearchFilter & { limit?: number }): Promise<Memory[]>;
+
   /**
    * 列出**全部未刪除**的記憶，供備份匯出使用（見 `docs/storage-ports.md` §記憶的匯出／匯入）。
    *
@@ -764,7 +783,7 @@ export interface MetadataStore {
    * - 回傳的是資料庫原文（未遮罩）；遮罩是呼叫端（REST 匯出）的責任，與其他讀取路徑一致。
    * - 沒有任何未刪除記憶時回 `[]`（不拋錯）。
    */
-  listMemoriesForExport(): Promise<Memory[]>;
+  listMemoriesForExport(): Promise<MemoryExportRecord[]>;
 
   /**
    * 關鍵字搜尋 chunk 文字與未刪除的記憶，回傳排名清單。

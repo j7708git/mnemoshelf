@@ -12,6 +12,7 @@ export type {
   ChunkMediaContainer,
   ChunkMediaTrack,
   Memory,
+  MemoryExportRecord,
   MemoryEmbeddingState,
   MemoryKind,
   MemoryPatch,
@@ -28,6 +29,9 @@ export type {
 } from "./ports/types.js";
 
 export type { MetadataStore } from "./ports/metadata-store.js";
+export { buildMemoryLibrarySql, normalizeMemoryLibraryFilter, readMemoryLibraryRows } from "./memory/library.js";
+export type { MemoryLibraryEntry, MemoryLibraryFilter, MemoryLibraryPage } from "./memory/library.js";
+export * from "./memory/organization.js";
 export { memoryContentHash, normalizeMemoryContentForHash } from "./memory/content-normalize.js";
 export {
   assertMemorySourceChunks,

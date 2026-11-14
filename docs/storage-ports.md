@@ -6,8 +6,15 @@
 
 原文回合以 `memory_sources` 保存，既有 `memories` 保存帶來源位置的檢索片段，沿用全文與向量索引。
 來源、片段與全文索引同交易保存；不新增另一套檔案 VectorIndex。記憶遮罩由持久 `MemoryPolicy`
-控制，預設開啟。來源讀取、整回合生命週期、備份 v2 與錯誤語意的現行契約見
+控制，預設開啟。來源讀取、整回合生命週期、備份與錯誤語意的現行契約見
 [原文記憶](raw-memory.md)；下方帶日期的舊記憶段落說明相容基礎，不覆蓋新來源行為。
+
+記憶組織欄位、完整管理分頁、物化召回規則、修訂競態與 schemaVersion 3 備份見
+[記憶整理與召回規則](memory-organization.md)。此契約優先於下方舊 scope／project／去重與 v1/v2 段落；
+`SearchFilter.memoryFilter` 使通用搜尋的記憶候選與專用召回採相同過濾，`listMemoriesForRecall`
+供最近回合召回。停用資料在排名前排除，管理查詢仍可讀。
+短記憶去重另保存原請求的內部 `dedupe_scope`／`dedupe_project`，並把 `assignedProject` 加入 key，
+防止用途規則改變造成重複寫入，或不同歸屬的共用記憶誤合併。
 
 MetadataStore 新增政策讀寫、來源新增／查重／讀取／列舉／範圍更新／刪除、來源片段列舉／重建與索引狀態統計。
 `Memory` 的 sourceId、messageIndex、chunkIndex、sourceStart、sourceEnd、chunkVersion 均為 additive nullable 欄位。
@@ -448,7 +455,7 @@ at-rest 仍明文、無加密），見 `docs/roots-and-privacy.md` §資料存�
 
 ## 記憶的匯出／匯入（2026-10-19）
 
-以下 v1 為短記憶相容格式；預設匯出現為 v2，亦含完整原文來源，詳見 [原文備份](raw-memory.md#備份與舊資料)。備份的範圍**只有記憶**：NDJSON（JSON Lines，一行一筆），**不含** chunk／向量與已刪除的歷史版本；
+以下 v1 為短記憶相容格式；預設匯出為 v3，含原文來源、組織快照與召回規則，詳見 [原文備份](raw-memory.md#備份與舊資料) 與 [組織備份契約](memory-organization.md#備份與相容)。備份的範圍**只有記憶**：NDJSON（JSON Lines，一行一筆），**不含** chunk／向量與已刪除的歷史版本；
 匯入後向量由背景 worker 重建。整庫搬遷（含向量檔）不在本版範圍，見 §設計規則 6。
 
 | 方法 | 語意 |

@@ -16,7 +16,7 @@ import { formatLog, type Connection, type LogFn, type PluginContextLike } from "
 
 export const LEGACY_TURN_AGENT = "opencode-plugin/turn";
 const FLUSH_INTERVAL_MS = 5 * 60 * 1000;
-const CAPTURE_AGENT = "opencode-plugin/raw-turn";
+export const CAPTURE_AGENT = "opencode-plugin/raw-turn";
 
 interface TerminalEvent {
   sessionID: string;

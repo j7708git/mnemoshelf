@@ -140,6 +140,7 @@ export async function runGenericRecall(
     const cwd = typeof rawCwd === "string" ? rawCwd : undefined;
 
     const context = await recallForPrompt({
+      callerAgent: (options.env ?? process.env).MNEMOSHELF_CALLER_AGENT?.trim() || undefined,
       prompt,
       cwd,
       env: options.env,

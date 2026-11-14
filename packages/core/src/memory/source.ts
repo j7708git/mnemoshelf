@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { normalizeMemoryOrganization, type MemoryOrganization, type MemoryOrganizationInput } from "./organization.js";
 import { MEMORY_SCOPES, normalizeMemoryPatch } from "../ports/metadata-store.js";
 import type { Memory, MemoryPatch, MemoryScope } from "../ports/types.js";
 import { maskSecrets } from "../privacy/secret-masking.js";
@@ -15,7 +16,7 @@ export interface MemorySourceMessage {
   occurredAt: string | null;
 }
 
-export interface MemorySource {
+export interface MemorySource extends MemoryOrganization {
   id: number;
   agent: string;
   scope: MemoryScope;
@@ -29,7 +30,7 @@ export interface MemorySource {
   deletedAt: string | null;
 }
 
-export type NewMemorySource = Omit<MemorySource, "id" | "createdAt" | "deletedAt">;
+export type NewMemorySource = Omit<MemorySource, "id" | "createdAt" | "deletedAt" | keyof MemoryOrganization> & MemoryOrganizationInput;
 export type MemorySourceEventCheck = Pick<NewMemorySource, "agent" | "sourceSession" | "sourceTurn" | "requestHash">;
 
 export interface NewMemorySourceChunk {
@@ -170,7 +171,11 @@ export function normalizeMemorySourceRequest(input: MemorySourceRequest): Memory
     return { sourceMessage, role, content, occurredAt };
   });
   if (messages.every(({ content }) => content.trim().length === 0)) throw new TypeError("原文來源的訊息全部為空");
-  return { agent, scope, project, sourceSession, sourceTurn, messages };
+  return { agent, scope, project, sourceSession, sourceTurn, messages,
+    ...(input.originProject === undefined ? {} : { originProject: input.originProject === null ? null : sourceMetadata(input.originProject, "originProject") }),
+    ...(input.assignedProject === undefined ? {} : { assignedProject: input.assignedProject === null ? null : sourceMetadata(input.assignedProject, "assignedProject") }),
+    ...(input.organization === undefined ? {} : { organization: normalizeMemoryOrganization(input.organization) }),
+  };
 }
 
 function hashFields(fields: unknown[]): string {

@@ -24,6 +24,7 @@ export async function runCodexRecall(
     if (input?.hook_event_name !== EVENT || typeof input.prompt !== "string") return null;
 
     const context = await recallForPrompt({
+      callerAgent: "codex/turn",
       prompt: input.prompt,
       cwd: typeof input.cwd === "string" ? input.cwd : undefined,
       env: options.env,

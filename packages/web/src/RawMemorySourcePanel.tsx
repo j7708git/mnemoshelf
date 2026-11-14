@@ -7,12 +7,14 @@ import {
   type MemorySourcePage,
 } from "./api";
 import { formatDateTime, MEMORY_SCOPE_LABEL, memorySourceRoleLabel } from "./format";
+import { RECALL_POLICY_LABEL } from "./memoryOrganization";
 
 interface SourceAccess {
   id: number;
   agent: string;
   scope: MemoryScope;
   project: string | null;
+  management?: boolean;
 }
 
 type State =
@@ -22,7 +24,7 @@ type State =
 
 const SOURCE_BUTTON = "rounded-md border border-line px-2.5 py-1 text-xs text-ink";
 
-export function RawMemorySourcePanel({ id, scope, agent, project }: SourceAccess) {
+export function RawMemorySourcePanel({ id, scope, agent, project, management = false }: SourceAccess) {
   const [state, setState] = useState<State>({ kind: "loading" });
   const [request, setRequest] = useState<{ cursor: MemorySourceCursor | null; restarted: boolean }>({
     cursor: null,
@@ -31,7 +33,7 @@ export function RawMemorySourcePanel({ id, scope, agent, project }: SourceAccess
 
   useEffect(() => {
     const controller = new AbortController();
-    void fetchMemorySource(id, { scope, agent, project }, request.cursor, controller.signal)
+    void fetchMemorySource(id, { scope, agent, project }, request.cursor, controller.signal, management)
       .then((page) => {
         if (!controller.signal.aborted) setState({ kind: "ready", page });
       })
@@ -44,7 +46,7 @@ export function RawMemorySourcePanel({ id, scope, agent, project }: SourceAccess
         setState({ kind: "error", message: error instanceof Error ? error.message : "讀取記憶來源失敗。" });
       });
     return () => controller.abort();
-  }, [agent, id, project, request, scope]);
+  }, [agent, id, project, request, scope, management]);
 
   const load = (cursor: MemorySourceCursor | null): void => {
     // 每次只顯示一頁，以免混用不同遮罩政策的內容與位置。
@@ -54,7 +56,7 @@ export function RawMemorySourcePanel({ id, scope, agent, project }: SourceAccess
 
   return (
     <section aria-label="原文回合來源" className="mt-2 space-y-2 rounded-lg bg-raised px-3 py-2 text-xs text-muted">
-      {request.restarted && <p role="status">記憶遮罩設定已變更，從開頭重新讀取。</p>}
+      {request.restarted && <p role="status">記憶遮罩或召回用途已變更，從開頭重新讀取。</p>}
       {state.kind === "loading" && <p role="status">正在讀取原文回合…</p>}
       {state.kind === "error" && (
         <>
@@ -104,8 +106,11 @@ export function RawMemorySourcePageContent({ page }: { page: MemorySourcePage })
         <dd className="break-all text-ink">{source.sourceSession}</dd>
         <dt>來源回合</dt>
         <dd className="break-all text-ink">{source.sourceTurn}</dd>
-        <dt>範圍</dt>
-        <dd className="text-ink">{MEMORY_SCOPE_LABEL[source.scope]}{source.project === null ? "" : `（${source.project}）`}</dd>
+        <dt>召回用途</dt>
+        <dd className="text-ink">{source.recallPolicy === undefined ? MEMORY_SCOPE_LABEL[source.scope] : RECALL_POLICY_LABEL[source.recallPolicy]}</dd>
+        <dt>歸屬專案</dt>
+        <dd className="text-ink">{(source.assignedProject === undefined ? source.project : source.assignedProject) ?? "未指定"}</dd>
+        <dt>寫入時來源專案</dt><dd className="text-ink">{source.originProject ?? "來源未知"}</dd>
         <dt>接收時間</dt>
         <dd className="text-ink">{formatDateTime(source.createdAt)}</dd>
         <dt>切塊版本</dt>

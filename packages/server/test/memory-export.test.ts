@@ -51,7 +51,7 @@ async function listMemoryRows(instance: MnemoshelfServer): Promise<Memory[]> {
 }
 
 /** 下載匯出檔（原始 bytes 解碼成文字，才能驗證結尾換行與位元組格式）。 */
-async function exportMemories(instance: MnemoshelfServer, version = "?schemaVersion=1"): Promise<{
+async function exportMemories(instance: MnemoshelfServer, version = ""): Promise<{
   status: number;
   text: string;
   contentType: string | null;
@@ -114,10 +114,11 @@ function parseExportLines(text: string): { line: number; record: Record<string, 
   expect(text.endsWith("\n")).toBe(true);
   const lines = text.split("\n");
   expect(lines.at(-1)).toBe("");
-  return lines.slice(0, -1).map((line, index) => ({
-    line: index + 1,
-    record: JSON.parse(line) as Record<string, unknown>,
-  }));
+  return lines.slice(0, -1).flatMap((line, index) => {
+    const row = JSON.parse(line) as Record<string, unknown>;
+    if (row.type === "settings") { expect(row.schemaVersion).toBe(3); return []; }
+    return [{ line: index + 1, record: row.type === "memory" ? { schemaVersion: MEMORY_EXPORT_SCHEMA_VERSION, ...(row.memory as Record<string, unknown>) } : row }];
+  });
 }
 
 let server: TestServer | undefined;
@@ -208,7 +209,7 @@ describe("記憶匯出：GET /memories/export", () => {
 
   it("空資料庫匯出成 0 bytes 的空檔（不是只有換行）", async () => {
     server = await startTestServer();
-    const exported = await exportMemories(server.instance);
+    const exported = await exportMemories(server.instance, "?schemaVersion=1");
     expect(exported.status).toBe(200);
     expect(exported.text).toBe("");
     expect(exported.contentType).toBe("application/x-ndjson; charset=utf-8");
@@ -263,7 +264,7 @@ describe("記憶匯出：GET /memories/export", () => {
     expect(sourceRow?.sourceMessage).not.toContain(GITHUB_STYLE_TOKEN);
   });
 
-  it("來源欄位：帶 sourceSession／sourceMessage 的記憶匯出時一併帶出（schemaVersion 維持 1）", async () => {
+  it("來源欄位：帶 sourceSession／sourceMessage 的記憶匯出時一併帶出（v3 沿用記憶列的來源欄位）", async () => {
     server = await startTestServer();
     const instance = server.instance;
 
@@ -372,7 +373,7 @@ describe("記憶匯入：POST /memories/import", () => {
     const imported = await importNdjson(instance, exported.text);
     expect(imported.status).toBe(200);
     const result = imported.body as MemoryImportResponse;
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       dryRun: false,
       total: originals.length,
       valid: originals.length,
@@ -527,7 +528,7 @@ describe("記憶匯入：POST /memories/import", () => {
 
     const dryRun = await importNdjson(instance, text, "?dryRun=1");
     expect(dryRun.status).toBe(200);
-    expect(dryRun.body).toEqual({
+    expect(dryRun.body).toMatchObject({
       dryRun: true,
       total: 3,
       valid: 3,
@@ -553,7 +554,7 @@ describe("記憶匯入：POST /memories/import", () => {
 
     const real = await importNdjson(instance, text);
     expect(real.status).toBe(200);
-    expect(real.body).toEqual({
+    expect(real.body).toMatchObject({
       dryRun: false,
       total: 3,
       valid: 3,
@@ -621,7 +622,7 @@ describe("記憶匯入：POST /memories/import", () => {
       ]),
     );
     expect(imported.status).toBe(200);
-    expect(imported.body).toEqual({
+    expect(imported.body).toMatchObject({
       dryRun: false,
       total: 3,
       valid: 3,
@@ -641,7 +642,7 @@ describe("記憶匯入：POST /memories/import", () => {
     const instance = server.instance;
     const empty = await importNdjson(instance, "");
     expect(empty.status).toBe(200);
-    expect(empty.body).toEqual({
+    expect(empty.body).toMatchObject({
       dryRun: false,
       total: 0,
       valid: 0,
@@ -681,6 +682,7 @@ describe("記憶匯入：POST /memories/import", () => {
 describe("記憶備份純函式", () => {
   it("serializeMemoriesExport：一行一筆、結尾換行、0 筆為空 Buffer；檔名為 memories-YYYYMMDD.ndjson", () => {
     const memory = (overrides: Partial<Memory>): Memory => ({
+      originProject: null, assignedProject: null, recallPolicy: "global", recallPolicySource: "legacy", recallRuleId: null, recallRuleRevision: null,
       id: 1,
       content: "內容",
       kind: "fact",
