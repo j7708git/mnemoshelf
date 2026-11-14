@@ -4,6 +4,8 @@
 >
 > **一句話**：透過共用 Hook 核心與通用 CLI 入口，以複製貼上的方式為各類 Agent 加上「回合前自動召回」與「MCP 工具存取」。
 >
+> **現在要做**：建置腳本，依宿主選擇召回及原文保存設定，再以合成對話驗證。
+>
 > **依據**：[Agent 整合契約](agent-integration.md)、[原文記憶契約](raw-memory.md)、[隱私與信任模型](roots-and-privacy.md)。
 
 ---
@@ -64,9 +66,9 @@ pnpm --filter '@mnemoshelf/server...' build
 - `PreInvocation` 預設採 `first-turn+explicit`：每個新使用者提問自動召回一次，同一回合的多步工具迴圈內不重複注入；若需每步都召回，可設 `MNEMOSHELF_RECALL_MODE=every-turn`。
 - `Stop` 在回合正常結束時解析 `transcript.jsonl`（排除 `thinking`、`tool_calls`、工具輸出與系統注入），並透過 `POST /memory-sources` 等冪保存對話原文。
 
-#### B. Codex（`UserPromptSubmit` 自動召回）
+#### B. Codex（自動召回＋可選 Stop 原文保存）
 
-完整說明見 [Codex 自動召回](codex-recall.md)，於專案 `.codex/hooks.json` 或 `~/.codex/hooks.json` 加入：
+完整說明見 [Codex 自動召回與原文保存](codex-recall.md)。跨專案啟用時加入 `~/.codex/hooks.json`，並移除專案 `.codex/hooks.json` 中相同的 Mnemoshelf 項目，保留其他 hook；只要單一專案時僅設專案層。這不改變記憶的本專案＋global 查詢範圍。
 
 ```json
 {
@@ -81,10 +83,23 @@ pnpm --filter '@mnemoshelf/server...' build
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "MNEMOSHELF_RUNTIME_FILE='<連線資訊檔>' '<Node 執行檔>' '<Mnemoshelf 原始碼目錄>/packages/server/dist/scripts/codex-capture.js'",
+            "timeout": 5
+          }
+        ]
+      }
     ]
   }
 }
 ```
+
+`Stop` 只保存當次 session／turn 的可見 user 與 assistant 完成項目，排除系統注入、推理和工具內容。僅讀取 Codex sessions root 內的 transcript，確認保存後寫入本機事件游標；離線不確認、不回填歷史。同輪重送由游標與服務等冪去重，完整限制見上方 Codex 指引。
 
 #### C. 其他支援 Command Hook 的宿主（通用 CLI：`generic-hook.js`）
 
@@ -120,7 +135,7 @@ pnpm --filter '@mnemoshelf/server...' build
 | Harness | Preset (`--preset`) | 召回事件 | 提示欄位 (`--prompt-field`) | 工作目錄欄位 (`--cwd-field`) | 輸出模式 (`--output-mode`) | 原文保存 (`Stop`) |
 | --- | --- | --- | --- | --- | --- | --- |
 | Antigravity | `antigravity`（或專用 `antigravity-hook.js`） | `PreInvocation` | `lastUserInput` | `workspacePaths.0` | `injectSteps` | 支援（`antigravity-hook.js stop`） |
-| Codex | `codex`（或專用 `codex-recall.js`） | `UserPromptSubmit` | `prompt` | `cwd` | `hookSpecificOutput` | 尚未實測（用 MCP `remember`） |
+| Codex | `codex`（或專用 `codex-recall.js`） | `UserPromptSubmit` | `prompt` | `cwd` | `hookSpecificOutput` | 支援（`codex-capture.js`；內附 CLI `0.167.0-alpha.4.1` 已實測） |
 | Claude Code | `claude-code` | `UserPromptSubmit` | `prompt` | `cwd` | `hookSpecificOutput` | 視宿主設定 |
 | Gemini CLI | `gemini-cli` | `BeforeAgent` | `prompt` | `cwd` | `hookSpecificOutput` | 視宿主設定 |
 | Cursor | `cursor` | `beforeSubmitPrompt` | `prompt` | `workspace_roots.0` | `additionalContext` | 視宿主設定 |
