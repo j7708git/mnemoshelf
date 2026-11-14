@@ -11,7 +11,7 @@
 ## 啟用與確認
 
 1. 讓 Mnemoshelf App 保持執行，在「Agent 連線資訊」確認 `runtime.json` 可用。
-2. 在原始碼目錄，以 Node.js 22.14 以上執行 `pnpm install --frozen-lockfile` 與 `pnpm --filter '@mnemoshelf/server...' build`。產物為 `packages/server/dist/scripts/codex-recall.js` 和 `codex-capture.js`，可搭配 v0.9.1 App。
+2. 在原始碼目錄，以 Node.js 22.14 以上執行 `pnpm install --frozen-lockfile` 與 `pnpm --filter '@mnemoshelf/server...' build`。產物為 `packages/server/dist/scripts/codex-recall.js` 和 `codex-capture.js`；本版請搭配 v0.9.2 App，以使用完整召回規則與版本核對。升級 App 不會自動更換既有 Hook 指向的建置路徑。
 3. 跨專案啟用時，將下面設定合併到 `~/.codex/hooks.json`；自訂 `CODEX_HOME` 者使用該目錄下的 `hooks.json`。只在特定專案啟用時，使用該專案的 `.codex/hooks.json`。
 4. 全域與專案 hook 會同時生效。轉成全域前，移除專案層相同的 Mnemoshelf 召回／擷取項目，保留其他 hook；只有檔案已無任何設定時才移除空檔。
 

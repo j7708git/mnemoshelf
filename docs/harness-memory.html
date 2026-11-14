@@ -681,8 +681,8 @@
     以及 <strong>Mnemoshelf 是怎麼做到「agent 的記憶」</strong>。不需要工程背景，也不用先懂程式。
   </p>
   <div class="meta-line">
-    <span>對應版本 v0.9.1</span>
-    <span>整理日期 2026-11-13</span>
+    <span>對應版本 v0.9.2</span>
+    <span>整理日期 2026-11-14</span>
     <span>單一檔案、可離線開啟</span>
     <span>資料來源見第 9 章</span>
   </div>
@@ -879,8 +879,10 @@
     <code>search</code>、<code>remember</code>、<code>recall</code>、<code>search_memories</code>、<code>forget</code>、<code>list_roots</code>、<code>read_memory_source</code>。
     這七個工具都只是把請求轉給本機服務，入口程式自己不開資料庫。</p>
 
-  <p>codex-cli 另外有一種「自己動手」的變形：用它的 hook 在自己的 prompt 前面貼上記憶。
-    這仍然算 MCP-only 這一類（自己寫程式接），不是第四套介面。</p>
+  <p>也可以使用宿主的 <strong>Hook</strong>：Codex 的 <code>UserPromptSubmit</code> 在送出提示時召回，
+    <code>Stop</code> 可保存當輪可見原文；Antigravity Adapter 以 <code>PreInvocation</code> 與
+    <code>Stop</code> 接入。這些腳本直接呼叫同一組 REST 端點，與 MCP 工具可並用，需由使用者自行啟用。
+    步驟見 <a href="codex-recall.md">Codex 接入說明</a>與 <a href="hook-integration.md">通用 Hook 指南</a>。</p>
 
   <p><strong>REST</strong> 是一種讓程式用網址呼叫功能的標準方式——就像把「幫我查一下記憶」寫成一個網址，再把結果拿回來；
     Mnemoshelf 對外提供的就是這樣一組網址。外掛和 MCP 入口都只是使用這組網址的客戶端。</p>
@@ -1055,7 +1057,7 @@
   <div class="memo" aria-label="記憶卡片範例">
     <div class="memo-top">
       <span class="tag tag-decision">decision</span>
-      <span class="tag">project：範例專案</span>
+      <span class="tag">歸屬：範例專案</span>
       <span class="tag">agent：dsh/turn</span>
       <span class="tag">pinned：否</span>
     </div>
@@ -1069,10 +1071,12 @@
       <colgroup><col style="width:30%"><col style="width:70%"></colgroup>
       <thead><tr><th scope="col">欄位</th><th scope="col">白話意思</th></tr></thead>
       <tbody>
-        <tr><td data-label="欄位"><code>content</code></td><td data-label="白話意思">舊短記憶文字，上限 8000 字元；完整回合走 memory-sources</td></tr>
+        <tr><td data-label="欄位"><code>content</code></td><td data-label="白話意思">短記憶文字，上限 8000 字元；完整回合走 memory-sources</td></tr>
         <tr><td data-label="欄位"><code>kind</code></td><td data-label="白話意思">四種：<code>fact</code>（事實）、<code>decision</code>（決定）、<code>pitfall</code>（踩過的坑）、<code>preference</code>（偏好）</td></tr>
-        <tr><td data-label="欄位"><code>scope</code></td><td data-label="白話意思">三種：<code>global</code>（所有專案）、<code>project</code>（某個專案）、<code>agent</code>（某個 agent 的約定範圍）</td></tr>
-        <tr><td data-label="欄位"><code>project</code></td><td data-label="白話意思">專案名稱；<code>scope</code> 是 <code>project</code> 時必填</td></tr>
+        <tr><td data-label="欄位"><code>originProject</code></td><td data-label="白話意思">首次寫入的來源專案，之後不改；舊資料無法確認時保留未知</td></tr>
+        <tr><td data-label="欄位"><code>assignedProject</code></td><td data-label="白話意思">目前整理到哪個專案，可更改；跨專案使用不會抹掉歸屬</td></tr>
+        <tr><td data-label="欄位"><code>recallPolicy</code></td><td data-label="白話意思">召回用途：<code>global</code>（跨專案）、<code>project</code>（歸屬專案）、<code>agent</code>（同寫入者標記）、<code>disabled</code>（保留但不召回）</td></tr>
+        <tr><td data-label="欄位"><code>scope</code>／<code>project</code></td><td data-label="白話意思">舊介面的相容欄位；整理與召回應以新欄位為準，不能只看 project 是否為空</td></tr>
         <tr><td data-label="欄位"><code>agent</code></td><td data-label="白話意思">誰寫的。只是<strong>來源標記</strong>，不是權限（第 6 章）</td></tr>
         <tr><td data-label="欄位"><code>sourceSession</code>／<code>sourceMessage</code></td><td data-label="白話意思">哪個對話、哪一輪。只是標記，不參與「重複」判斷，寫入後不能改</td></tr>
         <tr><td data-label="欄位"><code>pinned</code></td><td data-label="白話意思">釘選，方便整理用；不影響搜尋排名</td></tr>
@@ -1081,6 +1085,10 @@
       </tbody>
     </table>
   </div>
+
+  <p>管理頁分為記憶清單、召回預覽與召回規則。清單先對完整資料庫篩選再分頁，原文以回合聚合。
+    規則可指定專案、寫入者或兩者組合，預設只影響之後寫入；要套用既有資料須先預覽，單筆例外會保留。
+    詳細優先序與備份方式見 <a href="memory-organization.md">記憶整理與召回規則</a>。</p>
 
   <p><strong>embedding（嵌入）</strong>＝把文字或圖片轉成一串數字，讓機器能比較「像不像」。同一段話和一句意思接近的問句，
     在這串數字上會靠得比較近；這就是「語意搜尋」的基礎。</p>
@@ -1106,7 +1114,7 @@
     <li><strong>遮罩：</strong>App 開關預設開啟；開啟時寫入前與讀取時套同一組規則，把常見的憑證格式（私鑰、常見 token 前綴、JWT、
       連線字串裡的帳密等）換成穩定的 <code>[REDACTED:種類]</code>。這是<strong>盡力而為</strong>，不是萬無一失（第 6 章）。</li>
     <li><strong>原文去重：</strong>以寫入者、session、回合 ID 識別事件，相同內容重送回 <code>200 duplicate</code>；同 ID 卻有不同內容回 <code>409</code>。文字空白、換行與 Unicode 原樣保留，不套舊卡片的內容正規化。</li>
-    <li><strong>舊記憶：</strong>手動短記憶仍按內容、範圍、專案與寫入者去重；其 <code>force</code> 選項不適用原文事件。</li>
+    <li><strong>短記憶：</strong>依內容、原寫入範圍／專案、寫入者與目前歸屬去重；更改召回用途不會改掉原寫入維度。其 <code>force</code> 選項不適用原文事件。</li>
     <li><strong>算向量：</strong>剛寫完的新記憶狀態是 <code>pending</code>，背景工作算出向量後變成 <code>ready</code>；
       內容太長會標 <code>too-long</code> 永久跳過，其他失敗標 <code>failed</code> 之後可重試。</li>
   </ul>
@@ -1131,8 +1139,9 @@
       符合範圍但分數稍低的記憶就會被漏掉。</figcaption>
   </figure>
 
-  <p><strong>為什麼要「先過濾」？</strong>因為記憶有範圍：<code>global</code> 是所有專案共用、<code>project</code> 只屬於某個專案、
-    <code>agent</code> 是約定上的個人範圍。先把你這個情境看得到的挑出來，再排名，避免帶入其他專案的內容；這是個人 owner 下的檢索範圍，不是多使用者權限邊界。</p>
+  <p><strong>為什麼要「先過濾」？</strong>因為記憶有召回用途：<code>global</code> 可跨專案使用、
+    <code>project</code> 依歸屬專案比對、<code>agent</code> 依寫入者標記比對，<code>disabled</code> 不參與召回。
+    先挑出符合這次情境的內容，再排名；停用內容仍能在管理頁閱讀。這是本機 owner 的使用偏好，不是多使用者權限邊界。</p>
 
   <p><strong>語意不等於萬能：</strong>如果向量還沒準備好（例如剛寫完、或剛換過 embedding 模型），服務會<strong>降級</strong>成關鍵字比對，
     並在回應裡標 <code>degraded: true</code> 與原因：<code>no-embeddings</code>（沒有可用的向量）或
@@ -1241,12 +1250,14 @@
     不談整個產品的其他功能。</p>
 
   <h3>7.1 版本</h3>
-  <p>截至 <strong>v0.9.1（2026-11-13）</strong>，harness 記憶整合從 <strong>v0.5.0</strong> 開始隨版本一起釋出：
+  <p>截至 <strong>v0.9.2（2026-11-14）</strong>，harness 記憶整合從 <strong>v0.5.0</strong> 開始隨版本一起釋出：
     同一版包含 MCP 入口、OpenCode／OpenChamber 外掛與 dsh 外掛。v0.5.2 是依賴安全修補；
     v0.6.0 新增桌面版「連接 Agent」頁（四種 harness 的接入指引）；
     v0.7.0 把「回合結束寫摘要卡」換成<strong>保存可見原文</strong>（不再需要摘要模型）、MCP 增加第七個工具
     <code>read_memory_source</code>，並加入 codex 的自動召回 hook；
-    v0.8.0 補上 Roots 分享勾選與通用單檔上限持久化、macOS Apple Silicon 可選 WebGPU 加速，以及離線格式與評估工具；v0.5.1 本身與 v0.5.0 也只差版本號。</p>
+    v0.8.0 補上 Roots 分享勾選與通用單檔上限持久化、macOS Apple Silicon 可選 WebGPU 加速，以及離線格式與評估工具；
+    v0.9.2 加入完整記憶分頁、專案／寫入者召回規則、Codex Stop 原文保存與 Antigravity／通用 Hook 接入。
+    v0.5.1 本身與 v0.5.0 也只差版本號。</p>
 
   <h3>7.2 在哪些環境被實際操作過</h3>
 
@@ -1283,7 +1294,7 @@
   <h3>7.4 明確不做的事</h3>
   <ul class="checklist">
     <li><strong>沒有 per-agent 授權、per-agent token 或稽核紀錄</strong>；<code>agent</code> 與 <code>scope</code> 都不是安全邊界。</li>
-    <li><strong>沒有自動的跨專案召回</strong>：OpenCode 外掛只提供一次性的 <code>/memory-all</code> 查詢，不改變預設範圍。</li>
+    <li><strong>不會自動把專案用途擴為跨專案使用</strong>：跨專案用途由使用者以規則或單筆例外指定；OpenCode 的 <code>/memory-all</code> 只擴大當次查詢情境，仍排除停用資料。</li>
     <li><strong>沒有話題切換偵測</strong>；召回只看第一則提示與明示線索。</li>
     <li><strong>dsh 外掛</strong>不注入整份快照、不改 system prompt、不提供工具介面；只處理成功完成的回合。</li>
     <li><strong>原文擷取</strong>只保存宿主提供的可見文字，不包括隱藏推理、工具、附件或全量歷史；舊摘要無法還原成逐字稿。</li>
@@ -1354,8 +1365,8 @@
 <section id="sources">
   <h2><span class="num">9</span>資料來源與對應版本</h2>
 
-  <p>本頁對應 <strong>Mnemoshelf v0.9.1</strong>，整理日期 <strong>2026-11-13</strong>。
-    v0.5.2 只做依賴安全修補、v0.6.0 新增「連接 Agent」頁、v0.7.0 改為保存原文並新增第七個 MCP 工具與 codex 自動召回、v0.8.0 加入 Roots 分享與單檔上限設定及 macOS 可選 WebGPU 加速、v0.9.0／v0.9.1 新增加入資料夾的「瀏覽…」選擇器與 Web UI 改版（本頁所述 harness 記憶整合行為不變）。
+  <p>本頁對應 <strong>Mnemoshelf v0.9.2</strong>，整理日期 <strong>2026-11-14</strong>。
+    v0.5.2 只做依賴安全修補、v0.6.0 新增「連接 Agent」頁、v0.7.0 改為保存原文並新增第七個 MCP 工具與 codex 自動召回、v0.8.0 加入 Roots 分享與單檔上限設定及 macOS 可選 WebGPU 加速、v0.9.0／v0.9.1 新增加入資料夾的「瀏覽…」選擇器與 Web UI 改版；v0.9.2 將來源、歸屬與召回用途分開，並補齊 Codex Stop 與通用 Hook 接入。
     每一個數字與結論都取自下列公開文件或程式碼；兩者不一致時，以程式碼為準。</p>
 
   <div class="table-wrap">
@@ -1383,7 +1394,7 @@
 </section>
 
 <footer class="page-foot">
-  <p>Mnemoshelf · harness 記憶整合說明頁 · 對應 v0.9.1（2026-11-13）</p>
+  <p>Mnemoshelf · harness 記憶整合說明頁 · 對應 v0.9.2（2026-11-14）</p>
   <p>單一 HTML 檔，沒有外部字型、圖片或腳本；用瀏覽器直接開啟即可，離線也能讀。</p>
 </footer>
 

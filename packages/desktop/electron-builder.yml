@@ -56,7 +56,7 @@ linux:
 # macOS 只支援 Apple Silicon（arm64）。
 # **不要加 zip**：本專案的自動更新走 B 案（只檢查版本＋開啟下載頁），不用 Squirrel.Mac；
 # electron-updater 的 MacUpdater 需要 zip 才能下載／安裝，而我們不呼叫它。
-# 只有 dmg target 時 electron-builder 不會產生 `latest-mac.yml`，這是預期行為。
+# CI 仍可能產生 `latest-mac.yml` 與 dmg.blockmap；這些附件不代表 App 啟用自動安裝。
 mac:
   target:
     - target: dmg
