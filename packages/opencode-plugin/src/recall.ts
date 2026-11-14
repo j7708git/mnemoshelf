@@ -18,7 +18,7 @@ import {
   type SettingsWarning,
 } from "./config.js";
 import { BLOCK_MARKER, STATUS_SENTINEL, SYSTEM_REMINDER_PREFIX } from "./constants.js";
-import { createCaptureRuntime, LEGACY_TURN_AGENT, resolveCaptureSpoolDir } from "./capture.js";
+import { createCaptureRuntime, LEGACY_TURN_AGENT, CAPTURE_AGENT, resolveCaptureSpoolDir } from "./capture.js";
 import { isPositiveId, readMemoryPolicy } from "./raw-memory.js";
 import { packRawSources, RAW_RECALL_INTRO } from "./raw-recall.js";
 import { injectMemoryBlock } from "./inject.js";
@@ -431,7 +431,7 @@ export function planRecall(input: PlanRecallInput): PlanRecallResult {
 export type SearchFailureReason = "timeout" | "network" | "http" | "bad-response";
 
 export type SearchResult =
-  | { ok: true; hits: RecallHit[]; latencyMs: number; degraded: boolean; policyVersion?: number }
+  | { ok: true; hits: RecallHit[]; latencyMs: number; degraded: boolean; policyVersion?: number; recallVersion?: number }
   | { ok: false; reason: SearchFailureReason; status?: number; latencyMs: number };
 
 export interface SearchMemoriesInput {
@@ -486,7 +486,7 @@ export async function searchMemories(input: SearchMemoriesInput): Promise<Search
         accept: "application/json",
         authorization: `Bearer ${input.connection.token}`,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ ...body, agent: CAPTURE_AGENT }),
       redirect: "error",
       signal: controller.signal,
     });
@@ -506,6 +506,7 @@ export async function searchMemories(input: SearchMemoriesInput): Promise<Search
       latencyMs,
       degraded: (parsed as { degraded?: unknown }).degraded === true,
       policyVersion: policyVersionOf(parsed),
+      recallVersion: recallVersionOf(parsed),
     };
   } catch {
     const latencyMs = Date.now() - started;
@@ -518,6 +519,11 @@ export async function searchMemories(input: SearchMemoriesInput): Promise<Search
 function policyVersionOf(value: unknown): number | undefined {
   const version = (value as { policyVersion?: unknown } | null)?.policyVersion;
   return isPositiveId(version) ? version : undefined;
+}
+
+function recallVersionOf(value: unknown): number | undefined {
+  const version = (value as { recallVersion?: unknown } | null)?.recallVersion;
+  return typeof version === "number" && Number.isSafeInteger(version) && version >= 0 ? version : undefined;
 }
 
 function hashText(text: string): string {
@@ -543,13 +549,14 @@ export function buildRecentTurnsUrl(baseUrl: string, query: RecentTurnsQuery): s
   if (query.scope === "project" && query.project !== undefined && query.project !== "") {
     params.set("project", query.project);
   }
-  params.set("agent", LEGACY_TURN_AGENT);
+  params.set("writer", LEGACY_TURN_AGENT);
+  params.set("agent", CAPTURE_AGENT);
   params.set("limit", String(query.limit));
-  return `${baseUrl}/memories?${params.toString()}`;
+  return `${baseUrl}/memories/recent?${params.toString()}`;
 }
 
 export type RecentTurnsResult =
-  | { ok: true; turns: RecallTurn[]; latencyMs: number; policyVersion?: number }
+  | { ok: true; turns: RecallTurn[]; latencyMs: number; policyVersion?: number; recallVersion?: number }
   | { ok: false; reason: SearchFailureReason; status?: number; latencyMs: number };
 
 export interface FetchRecentTurnsInput extends RecentTurnsQuery {
@@ -607,7 +614,7 @@ export async function fetchRecentTurns(input: FetchRecentTurnsInput): Promise<Re
         createdAt: typeof record.createdAt === "string" ? record.createdAt : "",
       });
     }
-    return { ok: true, turns, latencyMs, policyVersion: policyVersionOf(parsed) };
+    return { ok: true, turns, latencyMs, policyVersion: policyVersionOf(parsed), recallVersion: recallVersionOf(parsed) };
   } catch {
     const latencyMs = Date.now() - started;
     return { ok: false, reason: controller.signal.aborted ? "timeout" : "network", latencyMs };
@@ -628,6 +635,7 @@ interface SessionState {
   dedupe: Map<number, DedupeEntry>;
   warnedOffline: boolean;
   policyVersion?: number;
+  recallVersion?: number;
   requestId?: number;
 }
 
@@ -910,9 +918,10 @@ export async function createMemoryRuntime(
     return session;
   };
 
-  const updatePolicy = (session: SessionState, version: number | undefined): void => {
-    if (session.policyVersion !== version || version === undefined) {
+  const updatePolicy = (session: SessionState, version: number | undefined, recallVersion?: number): void => {
+    if (session.policyVersion !== version || session.recallVersion !== recallVersion || version === undefined) {
       session.policyVersion = version;
+      session.recallVersion = recallVersion;
       session.cache.clear();
       session.dedupe.clear();
     }
@@ -977,7 +986,7 @@ export async function createMemoryRuntime(
       say({ skipped: initial.reason });
       return;
     }
-    updatePolicy(session, initial.policy.version);
+    updatePolicy(session, initial.policy.version, initial.policy.recallVersion);
     const cached = session.cache.get(key);
     if (cached !== undefined) {
       if (cached.block !== "") {
@@ -1026,21 +1035,21 @@ export async function createMemoryRuntime(
       say({ skipped: confirmed.reason });
       return;
     }
-    updatePolicy(session, confirmed.policy.version);
-    if (result.ok && result.policyVersion !== confirmed.policy.version) {
+    updatePolicy(session, confirmed.policy.version, confirmed.policy.recallVersion);
+    if (result.ok && (result.policyVersion !== confirmed.policy.version || result.recallVersion !== confirmed.policy.recallVersion)) {
       say({ skipped: "policy-changed", retry: true });
       [result, recent] = await queryMemory();
       if (!current()) return;
       confirmed = await readMemoryPolicy(connection, deps.fetchImpl, settings.timeoutMs);
       if (!current()) return;
-      if (!confirmed.ok || (result.ok && result.policyVersion !== confirmed.policy.version)) {
-        updatePolicy(session, confirmed.ok ? confirmed.policy.version : undefined);
+      if (!confirmed.ok || (result.ok && (result.policyVersion !== confirmed.policy.version || result.recallVersion !== confirmed.policy.recallVersion))) {
+        updatePolicy(session, confirmed.ok ? confirmed.policy.version : undefined, confirmed.ok ? confirmed.policy.recallVersion : undefined);
         say({ skipped: confirmed.ok ? "policy-changed" : confirmed.reason });
         return;
       }
-      updatePolicy(session, confirmed.policy.version);
+      updatePolicy(session, confirmed.policy.version, confirmed.policy.recallVersion);
     }
-    const turns = recent?.ok && recent.policyVersion === confirmed.policy.version ? recent.turns : [];
+    const turns = recent?.ok && recent.policyVersion === confirmed.policy.version && recent.recallVersion === confirmed.policy.recallVersion ? recent.turns : [];
     const latencyMs = result.latencyMs + (recent?.latencyMs ?? 0);
 
     pruneDedupe(session.dedupe, session.turn, settings.dedupeTTL);
@@ -1216,7 +1225,7 @@ export async function createMemoryRuntime(
       return;
     }
     const confirmed = await readMemoryPolicy(connection, deps.fetchImpl, COMMAND_TIMEOUT_MS);
-    if (!confirmed.ok || result.policyVersion !== confirmed.policy.version) {
+    if (!confirmed.ok || (result.policyVersion !== confirmed.policy.version || result.recallVersion !== confirmed.policy.recallVersion)) {
       await sendSynthetic(input.sessionID, statusText("[mnemoshelf] 記憶政策已變更或無法確認，請重新查詢。"));
       return;
     }

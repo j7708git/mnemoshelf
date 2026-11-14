@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { RawMemorySourceDisclosure } from "./RawMemorySourcePanel";
 import { searchMemories, type MemoryRecallResult } from "./api";
-import { formatDateTime, MEMORY_KIND_LABEL, MEMORY_SCOPE_LABEL, memoryOriginLabel, memorySourceRoleLabel } from "./format";
+import { formatDateTime, MEMORY_KIND_LABEL, MEMORY_SCOPE_LABEL, memorySourceRoleLabel } from "./format";
 import { memoryNameOption, memoryOptionNames } from "./useMemoryLibrary";
+import { RECALL_POLICY_LABEL } from "./memoryOrganization";
 
 type RecallState =
   | { kind: "idle" }
@@ -45,17 +46,18 @@ function RecallResults({ result }: { result: MemoryRecallResult }) {
           <li key={hit.id} className="rounded-xl border border-line bg-surface px-3 py-2">
             <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted">
               <span className="rounded bg-raised px-1.5 py-0.5">
-                {memoryOriginLabel(hit)}{hit.role == null ? "" : `・${memorySourceRoleLabel(hit.role)}`}
+                {hit.sourceId == null ? "短記憶" : "原文回合片段"}{hit.role == null ? "" : `・${memorySourceRoleLabel(hit.role)}`}
                 {hit.sourceId == null ? `・${MEMORY_KIND_LABEL[hit.kind]}` : ""}
               </span>
-              <span className="rounded bg-raised px-1.5 py-0.5">範圍 {MEMORY_SCOPE_LABEL[hit.scope]}</span>
-              <span className="rounded bg-raised px-1.5 py-0.5">專案 {hit.project ?? "未指定"}</span>
+              <span className="rounded bg-raised px-1.5 py-0.5">{hit.recallPolicy === undefined ? MEMORY_SCOPE_LABEL[hit.scope] : RECALL_POLICY_LABEL[hit.recallPolicy]}</span>
+              <span className="rounded bg-raised px-1.5 py-0.5">歸屬專案 {(hit.assignedProject === undefined ? hit.project : hit.assignedProject) ?? "未指定"}</span>
               <span>來源 {hit.source === "semantic" ? "語意" : "關鍵字"}</span>
               <span>分數 {hit.score.toFixed(3)}</span>
               <span>#{hit.id}</span>
             </div>
             <p className="mt-1 whitespace-pre-wrap break-words text-sm text-ink">{hit.content}</p>
             <p className="mt-1 text-[11px] text-muted">寫入者 {hit.agent}</p>
+            {hit.recallPolicy !== undefined && <p className="mt-1 text-[11px] text-muted">納入原因：{hit.recallPolicy === "global" ? "所有專案可使用" : hit.recallPolicy === "agent" ? "寫入者與召回身分標記相同" : "此搜尋情境涵蓋歸屬專案"} · 寫入來源：{hit.originProject ?? "來源未知"}</p>}
             {hit.sourceId != null && (
               <>
                 <p className="mt-1 text-[11px] text-muted">{hit.occurredAt == null ? "對話時間未知" : formatDateTime(hit.occurredAt)}</p>

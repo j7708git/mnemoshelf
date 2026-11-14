@@ -11,7 +11,7 @@ import {
   type MemorySearchFilter,
   type MetadataStore,
 } from "../ports/metadata-store.js";
-import type { MemoryPatch, MemoryScope, NewMemory, NewRoot } from "../ports/types.js";
+import type { Memory, MemoryPatch, MemoryScope, NewMemory, NewRoot } from "../ports/types.js";
 
 /** 每個測試都要拿到全新、獨立的實例（暫存目錄或 :memory:）。 */
 export type MetadataStoreFactory = () => MetadataStore | Promise<MetadataStore>;
@@ -55,7 +55,9 @@ function embeddingVector(values: number[] = [0.1, 0.2, 0.3]): Float32Array {
  * MetadataStore 的契約測試。任何實作（SQLite、PostgreSQL…）只要通過同一組測試，
  * 就符合 docs/storage-ports.md 的介面契約。
  */
-export function runMetadataStoreContract(name: string, factory: MetadataStoreFactory): void {
+export function runMetadataStoreContract(name: string, factory: MetadataStoreFactory,
+  writeLegacyMemory?: (store: MetadataStore, input: NewMemory) => Promise<Memory>,
+): void {
   describe(`MetadataStore contract (${name})`, () => {
     let store: MetadataStore;
 
@@ -1266,7 +1268,7 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
       for (let index = 1; index < times.length; index += 1) {
         expect(times[index]!).toBeGreaterThanOrEqual(times[index - 1]!);
       }
-      expect(exported[0]).toEqual(first);
+      expect(exported[0]).toEqual({ ...first, dedupeScope: first.scope, dedupeProject: first.project });
       expect(exported[0]?.deletedAt).toBeNull();
 
       // 與 `listMemories` 的排序對照：後者是前者的精確反向。
@@ -1383,16 +1385,18 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
     });
 
     it("normalizeLegacyMemoryScopes：矛盾組合各一列＋合法列不動、回傳更新數、第二次為 0", async () => {
-      const globalWithProject = await store.addMemory(
+      // 新寫入已建立組織快照，不再製造矛盾；用 adapter fixture 直接模擬舊資料列。
+      if (writeLegacyMemory === undefined) throw new Error("此契約需提供舊資料寫入 fixture");
+      const globalWithProject = await writeLegacyMemory(store,
         memoryInput({ content: "legacy：global 帶 project", scope: "global", project: "legacy-proj" }),
       );
-      const agentWithProject = await store.addMemory(
+      const agentWithProject = await writeLegacyMemory(store,
         memoryInput({ content: "legacy：agent 帶 project", scope: "agent", project: "legacy-proj", agent: "legacy-agent" }),
       );
-      const projectWithoutProject = await store.addMemory(
+      const projectWithoutProject = await writeLegacyMemory(store,
         memoryInput({ content: "legacy：project 沒有 project", scope: "project", project: null }),
       );
-      const projectWithBlankProject = await store.addMemory(
+      const projectWithBlankProject = await writeLegacyMemory(store,
         memoryInput({ content: "legacy：project 只有空白", scope: "project", project: "   " }),
       );
       const legalProject = await store.addMemory(
@@ -1409,8 +1413,11 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
 
       expect(await store.getMemory(globalWithProject.id)).toMatchObject({ scope: "global", project: null });
       expect(await store.getMemory(agentWithProject.id)).toMatchObject({ scope: "agent", project: null });
-      expect(await store.getMemory(projectWithoutProject.id)).toMatchObject({ scope: "global", project: null });
-      expect(await store.getMemory(projectWithBlankProject.id)).toMatchObject({ scope: "global", project: null });
+      expect(await store.getMemory(projectWithoutProject.id)).toMatchObject({ scope: "global", project: null, recallPolicy: "global", assignedProject: null });
+      expect(await store.getMemory(projectWithBlankProject.id)).toMatchObject({ scope: "global", project: null, recallPolicy: "global", assignedProject: null });
+      const recalled = await store.listMemoriesForRecall({ buckets: [{ scope: "global" }] });
+      expect(recalled.map(({ id }) => id)).toEqual(expect.arrayContaining([projectWithoutProject.id, projectWithBlankProject.id]));
+      expect((await store.addMemoryUnlessDuplicate(memoryInput({ content: "legacy：project 沒有 project", scope: "global", project: null }))).duplicate).toBe(true);
       // 合法列原樣保留（含 scope=project 的專案名稱）。
       expect(await store.getMemory(legalProject.id)).toMatchObject({ scope: "project", project: "legal-proj" });
       expect(await store.getMemory(legalGlobal.id)).toMatchObject({ scope: "global", project: null });

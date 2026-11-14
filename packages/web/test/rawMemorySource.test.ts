@@ -51,6 +51,21 @@ const firstPage: MemorySourcePage = {
 afterEach(() => vi.unstubAllGlobals());
 
 describe("原文來源 REST 讀取", () => {
+  it("管理讀取走獨立端點，disabled原文仍可讀並綁定兩個版本續讀", async () => {
+    const managed = { ...firstPage, recallVersion: 8, source: { ...firstPage.source, recallPolicy: "disabled" },
+      next: { ...firstPage.next!, recallVersion: 8 } };
+    const fetch = vi.fn().mockResolvedValueOnce(Response.json(managed))
+      .mockResolvedValueOnce(Response.json({ ...managed, recallVersion: 9, next: { ...managed.next, recallVersion: 9 } }));
+    vi.stubGlobal("fetch", fetch);
+    const first = await fetchMemorySource(3, firstPage.source, null, undefined, true);
+    await expect(fetchMemorySource(3, firstPage.source, first.next, undefined, true)).rejects.toBeInstanceOf(MemorySourcePolicyChangedError);
+    const [firstUrl, lastUrl] = fetch.mock.calls.map(([url]) => new URL(url, "http://example.invalid"));
+    expect(firstUrl.pathname).toBe("/memory-library/source/3");
+    expect(firstUrl.searchParams.has("scope")).toBe(false);
+    expect(lastUrl.searchParams.get("policyVersion")).toBe("2");
+    expect(lastUrl.searchParams.get("recallVersion")).toBe("8");
+  });
+
   it("從頭讀取後，將服務給的游標與相同專案範圍送回", async () => {
     const lastPage: MemorySourcePage = {
       ...firstPage,

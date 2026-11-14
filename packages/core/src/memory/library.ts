@@ -19,6 +19,7 @@ export interface MemoryLibraryEntry {
 }
 
 export interface MemoryLibraryPage {
+  recallVersion: number;
   entries: MemoryLibraryEntry[];
   total: number;
   counts: { sources: number; memories: number };
@@ -91,7 +92,7 @@ export function normalizeMemoryLibraryFilter(input: MemoryLibraryFilter = {}): N
 export function buildMemoryLibrarySql(
   input: MemoryLibraryFilter,
   dialect: "sqlite" | "postgres",
-  tables: { memories: string; sources: string },
+  tables: { memories: string; sources: string; settings: string },
 ): { sql: string; params: unknown[]; filter: NormalizedLibraryFilter } {
   const filter = normalizeMemoryLibraryFilter(input);
   const params: unknown[] = [];
@@ -123,15 +124,15 @@ export function buildMemoryLibrarySql(
   const jsonAggregate = dialect === "sqlite" ? "json_group_array(value)" : "json_agg(value)";
   const sql = `with library as (
     select 'memory' as library_type, m.id as library_id, m.id as representative_id,
-      m.project, m.agent as writer, case when m.pinned then 1 else 0 end as library_pinned,
+      m.assigned_project as project, m.agent as writer, case when m.pinned then 1 else 0 end as library_pinned,
       m.created_at as library_created_at, 1 as chunk_count
       from ${tables.memories} m where m.deleted_at is null and m.source_id is null
     union all
-    select 'source', s.id, min(m.id), s.project, s.agent,
+    select 'source', s.id, min(m.id), s.assigned_project, s.agent,
       max(case when m.pinned then 1 else 0 end), s.created_at, count(*)
       from ${tables.sources} s join ${tables.memories} m on m.source_id = s.id
       where s.deleted_at is null and m.deleted_at is null
-      group by s.id, s.project, s.agent, s.created_at
+      group by s.id, s.assigned_project, s.agent, s.created_at
   ), filtered as (select * from library where ${where}),
   page as (select * from filtered where ${after}
     order by library_pinned desc, library_created_at desc, library_type asc, library_id desc limit ${limit}),
@@ -143,7 +144,8 @@ export function buildMemoryLibrarySql(
     (select ${jsonAggregate} from (select distinct writer as value from library order by writer) w) as writers,
     (select count(*) from library where project is null) as unassigned)
   select m.*, page.library_type, page.library_id, page.library_pinned, page.library_created_at, page.chunk_count,
-    stats.total, stats.sources, stats.memories, facets.projects, facets.writers, facets.unassigned
+    stats.total, stats.sources, stats.memories, facets.projects, facets.writers, facets.unassigned,
+    (select data_revision from ${tables.settings} where id = 1) as recall_version
     from stats cross join facets left join page on 1 = 1
     left join ${tables.memories} m on m.id = page.representative_id
     order by page.library_pinned desc, page.library_created_at desc, page.library_type asc, page.library_id desc`;
@@ -174,6 +176,7 @@ export function readMemoryLibraryRows(
   } : null;
   const strings = (value: unknown): string[] => value == null ? [] : typeof value === "string" ? JSON.parse(value) as string[] : value as string[];
   return {
+    recallVersion: Number(meta.recall_version),
     entries: selected.map((row) => ({
       type: row.library_type as MemoryLibraryEntry["type"], id: Number(row.library_id),
       memory: { ...toMemory(row), pinned: Number(row.library_pinned) !== 0 }, chunkCount: Number(row.chunk_count),

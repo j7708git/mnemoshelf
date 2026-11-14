@@ -61,6 +61,7 @@ import {
   type MemoryPatch,
   type MemoryPolicy,
   MemorySourceConflictError,
+  MemoryRecallConflictError,
   memorySourceEventHash,
   type MediaDecoder,
   type MemoryScope,
@@ -86,6 +87,7 @@ import {
   type RootPreview,
   VIDEO_MAX_DURATION_SECONDS,
 } from "@mnemoshelf/core";
+import { organizationOf, parseOrganizationOrigin, parseRecallRule, organizationName, revisionNumber, RECALL_POLICIES } from "../memory-organization.js";
 import { isLoopbackBindHost, LOOPBACK_HOST, type BrowseScope } from "../config.js";
 import type { EmbedderSchedulingStatus } from "../worker-embedder.js";
 import {
@@ -142,6 +144,7 @@ import {
   planMemoryImport,
   serializeMemoriesExport,
   serializeRawMemoriesExport,
+  serializeOrganizedMemoriesExport,
   type MemoryImportResponse,
 } from "../memory-export.js";
 
@@ -217,6 +220,7 @@ export const API_PATH_PREFIXES: readonly string[] = [
   "search",
   "memories",
   "memory-library",
+  "memory-recall-rules",
   "memory-policy",
   "memory-sources",
   "diagnostics",
@@ -824,7 +828,7 @@ export function toHttpError(error: unknown): {
   if (error instanceof MemoryPolicyChangedError) {
     return { status: 409, body: { error: "policy-changed" }, headers: {} };
   }
-  if (error instanceof MemorySourceConflictError) {
+  if (error instanceof MemorySourceConflictError || error instanceof MemoryRecallConflictError) {
     return { status: 409, body: { error: { name: error.name, message: error.message, code: error.code } }, headers: {} };
   }
   if (error instanceof IndexInProgressError) return { status: 409, body: named(error.name, error.message), headers: {} };
@@ -2019,7 +2023,8 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       const replaced = supersedes === null ? null : await deps.store.getMemory(supersedes);
       const policy = await deps.store.getMemoryPolicy();
       const masked = memoryContentView(rawContent, policy);
-      const input = { content: masked.text, kind, scope, project, agent, supersedes, sourceSession, sourceMessage };
+      const origin = parseOrganizationOrigin(body);
+      const input = { content: masked.text, kind, scope, project, agent: replaced?.agent ?? agent, supersedes, sourceSession, sourceMessage, ...origin, ...(replaced === null ? {} : { organization: organizationOf(replaced) }) };
       const result = supersedes !== null || force
         ? { memory: await deps.store.addMemory(input), duplicate: false }
         : await deps.store.addMemoryUnlessDuplicate(input);
@@ -2195,6 +2200,18 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     throw new NotFoundError("路徑");
   };
 
+  const parseMemoryContext = (value: unknown) => {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) throw new ValidationError("memoryContext", "必須是物件");
+    const body = value as Record<string, unknown>;
+    return {
+      ...(body.project === undefined ? {} : { project: organizationName(body.project, "project")! }),
+      ...(body.agent === undefined ? {} : { agent: organizationName(body.agent, "writer")! }),
+      ...(body.writer === undefined ? {} : { writer: organizationName(body.writer, "writer")! }),
+      ...(body.includeAllProjects === undefined ? {} : { includeAllProjects: optionalBoolean(body.includeAllProjects, "includeAllProjects") }),
+      ...(body.scope === undefined ? {} : { scope: enumValue(body.scope, MEMORY_SCOPES, "scope", "global") }),
+    };
+  };
+
   const search = async (request: IncomingMessage): Promise<RouteResult> => {
     const body = await readJsonBody(request);
     // 型別以外一律由 normalizeSearchOptions 驗證（單一驗證來源）。
@@ -2205,6 +2222,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         mode: body.mode as SearchMode | undefined,
         rootIds: body.rootIds as number[] | undefined,
         agentOnly: body.agentOnly as boolean | undefined,
+        ...(body.memoryContext === undefined ? {} : { memoryContext: parseMemoryContext(body.memoryContext) }),
         k: body.k as number | undefined,
       },
     );
@@ -2374,6 +2392,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         ...(includeAllProjects === undefined ? {} : { includeAllProjects }),
         ...(scope === undefined ? {} : { scope }),
         ...(agent === undefined ? {} : { agent }),
+        ...(body.writer === undefined ? {} : { writer: organizationName(body.writer, "writer")! }),
         ...(kind === undefined ? {} : { kind }),
         k,
         ...(minScore === undefined ? {} : { minScore }),
@@ -2388,9 +2407,9 @@ export function createRestApp(deps: RestAppDeps): RestApp {
   };
 
   const exportMemories = (url: URL): RouteResult => {
-    const schemaVersion = url.searchParams.get("schemaVersion") ?? "2";
-    if (schemaVersion !== "1" && schemaVersion !== "2") {
-      throw new ValidationError("schemaVersion", "只接受 1 或 2");
+    const schemaVersion = url.searchParams.get("schemaVersion") ?? "3";
+    if (!["1", "2", "3"].includes(schemaVersion)) {
+      throw new ValidationError("schemaVersion", "只接受 1、2 或 3");
     }
     return {
       preparePolicyResponse: async () => {
@@ -2406,6 +2425,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
           });
         }
         const rows = await deps.store.listMemoriesForExport();
+        const settings = await deps.store.getMemoryRecallSettings();
+        if (schemaVersion !== "3" && (settings.rules.length > 0 || [...rows, ...sources].some((row) => row.recallPolicySource !== "legacy" || row.originProject !== null || row.assignedProject !== row.project || row.recallPolicy === "disabled"))) {
+          return () => ({ status: 409, body: { error: { name: "MemoryExportVersionConflict", code: "organization-present", message: "備份含組織或召回政策，請使用 schemaVersion=3" } } });
+        }
         // 原文釘選保存在片段上；備份按整回合記錄，不另匯出每個片段。
         const pinnedSourceIds = new Set(rows.flatMap((memory) =>
           memory.sourceId != null && memory.pinned ? [memory.sourceId] : [],
@@ -2415,13 +2438,15 @@ export function createRestApp(deps: RestAppDeps): RestApp {
           const present = createMemoryPresenter(policy);
           const memories = rows.flatMap((memory) => {
             if (memory.sourceId != null) return [];
-            return present({ memory, source: null }) ?? [];
+            const view = present({ memory, source: null });
+            return view === null ? [] : [{ ...view, dedupeScope: memory.dedupeScope, dedupeProject: memory.dedupeProject }];
           });
           return {
             status: 200,
             bytes: schemaVersion === "1"
               ? serializeMemoriesExport(memories)
-              : serializeRawMemoriesExport(memories, sourceRecords, policy),
+              : schemaVersion === "2" ? serializeRawMemoriesExport(memories, sourceRecords, policy)
+                : serializeOrganizedMemoriesExport(memories, sourceRecords, policy, settings),
             contentType: MEMORY_EXPORT_CONTENT_TYPE,
             headers: { "content-disposition": `attachment; filename="${memoryExportFilename()}"` },
           };
@@ -2432,12 +2457,19 @@ export function createRestApp(deps: RestAppDeps): RestApp {
 
   const importMemories = async (request: IncomingMessage, url: URL): Promise<RouteResult> => {
     const dryRun = parseDryRunParam(url.searchParams.get("dryRun"));
+    const rulesMode = url.searchParams.get("rulesMode") ?? "preserve";
+    if (rulesMode !== "preserve" && rulesMode !== "replace") throw new ValidationError("rulesMode", "必須是 preserve 或 replace");
+    const expectedRevision = rulesMode === "replace" ? revisionNumber(Number(url.searchParams.get("expectedRevision") ?? NaN), "expectedRevision") : undefined;
     const text = await readTextBody(request, MAX_MEMORY_IMPORT_BYTES);
     return await serializeMemoryWrite(async () => {
       const policy = await deps.store.getMemoryPolicy();
       const plan = planMemoryImport(text, policy);
       const valid = plan.total - plan.invalidCount;
-      const common = { dryRun, total: plan.total, valid, invalid: plan.invalid, redacted: plan.redacted };
+      const currentSettings = await deps.store.getMemoryRecallSettings();
+      const rules = { mode: rulesMode as "preserve" | "replace", available: plan.rules?.length ?? 0, availableInBackup: plan.rules !== undefined, replaced: false, revision: currentSettings.revision };
+      const common = { dryRun, total: plan.total, valid, invalid: plan.invalid, redacted: plan.redacted, rules };
+      if (rulesMode === "replace" && plan.rules === undefined) throw new ValidationError("rulesMode", "備份沒有 v3 規則設定");
+      if (rulesMode === "replace" && expectedRevision !== currentSettings.revision) throw new MemoryRecallConflictError();
       if (plan.invalidCount > 0) {
         return {
           status: 400,
@@ -2478,38 +2510,60 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         return { status: 200, body };
       }
 
+      if (rulesMode === "replace") {
+        const restored = await deps.store.replaceMemoryRecallRules(plan.rules!, { expectedRevision: expectedRevision! });
+        rules.replaced = true;
+        rules.revision = restored.revision;
+      }
       let created = 0;
-      for (const { input, chunks, pinned } of newSources) {
-        const result = await deps.store.addMemorySource(input, chunks);
-        if (result.duplicate) duplicates += 1;
-        else {
-          const firstMemory = result.memories[0];
-          if (pinned && firstMemory !== undefined) await deps.store.setMemoryPinned(firstMemory.id, true);
-          for (const memory of result.memories) deps.memoryEmbedder.enqueue(memory.id);
+      let attempted = duplicates;
+      let failedAfterCreate = false;
+      try {
+        for (const { input, chunks, pinned } of newSources) {
+          attempted += 1;
+          failedAfterCreate = false;
+          const result = await deps.store.addMemorySource(input, chunks);
+          if (result.duplicate) duplicates += 1;
+          else {
+            created += 1;
+            failedAfterCreate = true;
+            const firstMemory = result.memories[0];
+            if (pinned && firstMemory !== undefined) await deps.store.setMemoryPinned(firstMemory.id, true);
+            for (const memory of result.memories) deps.memoryEmbedder.enqueue(memory.id);
+          }
+        }
+
+        for (const entry of plan.entries) {
+          attempted += 1;
+          failedAfterCreate = false;
+          const result = await deps.store.addMemoryUnlessDuplicate({
+            content: entry.content,
+            kind: entry.kind,
+            scope: entry.scope,
+            project: entry.project,
+            agent: entry.agent,
+            supersedes: null,
+            sourceSession: entry.sourceSession,
+            sourceMessage: entry.sourceMessage,
+            organization: entry.organization,
+            restoreDedupe: entry.dedupe,
+          });
+          if (result.duplicate) {
+            duplicates += 1;
+            continue;
+          }
           created += 1;
+          failedAfterCreate = true;
+          if (entry.pinned) await deps.store.setMemoryPinned(result.memory.id, true);
+          deps.memoryEmbedder.enqueue(result.memory.id);
         }
+      } catch (error) {
+        const mapped = toHttpError(error);
+        return { status: mapped.status, body: {
+          ...mapped.body, ...common, duplicates, created, wouldCreate: 0,
+          partial: true, failed: 1, failedAfterCreate, pending: Math.max(0, valid - attempted), rulesRestored: rules.replaced,
+        } };
       }
-
-      for (const entry of plan.entries) {
-        const result = await deps.store.addMemoryUnlessDuplicate({
-          content: entry.content,
-          kind: entry.kind,
-          scope: entry.scope,
-          project: entry.project,
-          agent: entry.agent,
-          supersedes: null,
-          sourceSession: entry.sourceSession,
-          sourceMessage: entry.sourceMessage,
-        });
-        if (result.duplicate) {
-          duplicates += 1;
-          continue;
-        }
-        if (entry.pinned) await deps.store.setMemoryPinned(result.memory.id, true);
-        deps.memoryEmbedder.enqueue(result.memory.id);
-        created += 1;
-      }
-
       const body: MemoryImportResponse = { ...common, duplicates, created, wouldCreate: 0 };
       return { status: 200, body };
     });
@@ -2519,7 +2573,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     request: IncomingMessage, method: string, segments: string[],
   ): Promise<RouteResult> => {
     if (segments.length !== 1) throw new NotFoundError("路徑");
-    if (method === "GET") return { renderWithPolicy: (policy) => ({ status: 200, body: policy }) };
+    if (method === "GET") return { preparePolicyResponse: async () => {
+      const recallVersion = (await deps.store.getMemoryRecallSettings()).dataRevision;
+      return (policy) => ({ status: 200, body: { ...policy, recallVersion } });
+    } };
     if (method !== "PATCH") throw new MethodNotAllowedError(method, ["GET", "PATCH"]);
     const body = await readJsonBody(request);
     if (Object.keys(body).length !== 1 || typeof body.maskSecrets !== "boolean") {
@@ -2555,26 +2612,94 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     });
   };
 
-  const readMemorySource = async (id: number, params: URLSearchParams): Promise<RouteResult> => {
+  const readMemorySource = async (id: number, params: URLSearchParams, management = false): Promise<RouteResult> => {
     const scope = optionalEnumParam(params.get("scope"), MEMORY_SCOPES, "scope");
     const project = optionalQueryString(params.get("project"), "project", { maxLength: MAX_MEMORY_METADATA_CHARS });
     const agent = optionalQueryString(params.get("agent"), "agent", { maxLength: MAX_MEMORY_METADATA_CHARS });
     const includeAllProjects = booleanFlag(params.get("includeAllProjects"), "includeAllProjects", false);
-    const buckets = buildMemorySearchBuckets({ scope, project, agent, includeAllProjects });
+    const buckets = management ? [] : buildMemorySearchBuckets({ scope, project, agent, includeAllProjects });
     const page = parseSourcePageOptions(params);
     const indexState = await deps.store.memorySourceEmbeddingStats(id, deps.embedder.info.id);
     return {
       preparePolicyResponse: async () => {
+        const recallVersion = (await deps.store.getMemoryRecallSettings()).dataRevision;
         const source = await deps.store.getMemorySource(id);
-        if (source === null || source.deletedAt !== null || !isMemoryVisible(source, buckets)) {
+        if (source === null || source.deletedAt !== null || (!management && !isMemoryVisible(source, buckets))) {
           throw new NotFoundError("原文來源", id);
         }
+        if ((await deps.store.getMemoryRecallSettings()).dataRevision !== recallVersion) throw new MemoryPolicyChangedError();
         return (policy) => ({
           status: 200,
-          body: { source: sourceMetadata(source), indexState, ...paginateMemorySource(source, page, policy) },
+          body: { source: sourceMetadata(source), indexState, ...paginateMemorySource(source, page, policy, recallVersion) },
         });
       },
     };
+  };
+
+  const patchOrganization = async (request: IncomingMessage, segments: string[]): Promise<RouteResult> => {
+    const type = segments[1];
+    if (type !== "source" && type !== "memory") throw new NotFoundError("路徑");
+    const id = parseId(segments[2]!, "記憶");
+    const body = await readJsonBody(request);
+    if (Object.keys(body).some((key) => !["assignedProject", "recallPolicy", "expectedDataRevision"].includes(key))) throw new ValidationError("body", "含有不可修改的欄位");
+    if (body.assignedProject === undefined && body.recallPolicy === undefined) throw new ValidationError("body", "沒有可修改欄位");
+    if (body.recallPolicy !== undefined && body.recallPolicy !== null && !RECALL_POLICIES.includes(body.recallPolicy as typeof RECALL_POLICIES[number])) throw new ValidationError("recallPolicy", "召回政策不合法");
+    const patch = {
+      ...(body.assignedProject === undefined ? {} : { assignedProject: organizationName(body.assignedProject, "assignedProject", true) }),
+      ...(body.recallPolicy === undefined ? {} : { recallPolicy: body.recallPolicy as typeof RECALL_POLICIES[number] | null }),
+      ...(body.expectedDataRevision === undefined ? {} : { expectedDataRevision: revisionNumber(body.expectedDataRevision, "expectedDataRevision") }),
+    };
+    return serializeMemoryWrite(async () => {
+      const updated = await deps.store.updateMemoryOrganization(type, id, patch);
+      if (updated === null) throw new NotFoundError("記憶", id);
+      const recallVersion = (await deps.store.getMemoryRecallSettings()).dataRevision;
+      if (type === "source") return { status: 200, body: { source: sourceMetadata(updated as import("@mnemoshelf/core").MemorySource), recallVersion } };
+      const [entry] = await loadCurrentMemoryPresentations(deps.store, [id]);
+      return { renderWithPolicy: (policy) => ({ status: 200, body: { memory: entry === undefined ? null : createMemoryPresenter(policy)(entry), recallVersion, policyVersion: policy.version } }) };
+    });
+  };
+
+  const routeRecallRules = async (request: IncomingMessage, method: string, segments: string[]): Promise<RouteResult> => {
+    try {
+      if (segments.length === 1 && method === "GET") return { status: 200, body: await deps.store.getMemoryRecallSettings() };
+      if (segments.length !== 2) throw new NotFoundError("路徑");
+      const body = await readJsonBody(request);
+      if (segments[1] === "preview" && method === "POST") {
+        if (Object.keys(body).some((key) => key !== "rule")) throw new ValidationError("body", "只接受 rule 欄位");
+        return { status: 200, body: await deps.store.previewMemoryRecallRule(parseRecallRule(body.rule)) };
+      }
+      const allowed = method === "DELETE"
+        ? ["expectedRevision"]
+        : ["project", "writer", "policy", "expectedRevision", "applyExisting", "expectedDataRevision"];
+      if (Object.keys(body).some((key) => !allowed.includes(key))) throw new ValidationError("body", "含有不支援的欄位");
+      const expectedRevision = revisionNumber(body.expectedRevision, "expectedRevision");
+      if (method === "DELETE") return await serializeMemoryWrite(async () => ({ status: 200, body: await deps.store.deleteMemoryRecallRule(segments[1]!, expectedRevision) }));
+      if (method !== "PUT") throw new MethodNotAllowedError(method, ["PUT", "DELETE"]);
+      const rule = parseRecallRule({ project: body.project, writer: body.writer, policy: body.policy }, segments[1]);
+      const applyExisting = optionalBoolean(body.applyExisting, "applyExisting") ?? false;
+      const expectedDataRevision = body.expectedDataRevision === undefined ? undefined : revisionNumber(body.expectedDataRevision, "expectedDataRevision");
+      if (applyExisting && expectedDataRevision === undefined) throw new ValidationError("expectedDataRevision", "套用歷史記憶前必須預覽");
+      return await serializeMemoryWrite(async () => ({ status: 200, body: await deps.store.upsertMemoryRecallRule(rule, { expectedRevision, applyExisting, ...(expectedDataRevision === undefined ? {} : { expectedDataRevision }) }) }));
+    } catch (error) { if (error instanceof TypeError) throw new ValidationError("rule", error.message); throw error; }
+  };
+
+  const recentMemories = async (url: URL): Promise<RouteResult> => {
+    const params = url.searchParams;
+    const scope = optionalEnumParam(params.get("scope"), MEMORY_SCOPES, "scope");
+    const project = optionalQueryString(params.get("project"), "project", { maxLength: MAX_MEMORY_METADATA_CHARS });
+    const agent = optionalQueryString(params.get("agent"), "agent", { maxLength: MAX_MEMORY_METADATA_CHARS });
+    const writer = optionalQueryString(params.get("writer"), "writer", { maxLength: MAX_MEMORY_METADATA_CHARS });
+    const kind = optionalEnumParam(params.get("kind"), MEMORY_KINDS, "kind");
+    const limit = queryLimit(params.get("limit"));
+    const includeAllProjects = booleanFlag(params.get("includeAllProjects"), "includeAllProjects", false);
+    const buckets = buildMemorySearchBuckets({ scope, project, agent, includeAllProjects });
+    return { preparePolicyResponse: async () => {
+      const recallVersion = (await deps.store.getMemoryRecallSettings()).dataRevision;
+      const rows = await deps.store.listMemoriesForRecall({ buckets, ...(writer === undefined ? {} : { writer }), ...(kind === undefined ? {} : { kind }), ...(limit === undefined ? {} : { limit }) });
+      const entries = await loadMemoryPresentations(deps.store, rows);
+      if ((await deps.store.getMemoryRecallSettings()).dataRevision !== recallVersion) throw new MemoryPolicyChangedError();
+      return (policy) => { const present = createMemoryPresenter(policy); return { status: 200, body: { memories: entries.filter(({memory}) => isMemoryVisible(memory, buckets)).flatMap((entry) => present(entry) ?? []), policyVersion: policy.version, recallVersion, untrusted: true } }; };
+    } };
   };
 
   const routeMemorySources = async (
@@ -2634,6 +2759,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     if (segments.length === 2 && segments[1] === "import") {
       if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
       return await importMemories(request, url);
+    }
+    if (segments.length === 2 && segments[1] === "recent") {
+      if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
+      return recentMemories(url);
     }
     if (segments.length === 2 && segments[1] === "search") {
       if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
@@ -2711,9 +2840,13 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         result = await routeMemories(request, method, segments, url);
         break;
       case "memory-library":
-        if (segments.length !== 1) throw new NotFoundError("路徑");
-        if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]);
-        result = await listMemoryLibrary(url);
+        if (segments.length === 1) { if (method !== "GET") throw new MethodNotAllowedError(method, ["GET"]); result = await listMemoryLibrary(url); }
+        else if (segments.length === 3 && segments[1] === "source" && method === "GET") result = await readMemorySource(parseId(segments[2]!, "原文來源"), url.searchParams, true);
+        else if (segments.length === 4 && segments[3] === "organization" && method === "PATCH") result = await patchOrganization(request, segments);
+        else throw new NotFoundError("路徑");
+        break;
+      case "memory-recall-rules":
+        result = await routeRecallRules(request, method, segments);
         break;
       case "memory-policy":
         result = await routeMemoryPolicy(request, method, segments);
@@ -2774,7 +2907,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         }
         const { url, segments } = parseRequestTarget(request);
         if (isApiPath(segments)) {
-          memoryRequest = ["memories", "memory-library", "memory-policy", "memory-sources", "search"].includes(segments[0]!);
+          memoryRequest = ["memories", "memory-library", "memory-recall-rules", "memory-policy", "memory-sources", "search"].includes(segments[0]!);
           await dispatch(request, response, url, segments);
         } else {
           await serveWeb(request, response, url);

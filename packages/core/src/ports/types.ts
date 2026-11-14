@@ -1,3 +1,6 @@
+import type { MemoryDedupeIdentity, MemoryOrganization, MemoryOrganizationInput } from "../memory/organization.js";
+import type { MemorySearchFilter } from "./metadata-store.js";
+
 /**
  * 共用型別（storage-ports.md 的兩個窄介面所共用的實體與值物件）。
  * 欄位名稱是契約：不得刪減或改名。
@@ -163,7 +166,7 @@ export type MemoryScope = "global" | "project" | "agent";
 export type MemoryEmbeddingState = "pending" | "ready" | "failed" | "too-long";
 
 /** 一筆共享記憶。 */
-export interface Memory {
+export interface Memory extends MemoryOrganization {
   id: number;
   content: string;
   kind: MemoryKind;
@@ -214,11 +217,15 @@ export interface Memory {
 export type NewMemory = Omit<
   Memory,
   "id" | "createdAt" | "deletedAt" | "pinned" | "sourceSession" | "sourceMessage" |
-    "sourceId" | "messageIndex" | "chunkIndex" | "sourceStart" | "sourceEnd" | "chunkVersion"
-> & {
+    "sourceId" | "messageIndex" | "chunkIndex" | "sourceStart" | "sourceEnd" | "chunkVersion" | keyof MemoryOrganization
+> & MemoryOrganizationInput & {
+  restoreDedupe?: MemoryDedupeIdentity;
   sourceSession?: string | null;
   sourceMessage?: string | null;
 };
+
+/** 備份專用欄位；一般記憶讀取不暴露內部去重維度。 */
+export interface MemoryExportRecord extends Memory { dedupeScope: MemoryScope; dedupeProject: string | null }
 
 /**
  * 更新既有記憶時**可變更**的欄位（`MetadataStore.updateMemory`）。
@@ -239,6 +246,8 @@ export interface MemoryPatch {
 
 /** 查詢過濾條件。未指定 rootIds 表示不過濾。 */
 export interface SearchFilter {
+  /** 通用搜尋的記憶候選也採相同用途與寫入者條件。 */
+  memoryFilter?: MemorySearchFilter;
   rootIds?: number[];
   /**
    * 是否納入記憶（只有 `searchKeyword` 會回記憶；向量索引本身不含記憶）。

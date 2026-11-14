@@ -140,6 +140,7 @@ export async function runAntigravityPreInvocation(
 
     const cwd = resolveWorkspaceCwd(input);
     const context = await recallForPrompt({
+      callerAgent: "antigravity/turn",
       prompt,
       cwd,
       env,

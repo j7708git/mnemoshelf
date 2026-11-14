@@ -1,5 +1,9 @@
+import { PgMemoryOrganizationStore } from "./memory-organization.js";
 import {
   DuplicateRootError,
+  memoryDedupeIdentity, MEMORY_ORGANIZATION_COLUMNS, readMemoryOrganization, legacyMemoryOrganizationPatch,
+  type MemoryOrganizationPatch, type MemoryRecallRule, type MemoryRecallRuleWriteOptions,
+
   buildMemoryLibrarySql,
   readMemoryLibraryRows,
   type MemoryLibraryFilter,
@@ -14,7 +18,6 @@ import {
   memorySourceEventHash,
   normalizeMemoryLimit,
   normalizeChunkMedia,
-  normalizeMemoryPatch,
   normalizeMemorySearchFilter,
   normalizeMemorySearchK,
   normalizeMemorySourceEventCheck,
@@ -26,6 +29,7 @@ import {
   type Chunk,
   type ChunkKind,
   type Memory,
+  type MemoryExportRecord,
   type MemoryEmbeddingFailure,
   type MemoryEmbeddingStats,
   type MemoryFilter,
@@ -76,9 +80,9 @@ const ROOT_COLUMNS =
 const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash, media_json";
 const MEMORY_COLUMNS =
   `id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at,
-   source_id, message_index, chunk_index, source_start, source_end, chunk_version`;
+   source_id, message_index, chunk_index, source_start, source_end, chunk_version, ${MEMORY_ORGANIZATION_COLUMNS}`;
 const MEMORY_SOURCE_COLUMNS =
-  "id, agent, scope, project, source_session, source_turn, messages_json, request_hash, chunk_version, created_at, deleted_at";
+  `id, agent, scope, project, source_session, source_turn, messages_json, request_hash, chunk_version, created_at, deleted_at, ${MEMORY_ORGANIZATION_COLUMNS}`;
 
 /** `pg` 的 unique violation 錯誤碼（SQLite 是字串比對，PostgreSQL 是 SQLSTATE）。 */
 const UNIQUE_VIOLATION = "23505";
@@ -133,6 +137,7 @@ function rowToChunk(row: Record<string, unknown>): Chunk {
 
 function rowToMemory(row: Record<string, unknown>): Memory {
   return {
+    ...readMemoryOrganization(row),
     id: Number(row.id),
     content: String(row.content),
     kind: String(row.kind) as MemoryKind,
@@ -156,6 +161,7 @@ function rowToMemory(row: Record<string, unknown>): Memory {
 
 function rowToMemorySource(row: Record<string, unknown>): MemorySource {
   return {
+    ...readMemoryOrganization(row),
     id: Number(row.id),
     agent: String(row.agent),
     scope: String(row.scope) as MemoryScope,
@@ -189,7 +195,7 @@ interface PgMemorySearchWhere {
  * `firstParamIndex`、`firstParamIndex+1`…；bucket 之間 OR、`kind` 與 bucket 群組 AND。
  */
 function buildPgMemorySearchWhere(filter: NormalizedMemorySearchFilter, firstParamIndex: number): PgMemorySearchWhere {
-  const conditions = ["m.deleted_at is null"];
+  const conditions = ["m.deleted_at is null", "m.recall_policy <> 'disabled'"];
   const params: unknown[] = [];
   const placeholder = (): string => `$${firstParamIndex + params.length}`;
 
@@ -198,28 +204,29 @@ function buildPgMemorySearchWhere(filter: NormalizedMemorySearchFilter, firstPar
     params.push(filter.kind);
   }
 
+  if (filter.writer !== undefined) { conditions.push(`m.agent = ${placeholder()}`); params.push(filter.writer); }
   const buckets = filter.buckets;
   if (buckets !== undefined) {
     const parts: string[] = [];
     for (const bucket of buckets) {
       if (bucket.scope === "global") {
-        parts.push("m.scope = 'global'");
+        parts.push("m.recall_policy = 'global'");
         continue;
       }
       if (bucket.scope === "project") {
         if (bucket.project === undefined) {
-          parts.push("m.scope = 'project'");
+          parts.push("m.recall_policy = 'project'");
           continue;
         }
-        parts.push(`(m.scope = 'project' and m.project = ${placeholder()})`);
+        parts.push(`(m.recall_policy = 'project' and m.assigned_project = ${placeholder()})`);
         params.push(bucket.project);
         continue;
       }
       // scope === "agent"（正規化時已保證 agent 非空）
-      parts.push(`(m.scope = 'agent' and m.agent = ${placeholder()})`);
+      parts.push(`(m.recall_policy = 'agent' and m.agent = ${placeholder()})`);
       params.push(bucket.agent);
     }
-    conditions.push(`(${parts.join(" or ")})`);
+    conditions.push(parts.length === 0 ? "1 = 0" : `(${parts.join(" or ")})`);
   }
 
   return { clause: conditions.join(" and "), params };
@@ -361,6 +368,7 @@ export class PgMetadataStore implements MetadataStore {
   private readonly sources: string;
   private readonly deletedSources: string;
   private readonly policy: string;
+  private readonly organization: PgMemoryOrganizationStore;
 
   constructor(pool: Pool, options: PgMetadataStoreOptions = {}) {
     this.pool = pool;
@@ -371,6 +379,7 @@ export class PgMetadataStore implements MetadataStore {
     this.sources = qualified(this.schema, "memory_sources");
     this.deletedSources = qualified(this.schema, "deleted_memory_sources");
     this.policy = qualified(this.schema, "memory_policy");
+    this.organization = new PgMemoryOrganizationStore(pool, this.schema);
   }
 
   async migrate(): Promise<void> {
@@ -380,6 +389,7 @@ export class PgMetadataStore implements MetadataStore {
     await this.pool.query("create extension if not exists vector");
     // 多個 statement 以簡單查詢協定一次送出；全部 `if not exists`，可重複呼叫。
     await this.pool.query(metadataSchemaSql(this.schema));
+    await this.organization.migrate();
     // 卡 C2：既有資料列的 content_hash 回填（只在欄位為 null 時寫入，可重複呼叫）。
     await this.backfillMemoryContentHashes();
   }
@@ -387,6 +397,25 @@ export class PgMetadataStore implements MetadataStore {
   async getMemoryPolicy(): Promise<MemoryPolicy> {
     const result = await this.pool.query(`select mask_secrets, version from ${this.policy} where id = 1`);
     return readMemoryPolicy(result.rows[0]);
+  }
+
+  async getMemoryRecallSettings() { return this.organization.settings(); }
+  async previewMemoryRecallRule(rule: MemoryRecallRule) { return this.organization.preview(rule); }
+  async upsertMemoryRecallRule(rule: MemoryRecallRule, options: MemoryRecallRuleWriteOptions) { return this.organization.upsert(rule, options); }
+  async deleteMemoryRecallRule(id: string, expectedRevision: number) { return this.organization.delete(id, expectedRevision); }
+  async replaceMemoryRecallRules(rules: MemoryRecallRule[], options: { expectedRevision: number }) { return this.organization.replace(rules, options.expectedRevision); }
+  async updateMemoryOrganization(type: "source" | "memory", id: number, patch: MemoryOrganizationPatch): Promise<Memory | MemorySource | null> {
+    return withTransaction(this.pool, async (client) => {
+      const target = await this.organization.update(client, type, id, patch);
+      if (target === null) return null;
+      return target.type === "source" ? this.readSource(client, target.id) : this.readMemory(client, target.id);
+    });
+  }
+  async listMemoriesForRecall(filter: MemorySearchFilter & { limit?: number } = {}): Promise<Memory[]> {
+    const where = buildPgMemorySearchWhere(normalizeMemorySearchFilter(filter), 1);
+    const result = await this.pool.query(`select m.* from ${this.memories} m where ${where.clause} order by m.created_at desc, m.id desc limit $${where.params.length + 1}`,
+      [...where.params, normalizeMemoryLimit(filter.limit)]);
+    return result.rows.map(rowToMemory);
   }
 
   async setMemoryPolicy(maskSecrets: boolean): Promise<MemoryPolicy> {
@@ -430,6 +459,7 @@ export class PgMetadataStore implements MetadataStore {
     const keyHash = memorySourceEventHash(sourceInput);
     return await withTransaction(this.pool, async (client) => {
       await client.query("set transaction isolation level read committed");
+      const organization = await this.organization.forWrite(client, sourceInput);
       await this.assertSourceNotTombstoned(client, keyHash);
       const inserted = await client.query(`
         insert into ${this.sources} (agent, scope, project, source_session, source_turn, messages_json, request_hash, chunk_version, created_at)
@@ -441,7 +471,8 @@ export class PgMetadataStore implements MetadataStore {
       if (row !== undefined) {
         // 唯一索引的插入可能等到另一個交易硬刪完成，須用新的 snapshot 重查 tombstone。
         await this.assertSourceNotTombstoned(client, keyHash);
-        const source = rowToMemorySource(row);
+        await this.organization.write(client, "source", Number(row.id), organization);
+        const source = (await this.readSource(client, Number(row.id)))!;
         return { source, memories: await this.insertSourceChunks(client, source, snapshot, false), duplicate: false };
       }
 
@@ -479,6 +510,7 @@ export class PgMetadataStore implements MetadataStore {
 
   async replaceMemorySourceChunks(id: number, chunkVersion: string, chunks: NewMemorySourceChunk[]): Promise<Memory[]> {
     return await withTransaction(this.pool, async (client) => {
+      await this.organization.settings(client, true);
       const source = await this.readSource(client, id, true);
       if (source === null || source.deletedAt !== null) return [];
       assertMemorySourceChunks(source.messages, chunkVersion, chunks);
@@ -492,6 +524,7 @@ export class PgMetadataStore implements MetadataStore {
 
   async updateMemorySource(id: number, patch: MemoryPatch): Promise<MemorySource | null> {
     return await withTransaction(this.pool, async (client) => {
+      await this.organization.settings(client, true);
       const source = await this.readSource(client, id, true);
       return source === null ? null : this.updateSource(client, source, patch);
     });
@@ -499,6 +532,7 @@ export class PgMetadataStore implements MetadataStore {
 
   async deleteMemorySource(id: number, hard = false): Promise<boolean> {
     return await withTransaction(this.pool, async (client) => {
+      await this.organization.settings(client, true);
       const source = await this.readSource(client, id, true);
       return source === null ? false : this.deleteSource(client, source, hard);
     });
@@ -551,15 +585,15 @@ export class PgMetadataStore implements MetadataStore {
     [JSON.stringify(rows), source.scope, source.project, source.agent, pinned, source.sourceSession,
       source.createdAt, source.id, source.chunkVersion]);
     if (inserted.rows.length !== chunks.length) throw new Error("原文切塊未完整寫入");
-    return inserted.rows.map(rowToMemory).sort((a, b) => a.chunkIndex! - b.chunkIndex!);
+    await this.organization.write(client, "source", source.id, source);
+    return this.readSourceChunks(client, source.id);
   }
 
   private async updateSource(client: PoolClient, source: MemorySource, patch: MemoryPatch): Promise<MemorySource | null> {
     if (source.deletedAt !== null) return null;
-    const next = normalizeMemorySourceScope(source, patch);
-    await client.query(`update ${this.sources} set scope = $2, project = $3 where id = $1`, [source.id, next.scope, next.project]);
-    await client.query(`update ${this.memories} set scope = $2, project = $3 where source_id = $1`, [source.id, next.scope, next.project]);
-    return { ...source, ...next };
+    normalizeMemorySourceScope({ ...source, project: source.assignedProject }, patch);
+    await this.organization.update(client, "source", source.id, legacyMemoryOrganizationPatch(source, patch));
+    return this.readSource(client, source.id);
   }
 
   private async deleteSource(client: PoolClient, source: MemorySource, hard: boolean): Promise<boolean> {
@@ -762,8 +796,10 @@ export class PgMetadataStore implements MetadataStore {
   }
 
   async addMemory(m: NewMemory): Promise<Memory> {
+    const dedupe = memoryDedupeIdentity(m);
     const createdAt = new Date().toISOString();
     const memoryId = await withTransaction(this.pool, async (client) => {
+      const organization = await this.organization.forWrite(client, m);
       if (m.supersedes !== null) {
         await this.markSuperseded(client, m.supersedes, createdAt);
       }
@@ -785,7 +821,10 @@ export class PgMetadataStore implements MetadataStore {
           memoryContentHash(m.content),
         ],
       );
-      return Number(result.rows[0]!.id);
+      const id = Number(result.rows[0]!.id);
+      await client.query(`update ${this.memories} set dedupe_scope = $2, dedupe_project = $3 where id = $1`, [id, dedupe.scope, dedupe.project]);
+      await this.organization.write(client, "memory", id, organization);
+      return id;
     });
 
     const created = await this.getMemory(memoryId);
@@ -804,8 +843,10 @@ export class PgMetadataStore implements MetadataStore {
   async addMemoryUnlessDuplicate(m: NewMemory): Promise<{ memory: Memory; duplicate: boolean }> {
     const createdAt = new Date().toISOString();
     const contentHash = memoryContentHash(m.content);
+    const dedupe = memoryDedupeIdentity(m);
 
     const attempt = await withTransaction(this.pool, async (client) => {
+      const organization = await this.organization.forWrite(client, m);
       if (m.supersedes !== null) {
         await this.markSuperseded(client, m.supersedes, createdAt);
       }
@@ -816,9 +857,10 @@ export class PgMetadataStore implements MetadataStore {
           where not exists (
             select 1 from ${this.memories}
              where content_hash = $11
-               and scope = $3
-               and coalesce(project, '') = coalesce($4::text, '')
+               and dedupe_scope = $13
+               and coalesce(dedupe_project, '') = coalesce($14::text, '')
                and agent = $5
+               and assigned_project is not distinct from $12::text
                and deleted_at is null
                and source_id is null
           )
@@ -835,22 +877,30 @@ export class PgMetadataStore implements MetadataStore {
           createdAt,
           segmentOrNull(m.content),
           contentHash,
+          organization.assignedProject,
+          dedupe.scope, dedupe.project,
         ],
       );
 
-      if (inserted.rows.length > 0) return { memory: rowToMemory(inserted.rows[0]!), duplicate: false };
+      if (inserted.rows.length > 0) {
+        const id = Number(inserted.rows[0]!.id);
+        await client.query(`update ${this.memories} set dedupe_scope = $2, dedupe_project = $3 where id = $1`, [id, dedupe.scope, dedupe.project]);
+        await this.organization.write(client, "memory", id, organization);
+        return { memory: (await this.readMemory(client, id))!, duplicate: false };
+      }
 
       const existing = await client.query(
         `select ${MEMORY_COLUMNS} from ${this.memories}
           where content_hash = $1
-            and scope = $2
-            and coalesce(project, '') = coalesce($3::text, '')
+            and dedupe_scope = $2
+            and coalesce(dedupe_project, '') = coalesce($3::text, '')
             and agent = $4
+            and assigned_project is not distinct from $5::text
             and deleted_at is null
             and source_id is null
           order by id
           limit 1`,
-        [contentHash, m.scope, m.project, m.agent],
+        [contentHash, dedupe.scope, dedupe.project, m.agent, organization.assignedProject],
       );
       if (existing.rows.length === 0) throw new Error("去重判定為重複，但讀不回既有記憶");
       return { memory: rowToMemory(existing.rows[0]!), duplicate: true };
@@ -888,6 +938,7 @@ export class PgMetadataStore implements MetadataStore {
 
   async forgetMemory(id: number): Promise<void> {
     await withTransaction(this.pool, async (client) => {
+      await this.organization.settings(client, true);
       const target = await this.lockMemoryTarget(client, id);
       if (target === null || target.memory.deletedAt !== null) return;
       if (target.source !== null) {
@@ -907,12 +958,14 @@ export class PgMetadataStore implements MetadataStore {
    */
   async normalizeLegacyMemoryScopes(): Promise<{ updated: number }> {
     return await withTransaction(this.pool, async (client) => {
+      await this.organization.settings(client, true);
       const cleared = await client.query(
-        `update ${this.memories} set project = null where scope in ('global', 'agent') and project is not null and source_id is null`,
+        `update ${this.memories} set project = null, dedupe_project = null where scope in ('global', 'agent') and project is not null and source_id is null`,
       );
       const promoted = await client.query(
         `update ${this.memories}
-            set scope = 'global', project = null
+            set scope = 'global', project = null, recall_policy = 'global', assigned_project = null,
+                dedupe_scope = 'global', dedupe_project = null
           where scope = 'project' and (project is null or btrim(project) = '') and source_id is null`,
       );
       return { updated: (cleared.rowCount ?? 0) + (promoted.rowCount ?? 0) };
@@ -927,6 +980,7 @@ export class PgMetadataStore implements MetadataStore {
    */
   async hardDeleteMemory(id: number): Promise<boolean> {
     return await withTransaction(this.pool, async (client) => {
+      await this.organization.settings(client, true);
       const target = await this.lockMemoryTarget(client, id);
       if (target === null) return false;
       if (target.source !== null) return this.deleteSource(client, target.source, true);
@@ -938,6 +992,7 @@ export class PgMetadataStore implements MetadataStore {
   /** 設定釘選（冪等）；不存在的 id 更新不到任何列，等同無操作。 */
   async setMemoryPinned(id: number, pinned: boolean): Promise<void> {
     await withTransaction(this.pool, async (client) => {
+      await this.organization.settings(client, true);
       const target = await this.lockMemoryTarget(client, id);
       if (target === null) return;
       if (target.source !== null) {
@@ -952,24 +1007,21 @@ export class PgMetadataStore implements MetadataStore {
   /**
    * 更新記憶的 `scope`／`project`（語意與 SQLite 後端完全相同，見 `MetadataStore.updateMemory`）。
    *
-   * 先 select 現值以套用 `normalizeMemoryPatch`（合併與正規化只有一處），再以
+   * 先 select 現值，再將相容 patch 轉為組織快照的單筆例外；以同一交易更新來源與片段。
    * `update … returning` 一次拿到更新後的列；`deleted_at is null` 讓「讀到之後才被軟刪除」
    * 的競態也回 `null`（0 列），與 SQLite 端一致。內容沒動，`seg`/`tsv` 不必重算。
    */
   async updateMemory(id: number, patch: MemoryPatch): Promise<Memory | null> {
     return await withTransaction(this.pool, async (client) => {
+      await this.organization.settings(client, true);
       const target = await this.lockMemoryTarget(client, id);
       if (target === null || target.memory.deletedAt !== null) return null;
       if (target.source !== null) {
         const source = await this.updateSource(client, target.source, patch);
-        return source === null ? null : { ...target.memory, scope: source.scope, project: source.project };
+        return source === null ? null : this.readMemory(client, id);
       }
-      const next = normalizeMemoryPatch(target.memory, patch);
-      const result = await client.query(
-        `update ${this.memories} set scope = $2, project = $3 where id = $1 returning ${MEMORY_COLUMNS}`,
-        [id, next.scope, next.project],
-      );
-      return result.rows.length === 0 ? null : rowToMemory(result.rows[0]!);
+      await this.organization.update(client, "memory", id, legacyMemoryOrganizationPatch(target.memory, patch));
+      return this.readMemory(client, id);
     });
   }
 
@@ -1180,7 +1232,7 @@ export class PgMetadataStore implements MetadataStore {
   }
 
   async listMemoryLibrary(filter: MemoryLibraryFilter = {}): Promise<MemoryLibraryPage> {
-    const query = buildMemoryLibrarySql(filter, "postgres", { memories: this.memories, sources: this.sources });
+    const query = buildMemoryLibrarySql(filter, "postgres", { memories: this.memories, sources: this.sources, settings: this.organization.settingsTable });
     const result = await this.pool.query(query.sql, query.params);
     return readMemoryLibraryRows(result.rows, query.filter, rowToMemory);
   }
@@ -1190,13 +1242,13 @@ export class PgMetadataStore implements MetadataStore {
    *
    * 備份用：**不套** `limit`、排序與 `listMemories` 相反（`created_at asc, id asc`）。
    */
-  async listMemoriesForExport(): Promise<Memory[]> {
+  async listMemoriesForExport(): Promise<MemoryExportRecord[]> {
     const result = await this.pool.query(
-      `select ${MEMORY_COLUMNS} from ${this.memories}
+      `select ${MEMORY_COLUMNS}, dedupe_scope, dedupe_project from ${this.memories}
         where deleted_at is null
         order by created_at asc, id asc`,
     );
-    return result.rows.map(rowToMemory);
+    return result.rows.map((row) => ({ ...rowToMemory(row), dedupeScope: String(row.dedupe_scope ?? row.scope) as MemoryScope, dedupeProject: row.dedupe_scope == null ? (row.project == null ? null : String(row.project)) : (row.dedupe_project == null ? null : String(row.dedupe_project)) }));
   }
 
   /**
@@ -1246,12 +1298,13 @@ export class PgMetadataStore implements MetadataStore {
 
     // 記憶：沒有 root，因此預設只在「未指定 rootIds」時納入（可用 includeMemories 覆寫）。
     if (includeMemories) {
-      const params: unknown[] = [...tokens, k];
+      const where = buildPgMemorySearchWhere(normalizeMemorySearchFilter(filter.memoryFilter), tokens.length + 1);
+      const params: unknown[] = [...tokens, ...where.params, k];
       const result = await this.pool.query(
         `with q as (select ${tsquery} as tsq)
          select 'm:' || m.id as key, ts_rank(m.tsv, q.tsq) as score
            from ${this.memories} m, q
-          where m.tsv @@ q.tsq and m.deleted_at is null
+          where m.tsv @@ q.tsq and ${where.clause}
           order by score desc, key asc
           limit $${params.length}`,
         params,

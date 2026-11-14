@@ -5,6 +5,7 @@ import {
   normalizeMemorySourceRequest,
   RAW_MEMORY_CHUNK_VERSION,
   type Memory,
+  type MemoryOrganization,
   type MemoryPolicy,
   type MemoryScope,
   type MemorySearchBucket,
@@ -12,13 +13,14 @@ import {
   type MemorySourceMessage,
   type NewMemorySource,
 } from "@mnemoshelf/core";
+import { organizationOf, parseOrganizationOrigin } from "./memory-organization.js";
 import { ValidationError } from "./errors.js";
 import { memoryContentView, metadataView, sourceMessageView, splitsSurrogate } from "./memory-policy.js";
 
 export const MAX_MEMORY_SOURCE_BYTES = 8 * 1024 * 1024;
 export type SourceWriteRequest = Omit<NewMemorySource, "requestHash" | "chunkVersion">;
 
-export interface SourceMetadata {
+export interface SourceMetadata extends MemoryOrganization {
   id: number;
   agent: string;
   scope: MemoryScope;
@@ -30,7 +32,7 @@ export interface SourceMetadata {
   messageCount: number;
 }
 
-type SourceCursor = { messageIndex: number; offset: number; policyVersion: number };
+type SourceCursor = { messageIndex: number; offset: number; policyVersion: number; recallVersion?: number };
 type SourcePageOptions = Omit<SourceCursor, "policyVersion"> & { maxChars: number; policyVersion?: number };
 
 export class MemoryPolicyChangedError extends Error {}
@@ -39,7 +41,7 @@ export function parseSourceWriteRequest(input: unknown): SourceWriteRequest {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
     throw new ValidationError("source", "必須是 JSON 物件");
   }
-  const allowed = ["agent", "scope", "project", "sourceSession", "sourceTurn", "messages"];
+  const allowed = ["agent", "scope", "project", "sourceSession", "sourceTurn", "messages", "originProject", "assignedProject"];
   if (Object.keys(input).some((key) => !allowed.includes(key))) {
     throw new ValidationError("source", "含有不支援的欄位");
   }
@@ -54,7 +56,7 @@ export function parseSourceWriteRequest(input: unknown): SourceWriteRequest {
     throw new ValidationError("messages", "含有不支援的訊息欄位");
   }
   try {
-    return normalizeMemorySourceRequest({ ...payload, project: payload.project === undefined ? null : payload.project });
+    return normalizeMemorySourceRequest({ ...payload, ...parseOrganizationOrigin(input as Record<string, unknown>), project: payload.project === undefined ? null : payload.project });
   } catch (error) {
     if (!(error instanceof TypeError)) throw error;
     throw new ValidationError("source", error.message);
@@ -75,6 +77,9 @@ export function prepareMemorySource(source: SourceWriteRequest, policy: MemoryPo
 
 export function sourceMetadata(source: MemorySource): SourceMetadata {
   return {
+    ...organizationOf(source),
+    originProject: metadataView(source.originProject),
+    assignedProject: metadataView(source.assignedProject),
     id: source.id,
     agent: metadataView(source.agent),
     scope: source.scope,
@@ -96,12 +101,15 @@ export function sourceBackupView(source: MemorySource, policy: MemoryPolicy): So
 }
 
 export function isMemoryVisible(
-  memory: Pick<Memory, "scope" | "project" | "agent">,
+  memory: Pick<Memory, "scope" | "project" | "agent"> & Partial<MemoryOrganization>,
   buckets: readonly MemorySearchBucket[],
 ): boolean {
+  const policy = memory.recallPolicy ?? memory.scope;
+  const project = memory.assignedProject === undefined ? memory.project : memory.assignedProject;
+  if (policy === "disabled" || (policy === "project" && project === null)) return false;
   return buckets.some((bucket) =>
-    bucket.scope === memory.scope &&
-    (bucket.project === undefined || bucket.project === memory.project) &&
+    bucket.scope === policy &&
+    (bucket.project === undefined || bucket.project === project) &&
     (bucket.agent === undefined || bucket.agent === memory.agent),
   );
 }
@@ -119,14 +127,16 @@ export function parseSourcePageOptions(params: URLSearchParams): SourcePageOptio
   const messageIndex = numberParam("messageIndex", 0);
   const offset = numberParam("offset", 0);
   const policyVersion = numberParam("policyVersion", 1);
+  const recallVersion = numberParam("recallVersion", 0);
   const maxChars = numberParam("maxChars", 1, 32_000) ?? 8_000;
   if (((messageIndex ?? 0) > 0 || (offset ?? 0) > 0) && policyVersion === undefined) {
     throw new ValidationError("policyVersion", "續讀時必須提供政策版本");
   }
-  return { messageIndex: messageIndex ?? 0, offset: offset ?? 0, maxChars, policyVersion };
+  return { messageIndex: messageIndex ?? 0, offset: offset ?? 0, maxChars, policyVersion, recallVersion };
 }
 
-export function paginateMemorySource(source: MemorySource, options: SourcePageOptions, policy: MemoryPolicy) {
+export function paginateMemorySource(source: MemorySource, options: SourcePageOptions, policy: MemoryPolicy, recallVersion?: number) {
+  if (recallVersion !== undefined && ((options.messageIndex > 0 || options.offset > 0) && options.recallVersion === undefined || options.recallVersion !== undefined && options.recallVersion !== recallVersion)) throw new MemoryPolicyChangedError();
   if (options.policyVersion !== undefined && options.policyVersion !== policy.version) {
     throw new MemoryPolicyChangedError();
   }
@@ -171,7 +181,7 @@ export function paginateMemorySource(source: MemorySource, options: SourcePageOp
     }
   }
   const next: SourceCursor | null = messageIndex < source.messages.length
-    ? { messageIndex, offset, policyVersion: policy.version }
+    ? { messageIndex, offset, policyVersion: policy.version, ...(recallVersion === undefined ? {} : { recallVersion }) }
     : null;
-  return { messages, next, truncated: next !== null, policyVersion: policy.version, untrusted: true as const };
+  return { messages, next, truncated: next !== null, policyVersion: policy.version, ...(recallVersion === undefined ? {} : { recallVersion }), untrusted: true as const };
 }

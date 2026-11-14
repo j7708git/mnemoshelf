@@ -1,3 +1,8 @@
+import { SqliteMemoryOrganizationStore } from "./memory-organization.js";
+import {
+  memoryDedupeIdentity, MEMORY_ORGANIZATION_COLUMNS, readMemoryOrganization, legacyMemoryOrganizationPatch,
+  type MemoryOrganizationPatch, type MemoryRecallRule, type MemoryRecallRuleWriteOptions,
+} from "../../memory/organization.js";
 import { DuplicateRootError } from "../../errors.js";
 import { memoryContentHash } from "../../memory/content-normalize.js";
 import { buildMemoryLibrarySql, readMemoryLibraryRows, type MemoryLibraryFilter, type MemoryLibraryPage } from "../../memory/library.js";
@@ -25,7 +30,6 @@ import {
   cosineSimilarity,
   normalizeMemoryLimit,
   normalizeChunkMedia,
-  normalizeMemoryPatch,
   normalizeRootMaxFileBytes,
   normalizeRootVideoMaxFileBytes,
   normalizeMemorySearchFilter,
@@ -43,6 +47,7 @@ import type {
   Chunk,
   ChunkKind,
   Memory,
+  MemoryExportRecord,
   MemoryKind,
   MemoryPatch,
   MemoryScope,
@@ -65,9 +70,9 @@ const ROOT_COLUMNS =
 const CHUNK_COLUMNS = "id, root_id, rel_path, seq, kind, text, content_hash, media_json";
 const MEMORY_COLUMNS =
   `id, content, kind, scope, project, agent, supersedes, pinned, source_session, source_message, created_at, deleted_at,
-   source_id, message_index, chunk_index, source_start, source_end, chunk_version`;
+   source_id, message_index, chunk_index, source_start, source_end, chunk_version, ${MEMORY_ORGANIZATION_COLUMNS}`;
 const MEMORY_SOURCE_COLUMNS =
-  "id, agent, scope, project, source_session, source_turn, messages_json, request_hash, chunk_version, created_at, deleted_at";
+  `id, agent, scope, project, source_session, source_turn, messages_json, request_hash, chunk_version, created_at, deleted_at, ${MEMORY_ORGANIZATION_COLUMNS}`;
 
 function parseStringArray(value: unknown): string[] {
   if (typeof value !== "string") return [];
@@ -115,6 +120,7 @@ function rowToChunk(row: Record<string, unknown>): Chunk {
 
 function rowToMemory(row: Record<string, unknown>): Memory {
   return {
+    ...readMemoryOrganization(row),
     id: Number(row.id),
     content: String(row.content),
     kind: String(row.kind) as MemoryKind,
@@ -138,6 +144,7 @@ function rowToMemory(row: Record<string, unknown>): Memory {
 
 function rowToMemorySource(row: Record<string, unknown>): MemorySource {
   return {
+    ...readMemoryOrganization(row),
     id: Number(row.id),
     agent: String(row.agent),
     scope: String(row.scope) as MemoryScope,
@@ -189,7 +196,7 @@ interface MemorySearchWhere {
  * 參數綁定順序與 SQL 中的 `?` 出現順序一致；bucket 之間是 OR、`kind` 與 bucket 群組是 AND。
  */
 function buildMemorySearchWhere(filter: NormalizedMemorySearchFilter): MemorySearchWhere {
-  const conditions = ["m.deleted_at is null"];
+  const conditions = ["m.deleted_at is null", "m.recall_policy <> 'disabled'"];
   const params: unknown[] = [];
 
   if (filter.kind !== undefined) {
@@ -197,28 +204,29 @@ function buildMemorySearchWhere(filter: NormalizedMemorySearchFilter): MemorySea
     params.push(filter.kind);
   }
 
+  if (filter.writer !== undefined) { conditions.push("m.agent = ?"); params.push(filter.writer); }
   const buckets = filter.buckets;
   if (buckets !== undefined) {
     const parts: string[] = [];
     for (const bucket of buckets) {
       if (bucket.scope === "global") {
-        parts.push("m.scope = 'global'");
+        parts.push("m.recall_policy = 'global'");
         continue;
       }
       if (bucket.scope === "project") {
         if (bucket.project === undefined) {
-          parts.push("m.scope = 'project'");
+          parts.push("m.recall_policy = 'project'");
           continue;
         }
         params.push(bucket.project);
-        parts.push("(m.scope = 'project' and m.project = ?)");
+        parts.push("(m.recall_policy = 'project' and m.assigned_project = ?)");
         continue;
       }
       // scope === "agent"（正規化時已保證 agent 非空）
       params.push(bucket.agent);
-      parts.push("(m.scope = 'agent' and m.agent = ?)");
+      parts.push("(m.recall_policy = 'agent' and m.agent = ?)");
     }
-    conditions.push(`(${parts.join(" or ")})`);
+    conditions.push(parts.length === 0 ? "1 = 0" : `(${parts.join(" or ")})`);
   }
 
   return { clause: conditions.join(" and "), params };
@@ -234,13 +242,33 @@ function buildMemorySearchWhere(filter: NormalizedMemorySearchFilter): MemorySea
  */
 export class SqliteMetadataStore implements MetadataStore {
   private readonly db: SqliteDatabase;
+  private readonly organization: SqliteMemoryOrganizationStore;
 
   constructor(db: SqliteDatabase) {
     this.db = db;
+    this.organization = new SqliteMemoryOrganizationStore(db);
   }
 
   async migrate(): Promise<void> {
     runMigrations(this.db);
+  }
+
+  async getMemoryRecallSettings() { return this.organization.settings(); }
+  async previewMemoryRecallRule(rule: MemoryRecallRule) { return this.organization.preview(rule); }
+  async upsertMemoryRecallRule(rule: MemoryRecallRule, options: MemoryRecallRuleWriteOptions) { return this.organization.upsert(rule, options); }
+  async deleteMemoryRecallRule(id: string, expectedRevision: number) { return this.organization.delete(id, expectedRevision); }
+  async replaceMemoryRecallRules(rules: MemoryRecallRule[], options: { expectedRevision: number }) { return this.organization.replace(rules, options.expectedRevision); }
+  async updateMemoryOrganization(type: "source" | "memory", id: number, patch: MemoryOrganizationPatch): Promise<Memory | MemorySource | null> {
+    return this.db.transaction(() => {
+      const target = this.organization.update(type, id, patch);
+      if (target === null) return null;
+      return target.type === "source" ? this.readSource(target.id) : this.readMemory(target.id);
+    }).immediate();
+  }
+  async listMemoriesForRecall(filter: MemorySearchFilter & { limit?: number } = {}): Promise<Memory[]> {
+    const where = buildMemorySearchWhere(normalizeMemorySearchFilter(filter));
+    return selectRows(this.db, `select m.* from memories m where ${where.clause} order by m.created_at desc, m.id desc limit ?`,
+      ...where.params, normalizeMemoryLimit(filter.limit)).map(rowToMemory);
   }
 
   async getMemoryPolicy(): Promise<MemoryPolicy> {
@@ -276,12 +304,14 @@ export class SqliteMetadataStore implements MetadataStore {
         const source = rowToMemorySource(existing);
         return { source, memories: this.readSourceChunks(source.id), duplicate: true };
       }
+      const organization = this.organization.forWrite(sourceInput);
       const row = selectRow(this.db, `
         insert into memory_sources (agent, scope, project, source_session, source_turn, messages_json, request_hash, chunk_version, created_at)
         values (?, ?, ?, ?, ?, ?, ?, ?, ?) returning ${MEMORY_SOURCE_COLUMNS}`,
       agent, scope, project, sourceSession, sourceTurn, JSON.stringify(messages), requestHash, chunkVersion, new Date().toISOString());
       if (row === undefined) throw new Error("原文來源未寫入");
-      const source = rowToMemorySource(row);
+      this.organization.write("source", Number(row.id), organization);
+      const source = this.readSource(Number(row.id))!;
       return { source, memories: this.insertSourceChunks(source, chunks, false), duplicate: false };
     }).immediate();
   }
@@ -362,8 +392,9 @@ export class SqliteMetadataStore implements MetadataStore {
       );
       if (row === undefined) throw new Error("原文切塊未寫入");
       const memory = rowToMemory(row);
+      this.organization.write("memory", memory.id, source);
       this.insertMemoryFts(memory.id, content);
-      return memory;
+      return this.readMemory(memory.id)!;
     });
   }
 
@@ -381,10 +412,9 @@ export class SqliteMetadataStore implements MetadataStore {
   private updateSource(id: number, patch: MemoryPatch): MemorySource | null {
     const source = this.readSource(id);
     if (source === null || source.deletedAt !== null) return null;
-    const next = normalizeMemorySourceScope(source, patch);
-    this.db.prepare("update memory_sources set scope = ?, project = ? where id = ?").run(next.scope, next.project, id);
-    this.db.prepare("update memories set scope = ?, project = ? where source_id = ?").run(next.scope, next.project, id);
-    return { ...source, ...next };
+    normalizeMemorySourceScope({ ...source, project: source.assignedProject }, patch);
+    this.organization.update("source", id, legacyMemoryOrganizationPatch(source, patch));
+    return this.readSource(id);
   }
 
   private deleteSource(id: number, hard: boolean): boolean {
@@ -601,8 +631,10 @@ export class SqliteMetadataStore implements MetadataStore {
   }
 
   async addMemory(m: NewMemory): Promise<Memory> {
+    const dedupe = memoryDedupeIdentity(m);
     const createdAt = new Date().toISOString();
     const insert = this.db.transaction((): number => {
+      const organization = this.organization.forWrite(m);
       if (m.supersedes !== null) {
         this.markSuperseded(m.supersedes, createdAt);
       }
@@ -624,6 +656,8 @@ export class SqliteMetadataStore implements MetadataStore {
           memoryContentHash(m.content),
         );
       const memoryId = Number(info.lastInsertRowid);
+      this.db.prepare("update memories set dedupe_scope = ?, dedupe_project = ? where id = ?").run(dedupe.scope, dedupe.project, memoryId);
+      this.organization.write("memory", memoryId, organization);
       this.insertMemoryFts(memoryId, m.content);
       return memoryId;
     });
@@ -648,8 +682,10 @@ export class SqliteMetadataStore implements MetadataStore {
   async addMemoryUnlessDuplicate(m: NewMemory): Promise<{ memory: Memory; duplicate: boolean }> {
     const createdAt = new Date().toISOString();
     const contentHash = memoryContentHash(m.content);
+    const dedupe = memoryDedupeIdentity(m);
 
     const attempt = this.db.transaction((): { id: number; duplicate: boolean } => {
+      const organization = this.organization.forWrite(m);
       if (m.supersedes !== null) {
         this.markSuperseded(m.supersedes, createdAt);
       }
@@ -660,7 +696,7 @@ export class SqliteMetadataStore implements MetadataStore {
            select ?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?
             where not exists (
               select 1 from memories
-               where content_hash = ? and scope = ? and project is ? and agent = ? and deleted_at is null and source_id is null
+               where content_hash = ? and dedupe_scope = ? and dedupe_project is ? and agent = ? and assigned_project is ? and deleted_at is null and source_id is null
             )`,
         )
         .run(
@@ -675,28 +711,32 @@ export class SqliteMetadataStore implements MetadataStore {
           createdAt,
           contentHash,
           contentHash,
-          m.scope,
-          m.project,
+          dedupe.scope,
+          dedupe.project,
           m.agent,
+          organization.assignedProject,
         );
 
       if (Number(info.changes) === 0) {
         const existing = selectRow(
           this.db,
           `select ${MEMORY_COLUMNS} from memories
-            where content_hash = ? and scope = ? and project is ? and agent = ? and deleted_at is null and source_id is null
+            where content_hash = ? and dedupe_scope = ? and dedupe_project is ? and agent = ? and assigned_project is ? and deleted_at is null and source_id is null
             order by id
             limit 1`,
           contentHash,
-          m.scope,
-          m.project,
+          dedupe.scope,
+          dedupe.project,
           m.agent,
+          organization.assignedProject,
         );
         if (existing === undefined) throw new Error("去重判定為重複，但讀不回既有記憶");
         return { id: Number(existing.id), duplicate: true };
       }
 
       const memoryId = Number(info.lastInsertRowid);
+      this.db.prepare("update memories set dedupe_scope = ?, dedupe_project = ? where id = ?").run(dedupe.scope, dedupe.project, memoryId);
+      this.organization.write("memory", memoryId, organization);
       this.insertMemoryFts(memoryId, m.content);
       return { id: memoryId, duplicate: false };
     });
@@ -737,12 +777,13 @@ export class SqliteMetadataStore implements MetadataStore {
   async normalizeLegacyMemoryScopes(): Promise<{ updated: number }> {
     const normalize = this.db.transaction((): number => {
       const clearedProject = this.db
-        .prepare("update memories set project = null where scope in ('global', 'agent') and project is not null and source_id is null")
+        .prepare("update memories set project = null, dedupe_project = null where scope in ('global', 'agent') and project is not null and source_id is null")
         .run();
       const promotedScope = this.db
         .prepare(
           `update memories
-              set scope = 'global', project = null
+              set scope = 'global', project = null, recall_policy = 'global', assigned_project = null,
+                  dedupe_scope = 'global', dedupe_project = null
             where scope = 'project' and (project is null or trim(project) = '') and source_id is null`,
         )
         .run();
@@ -785,7 +826,7 @@ export class SqliteMetadataStore implements MetadataStore {
   /**
    * 更新記憶的 `scope`／`project`（見 `MetadataStore.updateMemory`）。
    *
-   * 先讀回現值再套 patch（`normalizeMemoryPatch`）——合併與正規化語意只有一處，
+   * 先讀現值，再以相容 patch 轉成單筆用途例外；來源與獨立歸屬不因 global/agent 被抹除。
    * 不寫成 `coalesce(?, …)` 這種 SQL 表達；`deleted_at is null` 讓「讀到之後才被軟刪除」
    * 的競態也回 `null`，與 PG 端的 `returning` 語意一致。內容沒動，因此 FTS 列不必更新。
    */
@@ -795,11 +836,10 @@ export class SqliteMetadataStore implements MetadataStore {
       if (existing === null || existing.deletedAt !== null) return null;
       if (existing.sourceId != null) {
         const source = this.updateSource(existing.sourceId, patch);
-        return source === null ? null : { ...existing, scope: source.scope, project: source.project };
+        return source === null ? null : this.readMemory(id);
       }
-      const next = normalizeMemoryPatch(existing, patch);
-      this.db.prepare("update memories set scope = ?, project = ? where id = ?").run(next.scope, next.project, id);
-      return { ...existing, ...next };
+      this.organization.update("memory", id, legacyMemoryOrganizationPatch(existing, patch));
+      return this.readMemory(id);
     }).immediate();
   }
 
@@ -1007,7 +1047,7 @@ export class SqliteMetadataStore implements MetadataStore {
   }
 
   async listMemoryLibrary(filter: MemoryLibraryFilter = {}): Promise<MemoryLibraryPage> {
-    const query = buildMemoryLibrarySql(filter, "sqlite", { memories: "memories", sources: "memory_sources" });
+    const query = buildMemoryLibrarySql(filter, "sqlite", { memories: "memories", sources: "memory_sources", settings: "memory_recall_settings" });
     const rows = selectRows(this.db, query.sql, ...query.params);
     return readMemoryLibraryRows(rows, query.filter, rowToMemory);
   }
@@ -1018,11 +1058,11 @@ export class SqliteMetadataStore implements MetadataStore {
    * 備份用：刻意**不套** `normalizeMemoryLimit`（沒有 `limit`），排序與 `listMemories` 相反
    * （`created_at asc, id asc`），讓匯入端依相同順序重建相對先後。
    */
-  async listMemoriesForExport(): Promise<Memory[]> {
+  async listMemoriesForExport(): Promise<MemoryExportRecord[]> {
     return selectRows(
       this.db,
-      `select ${MEMORY_COLUMNS} from memories where deleted_at is null order by created_at asc, id asc`,
-    ).map(rowToMemory);
+      `select ${MEMORY_COLUMNS}, dedupe_scope, dedupe_project from memories where deleted_at is null order by created_at asc, id asc`,
+    ).map((row) => ({ ...rowToMemory(row), dedupeScope: String(row.dedupe_scope ?? row.scope) as MemoryScope, dedupeProject: row.dedupe_scope == null ? (row.project == null ? null : String(row.project)) : (row.dedupe_project == null ? null : String(row.dedupe_project)) }));
   }
 
   /**
@@ -1061,13 +1101,15 @@ export class SqliteMetadataStore implements MetadataStore {
     }
 
     if (includeMemories) {
+      const where = buildMemorySearchWhere(normalizeMemorySearchFilter(filter.memoryFilter));
       const rows = selectRows(
         this.db,
-        `select memories.id as id, bm25(memories_fts) as score
-           from memories_fts join memories on memories.id = memories_fts.rowid
-          where memories_fts match ? and memories.deleted_at is null
+        `select m.id as id, bm25(memories_fts) as score
+           from memories_fts join memories m on m.id = memories_fts.rowid
+          where memories_fts match ? and ${where.clause}
           order by score limit ?`,
         matchExpression,
+        ...where.params,
         k,
       );
       for (const row of rows) {

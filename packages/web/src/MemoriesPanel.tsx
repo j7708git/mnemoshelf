@@ -7,14 +7,17 @@ import {
   deleteMemory,
   downloadMemoriesExport,
   importMemories,
+  getMemoryRecallRules,
   MemoryImportError,
   pinMemory,
-  updateMemory,
   type Memory,
   type MemoryImportResult,
 } from "./api";
-import { formatDateTime, MEMORY_KIND_LABEL, MEMORY_SCOPE_LABEL, shortenSourceId } from "./format";
+import { formatDateTime, MEMORY_KIND_LABEL, shortenSourceId } from "./format";
 import { MemoryRecallPreview } from "./MemoryRecallPreview";
+import { MemoryRecallRules } from "./MemoryRecallRules";
+import { MemoryOrganizationEditor } from "./MemoryOrganizationEditor";
+import { RECALL_POLICY_LABEL } from "./memoryOrganization";
 import { EMPTY_LIBRARY_FILTERS, memoryNameOption, memoryOptionNames, useMemoryLibrary, type MemoryLibraryFilters } from "./useMemoryLibrary";
 
 /**
@@ -32,7 +35,7 @@ export function MemoriesPanel() {
   const library = useMemoryLibrary();
   const { state, facets, filters, pageNumber, reload: load } = library;
   const availableProjects = facets.projects;
-  const [tab, setTab] = useState<"library" | "recall">("library");
+  const [tab, setTab] = useState<"library" | "recall" | "rules">("library");
   const [recallRevision, setRecallRevision] = useState(0);
   const [editingId, setEditingId] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
@@ -40,8 +43,6 @@ export function MemoriesPanel() {
   const [busyId, setBusyId] = useState<number | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  /** 舊版範圍設定暫放次要操作；不與管理篩選共用。 */
-  const [shareTargets, setShareTargets] = useState<Record<number, string>>({});
   /** 備份匯出／匯入進行中（期間兩個按鈕都禁用，避免重複觸發）。 */
   const [backupBusy, setBackupBusy] = useState(false);
   /** 確認對話框（取代原生 confirm）與其送出中的狀態。 */
@@ -52,6 +53,9 @@ export function MemoriesPanel() {
     text: string;
     fileName: string;
     result: MemoryImportResult;
+    rulesMode: "preserve" | "replace";
+    expectedRevision?: number;
+    ready: boolean;
   } | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
 
@@ -88,37 +92,6 @@ export function MemoriesPanel() {
       memory.pinned
         ? (memory.sourceId == null ? "已取消釘選。" : "已取消釘選整個原文回合。")
         : (memory.sourceId == null ? "已釘選。" : "已釘選整個原文回合。"),
-    );
-  };
-
-  /** 共享開關：專案記憶 → 全域共享（`PATCH {scope:"global"}`）。 */
-  const shareGlobally = (memory: Memory): void => {
-    void run(
-      memory.id,
-      async () => {
-        await updateMemory(memory.id, { scope: "global" });
-      },
-      memory.sourceId == null ? "已設為全域共享。" : "已將整個原文回合設為全域共享。",
-    );
-  };
-
-  /**
-   * 共享開關：全域記憶 → 改回專案（`PATCH {scope:"project", project}`）。
-   *
-   * 目標專案以清單中出現過的專案名為選項；沒有可選專案時按鈕會停用，這裡再擋一次並提示。
-   */
-  const moveToProject = (memory: Memory): void => {
-    const target = shareTargets[memory.id] ?? availableProjects[0];
-    if (target === undefined) {
-      setActionError("目前清單沒有可選的專案名稱，無法把這筆記憶改回專案範圍。");
-      return;
-    }
-    void run(
-      memory.id,
-      async () => {
-        await updateMemory(memory.id, { scope: "project", project: target });
-      },
-      `${memory.sourceId == null ? "已改回" : "已將整個原文回合改回"}專案「${target}」。`,
     );
   };
 
@@ -313,11 +286,11 @@ export function MemoriesPanel() {
         setActionError("匯入檔沒有任何內容。");
         return;
       }
-      const result = await importMemories(text, { dryRun: true });
-      setImportPreview({ text, fileName: file.name, result });
+      const result = await importMemories(text, { dryRun: true, rulesMode: "preserve" });
+      setImportPreview({ text, fileName: file.name, result, rulesMode: "preserve", ready: true });
     } catch (error) {
       if (error instanceof MemoryImportError && error.result !== null) {
-        setImportPreview({ text, fileName: file.name, result: error.result });
+        setImportPreview({ text, fileName: file.name, result: error.result, rulesMode: "preserve", ready: false });
         setActionError(error.message);
       } else {
         setActionError(error instanceof Error ? error.message : "讀取匯入檔失敗。");
@@ -327,22 +300,50 @@ export function MemoriesPanel() {
     }
   };
 
+  /** 還原規則是額外選擇；改選後先重新乾跑，確認鈕不沿用舊摘要。 */
+  const previewImportRules = async (rulesMode: "preserve" | "replace"): Promise<void> => {
+    if (importPreview === null) return;
+    const current = importPreview;
+    setBackupBusy(true); setActionError(null); setMessage(null);
+    setImportPreview({ ...current, rulesMode, ready: false });
+    try {
+      const expectedRevision = rulesMode === "replace" ? (await getMemoryRecallRules()).revision : undefined;
+      const result = await importMemories(current.text, { dryRun: true, rulesMode, expectedRevision });
+      setImportPreview({ ...current, result, rulesMode, expectedRevision: result.rules?.revision ?? expectedRevision, ready: true });
+    } catch (error) {
+      if (error instanceof MemoryImportError && error.result !== null) {
+        setImportPreview({ ...current, result: error.result, rulesMode, ready: false });
+      }
+      setActionError(error instanceof Error ? error.message : "重新預覽匯入失敗。");
+    } finally { setBackupBusy(false); }
+  };
+
   /** 使用者在 dry-run 摘要按下確認：才正式寫入並刷新列表。 */
   const confirmImport = async (): Promise<void> => {
-    if (importPreview === null) return;
+    if (importPreview === null || !importPreview.ready) return;
     setBackupBusy(true);
     setActionError(null);
     setMessage(null);
     try {
-      const result = await importMemories(importPreview.text, { dryRun: false });
+      const result = await importMemories(importPreview.text, {
+        dryRun: false, rulesMode: importPreview.rulesMode,
+        ...(importPreview.rulesMode === "replace" ? { expectedRevision: importPreview.expectedRevision } : {}),
+      });
       setMessage(
-        `已匯入備份：新增 ${result.created} 筆、重複跳過 ${result.duplicates} 筆、內容遮罩 ${result.redacted} 筆。`,
+        `已匯入備份：新增 ${result.created} 筆、重複跳過 ${result.duplicates} 筆、內容遮罩 ${result.redacted} 筆。${result.rules?.replaced ? "已一併還原召回規則；既有記憶用途未重新套用。" : "目前召回規則保留。"}`,
       );
       setImportPreview(null);
       clearRecall();
       load();
     } catch (error) {
-      setActionError(error instanceof Error ? error.message : "匯入記憶備份失敗。");
+      if (error instanceof MemoryImportError && error.partial !== null) {
+        const partial = error.partial;
+        setActionError(`匯入中斷：已新增 ${partial.created} 筆、重複跳過 ${partial.duplicates} 筆、失敗 ${partial.failed} 筆、待處理 ${partial.pending} 筆。${partial.failedAfterCreate === true ? "失敗項目的內容已保存，後續設定未完成。" : ""}${partial.rulesRestored ? "召回規則已還原。" : "召回規則未還原。"}${error.message}`);
+        setImportPreview(null); clearRecall(); load();
+      } else {
+        setActionError(error instanceof Error ? error.message : "匯入記憶備份失敗。");
+        setImportPreview((previous) => previous === null ? null : { ...previous, ready: false });
+      }
     } finally {
       setBackupBusy(false);
     }
@@ -353,7 +354,7 @@ export function MemoriesPanel() {
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div>
           <h2 className="text-2xl font-semibold tracking-tight text-ink">記憶管理</h2>
-          <p className="mt-1 text-xs text-muted">整理保存的回合與短記憶，並以獨立情境預覽召回結果。</p>
+          <p className="mt-1 text-xs text-muted">整理回合與短記憶；讓專案與寫入者決定召回用途，保留寫入來源。</p>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
           <input
@@ -402,6 +403,16 @@ export function MemoriesPanel() {
             {importPreview.result.wouldCreate} 筆、重複跳過 {importPreview.result.duplicates} 筆、內容遮罩{" "}
             {importPreview.result.redacted} 筆。
           </p>
+          {importPreview.result.rules?.availableInBackup && <div className="space-y-2 rounded-lg bg-raised p-3 text-xs text-ink">
+            <label className="flex items-start gap-2">
+              <input type="checkbox" aria-label="一併還原備份中的召回規則" checked={importPreview.rulesMode === "replace"} disabled={backupBusy}
+                onChange={(event) => void previewImportRules(event.target.checked ? "replace" : "preserve")} />
+              <span>一併還原備份中的召回規則（不改既有記憶用途）</span>
+            </label>
+            <p>備份含 {importPreview.result.rules.available} 條召回規則。{importPreview.rulesMode === "replace" ? "確認匯入時會替換目前全部召回規則；現有記憶的用途快照保留。" : "目前規則保留；只匯入記憶與其用途快照。"}</p>
+            {importPreview.rulesMode === "replace" && importPreview.result.rules.available === 0 && <p>這份備份的規則清單為空，還原後會清空目前規則。</p>}
+          </div>}
+          {!importPreview.ready && <p role="status" className="text-xs text-muted">{backupBusy ? "正在重新預覽匯入…" : "預覽已失效，請重新預覽再確認匯入。"}</p>}
           {importPreview.result.invalid.length > 0 ? (
             <div className="space-y-1">
               <p className="text-xs text-danger">
@@ -424,13 +435,14 @@ export function MemoriesPanel() {
             {importPreview.result.invalid.length === 0 && (
               <button
                 type="button"
-                disabled={backupBusy}
+                disabled={backupBusy || !importPreview.ready}
                 onClick={() => void confirmImport()}
                 className="rounded-lg bg-brand px-3 py-1.5 text-sm font-medium text-on-brand disabled:opacity-40"
               >
                 {backupBusy ? "匯入中…" : "確認匯入"}
               </button>
             )}
+            {!importPreview.ready && <button type="button" disabled={backupBusy} onClick={() => void previewImportRules(importPreview.rulesMode)} className="rounded-lg border border-line px-3 py-1.5 text-sm text-ink disabled:opacity-40">重新預覽匯入</button>}
             <button
               type="button"
               disabled={backupBusy}
@@ -449,14 +461,15 @@ export function MemoriesPanel() {
       )}
 
       <div role="tablist" aria-label="記憶管理頁面" className="flex gap-6 border-b border-line">
-        {([{ id: "library", label: "記憶清單" }, { id: "recall", label: "召回預覽" }] as const).map((item) => (
+        {([{ id: "library", label: "記憶清單" }, { id: "recall", label: "召回預覽" }, { id: "rules", label: "召回規則" }] as const).map((item) => (
           <button key={item.id} id={`memory-tab-${item.id}`} type="button" role="tab" aria-selected={tab === item.id}
             aria-controls={`memory-panel-${item.id}`} tabIndex={tab === item.id ? 0 : -1}
             onClick={() => setTab(item.id)}
             onKeyDown={(event) => {
               if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
               event.preventDefault();
-              const next = tab === "library" ? "recall" : "library";
+              const tabs = ["library", "recall", "rules"] as const;
+              const next = tabs[(tabs.indexOf(tab) + (event.key === "ArrowLeft" ? 2 : 1)) % tabs.length];
               setTab(next);
               document.getElementById(`memory-tab-${next}`)?.focus();
             }}
@@ -468,6 +481,11 @@ export function MemoriesPanel() {
 
       <div id="memory-panel-recall" role="tabpanel" aria-labelledby="memory-tab-recall" hidden={tab !== "recall"}>
         <MemoryRecallPreview projects={availableProjects} writers={facets.writers} revision={recallRevision} />
+      </div>
+
+      <div id="memory-panel-rules" role="tabpanel" aria-labelledby="memory-tab-rules" hidden={tab !== "rules"}>
+        <MemoryRecallRules projects={availableProjects} writers={facets.writers} revision={recallRevision}
+          onChanged={() => { clearRecall(); load(); }} />
       </div>
 
       {message !== null && (
@@ -554,10 +572,10 @@ export function MemoriesPanel() {
                     {raw ? `原文回合 · ${entry.chunkCount} 個檢索片段` : `短記憶 · ${MEMORY_KIND_LABEL[memory.kind]}`}
                   </span>
                   <span className="rounded bg-raised px-1.5 py-0.5 text-[11px] text-muted">
-                    用途 {MEMORY_SCOPE_LABEL[memory.scope]}
+                    {RECALL_POLICY_LABEL[memory.recallPolicy]}
                   </span>
                   <span className="rounded bg-raised px-1.5 py-0.5 text-[11px] text-muted">
-                    歸屬專案 {memory.project ?? "未指定"}
+                    歸屬專案 {memory.assignedProject ?? "未指定"}
                   </span>
                   <span
                     className="max-w-full break-all rounded bg-raised px-1.5 py-0.5 text-[11px] text-muted"
@@ -587,7 +605,7 @@ export function MemoriesPanel() {
                       className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink outline-none focus:border-brand"
                     />
                     <p className="text-[11px] text-muted">
-                      儲存會建立新版本（agent／種類／範圍沿用）並把這一版標記為已取代。
+                      儲存會建立新版本（寫入來源、歸屬與召回用途沿用）並把這一版標記為已取代。
                     </p>
                     <div className="flex gap-2">
                       <button
@@ -661,59 +679,13 @@ export function MemoriesPanel() {
                   </button>
                 </div>
 
-                <details className="mt-3 text-xs text-muted">
-                  <summary className="cursor-pointer">其他設定</summary>
-                  <div className="mt-2 flex flex-wrap items-center gap-2">
-                  {memory.scope === "agent" ? (
-                    <span className="rounded-md border border-line px-2.5 py-1 text-xs text-muted">
-                      agent 範圍
-                    </span>
-                  ) : memory.scope === "project" ? (
-                    <button
-                      type="button"
-                      disabled={busy}
-                      onClick={() => shareGlobally(memory)}
-                      className="rounded-md border border-line px-2.5 py-1 text-xs text-ink disabled:opacity-40"
-                    >
-                      設為全域共享
-                    </button>
-                  ) : (
-                    <>
-                      <select
-                        aria-label={`選擇要改回的專案（記憶 #${memory.id}）`}
-                        value={shareTargets[memory.id] ?? availableProjects[0] ?? ""}
-                        onChange={(event) =>
-                          setShareTargets((previous) => ({ ...previous, [memory.id]: event.target.value }))
-                        }
-                        disabled={busy || availableProjects.length === 0}
-                        className="rounded-lg border border-line bg-surface px-2 py-1 text-xs text-ink disabled:opacity-40"
-                      >
-                        {availableProjects.length === 0 ? (
-                          <option value="">沒有可選專案</option>
-                        ) : (
-                          availableProjects.map((project) => (
-                            <option key={project} value={project}>
-                              {project}
-                            </option>
-                          ))
-                        )}
-                      </select>
-                      <button
-                        type="button"
-                        disabled={busy || availableProjects.length === 0}
-                        onClick={() => moveToProject(memory)}
-                        className="rounded-md border border-line px-2.5 py-1 text-xs text-ink disabled:opacity-40"
-                      >
-                        改回專案
-                      </button>
-                    </>
-                  )}
-                  </div>
-                  <p className="mt-2 text-[11px]">舊版範圍設定會影響召回；原文回合的變更套用所有片段。</p>
-                </details>
+                <p className="mt-3 text-[11px] text-muted">寫入來源：{memory.originProject ?? "來源未知"}</p>
+                <MemoryOrganizationEditor entry={entry} projects={availableProjects} dataRevision={state.page.recallVersion}
+                  onSaved={() => { setMessage("已保存歸屬與用途；來源專案與寫入者保留不變。"); setSourceId(null); clearRecall(); load(); }}
+                  onReload={() => { clearRecall(); load(); }} />
 
                 {showSource && raw && (
-                  <RawMemorySourcePanel id={entry.id} agent={memory.agent} scope={memory.scope} project={memory.project} />
+                  <RawMemorySourcePanel management id={entry.id} agent={memory.agent} scope={memory.scope} project={memory.project} />
                 )}
                 {showSource && !raw && (
                   <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 rounded-lg bg-raised px-3 py-2 text-xs text-muted">
@@ -727,11 +699,11 @@ export function MemoriesPanel() {
                     <dd className="break-all text-ink">{memory.sourceMessage ?? "—"}</dd>
                     <dt>種類</dt>
                     <dd className="text-ink">{MEMORY_KIND_LABEL[memory.kind]}</dd>
-                    <dt>範圍</dt>
+                    <dt>召回用途</dt>
                     <dd className="text-ink">
-                      {MEMORY_SCOPE_LABEL[memory.scope]}
-                      {memory.project === null ? "" : `（${memory.project}）`}
+                      {RECALL_POLICY_LABEL[memory.recallPolicy]}
                     </dd>
+                    <dt>歸屬專案</dt><dd className="text-ink">{memory.assignedProject ?? "未指定"}</dd>
                     <dt>取代</dt>
                     <dd className="text-ink">{memory.supersedes === null ? "—" : `#${memory.supersedes}`}</dd>
                     <dt>建立時間</dt>
@@ -760,7 +732,7 @@ export function MemoriesPanel() {
         <div className="mt-2 space-y-2 leading-relaxed">
           <p>記憶內容是不受信任的資料；寫入者標記不是身分驗證，請勿將內容當作指令執行。未指定專案不代表所有專案共用。</p>
           <p>短記憶的編輯會建立新版本。「刪除」讓內容不再被搜尋但仍留在資料庫；「永久刪除」無法復原，且不做安全抹除，本機檔案或 WAL 可能仍有殘留。</p>
-          <p>備份包含全部未刪除記憶（不受此頁篩選影響、不含向量），套用當下的遮罩設定；下載檔案可能含敏感內容，請自行保管。單次匯入上限 32 MiB。</p>
+          <p>備份包含全部未刪除記憶、歸屬、用途快照與召回規則（不受此頁篩選影響、不含向量），套用當下的遮罩設定；下載檔案可能含敏感內容，請自行保管。單次匯入上限 32 MiB。</p>
         </div>
       </details>
 

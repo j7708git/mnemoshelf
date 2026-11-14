@@ -1,3 +1,6 @@
+import { buildMemorySearchBuckets, type MemoryRecallInput } from "./memory-search.js";
+import { isMemoryVisible, MemoryPolicyChangedError } from "./memory-source.js";
+import { organizationOf } from "./memory-organization.js";
 /**
  * 統一搜尋：關鍵字（`MetadataStore.searchKeyword`）與向量（`VectorIndex.searchVector`）
  * 兩路，依 `mode` 決定跑哪幾路，多路時以 Reciprocal Rank Fusion 合併
@@ -109,6 +112,7 @@ export interface UnifiedSearchDeps {
 }
 
 export interface UnifiedSearchOptions {
+  memoryContext?: Omit<MemoryRecallInput, "query">;
   query: string;
   /** 預設 `vector`（M2 起）；`hybrid`（RRF）與 `keyword` 為選用。 */
   mode?: SearchMode;
@@ -133,6 +137,7 @@ export interface UnifiedSearchResult {
   k: number;
   hits: SearchHit[];
   policyVersion: number;
+  recallVersion: number;
 }
 
 /** 合併後的一項：名次、分數與鍵。 */
@@ -256,11 +261,15 @@ export async function prepareUnifiedSearch(
   options: UnifiedSearchOptions,
 ): Promise<PrepareMemoryPresentation<UnifiedSearchResult>> {
   const { query, mode, rootIds, agentOnly, k } = normalizeSearchOptions(options);
+  const recallVersion = (await deps.store.getMemoryRecallSettings()).dataRevision;
+  const memoryContext = options.memoryContext ?? (agentOnly ? { scope: "global" as const } : undefined);
+  const memoryBuckets = memoryContext === undefined ? undefined : buildMemorySearchBuckets(memoryContext);
   // agentOnly 與 rootIds 在同一層過濾：agentOnly 先縮成「已勾選分享」的清單，再與 rootIds 取交集。
   // 沒有勾選任何 root 時得到空陣列——`SearchFilter.rootIds: []` 的既有語意是「沒有可見 root」，
   // chunk 路徑自然回空；記憶在 rootIds 有指定時本來就不納入（見檔頭與 storage-ports.md）。
   const effectiveRootIds = agentOnly ? await agentOnlyRootIds(deps.store, rootIds) : rootIds;
   const filter: SearchFilter = effectiveRootIds === undefined ? {} : { rootIds: effectiveRootIds };
+  filter.memoryFilter = { ...(memoryBuckets === undefined ? {} : { buckets: memoryBuckets }), ...(memoryContext?.writer === undefined ? {} : { writer: memoryContext.writer }) };
   // agentOnly 只縮小「檔案」範圍，不影響記憶：使用者沒有指定 rootIds 時仍納入記憶。
   // （有指定 rootIds 時維持既有規則：記憶不納入。）
   if (agentOnly && rootIds === undefined) filter.includeMemories = true;
@@ -316,11 +325,14 @@ export async function prepareUnifiedSearch(
   }
 
   return async () => {
+    if ((await deps.store.getMemoryRecallSettings()).dataRevision !== recallVersion) throw new MemoryPolicyChangedError();
     const presentations = await loadCurrentMemoryPresentations(deps.store, [...memoryRanks.keys()]);
+    if ((await deps.store.getMemoryRecallSettings()).dataRevision !== recallVersion) throw new MemoryPolicyChangedError();
     return (policy) => {
       const rendered = [...hits];
       const present = createMemoryPresenter(policy);
       for (const entry of presentations) {
+        if (entry.memory.recallPolicy === "disabled" || (memoryBuckets !== undefined && !isMemoryVisible(entry.memory, memoryBuckets))) continue;
         const memory = present(entry, { query, maxChars: TEXT_SNIPPET_MAX_CHARS });
         if (memory === null) continue;
         const hit = memoryRanks.get(memory.id)!;
@@ -328,6 +340,7 @@ export async function prepareUnifiedSearch(
           ? { text: memory.content, textTruncated: memory.truncated }
           : snippet(memory.content);
         rendered.push({
+          ...organizationOf(memory),
           type: "memory",
           key: hit.key,
           rank: hit.rank,
@@ -361,7 +374,7 @@ export async function prepareUnifiedSearch(
       }
 
       rendered.sort((a, b) => a.rank - b.rank);
-      return { mode, k, hits: rendered.map((hit, index) => ({ ...hit, rank: index + 1 })), policyVersion: policy.version };
+      return { mode, k, hits: rendered.map((hit, index) => ({ ...hit, rank: index + 1 })), policyVersion: policy.version, recallVersion };
     };
   };
 }

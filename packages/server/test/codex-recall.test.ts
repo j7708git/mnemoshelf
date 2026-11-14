@@ -84,6 +84,7 @@ describe("Codex 自動召回", () => {
     expect(search?.redirect).toBe("error");
     expect(new Headers(search?.headers).get("authorization")).toBe(`Bearer ${credential}`);
     expect(JSON.parse(String(search?.body))).toEqual({
+      agent: "codex/turn",
       query: `${hookEvent.prompt}\n \n \npassword=\"[REDACTED:assignment]\"`,
       project: "project-a",
       k: 4,
@@ -112,7 +113,7 @@ describe("Codex 自動召回", () => {
         env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, homeDir, fetchImpl,
       });
       expect(JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body))).toEqual({
-        query: hookEvent.prompt, scope: "global", k: 4, minScore: 0.65,
+        query: hookEvent.prompt, scope: "global", agent: "codex/turn", k: 4, minScore: 0.65,
       });
       expect(output?.hookSpecificOutput.additionalContext).toContain(globalHit.content);
       expect(output?.hookSpecificOutput.additionalContext).not.toContain("其他專案");
@@ -214,4 +215,19 @@ describe("Codex 自動召回", () => {
     expect(output).toBeNull();
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
+});
+
+it("召回身分精確使用 codex/turn，政策版本變更時不注入", async () => {
+  let confirmedRecallVersion = 4;
+  const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+    if (url === `${baseUrl}/health`) return Response.json({ service: "mnemoshelf" });
+    if (url === `${baseUrl}/memory-policy`) return Response.json({ maskSecrets: true, version: 1, recallVersion: confirmedRecallVersion });
+    return Response.json({ degraded: false, policyVersion: 1, recallVersion: 4, hits: [{ ...globalHit, scope: "agent", recallPolicy: "agent", agent: "codex/turn", content: "同寫入者政策可召回" }] });
+  });
+  const run = () => runCodexRecall(Readable.from([JSON.stringify({ ...hookEvent, cwd: projectDir })]), { env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, homeDir, fetchImpl });
+  expect((await run())?.hookSpecificOutput.additionalContext).toContain("同寫入者政策可召回");
+  const call = fetchImpl.mock.calls.find(([url]) => url === `${baseUrl}/memories/search`);
+  expect(JSON.parse(String(call?.[1]?.body)).agent).toBe("codex/turn");
+  confirmedRecallVersion = 5;
+  expect(await run()).toBeNull();
 });

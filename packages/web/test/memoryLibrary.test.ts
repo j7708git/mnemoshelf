@@ -5,7 +5,7 @@ import { EMPTY_LIBRARY_FILTERS, memoryLibraryQuery, memoryNameOption, memoryOpti
 const emptyPage: MemoryLibraryPage = {
   entries: [], total: 0, counts: { sources: 0, memories: 0 },
   facets: { projects: ["all", "後頁專案"], writers: ["all", "後頁寫入者"], hasUnassigned: true },
-  nextCursor: null,
+  nextCursor: null, recallVersion: 1,
 };
 
 afterEach(() => vi.unstubAllGlobals());

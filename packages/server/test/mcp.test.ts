@@ -153,6 +153,7 @@ describe("MCP stdio 入口", () => {
       "project",
       "query",
       "scope",
+      "writer",
     ]);
     expect(searchMemories.description).toContain("MNEMOSHELF_PROJECT");
     expect(searchMemories.description).toContain("includeAllProjects");
@@ -389,7 +390,7 @@ describe("MCP stdio 入口", () => {
       }),
     );
 
-    const listed = await mcp.client.callTool({ name: "recall", arguments: {} });
+    const listed = await mcp.client.callTool({ name: "recall", arguments: { includeAllProjects: true } });
     expect(listed.isError).toBeFalsy();
     const memories = jsonOf<{ memories: { id: number; agent: string; kind: string; project: string | null }[] }>(listed).memories;
     expect(memories.map((memory) => memory.id)).toEqual([second.id, first.id]);
@@ -402,13 +403,13 @@ describe("MCP stdio 入口", () => {
     expect(filtered.memories.map((memory) => memory.id)).toEqual([first.id]);
 
     const limited = jsonOf<{ memories: { id: number }[] }>(
-      await mcp.client.callTool({ name: "recall", arguments: { limit: 1 } }),
+      await mcp.client.callTool({ name: "recall", arguments: { limit: 1, includeAllProjects: true } }),
     );
     expect(limited.memories.map((memory) => memory.id)).toEqual([second.id]);
 
     // 軟刪除後不再列出
     await mcp.client.callTool({ name: "forget", arguments: { id: first.id } });
-    const afterForget = jsonOf<{ memories: { id: number }[] }>(await mcp.client.callTool({ name: "recall", arguments: {} }));
+    const afterForget = jsonOf<{ memories: { id: number }[] }>(await mcp.client.callTool({ name: "recall", arguments: { includeAllProjects: true } }));
     expect(afterForget.memories.map((memory) => memory.id)).toEqual([second.id]);
 
     // 參數不合法 → 轉發 REST 的 400

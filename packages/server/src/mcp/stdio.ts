@@ -127,7 +127,7 @@ export const MCP_TOOLS: Tool[] = [
   {
     name: "recall",
     description:
-      `列出未刪除的記憶（由新到舊），可帶 filter：kind／scope／project／agent／limit` +
+      `依召回政策列出目前專案、全域與自身標記的記憶（由新到舊）；disabled 不納入。可帶 kind／scope／project／agent（寫入者篩選）／limit` +
       `（limit 預設 100、上限 500）。內容依目前記憶政策顯示。` +
       `每筆帶來源欄位：agent（寫入者標記）與 sourceSession／sourceMessage（寫入來源，可為 null）。` +
       `${TRUST_MODEL_WARNING}${UNTRUSTED_DATA_WARNING}`,
@@ -138,6 +138,8 @@ export const MCP_TOOLS: Tool[] = [
         scope: { type: "string", enum: ["global", "project", "agent"] },
         project: { type: "string", maxLength: 200, description: "專案名稱（上限 200 字元）" },
         agent: { type: "string", maxLength: 200, description: "寫入者標識（上限 200 字元）" },
+        writer: { type: "string", maxLength: 200, description: "精確寫入者篩選（agent 的新名稱）" },
+        includeAllProjects: { type: "boolean", description: "明確跨全部專案召回" },
         limit: { type: "integer" },
       },
     },
@@ -165,6 +167,7 @@ export const MCP_TOOLS: Tool[] = [
         scope: { type: "string", enum: ["global", "project", "agent"], description: "明確指定召回範圍" },
         kind: { type: "string", enum: ["fact", "decision", "pitfall", "preference"] },
         k: { type: "integer", description: "回傳筆數，預設 10、上限 100" },
+        writer: { type: "string", maxLength: 200, description: "精確寫入者篩選，與召回身分標記分開" },
         minScore: { type: "number", description: "0..1，只過濾語意結果" },
       },
       required: ["query"],
@@ -188,6 +191,7 @@ export const MCP_TOOLS: Tool[] = [
         offset: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
         maxChars: { type: "integer", minimum: 1, maximum: 32_000 },
         policyVersion: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
+        recallVersion: { type: "integer", minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
       },
       required: ["id"],
     },
@@ -513,6 +517,10 @@ export function createMcpServer(options: McpServerOptions): Server {
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const args: Record<string, unknown> = isRecord(request.params.arguments) ? request.params.arguments : {};
 
+    const recallContext = () => {
+      const resolution = resolveProjectName({ argument: args.project, configProject: state.project, ...(options.cwd === undefined ? {} : { cwd: options.cwd }), ...(options.homeDir === undefined ? {} : { homeDir: options.homeDir }) });
+      return { ...(resolution.project === null ? (args.includeAllProjects === true ? {} : { scope: "global" }) : { project: resolution.project }), agent: server.getClientVersion()?.name ?? "mcp", ...(args.scope === undefined ? {} : { scope: args.scope }), ...(args.includeAllProjects === undefined ? {} : { includeAllProjects: args.includeAllProjects }) };
+    };
     try {
       switch (request.params.name) {
         case "search": {
@@ -533,6 +541,7 @@ export function createMcpServer(options: McpServerOptions): Server {
             ...(args.rootIds === undefined ? {} : { rootIds: args.rootIds }),
             ...(args.k === undefined ? {} : { k: args.k }),
             agentOnly,
+            memoryContext: recallContext(),
           })) as Record<string, unknown>;
           const payload =
             sharedRootsCount === undefined
@@ -600,6 +609,8 @@ export function createMcpServer(options: McpServerOptions): Server {
                   ...(args.kind === undefined ? {} : { kind: args.kind }),
                   scope,
                   project,
+                  originProject: resolution.project,
+                  assignedProject: resolution.project,
                   agent,
                   // `force` 原樣轉發（非 boolean 由 REST 回 400），不在 MCP 層自行解讀。
                   ...(args.force === undefined ? {} : { force: args.force }),
@@ -616,11 +627,10 @@ export function createMcpServer(options: McpServerOptions): Server {
             JSON.stringify(
               await callRestWithReconnect(
                 "GET",
-                `/memories${queryString({
+                `/memories/recent${queryString({
+                  ...recallContext(),
                   kind: args.kind,
-                  scope: args.scope,
-                  project: args.project,
-                  agent: args.agent,
+                  writer: args.writer ?? args.agent,
                   limit: args.limit,
                 })}`,
                 "retry",
@@ -671,6 +681,7 @@ export function createMcpServer(options: McpServerOptions): Server {
                 ...(args.k === undefined ? {} : { k: args.k }),
                 ...(args.minScore === undefined ? {} : { minScore: args.minScore }),
                 agent,
+                ...(args.writer === undefined ? {} : { writer: args.writer }),
               }),
               null,
               2,
@@ -684,14 +695,13 @@ export function createMcpServer(options: McpServerOptions): Server {
             throw new ValidationError("id", "必須是正整數");
           }
           const query = queryString({
-            scope: args.scope,
-            project: args.project,
-            agent: args.agent,
-            includeAllProjects: args.includeAllProjects,
+            ...recallContext(),
+            ...(args.agent === undefined ? {} : { agent: args.agent }),
             messageIndex: args.messageIndex,
             offset: args.offset,
             maxChars: args.maxChars,
             policyVersion: args.policyVersion,
+            recallVersion: args.recallVersion,
           });
           const data = await callRestWithReconnect("GET", `/memory-sources/${id}${query}`, "retry");
           if (!isRecord(data) || !isRecord(data.source) || data.source.id !== id ||

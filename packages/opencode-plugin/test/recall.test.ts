@@ -513,7 +513,7 @@ describe("最近回合紀錄（recent turns）", () => {
     expect(
       buildRecentTurnsUrl(connection.baseUrl, { scope: "project", project: "mnemoshelf", limit: 3 }),
     ).toBe(
-      "http://127.0.0.1:43117/memories?scope=project&project=mnemoshelf&agent=opencode-plugin%2Fturn&limit=3",
+      "http://127.0.0.1:43117/memories/recent?scope=project&project=mnemoshelf&writer=opencode-plugin%2Fturn&agent=opencode-plugin%2Fraw-turn&limit=3",
     );
   });
 
@@ -521,7 +521,7 @@ describe("最近回合紀錄（recent turns）", () => {
     const url = buildRecentTurnsUrl(connection.baseUrl, { scope: "global", limit: 5 });
     expect(url).toContain("scope=global");
     expect(url).not.toContain("project=");
-    expect(url).toContain("agent=opencode-plugin%2Fturn");
+    expect(url).toContain("writer=opencode-plugin%2Fturn");
     expect(url).toContain("limit=5");
   });
 

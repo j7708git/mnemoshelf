@@ -23,6 +23,7 @@ export interface SourceWriteRequest {
 export interface MemoryPolicy {
   maskSecrets: boolean;
   version: number;
+  recallVersion?: number;
 }
 
 export interface RawConnection {
@@ -115,7 +116,7 @@ export async function readMemoryPolicy(
     if (typeof policy?.maskSecrets !== "boolean" || !isPositiveId(policy.version)) {
       return { ok: false, reason: "upgrade-required" };
     }
-    return { ok: true, policy: { maskSecrets: policy.maskSecrets, version: policy.version } };
+    return { ok: true, policy: { maskSecrets: policy.maskSecrets, version: policy.version, ...(typeof policy.recallVersion === "number" && Number.isSafeInteger(policy.recallVersion) && policy.recallVersion >= 0 ? { recallVersion: policy.recallVersion } : {}) } };
   } catch {
     return { ok: false, reason: "policy-unavailable" };
   }

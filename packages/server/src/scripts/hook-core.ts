@@ -28,6 +28,7 @@ export const BLOCK_INTRO = "以下是先前對話的回合紀錄與背景資料�
 export const BLOCK_END = "</memory-context>";
 
 export interface RecallOptions {
+  callerAgent?: string;
   prompt: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
@@ -193,7 +194,7 @@ export async function resolveHookConnection(options: {
 export function formatRecallBlock(
   result: unknown,
   project: string | null,
-  options: { limit?: number; maxBlockChars?: number; minScore?: number } = {},
+  options: { limit?: number; maxBlockChars?: number; minScore?: number; callerAgent?: string } = {},
 ): string | null {
   const response = asRecord(result);
   if (response?.degraded !== false || !Array.isArray(response.hits)) return null;
@@ -209,7 +210,9 @@ export function formatRecallBlock(
     const hit = asRecord(rawHit);
     if (hit === null || hit.source !== "semantic" || typeof hit.content !== "string") continue;
     if (typeof hit.score !== "number" || !Number.isFinite(hit.score) || hit.score < minScore || hit.score > 1) continue;
-    if (hit.scope !== "global" && (project === null || hit.scope !== "project" || hit.project !== project)) continue;
+    const recallPolicy = hit.recallPolicy ?? hit.scope;
+    const assignedProject = hit.assignedProject === undefined ? hit.project : hit.assignedProject;
+    if (recallPolicy !== "global" && !(recallPolicy === "project" && project !== null && assignedProject === project) && !(recallPolicy === "agent" && options.callerAgent !== undefined && hit.agent === options.callerAgent)) continue;
 
     const policyAware =
       typeof response.policyVersion === "number" &&
@@ -275,12 +278,20 @@ export async function recallForPrompt(options: RecallOptions): Promise<string | 
         "content-type": "application/json",
         accept: "application/json",
       },
-      body: JSON.stringify({ query, ...scope, k: limit, minScore }),
+      body: JSON.stringify({ query, ...scope, ...(options.callerAgent === undefined ? {} : { agent: options.callerAgent }), k: limit, minScore }),
       redirect: "error",
       signal: AbortSignal.timeout(options.searchTimeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS),
     });
     if (!response.ok) return null;
-    return formatRecallBlock(await response.json(), project, {
+    const result = asRecord(await response.json());
+    if (typeof result?.recallVersion === "number") {
+      const confirmed = await fetchImpl(`${config.url}/memory-policy`, { headers: { authorization: `Bearer ${config.token}`, accept: "application/json" }, redirect: "error", signal: AbortSignal.timeout(DEFAULT_POLICY_TIMEOUT_MS) });
+      if (!confirmed.ok) return null;
+      const policy = asRecord(await confirmed.json());
+      if (policy?.version !== result.policyVersion || policy?.recallVersion !== result.recallVersion) return null;
+    }
+    return formatRecallBlock(result, project, {
+      callerAgent: options.callerAgent,
       limit,
       maxBlockChars: options.maxBlockChars,
       minScore,

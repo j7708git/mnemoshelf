@@ -253,11 +253,11 @@ describe("啟動：legacy 記憶 scope 正規化", () => {
     });
   }
 
-  it("啟動時冪等正規化矛盾資料、只記筆數（不記內容）；第二次啟動不再更新", async () => {
+  it("新寫入立即投影相容欄位並保存歸屬；重啟不改政策或記錄內容", async () => {
     const dataDir = await makeTempDir("mnemoshelf-legacy-scope-");
     dirs.push(dataDir);
 
-    // 第一階段：用 store 直接寫入 REST 不會允許的矛盾組合（模擬舊版遺留資料）。
+    // 直接寫入舊 API 曾允許的 scope/project 組合，現在建立時即保存組織並投影。
     custom = await startOn(dataDir);
     const legacy = custom.store;
     const globalWithProject = await legacy.addMemory({
@@ -295,7 +295,7 @@ describe("啟動：legacy 記憶 scope 正規化", () => {
     await custom.close();
     custom = undefined;
 
-    // 第二階段：重啟 → 啟動時正規化；stderr 只記筆數、不得含記憶內容。
+    // 重啟不應再改已保存的政策；任何記憶內容都不應進 stderr。
     const messages: string[] = [];
     const spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
       messages.push(args.map((arg) => String(arg)).join(" "));
@@ -303,10 +303,9 @@ describe("啟動：legacy 記憶 scope 正規化", () => {
     try {
       custom = await startOn(dataDir);
       const normalizedMessages = messages.filter((message) => message.includes("已正規化"));
-      expect(normalizedMessages).toHaveLength(1);
-      expect(normalizedMessages[0]).toContain("3 筆");
+      expect(normalizedMessages).toHaveLength(0);
       for (const content of ["legacy global 帶 project", "legacy agent 帶 project", "legacy project 沒有 project"]) {
-        expect(normalizedMessages[0]).not.toContain(content);
+        expect(messages.join("\n")).not.toContain(content);
       }
     } finally {
       spy.mockRestore();
@@ -316,9 +315,9 @@ describe("啟動：legacy 記憶 scope 正規化", () => {
     if (running === undefined) throw new Error("第二階段的服務未啟動");
     const listed = (await api(running, "GET", "/memories")).body as ListMemoriesResponse;
     const byId = new Map(listed.memories.map((memory) => [memory.id, memory]));
-    expect(byId.get(globalWithProject.id)).toMatchObject({ scope: "global", project: null });
+    expect(byId.get(globalWithProject.id)).toMatchObject({ scope: "global", project: null, originProject: "legacy-proj", assignedProject: "legacy-proj" });
     expect(byId.get(agentWithProject.id)).toMatchObject({ scope: "agent", project: null });
-    expect(byId.get(projectWithoutProject.id)).toMatchObject({ scope: "global", project: null });
+    expect(byId.get(projectWithoutProject.id)).toMatchObject({ scope: "agent", project: null, recallPolicy: "disabled", assignedProject: null });
     expect(byId.get(legalProject.id)).toMatchObject({ scope: "project", project: "legal-proj" });
     await custom.close();
     custom = undefined;

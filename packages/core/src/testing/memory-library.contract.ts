@@ -26,7 +26,7 @@ export function runMemoryLibraryContract(name: string, factory: MetadataStoreFac
     }
 
     it("空庫有完整且一致的統計與空選單", async () => {
-      expect(await store.listMemoryLibrary()).toEqual({ entries: [], total: 0, counts: { sources: 0, memories: 0 },
+      expect(await store.listMemoryLibrary()).toEqual({ recallVersion: 1, entries: [], total: 0, counts: { sources: 0, memories: 0 },
         facets: { projects: [], writers: [], hasUnassigned: false }, nextCursor: null });
     });
 

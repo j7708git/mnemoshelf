@@ -25,6 +25,7 @@ import type {
   MemorySearchFilter,
   MetadataStore,
 } from "@mnemoshelf/core";
+import { MemoryPolicyChangedError } from "./memory-source.js";
 import { ValidationError } from "./errors.js";
 import {
   createMemoryPresenter,
@@ -71,6 +72,7 @@ export interface MemoryRecallInput {
   scope?: MemoryScope;
   /** 只有明確提供時才納入 agent scope（MCP 一律帶 client 名稱）。 */
   agent?: string;
+  writer?: string;
   kind?: MemoryKind;
   /** 回傳筆數（呼叫端已驗證；未提供用 `MEMORY_SEARCH_DEFAULT_K`）。 */
   k?: number;
@@ -83,6 +85,7 @@ export interface MemoryRecallResponseBody {
   query: string;
   k: number;
   policyVersion: number;
+  recallVersion: number;
   degraded: boolean;
   degradedReason: MemoryRecallDegradedReason | null;
   /** 記憶語意化統計（與 `GET /diagnostics` 的 `memories` 相同來源）。 */
@@ -243,10 +246,12 @@ export async function prepareMemoryRecall(
   deps: MemorySearchDeps,
   input: MemoryRecallInput,
 ): Promise<PrepareMemoryPresentation<MemoryRecallResponseBody>> {
+  const recallVersion = (await deps.store.getMemoryRecallSettings()).dataRevision;
   const buckets = buildMemorySearchBuckets(input);
   const k = input.k ?? MEMORY_SEARCH_DEFAULT_K;
   const filter: MemorySearchFilter = {
     buckets,
+    ...(input.writer === undefined ? {} : { writer: input.writer }),
     ...(input.kind === undefined ? {} : { kind: input.kind }),
   };
   const embedderId = deps.embedder.info.id;
@@ -293,7 +298,9 @@ export async function prepareMemoryRecall(
 
   const ranks = new Map(selected.map(({ memory, item }) => [memory.id, item]));
   return async () => {
+    if ((await deps.store.getMemoryRecallSettings()).dataRevision !== recallVersion) throw new MemoryPolicyChangedError();
     const presentations = await loadCurrentMemoryPresentations(deps.store, [...ranks.keys()]);
+    if ((await deps.store.getMemoryRecallSettings()).dataRevision !== recallVersion) throw new MemoryPolicyChangedError();
     return (policy) => {
       const present = createMemoryPresenter(policy);
       const hits: MemoryRecallHit[] = [];
@@ -309,6 +316,7 @@ export async function prepareMemoryRecall(
         query: memoryContentView(input.query, policy).text,
         k,
         policyVersion: policy.version,
+        recallVersion,
         degraded,
         degradedReason,
         memoryEmbedding,

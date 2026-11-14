@@ -8,6 +8,7 @@ import { migration0006RawMemory } from "./0006_raw_memory.js";
 import { migration0007ChunkMedia } from "./0007_chunk_media.js";
 import { migration0008RootVideoMaxFileBytes } from "./0008_root_video_max_file_bytes.js";
 import { migration0009RootAgentSearchAndMaxFileBytes } from "./0009_root_agent_search_and_max_file_bytes.js";
+import { migration0010MemoryOrganization } from "./0010_memory_organization.js";
 
 /** 依序套用的遷移清單；只允許在尾端追加。 */
 export const MIGRATIONS: readonly Migration[] = [
@@ -20,6 +21,7 @@ export const MIGRATIONS: readonly Migration[] = [
   migration0007ChunkMedia,
   migration0008RootVideoMaxFileBytes,
   migration0009RootAgentSearchAndMaxFileBytes,
+  migration0010MemoryOrganization,
 ];
 
 export {
@@ -32,5 +34,6 @@ export {
   migration0007ChunkMedia,
   migration0008RootVideoMaxFileBytes,
   migration0009RootAgentSearchAndMaxFileBytes,
+  migration0010MemoryOrganization,
 };
 export type { Migration };

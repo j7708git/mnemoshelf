@@ -1098,6 +1098,16 @@ export type MemoryKind = "fact" | "decision" | "pitfall" | "preference";
 
 /** 記憶的作用範圍（與 Core 契約一致）。 */
 export type MemoryScope = "global" | "project" | "agent";
+export type MemoryRecallPolicy = MemoryScope | "disabled";
+
+export interface MemoryOrganization {
+  originProject: string | null;
+  assignedProject: string | null;
+  recallPolicy: MemoryRecallPolicy;
+  recallPolicySource: "legacy" | "default" | "rule" | "override";
+  recallRuleId: string | null;
+  recallRuleRevision: number | null;
+}
 
 export type MemorySourceRole = "user" | "assistant";
 
@@ -1116,7 +1126,7 @@ interface MemorySourceReference {
 }
 
 /** `GET /memories` 回傳的記憶（欄位以 Core 契約為準）。 */
-export interface Memory extends MemorySourceReference {
+export interface Memory extends MemorySourceReference, Partial<MemoryOrganization> {
   id: number;
   content: string;
   kind: MemoryKind;
@@ -1206,10 +1216,11 @@ export interface MemorySourceCursor {
   messageIndex: number;
   offset: number;
   policyVersion: number;
+  recallVersion?: number;
 }
 
 export interface MemorySourcePage {
-  source: {
+  source: Partial<MemoryOrganization> & {
     id: number;
     agent: string;
     scope: MemoryScope;
@@ -1234,13 +1245,14 @@ export interface MemorySourcePage {
   next: MemorySourceCursor | null;
   truncated: boolean;
   policyVersion: number;
+  recallVersion?: number;
   indexState: MemoryEmbeddingStats;
   untrusted: true;
 }
 
 export class MemorySourcePolicyChangedError extends Error {
   constructor() {
-    super("記憶遮罩設定已變更，請從開頭重新讀取。");
+    super("記憶遮罩或召回用途已變更，請從開頭重新讀取。");
     this.name = "MemorySourcePolicyChangedError";
   }
 }
@@ -1250,24 +1262,29 @@ export async function fetchMemorySource(
   access: { scope: MemoryScope; project: string | null; agent: string },
   cursor: MemorySourceCursor | null,
   signal?: AbortSignal,
+  management = false,
 ): Promise<MemorySourcePage> {
-  const query = new URLSearchParams({ scope: access.scope });
-  if (access.scope === "project" && access.project !== null) query.set("project", access.project);
-  if (access.scope === "agent") query.set("agent", access.agent);
+  const query = new URLSearchParams();
+  if (!management) {
+    query.set("scope", access.scope);
+    if (access.scope === "project" && access.project !== null) query.set("project", access.project);
+    if (access.scope === "agent") query.set("agent", access.agent);
+  }
   if (cursor !== null) {
     query.set("messageIndex", String(cursor.messageIndex));
     query.set("offset", String(cursor.offset));
     query.set("policyVersion", String(cursor.policyVersion));
+    if (cursor.recallVersion !== undefined) query.set("recallVersion", String(cursor.recallVersion));
   }
 
-  const response = await apiFetch(`/memory-sources/${id}?${query}`, {
+  const response = await apiFetch(`${management ? "/memory-library/source" : "/memory-sources"}/${id}?${query}`, {
     headers: { accept: "application/json" },
     cache: "no-store",
     signal,
   });
   if (response.status === 409) {
     const error = (await response.json().catch(() => null)) as { error?: unknown } | null;
-    if (error?.error === "policy-changed") throw new MemorySourcePolicyChangedError();
+    if (error?.error === "policy-changed" || error?.error === "recall-changed") throw new MemorySourcePolicyChangedError();
   }
   if (response.status === 404) throw new Error("來源不存在、已刪除或不在可讀取的範圍。");
   if (!response.ok) throw new Error(`讀取記憶來源失敗（HTTP ${response.status}）。`);
@@ -1280,7 +1297,12 @@ export async function fetchMemorySource(
         !Number.isSafeInteger(page.next.offset)))) {
     throw new Error("本機服務回傳的記憶來源格式不正確。");
   }
+  if (page.recallVersion !== undefined && (!Number.isSafeInteger(page.recallVersion) || page.recallVersion < 0 ||
+    (page.next !== null && page.next.recallVersion !== page.recallVersion))) {
+    throw new Error("本機服務回傳的記憶來源修訂不正確。");
+  }
   if (cursor !== null && page.policyVersion !== cursor.policyVersion) throw new MemorySourcePolicyChangedError();
+  if (cursor?.recallVersion !== undefined && page.recallVersion !== cursor.recallVersion) throw new MemorySourcePolicyChangedError();
   return page;
 }
 
@@ -1321,7 +1343,7 @@ export async function listMemories(): Promise<Memory[]> {
 export interface MemoryLibraryEntry {
   type: "source" | "memory";
   id: number;
-  memory: Memory;
+  memory: Memory & MemoryOrganization;
   chunkCount: number;
 }
 
@@ -1331,6 +1353,79 @@ export interface MemoryLibraryPage {
   counts: { sources: number; memories: number };
   facets: { projects: string[]; writers: string[]; hasUnassigned: boolean };
   nextCursor: string | null;
+  recallVersion: number;
+}
+
+export interface MemoryRecallRule {
+  id: string;
+  project?: string;
+  writer?: string;
+  policy: MemoryRecallPolicy;
+}
+
+export interface MemoryRecallSettings {
+  revision: number;
+  dataRevision: number;
+  rules: MemoryRecallRule[];
+}
+
+export interface MemoryRulePreview {
+  revision: number;
+  dataRevision: number;
+  matched: { sources: number; memories: number };
+  changed: { sources: number; memories: number };
+  preservedOverrides: { sources: number; memories: number };
+}
+
+export interface MemoryRuleSaveResult extends Omit<MemoryRulePreview, "revision" | "dataRevision"> {
+  settings: MemoryRecallSettings;
+}
+
+export class MemoryRecallConflictError extends Error {
+  constructor() {
+    super("記憶或召回規則已被更新，請重新載入並預覽後再保存。");
+    this.name = "MemoryRecallConflictError";
+  }
+}
+
+async function memoryRuleResponse<T>(response: Response, fallback: string): Promise<T> {
+  if (response.status === 409) throw new MemoryRecallConflictError();
+  if (!response.ok) throw new Error(await readErrorMessage(response, fallback));
+  return await response.json() as T;
+}
+
+export async function getMemoryRecallRules(signal?: AbortSignal): Promise<MemoryRecallSettings> {
+  return memoryRuleResponse(await apiFetch("/memory-recall-rules", { cache: "no-store", signal }), "讀取召回規則失敗");
+}
+
+export async function previewMemoryRecallRule(rule: MemoryRecallRule, signal?: AbortSignal): Promise<MemoryRulePreview> {
+  return memoryRuleResponse(await apiFetch("/memory-recall-rules/preview", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ rule }), signal,
+  }), "預覽召回規則失敗");
+}
+
+export async function saveMemoryRecallRule(rule: MemoryRecallRule, options: {
+  expectedRevision: number; applyExisting: boolean; expectedDataRevision?: number;
+}): Promise<MemoryRuleSaveResult> {
+  const { id, ...fields } = rule;
+  return memoryRuleResponse(await apiFetch(`/memory-recall-rules/${encodeURIComponent(id)}`, {
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...fields, ...options }),
+  }), "保存召回規則失敗");
+}
+
+export async function deleteMemoryRecallRule(id: string, expectedRevision: number): Promise<MemoryRecallSettings> {
+  return memoryRuleResponse(await apiFetch(`/memory-recall-rules/${encodeURIComponent(id)}`, {
+    method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ expectedRevision }),
+  }), "刪除召回規則失敗");
+}
+
+/** 整理與單筆例外以完整回合／短記憶為單位；來源專案與寫入者不送出修改。 */
+export async function updateMemoryOrganization(type: MemoryLibraryEntry["type"], id: number, patch: {
+  assignedProject?: string | null; recallPolicy?: MemoryRecallPolicy | null; expectedDataRevision?: number;
+}): Promise<void> {
+  await memoryRuleResponse(await apiFetch(`/memory-library/${type}/${id}/organization`, {
+    method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(patch),
+  }), "保存記憶歸屬與用途失敗");
 }
 
 export interface MemoryLibraryQuery {
@@ -1355,14 +1450,18 @@ export async function listMemoryLibrary(input: MemoryLibraryQuery = {}, signal?:
   const count = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
   const names = (value: unknown): value is string[] => Array.isArray(value) && value.every((name) => typeof name === "string");
   if (page === null || typeof page !== "object" || !Array.isArray(page.entries) ||
-    !count(page.total) || !count(page.counts?.sources) || !count(page.counts?.memories) ||
+    !count(page.total) || !count(page.recallVersion) || !count(page.counts?.sources) || !count(page.counts?.memories) ||
     page.total !== page.counts.sources + page.counts.memories ||
     !names(page.facets?.projects) || !names(page.facets?.writers) || typeof page.facets?.hasUnassigned !== "boolean" ||
     (page.nextCursor !== null && typeof page.nextCursor !== "string") ||
     page.entries.some((entry) => entry === null || typeof entry !== "object" ||
       !["source", "memory"].includes(entry.type) || !count(entry.id) || entry.id === 0 ||
       !count(entry.chunkCount) || entry.chunkCount === 0 || !count(entry.memory?.id) ||
-      entry.memory.id === 0 || typeof entry.memory.content !== "string" || typeof entry.memory.agent !== "string")) {
+      entry.memory.id === 0 || typeof entry.memory.content !== "string" || typeof entry.memory.agent !== "string" ||
+      !["project", "global", "agent", "disabled"].includes(entry.memory.recallPolicy) ||
+      !["legacy", "default", "rule", "override"].includes(entry.memory.recallPolicySource) ||
+      (entry.memory.originProject !== null && typeof entry.memory.originProject !== "string") ||
+      (entry.memory.assignedProject !== null && typeof entry.memory.assignedProject !== "string"))) {
     throw new Error("本機服務回傳的記憶清單格式不正確。");
   }
   return page;
@@ -1478,6 +1577,17 @@ export interface MemoryImportResult {
   redacted: number;
   created: number;
   wouldCreate: number;
+  rules?: { mode: "preserve" | "replace"; available: number; availableInBackup: boolean; replaced: boolean; revision: number };
+}
+
+export interface MemoryImportPartialResult {
+  partial: true;
+  created: number;
+  duplicates: number;
+  failed: number;
+  pending: number;
+  rulesRestored: boolean;
+  failedAfterCreate?: boolean;
 }
 
 /**
@@ -1485,11 +1595,13 @@ export interface MemoryImportResult {
  */
 export class MemoryImportError extends Error {
   readonly result: MemoryImportResult | null;
+  readonly partial: MemoryImportPartialResult | null;
 
-  constructor(message: string, result: MemoryImportResult | null = null) {
+  constructor(message: string, result: MemoryImportResult | null = null, partial: MemoryImportPartialResult | null = null) {
     super(message);
     this.name = "MemoryImportError";
     this.result = result;
+    this.partial = partial;
   }
 }
 
@@ -1560,10 +1672,13 @@ export async function downloadMemoriesExport(): Promise<{ filename: string }> {
  */
 export async function importMemories(
   text: string,
-  opts: { dryRun: boolean },
+  opts: { dryRun: boolean; rulesMode?: "preserve" | "replace"; expectedRevision?: number },
 ): Promise<MemoryImportResult> {
-  const query = opts.dryRun ? "?dryRun=1" : "";
-  const response = await apiFetch(`/memories/import${query}`, {
+  const query = new URLSearchParams();
+  if (opts.dryRun) query.set("dryRun", "1");
+  if (opts.rulesMode !== undefined) query.set("rulesMode", opts.rulesMode);
+  if (opts.expectedRevision !== undefined) query.set("expectedRevision", String(opts.expectedRevision));
+  const response = await apiFetch(`/memories/import${query.size > 0 ? `?${query}` : ""}`, {
     method: "POST",
     headers: { "content-type": "application/x-ndjson" },
     body: text,
@@ -1575,9 +1690,11 @@ export async function importMemories(
     } catch {
       // 非 JSON（理論上不會發生）：用通用訊息。
     }
-    const errorRecord = body as { error?: { message?: unknown } } | null;
+    const errorRecord = body as { error?: { message?: unknown }; partial?: boolean } | null;
     const message =
       typeof errorRecord?.error?.message === "string" ? errorRecord.error.message : "匯入記憶備份失敗";
+    if (errorRecord?.partial === true) throw new MemoryImportError(message, null, body as MemoryImportPartialResult);
+    if (response.status === 409) throw new MemoryRecallConflictError();
     throw new MemoryImportError(message, isMemoryImportResult(body) ? body : null);
   }
   return (await response.json()) as MemoryImportResult;
@@ -1622,6 +1739,7 @@ export interface MemoryRecallResult {
   degradedReason: MemoryRecallDegradedReason | null;
   memoryEmbedding: MemoryEmbeddingStats;
   hits: MemoryRecallHit[];
+  recallVersion?: number;
 }
 
 /**
