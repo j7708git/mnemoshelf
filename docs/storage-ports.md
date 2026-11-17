@@ -310,11 +310,11 @@ interface ChunkMedia {
 
 ## 記憶的釘選（M3 擴充）
 
-管理面的標記：`Memory.pinned: boolean`（型別見 `ports/types.ts`）。既有資料與新增的記憶一律
-預設 `false`；`NewMemory` 刻意**不含** `pinned`，要釘選請用下列方法。
+管理面的標記為 `Memory.pinned: boolean`（型別見 `ports/types.ts`），預設 `false`。
 
 | 方法 | 語意 |
 |---|---|
+| `MetadataStore.addMemory(memory, { pinned })` | 在建立新版及軟刪除舊版的同一筆交易設定釘選 |
 | `MetadataStore.setMemoryPinned(id, pinned)` | 設定／取消釘選，**冪等** |
 
 - **不存在的 id 是無操作**（不拋錯），與 `forgetMemory` 的既有風格一致；需要回 404 的

@@ -630,7 +630,7 @@ export class SqliteMetadataStore implements MetadataStore {
     );
   }
 
-  async addMemory(m: NewMemory): Promise<Memory> {
+  async addMemory(m: NewMemory, { pinned = false } = {}): Promise<Memory> {
     const dedupe = memoryDedupeIdentity(m);
     const createdAt = new Date().toISOString();
     const insert = this.db.transaction((): number => {
@@ -640,8 +640,8 @@ export class SqliteMetadataStore implements MetadataStore {
       }
       const info = this.db
         .prepare(
-          `insert into memories(content, kind, scope, project, agent, supersedes, source_session, source_message, created_at, deleted_at, content_hash)
-           values (?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?)`,
+          `insert into memories(content, kind, scope, project, agent, supersedes, source_session, source_message, created_at, deleted_at, content_hash, pinned)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?, ?)`,
         )
         .run(
           m.content,
@@ -654,6 +654,7 @@ export class SqliteMetadataStore implements MetadataStore {
           m.sourceMessage ?? null,
           createdAt,
           memoryContentHash(m.content),
+          pinned ? 1 : 0,
         );
       const memoryId = Number(info.lastInsertRowid);
       this.db.prepare("update memories set dedupe_scope = ?, dedupe_project = ? where id = ?").run(dedupe.scope, dedupe.project, memoryId);

@@ -178,7 +178,7 @@ export interface Memory extends MemoryOrganization {
   /**
    * 是否釘選（M3 擴充）。
    *
-   * 由 `MetadataStore.setMemoryPinned` 設定；既有資料與新增的記憶一律預設 `false`。
+   * 可由 `MetadataStore.setMemoryPinned` 設定；新增記憶預設 `false`，編輯時可繼承舊版。
    * 這是管理面的標記，**不影響**搜尋排名或 `listMemories` 的排序（UI 自行把釘選者排前面）。
    */
   pinned: boolean;
@@ -208,8 +208,7 @@ export interface Memory extends MemoryOrganization {
 /**
  * 新增記憶時的輸入（id／createdAt／deletedAt 由儲存層產生）。
  *
- * `pinned` 刻意**不在**輸入內：新增的記憶一律 `false`，要釘選請用
- * `MetadataStore.setMemoryPinned`（見 `Memory.pinned`）。
+ * `pinned` 預設為 `false`；編輯時由 `MetadataStore.addMemory` 的寫入選項繼承。
  *
  * `sourceSession`／`sourceMessage` 是**選填**（未提供或 `null` → 儲存為 `null`）：
  * 這樣既有的呼叫端不必改，也讓舊資料與新資料共用同一個型別（D4a 是 additive 擴充）。

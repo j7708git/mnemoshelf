@@ -599,10 +599,11 @@ export function runMetadataStoreContract(name: string, factory: MetadataStoreFac
         project: null,
         agent: "implementer",
         supersedes: first.id,
-      });
+      }, { pinned: true });
 
       expect((await store.getMemory(first.id))?.deletedAt).not.toBeNull();
       expect(second.supersedes).toBe(first.id);
+      expect(second.pinned).toBe(true);
 
       const hits = await store.searchKeyword("縮排", {}, 10);
       expect(hits.map((h) => h.key)).toEqual([`m:${second.id}`]);

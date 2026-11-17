@@ -18,6 +18,7 @@
  * - `POST /search`（`query` 超過模型單筆輸入上限時 → `400 InputTooLongError`，見 `toHttpError`）
  * - `POST /memories`（精確去重：重複回 200＋`duplicate: true`，新增回 201 並 enqueue 背景嵌入）、
  *   `GET /memories`、`PATCH /memories/:id`、`POST /memories/:id/pin`、
+ *   `POST /memories/:id/revisions`（更正短記憶內容）、
  *   `DELETE /memories/:id`（預設軟刪除；`?hard=true` 硬刪除）
  * - `GET  /memories/export`（NDJSON 備份下載；讀取遮罩視圖、只含未刪除）
  *   `POST /memories/import`（NDJSON 匯入；raw body 上限 32 MiB、`?dryRun=1` 只預覽、
@@ -66,6 +67,7 @@ import {
   type MediaDecoder,
   type MemoryScope,
   type MetadataStore,
+  type NewMemory,
   type Modality,
   normalizeMemoryPatch,
   normalizeMemoryLibraryFilter,
@@ -95,6 +97,7 @@ import {
   IndexInProgressError,
   InvalidHostError,
   InvalidRequestUrlError,
+  MemoryRevisionConflictError,
   MethodNotAllowedError,
   NotFoundError,
   NonLoopbackRequestError,
@@ -831,6 +834,7 @@ export function toHttpError(error: unknown): {
   if (error instanceof MemorySourceConflictError || error instanceof MemoryRecallConflictError) {
     return { status: 409, body: { error: { name: error.name, message: error.message, code: error.code } }, headers: {} };
   }
+  if (error instanceof MemoryRevisionConflictError) return { status: 409, body: named(error.name, error.message), headers: {} };
   if (error instanceof IndexInProgressError) return { status: 409, body: named(error.name, error.message), headers: {} };
   if (error instanceof PayloadTooLargeError) return { status: 413, body: named(error.name, error.message), headers: {} };
   if (error instanceof FileTooLargeError) return { status: 413, body: named(error.name, error.message), headers: {} };
@@ -1947,6 +1951,26 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     return { status: 200, body };
   };
 
+  // 呼叫者在記憶寫入佇列內讀取舊版，並在同一次寫入中建立新版。
+  const getMemoryToRevise = async (id: number): Promise<Memory> => {
+    const memory = await deps.store.getMemory(id);
+    if (memory === null) throw new NotFoundError("記憶", id);
+    if (memory.sourceId != null) throw new MemorySourceConflictError();
+    if (memory.deletedAt !== null) throw new MemoryRevisionConflictError();
+    return memory;
+  };
+
+  const writeMemory = async (input: NewMemory, { force = false, pinned = false } = {}): Promise<RouteResult> => {
+    const masked = memoryContentView(input.content, await deps.store.getMemoryPolicy());
+    const prepared = { ...input, content: masked.text };
+    const { memory, duplicate } = input.supersedes !== null || force
+      ? { memory: await deps.store.addMemory(prepared, { pinned }), duplicate: false }
+      : await deps.store.addMemoryUnlessDuplicate(prepared);
+    if (duplicate) return presentMemoryResponse(200, memory.id, { duplicate: true, redacted: false, redactedCount: 0 });
+    deps.memoryEmbedder.enqueue(memory.id);
+    return presentMemoryResponse(201, memory.id, { duplicate: false, redacted: masked.redacted, redactedCount: masked.count });
+  };
+
   /**
    * `POST /memories`：新增記憶（卡 C2：精確去重）。
    *
@@ -1960,8 +1984,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
    * （讀取視圖，遮罩）＋`duplicate: true`；新增則回 `201`＋`duplicate: false`。
    * 去重比較的是**遮罩後**內容（寫入前已遮罩），因此「憑證不同但遮罩後同文」視為重複。
    *
-   * 被取代者原本若已釘選，新版本**繼承**其 `pinned`（`NewMemory` 契約仍無 `pinned`，
-   * 新記憶一律 `false`；這裡是 server 端在建立後補一次 `setMemoryPinned` 的行為細節）。
+   * 新版本在同一筆儲存交易繼承 `pinned`。取代的 id 必須是尚未刪除的短記憶。
    *
    * **O2（卡 B1）scope／project 正規化**：
    * - `scope` 省略且有 `project` → 視為 `scope: "project"`（方便呼叫端；避免默默存出矛盾組合）；
@@ -2018,24 +2041,37 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     // D4a：來源欄位（可選、additive）；未提供存 null，不影響去重 key。
     const sourceSession = optionalSourceRef(body.sourceSession, "sourceSession");
     const sourceMessage = optionalSourceRef(body.sourceMessage, "sourceMessage");
+    const origin = parseOrganizationOrigin(body);
 
     return await serializeMemoryWrite(async () => {
-      const replaced = supersedes === null ? null : await deps.store.getMemory(supersedes);
-      const policy = await deps.store.getMemoryPolicy();
-      const masked = memoryContentView(rawContent, policy);
-      const origin = parseOrganizationOrigin(body);
-      const input = { content: masked.text, kind, scope, project, agent: replaced?.agent ?? agent, supersedes, sourceSession, sourceMessage, ...origin, ...(replaced === null ? {} : { organization: organizationOf(replaced) }) };
-      const result = supersedes !== null || force
-        ? { memory: await deps.store.addMemory(input), duplicate: false }
-        : await deps.store.addMemoryUnlessDuplicate(input);
+      const previous = supersedes === null ? null : await getMemoryToRevise(supersedes);
+      return writeMemory({
+        content: rawContent, kind, scope, project, agent: previous?.agent ?? agent, supersedes, sourceSession, sourceMessage, ...origin,
+        ...(previous === null ? {} : { organization: organizationOf(previous) }),
+      }, { force, pinned: previous?.pinned ?? false });
+    });
+  };
 
-      const { id } = result.memory;
-      if (result.duplicate) {
-        return presentMemoryResponse(200, id, { duplicate: true, redacted: false, redactedCount: 0 });
-      }
-      if (replaced?.pinned === true) await deps.store.setMemoryPinned(id, true);
-      deps.memoryEmbedder.enqueue(id);
-      return presentMemoryResponse(201, id, { duplicate: false, redacted: masked.redacted, redactedCount: masked.count });
+  /** `POST /memories/:id/revisions`：更正短記憶的內容，繼承原本的來源、歸屬與用途。 */
+  const reviseMemory = async (request: IncomingMessage, id: number): Promise<RouteResult> => {
+    const body = await readJsonBody(request);
+    for (const key of Object.keys(body)) {
+      if (key !== "content") throw new ValidationError(key, "更正短記憶只接受 content");
+    }
+    const content = requireString(body.content, "content", { maxLength: MAX_MEMORY_CHARS });
+    return serializeMemoryWrite(async () => {
+      const previous = await getMemoryToRevise(id);
+      return writeMemory({
+        content,
+        kind: previous.kind,
+        scope: previous.scope,
+        project: previous.project,
+        agent: previous.agent,
+        supersedes: id,
+        sourceSession: previous.sourceSession,
+        sourceMessage: previous.sourceMessage,
+        organization: organizationOf(previous),
+      }, { pinned: previous.pinned });
     });
   };
 
@@ -2776,6 +2812,10 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     if (segments.length === 3 && segments[2] === "pin") {
       if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
       return await pinMemory(request, parseId(segments[1]!, "記憶"));
+    }
+    if (segments.length === 3 && segments[2] === "revisions") {
+      if (method !== "POST") throw new MethodNotAllowedError(method, ["POST"]);
+      return await reviseMemory(request, parseId(segments[1]!, "記憶"));
     }
     throw new NotFoundError("路徑");
   };

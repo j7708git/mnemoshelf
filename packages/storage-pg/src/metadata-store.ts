@@ -795,7 +795,7 @@ export class PgMetadataStore implements MetadataStore {
     return result.rows.map((row) => String(row.rel_path));
   }
 
-  async addMemory(m: NewMemory): Promise<Memory> {
+  async addMemory(m: NewMemory, { pinned = false } = {}): Promise<Memory> {
     const dedupe = memoryDedupeIdentity(m);
     const createdAt = new Date().toISOString();
     const memoryId = await withTransaction(this.pool, async (client) => {
@@ -804,8 +804,8 @@ export class PgMetadataStore implements MetadataStore {
         await this.markSuperseded(client, m.supersedes, createdAt);
       }
       const result = await client.query(
-        `insert into ${this.memories}(content, kind, scope, project, agent, supersedes, source_session, source_message, created_at, deleted_at, seg, content_hash)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, null, $10, $11)
+        `insert into ${this.memories}(content, kind, scope, project, agent, supersedes, source_session, source_message, created_at, deleted_at, seg, content_hash, pinned)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, null, $10, $11, $12)
          returning id`,
         [
           m.content,
@@ -819,6 +819,7 @@ export class PgMetadataStore implements MetadataStore {
           createdAt,
           segmentOrNull(m.content),
           memoryContentHash(m.content),
+          pinned,
         ],
       );
       const id = Number(result.rows[0]!.id);

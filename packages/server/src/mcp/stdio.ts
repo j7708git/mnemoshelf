@@ -27,6 +27,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema, type Tool } from "@model
 import type { McpConfig } from "../config.js";
 import { McpConnectionError, McpConnectionLostError, ValidationError } from "../errors.js";
 import { APP_VERSION } from "../http/app.js";
+import { MAX_MEMORY_CHARS } from "../memory-export.js";
 import { resolveMcpConnection, type McpConnection, type McpConnectionSource } from "./runtime-connection.js";
 
 /** 每個工具描述都會帶上的警語（任務卡要求）。 */
@@ -97,7 +98,7 @@ export const MCP_TOOLS: Tool[] = [
       `kind：fact／decision／pitfall／preference；scope：global／project／agent。` +
       `專案優先——要寫成全域共享請明確指定 scope: "global"。` +
       `精確去重：同一範圍（scope／project／agent）已有相同內容時不新增，回應是既有記憶並帶 duplicate: true；` +
-      `要強制新增請帶 force: true。內容編輯（產生新版本並取代舊版）仍用 REST 的 supersedes 語意。` +
+      `要強制新增請帶 force: true。更正既有短記憶請使用 update_memory。` +
       `依目前記憶政策遮蔽可辨識的機密（API key／token／私鑰等），回應帶 redacted／redactedCount。` +
       `回應的來源欄位 sourceSession／sourceMessage 一律為 null（MCP 工具沒有 session 資訊；` +
       `自動寫入者走 REST 自行提供）。${UNTRUSTED_DATA_WARNING}`,
@@ -122,6 +123,21 @@ export const MCP_TOOLS: Tool[] = [
         },
       },
       required: ["content"],
+    },
+  },
+  {
+    name: "update_memory",
+    description:
+      `以 id 更正一筆有效短記憶的內容，回傳新版（含新的 id 與 supersedes）；舊版會軟刪除並退出召回。` +
+      `新版繼承原本的來源、歸屬、召回用途與釘選。原文回合請另行記錄更正。${UNTRUSTED_DATA_WARNING}`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        id: { type: "integer", minimum: 1, maximum: Number.MAX_SAFE_INTEGER, description: "要更正的短記憶 id" },
+        content: { type: "string", minLength: 1, maxLength: MAX_MEMORY_CHARS, description: "更正後的完整內容" },
+      },
+      required: ["id", "content"],
+      additionalProperties: false,
     },
   },
   {
@@ -285,7 +301,7 @@ export class RestCallError extends Error {
  * 只有「重試一次也不會改變結果」的呼叫才可以重試：
  * - `retry`：唯讀查詢，以及**沒有** `force: true` 的 `remember`（REST 對相同內容去重，
  *   重試不會產生第二筆）。
- * - `no-retry-write`：`remember` 帶 `force: true`——去重被跳過，重試可能多寫一筆。
+ * - `no-retry-write`：`remember` 帶 `force: true` 或 `update_memory`；連線中斷時須先查詢寫入結果。
  * - `no-retry-delete`：`forget`——重試可能拿到 404，被誤當成「刪除失敗」。
  *
  * 不重試的呼叫失敗時回 `McpConnectionLostError`（穩定代碼 `connection-lost`），
@@ -429,7 +445,7 @@ function toolError(error: unknown): { content: { type: "text"; text: string }[];
  * 建立 MCP server（尚未連接 transport）。
  *
  * 工具參數幾乎原樣轉發給 REST，因此驗證邏輯只有一處（REST）。只有需要組進 URL 的
- * `forget.id` 先做整數檢查，才能在打 REST 前給出清楚的訊息。
+ * 記憶 id 先做整數檢查，才能在打 REST 前給出清楚的訊息。
  */
 export function createMcpServer(options: McpServerOptions): Server {
   const log = options.log ?? ((message: string) => console.error(message));
@@ -713,6 +729,15 @@ export function createMcpServer(options: McpServerOptions): Server {
           return toolText(JSON.stringify(data, null, 2));
         }
 
+        case "update_memory": {
+          const { id, ...body } = args;
+          if (typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0) {
+            throw new ValidationError("id", "必須是安全範圍內的正整數");
+          }
+          const memory = await callRestWithReconnect("POST", `/memories/${id}/revisions`, "no-retry-write", body);
+          return toolText(JSON.stringify(memory, null, 2));
+        }
+
         case "forget": {
           const id = Number(args.id);
           if (!Number.isInteger(id) || id <= 0) throw new ValidationError("id", "必須是正整數");
@@ -826,7 +851,7 @@ function warnIgnoredEnv(
  *
  * 工具呼叫若在**連線層**失敗（服務重啟換埠、暫時連不上），只有**可以安全重試**的工具會
  * 重新解析一次連線（重讀 `runtime.json`、重做 pid 與 `/health` 檢查）並重試該次呼叫一次；
- * 寫入帶 `force: true` 與 `forget` **不重試**（重試可能多寫一筆或刪錯），改回報穩定代碼
+ * `remember` 帶 `force: true`、`update_memory` 與 `forget` **不重試**，改回報穩定代碼
  * `connection-lost` 請使用者先查詢確認。HTTP 有回應的錯誤（401／404／400…）不重試。
  * 重試上限固定 1 次。環境變數來源（`MNEMOSHELF_URL` ＋ `MNEMOSHELF_TOKEN`）重解析時仍是
  * 同一組環境變數，不會改讀 `runtime.json`——服務換埠後請更新環境變數或重啟 agent。

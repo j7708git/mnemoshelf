@@ -1214,7 +1214,7 @@ export function buildInstallCard(harness: AgentGuideHarnessTab, input: AgentGuid
         "",
         "## 3. 重啟 client 並確認",
         "",
-        "完整關閉再啟動 client，確認工具清單有七個工具：`search`、`remember`、`recall`、",
+        "完整關閉再啟動 client，確認工具清單包含 `search`、`remember`、`update_memory`、`recall`、",
         "`forget`、`list_roots`、`search_memories`、`read_memory_source`。",
         "",
         `這個 agent 的預設專案是 \`${project}\`（可自行改 \`MNEMOSHELF_PROJECT\`）。`,
