@@ -68,8 +68,8 @@ session 最長 15 分鐘、每服務最多 128 個、每個最多 4 條活動串
 | `POST /memories/search` | 記憶語意召回（語意不可用時降級關鍵字） |
 | `GET /memories/export` / `POST /memories/import` | NDJSON 備份（import 支援 `?dryRun=1`／`true`，上限 32 MiB） |
 
-備份預設 v2，包含短記憶與完整原文來源，依當下遮罩政策產生；舊 v1 仍可匯入。
-原文上限、事件衝突、分頁與備份相容性見 [原文記憶](raw-memory.md)。
+備份預設 v3，包含短記憶、完整原文來源、組織快照與召回規則，依當下遮罩政策產生；舊 v1／v2 仍可匯入。
+原文上限、事件衝突、分頁與備份相容性見 [原文記憶](raw-memory.md)，組織快照與規則還原見 [記憶整理與召回規則](memory-organization.md)。
 
 `maxFileBytes`（通用單檔上限，非影片）與 `videoMaxFileBytes` 都是 **per-root 持久化**欄位：
 `root.maxFileBytes` 未設定時沿用服務層預設 10 MiB；明確設定後重啟服務仍保留（不再回退預設）。
