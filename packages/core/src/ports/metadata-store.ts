@@ -622,8 +622,8 @@ export interface MetadataStore {
    */
   listRelPaths(rootId: number): Promise<string[]>;
 
-  /** 新增記憶；`supersedes` 有值時把被取代者標記 `deletedAt`。新增的記憶一律 `pinned=false`。 */
-  addMemory(m: NewMemory): Promise<Memory>;
+  /** 新增記憶；同一交易標記被取代者的 `deletedAt`，並設定新版的釘選（預設 `false`）。 */
+  addMemory(m: NewMemory, options?: { pinned?: boolean }): Promise<Memory>;
 
   /**
    * 寫入記憶，但**先做精確去重**：同一 key（內容 hash＋原請求 scope/project＋agent＋assignedProject）已有

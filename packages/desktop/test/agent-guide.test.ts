@@ -333,6 +333,7 @@ describe("buildInstallCard：卡片與片段同源", () => {
     expect(card).toContain("codex mcp list");
     expect(card).toContain("docs/codex-recall.md");
     expect(card).toContain("/hooks");
+    expect(card).not.toContain("七個");
   });
 
   it("dsh 卡優先給 dsh plugin add 絕對路徑，並含兩段手動片段與 install", () => {
@@ -349,12 +350,13 @@ describe("buildInstallCard：卡片與片段同源", () => {
     expect(card).toContain("dsh plugin --profile <PROFILE> add");
   });
 
-  it("other 卡指向欄位對照並要求確認七個工具", () => {
+  it("other 卡指向欄位對照並要求確認 MCP 工具", () => {
     const card = buildInstallCard("other", input);
     expect(card).toContain("其他 client 的欄位對照");
-    expect(card).toContain("七個工具");
+    expect(card).toContain("update_memory");
     expect(card).toContain("search_memories");
     expect(card).toContain("read_memory_source");
+    expect(card).not.toContain("七個");
   });
 });
 

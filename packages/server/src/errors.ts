@@ -15,6 +15,14 @@ export class MissingTokenError extends Error {
   }
 }
 
+/** 被取代或軟刪除的版本已失效。 */
+export class MemoryRevisionConflictError extends Error {
+  constructor() {
+    super("這筆記憶已被取代或刪除，請重新召回後再更正");
+    this.name = "MemoryRevisionConflictError";
+  }
+}
+
 /** 缺少 MCP stdio 入口所需的連線設定（`MNEMOSHELF_URL` / `MNEMOSHELF_TOKEN`）。 */
 export class MissingMcpConfigError extends Error {
   /** 缺少的環境變數名稱。 */

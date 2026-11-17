@@ -1,8 +1,8 @@
 import { PgMemoryOrganizationStore } from "./memory-organization.js";
 import {
   DuplicateRootError,
-  memoryDedupeIdentity, MEMORY_ORGANIZATION_COLUMNS, readMemoryOrganization, legacyMemoryOrganizationPatch,
-  type MemoryOrganizationPatch, type MemoryRecallRule, type MemoryRecallRuleWriteOptions,
+  memoryDedupeIdentity, readMemoryDedupeIdentity, MEMORY_ORGANIZATION_COLUMNS, readMemoryOrganization, legacyMemoryOrganizationPatch,
+  type MemoryDedupeIdentity, type MemoryOrganizationPatch, type MemoryRecallRule, type MemoryRecallRuleWriteOptions,
 
   buildMemoryLibrarySql,
   readMemoryLibraryRows,
@@ -795,17 +795,28 @@ export class PgMetadataStore implements MetadataStore {
     return result.rows.map((row) => String(row.rel_path));
   }
 
-  async addMemory(m: NewMemory): Promise<Memory> {
-    const dedupe = memoryDedupeIdentity(m);
+  private async dedupeForWrite(client: PoolClient, m: NewMemory): Promise<MemoryDedupeIdentity> {
+    if (m.supersedes !== null && m.restoreDedupe === undefined) {
+      const result = await client.query(
+        `select dedupe_scope, dedupe_project, scope, project from ${this.memories} where id = $1 and source_id is null`,
+        [m.supersedes],
+      );
+      if (result.rows[0] !== undefined) return readMemoryDedupeIdentity(result.rows[0]);
+    }
+    return memoryDedupeIdentity(m);
+  }
+
+  async addMemory(m: NewMemory, { pinned = false } = {}): Promise<Memory> {
     const createdAt = new Date().toISOString();
     const memoryId = await withTransaction(this.pool, async (client) => {
       const organization = await this.organization.forWrite(client, m);
+      const dedupe = await this.dedupeForWrite(client, m);
       if (m.supersedes !== null) {
         await this.markSuperseded(client, m.supersedes, createdAt);
       }
       const result = await client.query(
-        `insert into ${this.memories}(content, kind, scope, project, agent, supersedes, source_session, source_message, created_at, deleted_at, seg, content_hash)
-         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, null, $10, $11)
+        `insert into ${this.memories}(content, kind, scope, project, agent, supersedes, source_session, source_message, created_at, deleted_at, seg, content_hash, pinned)
+         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, null, $10, $11, $12)
          returning id`,
         [
           m.content,
@@ -819,6 +830,7 @@ export class PgMetadataStore implements MetadataStore {
           createdAt,
           segmentOrNull(m.content),
           memoryContentHash(m.content),
+          pinned,
         ],
       );
       const id = Number(result.rows[0]!.id);
@@ -835,18 +847,17 @@ export class PgMetadataStore implements MetadataStore {
   /**
    * 原子 insert-or-return-existing（見 `MetadataStore.addMemoryUnlessDuplicate`）。
    *
-   * 去重 key＝（內容 hash, `scope`, `project`, `agent`），`project` 用
-   * `coalesce(project, '') = coalesce($n, '')` 做 null-safe 比較。檢查與新增在同一句
+   * 去重 key 包含內容 hash、原請求範圍與專案、agent 及目前歸屬。檢查與新增在同一句
    * `insert … select … where not exists`（單一 SQL 敘述，搭配交易處理 supersedes 與重讀），
    * 對齊 SQLite 後端的語意。
    */
   async addMemoryUnlessDuplicate(m: NewMemory): Promise<{ memory: Memory; duplicate: boolean }> {
     const createdAt = new Date().toISOString();
     const contentHash = memoryContentHash(m.content);
-    const dedupe = memoryDedupeIdentity(m);
 
     const attempt = await withTransaction(this.pool, async (client) => {
       const organization = await this.organization.forWrite(client, m);
+      const dedupe = await this.dedupeForWrite(client, m);
       if (m.supersedes !== null) {
         await this.markSuperseded(client, m.supersedes, createdAt);
       }
@@ -1248,7 +1259,10 @@ export class PgMetadataStore implements MetadataStore {
         where deleted_at is null
         order by created_at asc, id asc`,
     );
-    return result.rows.map((row) => ({ ...rowToMemory(row), dedupeScope: String(row.dedupe_scope ?? row.scope) as MemoryScope, dedupeProject: row.dedupe_scope == null ? (row.project == null ? null : String(row.project)) : (row.dedupe_project == null ? null : String(row.dedupe_project)) }));
+    return result.rows.map((row) => {
+      const dedupe = readMemoryDedupeIdentity(row);
+      return { ...rowToMemory(row), dedupeScope: dedupe.scope, dedupeProject: dedupe.project };
+    });
   }
 
   /**

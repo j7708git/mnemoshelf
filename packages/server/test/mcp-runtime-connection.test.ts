@@ -852,6 +852,7 @@ describe("MCP 入口透過連線資訊檔啟動（端到端）", () => {
         "remember",
         "search",
         "search_memories",
+        "update_memory",
       ]);
 
       const written = await client.callTool({

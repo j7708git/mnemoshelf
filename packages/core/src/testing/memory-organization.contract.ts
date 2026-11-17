@@ -169,6 +169,65 @@ export function runMemoryOrganizationContract(name: string, factory: () => Memor
       expect(await store.getMemory(restored.memory.id)).toEqual(restored.memory);
     });
 
+    it.each(["addMemory", "addMemoryUnlessDuplicate"] as const)(
+      "%s 編輯保留最初的專案去重維度，沿用目前歸屬",
+      async (method) => {
+        const original = await store.addMemory(input());
+        const moved = (await store.updateMemoryOrganization("memory", original.id, {
+          assignedProject: "beta", recallPolicy: "global",
+        }))!;
+        expect(moved).toMatchObject({ scope: "global", project: null, assignedProject: "beta" });
+        const content = "corrected project memory";
+        const revisionInput = input({ content, scope: moved.scope, project: moved.project, supersedes: original.id });
+        const revision = method === "addMemory"
+          ? await store.addMemory(revisionInput)
+          : (await store.addMemoryUnlessDuplicate(revisionInput)).memory;
+
+        expect(await store.listMemoriesForExport()).toMatchObject([{
+          id: revision.id, content, assignedProject: "beta", dedupeScope: "project", dedupeProject: "alpha",
+        }]);
+        // 去重仍以目前歸屬為界，scope／project 則使用最初請求。
+        expect(await store.addMemoryUnlessDuplicate(input({ content, assignedProject: "beta" })))
+          .toEqual({ memory: revision, duplicate: true });
+        expect((await store.listMemoryLibrary()).total).toBe(1);
+      },
+    );
+
+    it("supersedes 的去重比對沿用原請求維度", async () => {
+      const original = await store.addMemory(input());
+      await store.updateMemoryOrganization("memory", original.id, { recallPolicy: "global" });
+      const content = "existing corrected content";
+      const existing = await store.addMemory(input({ content }));
+      expect(await store.addMemoryUnlessDuplicate(input({
+        content, scope: "global", project: null, supersedes: original.id,
+      }))).toEqual({ memory: existing, duplicate: true });
+      expect((await store.listMemoryLibrary()).total).toBe(1);
+    });
+
+    it("無歸屬的全域記憶停用後仍沿用原去重維度，明示還原欄位優先", async () => {
+      const request = input({ scope: "global", project: null });
+      const original = await store.addMemory(request);
+      const disabled = (await store.updateMemoryOrganization("memory", original.id, { recallPolicy: "disabled" }))!;
+      expect(disabled).toMatchObject({ scope: "agent", project: null, assignedProject: null });
+      const content = "corrected unassigned memory";
+      const revisionInput = { ...request, content, scope: disabled.scope, supersedes: original.id };
+      const revision = await store.addMemory(revisionInput);
+      expect(await store.listMemoriesForExport()).toMatchObject([{
+        id: revision.id, dedupeScope: "global", dedupeProject: null,
+      }]);
+      expect(await store.addMemoryUnlessDuplicate({ ...request, content })).toEqual({ memory: revision, duplicate: true });
+
+      const restored = await store.addMemoryUnlessDuplicate({
+        ...revisionInput,
+        supersedes: revision.id,
+        restoreDedupe: { scope: "project", project: "backup-project" },
+      });
+      expect(restored.duplicate).toBe(false);
+      expect(await store.listMemoriesForExport()).toMatchObject([{
+        id: restored.memory.id, dedupeScope: "project", dedupeProject: "backup-project",
+      }]);
+    });
+
     it("備份保留原去重維度，同庫匯入冪等且不同原請求不因有效投影相同而被合併", async () => {
       const original = await store.addMemory(input());
       await store.updateMemoryOrganization("memory", original.id, { recallPolicy: "global" });

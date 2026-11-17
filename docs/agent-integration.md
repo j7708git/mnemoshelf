@@ -14,7 +14,7 @@ Mnemoshelf 的服務只綁 `127.0.0.1`，而且所有 REST 端點都需要 Beare
 | **0.5.0** | 本文的三層接入契約與三個入口同日釋出：MCP 入口、OpenCode／OpenChamber 外掛、`@mnemoshelf/dsh-plugin`（dsh bundle）。MCP／REST 契約與 0.4.x 相同；dsh 外掛新增回合前召回與回合卡寫入（含 spool）。 |
 | **0.5.1** | App 內更新證明版：功能與 0.5.0 相同（除版本號）。MCP／REST／外掛契約與行為未變。 |
 
-- 原文記憶更新：`runtime.json` 的 `schemaVersion` 仍是 `1`；MCP 現有七個工具（`search`、`remember`、`recall`、`forget`、`list_roots`、`search_memories`、`read_memory_source`）。上表是歷史釋出狀態，不代表本輪已發版。
+- 原文記憶更新：`runtime.json` 的 `schemaVersion` 仍是 `1`。MCP 工具見 [操作手冊](operations.md#mcp-工具)。上表記錄歷史釋出狀態。
 - harness 版本需求：OpenCode 見 [OpenCode 外掛需求](opencode-plugin.md)、dsh 見
   `packages/dsh-plugin/README.md`、codex-cli 的實測版本見下文「MCP-only 快速上手」。
 - **實測範圍（2026-10-28，Linux x64）**：OpenCode 2.2.0（外掛型別 `@opencode/plugin@2.1.1`）、
@@ -186,6 +186,7 @@ MCP 入口的連線來源有兩條，**先環境變數、後連線資訊檔**：
 | `search`／`recall`／`search_memories`／`list_roots` | 重試一次 | 唯讀。 |
 | `remember`（沒有 `force: true`） | 重試一次 | REST 對相同內容去重，重試不會產生第二筆。 |
 | `remember`（`force: true`） | **不重試** | 去重被跳過，重試可能多寫一筆。 |
+| `update_memory` | **不重試** | 前一次可能已建立新版，請先召回確認。 |
 | `forget` | **不重試** | 重試會拿 404 冒充「刪除失敗」，誤導使用者。 |
 
 不重試（或重試一次後仍失敗）時，工具回應帶穩定代碼 `connection-lost`，並說明這次寫入／刪除的
@@ -329,7 +330,7 @@ MCP 是 Agent 主動呼叫的工具；外掛在宿主生命週期自動召回及
 
 | 接入 | 寫入 | 讀取 |
 | --- | --- | --- |
-| MCP | `remember` 保存主動提供的短記憶 | search／recall／search_memories／read_memory_source 等七個工具 |
+| MCP | `remember` 保存主動提供的短記憶，`update_memory` 更正 | `search`／`recall`／`search_memories`／`read_memory_source` |
 | OpenCode／OpenChamber | captureEnabled 預設關閉；舊 digestEnabled 可遷移，不需要 digestModel | 符合觸發條件時自動召回 |
 | dsh | 預設在完成回合擷取原文，可用 captureEnabled 關閉 | 每個回合第一步自動召回 |
 | REST 程式 | 短記憶 POST /memories；完整回合 POST /memory-sources | 搜尋與按來源續讀 |
@@ -681,8 +682,8 @@ MNEMOSHELF_RUNTIME_FILE="$HOME/.local/share/mnemoshelf/runtime.json" node rememb
    完整關閉再啟動 client（不是只開新視窗），讓它啟動 MCP 入口。多數 client 會列出工具；
    也可以看 client 的 MCP log／MCP 入口的 stderr。
 
-   **成功長什麼樣**：工具清單出現 `mnemoshelf` 的七個工具：`search`、`remember`、`recall`、
-   `forget`、`list_roots`、`search_memories`；MCP 入口 stderr 有一行
+   **成功長什麼樣**：工具清單出現 `mnemoshelf` 的工具，包含 `remember`、`update_memory`、
+   `recall` 和 `forget`。MCP 入口 stderr 有一行
    `[mnemoshelf-mcp] 連線來源：連線資訊檔（runtime.json）（127.0.0.1:<port>）`。
 
 4. **`remember`**（約 5 分鐘）
@@ -775,7 +776,7 @@ MNEMOSHELF_RUNTIME_FILE="$HOME/.local/share/mnemoshelf/runtime.json" node rememb
 ### 驗收清單
 
 - [ ] `runtime.json` 存在，`GET /health` 的 `service` 是 `mnemoshelf`。
-- [ ] client 的 `tools/list` 有七個工具。
+- [ ] client 的 `tools/list` 包含 [操作手冊](operations.md#mcp-工具) 列出的工具。
 - [ ] `remember` 回 `201` 或 `200 duplicate: true`。
 - [ ] `recall`／`search_memories` 找得回同一筆。
 - [ ] 文件與設定片段沒有 token；`runtime.json` 不在 repo 內。

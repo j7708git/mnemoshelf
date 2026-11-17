@@ -4,7 +4,7 @@
  * 另一端用 SDK 的 `Client` 連上同一個框架（newline-delimited JSON），
  * 因此 initialize／tools/list／tools/call 都是真的協定往返。
  *
- * 驗收 3：initialize → tools/list（7 工具）→ tools/call（remember→search 找回同一筆；forget 後搜不到）；
+ * 驗收：initialize → tools/list → tools/call（含 remember → update_memory → recall → forget）；
  * token 錯誤時工具回報錯誤。
  */
 import { PassThrough } from "node:stream";
@@ -98,7 +98,7 @@ afterEach(async () => {
 });
 
 describe("MCP stdio 入口", () => {
-  it("initialize → tools/list（7 工具，描述含不受信任資料警語）", async () => {
+  it("initialize → tools/list（8 工具，描述含不受信任資料警語）", async () => {
     const harness = await startMcp();
     rest = harness.rest;
     mcp = harness.mcp;
@@ -118,6 +118,7 @@ describe("MCP stdio 入口", () => {
       "remember",
       "search",
       "search_memories",
+      "update_memory",
     ]);
     for (const tool of tools.tools) {
       expect(tool.description ?? "").toContain("不受信任");
@@ -143,6 +144,9 @@ describe("MCP stdio 入口", () => {
     ]);
     expect(remember.description).toContain("duplicate: true");
     expect(remember.description).toContain("force");
+    const update = tools.tools.find((tool) => tool.name === "update_memory")!;
+    expect(update.inputSchema.required).toEqual(["id", "content"]);
+    expect(update.inputSchema.additionalProperties).toBe(false);
 
     const searchMemories = tools.tools.find((tool) => tool.name === "search_memories")!;
     expect(Object.keys((searchMemories.inputSchema.properties ?? {}) as Record<string, unknown>).sort()).toEqual([
@@ -330,6 +334,178 @@ describe("MCP stdio 入口", () => {
     const afterForget = await mcp.client.callTool({ name: "search", arguments: { query: "unique-marker-77", mode: "keyword" } });
     const remaining = jsonOf<{ hits: { type: string }[] }>(afterForget).hits.filter((hit) => hit.type === "memory");
     expect(remaining).toHaveLength(0);
+  });
+
+  it("remember → update_memory → recall 新版 → forget 軟刪除", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+    const { instance } = rest;
+    const client = mcp.client;
+    const remember = await client.callTool({
+      name: "remember",
+      arguments: { content: "合成偏好：使用四格縮排", kind: "preference", project: "original-project" },
+    });
+    expect(remember.isError).toBeFalsy();
+    const original = jsonOf<{ id: number }>(remember);
+    expect((await api(instance, "POST", `/memories/${original.id}/pin`, { body: { pinned: true } })).status).toBe(200);
+    expect((await api(instance, "PATCH", `/memory-library/memory/${original.id}/organization`, {
+      body: { assignedProject: "current-project", recallPolicy: "project" },
+    })).status).toBe(200);
+
+    const content = "合成偏好：使用兩格縮排";
+    const updated = await client.callTool({ name: "update_memory", arguments: { id: original.id, content } });
+    expect(updated.isError).toBeFalsy();
+    const revision = jsonOf<{ id: number }>(updated);
+    expect(revision.id).not.toBe(original.id);
+    expect(revision).toMatchObject({
+      supersedes: original.id, content, kind: "preference", pinned: true, agent: "test-client",
+      originProject: "original-project", assignedProject: "current-project",
+      recallPolicy: "project", recallPolicySource: "override",
+    });
+    expect(await instance.store.listMemoriesForExport()).toMatchObject([{
+      id: revision.id, dedupeScope: "project", dedupeProject: "original-project",
+    }]);
+    expect(await instance.store.getMemory(original.id)).toMatchObject({ deletedAt: expect.any(String) });
+    const staleEdit = await api(instance, "POST", "/memories", {
+      body: { supersedes: original.id, content: "合成過期編輯", agent: "web" },
+    });
+    expect(staleEdit.status).toBe(409);
+
+    const recall = () => client.callTool({ name: "recall", arguments: { project: "current-project" } });
+    expect(jsonOf(await recall())).toMatchObject({ memories: [{ id: revision.id, content }] });
+
+    const forgotten = await client.callTool({ name: "forget", arguments: { id: revision.id } });
+    expect(forgotten.isError).toBeFalsy();
+    expect(jsonOf(forgotten)).toEqual({ id: revision.id, deleted: true });
+    expect(await instance.store.getMemory(revision.id)).toMatchObject({ content, deletedAt: expect.any(String) });
+    expect(jsonOf(await recall())).toMatchObject({ memories: [] });
+  });
+
+  it.each([
+    { request: { scope: "project", project: "original-project" }, policy: "global", projectedScope: "global" },
+    { request: { scope: "global", project: null }, policy: "disabled", projectedScope: "agent" },
+  ])("update_memory 保留 $request.scope 寫入的去重維度（目前用途 $policy）", async ({ request, policy, projectedScope }) => {
+    const homeDir = path.resolve("synthetic-home");
+    const harness = await startMcp(TEST_TOKEN, { cwd: homeDir, homeDir });
+    rest = harness.rest;
+    mcp = harness.mcp;
+    const { instance } = rest;
+    const client = mcp.client;
+    const { scope, project } = request;
+    const remember = (content: string) => client.callTool({
+      name: "remember", arguments: { content, scope, ...(project === null ? {} : { project }) },
+    });
+
+    const saved = await remember("合成去重測試舊內容");
+    expect(saved.isError).toBeFalsy();
+    const original = jsonOf<{ id: number }>(saved);
+    expect(original).toMatchObject({ scope, project, assignedProject: project });
+    expect(await api(instance, "PATCH", `/memory-library/memory/${original.id}/organization`, {
+      body: { recallPolicy: policy },
+    })).toMatchObject({ status: 200 });
+
+    const content = "合成去重測試新版內容";
+    const updated = await client.callTool({ name: "update_memory", arguments: { id: original.id, content } });
+    expect(updated.isError).toBeFalsy();
+    const revision = jsonOf<{ id: number }>(updated);
+    expect(revision).toMatchObject({ scope: projectedScope, project: null, recallPolicy: policy });
+
+    const backup = await fetch(`${instance.url}/memories/export`, { headers: { authorization: `Bearer ${TEST_TOKEN}` } });
+    expect(backup.status).toBe(200);
+    const rows = (await backup.text()).trim().split("\n").map((line) => JSON.parse(line) as unknown);
+    expect(rows).toContainEqual(expect.objectContaining({
+      schemaVersion: 3, type: "memory", memory: expect.objectContaining({ content }), dedupe: { scope, project },
+    }));
+
+    const replay = await remember(content);
+    expect(replay.isError).toBeFalsy();
+    expect(jsonOf(replay)).toMatchObject({ id: revision.id, duplicate: true });
+    expect((await instance.store.listMemoriesForExport()).map(({ id }) => id)).toEqual([revision.id]);
+  });
+
+  it("REST supersedes 編輯會沿用原始去重維度及目前歸屬", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+    const { instance } = rest;
+    const saved = await mcp.client.callTool({
+      name: "remember", arguments: { content: "合成網頁編輯舊內容", project: "original-project" },
+    });
+    expect(saved.isError).toBeFalsy();
+    const original = jsonOf<{ id: number }>(saved);
+    expect(await api(instance, "PATCH", `/memory-library/memory/${original.id}/organization`, {
+      body: { assignedProject: "current-project", recallPolicy: "global" },
+    })).toMatchObject({ status: 200 });
+
+    const content = "合成網頁編輯新內容";
+    const edited = await api(instance, "POST", "/memories", {
+      body: { content, agent: "web", scope: "global", supersedes: original.id },
+    });
+    expect(edited.status).toBe(201);
+    const revision = edited.body as { id: number };
+    expect(await instance.store.listMemoriesForExport()).toMatchObject([{
+      id: revision.id, assignedProject: "current-project", dedupeScope: "project", dedupeProject: "original-project",
+    }]);
+    expect(await api(instance, "POST", "/memories", { body: {
+      content, agent: "test-client", scope: "project", project: "original-project", assignedProject: "current-project",
+    } })).toMatchObject({ status: 200, body: { id: revision.id, duplicate: true } });
+    expect((await instance.store.listMemoriesForExport()).map(({ id }) => id)).toEqual([revision.id]);
+  });
+
+  it("拒絕更新無效 id、非法內容與原文片段", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+    const { instance } = rest;
+    const source = await api(instance, "POST", "/memory-sources", { body: {
+      agent: "raw-test", scope: "global", sourceSession: "session-a", sourceTurn: "turn-a",
+      messages: [{ sourceMessage: "message-a", role: "user", content: "合成原文紀錄", occurredAt: null }],
+    } });
+    expect(source.status).toBe(201);
+    const [chunkId] = (source.body as { memoryIds: number[] }).memoryIds;
+    expect(chunkId).toBeGreaterThan(0);
+
+    const invalidUpdates = [
+      { arguments: { id: "1", content: "合成更正" }, error: "ValidationError" },
+      { arguments: { id: Number.MAX_SAFE_INTEGER + 1, content: "合成更正" }, error: "ValidationError" },
+      { arguments: { id: chunkId, content: " " }, error: "HTTP 400" },
+      { arguments: { id: chunkId, content: "合成更正", scope: "global" }, error: "HTTP 400" },
+      { arguments: { id: 987654, content: "合成更正" }, error: "HTTP 404" },
+      { arguments: { id: chunkId, content: "合成更正" }, error: "MemorySourceConflictError（HTTP 409）" },
+    ];
+    for (const { arguments: args, error } of invalidUpdates) {
+      const result = await mcp.client.callTool({ name: "update_memory", arguments: args });
+      expect(result.isError).toBe(true);
+      expect(textOf(result)).toContain(error);
+    }
+    expect(await instance.store.getMemory(chunkId!)).toMatchObject({ deletedAt: null });
+    expect((await instance.store.listMemories()).map(({ id }) => id)).toEqual([chunkId]);
+  });
+
+  it("同一短記憶的同時更正只建立一筆新版，已刪除的新版也拒絕更新", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+    const client = mcp.client;
+    const { id } = jsonOf<{ id: number }>(await client.callTool({
+      name: "remember", arguments: { content: "合成舊版", scope: "global" },
+    }));
+    const update = (id: number, content: string) => client.callTool({ name: "update_memory", arguments: { id, content } });
+    const attempts = await Promise.all([update(id, "合成新版 A"), update(id, "合成新版 B")]);
+    const errors = attempts.filter((result) => result.isError);
+    const successes = attempts.filter((result) => !result.isError);
+    expect(errors).toHaveLength(1);
+    expect(textOf(errors[0])).toContain("MemoryRevisionConflictError（HTTP 409）");
+    expect(successes).toHaveLength(1);
+    const revision = jsonOf<{ id: number }>(successes[0]);
+    expect((await rest.instance.store.listMemories()).map((memory) => memory.id)).toEqual([revision.id]);
+
+    await client.callTool({ name: "forget", arguments: { id: revision.id } });
+    const deleted = await update(revision.id, "合成企圖更新已刪除版本");
+    expect(deleted.isError).toBe(true);
+    expect(textOf(deleted)).toContain("MemoryRevisionConflictError（HTTP 409）");
+    expect(await rest.instance.store.listMemories()).toEqual([]);
   });
 
   it("remember 精確去重：重複回既有記憶＋duplicate: true；force 可新增；非 boolean force 回工具錯誤", async () => {
@@ -631,12 +807,17 @@ describe("MCP stdio 入口", () => {
 
     // 協定握手不需要 token（MCP 不重複實作授權）
     expect(harness.mcp.client.getServerVersion()?.name).toBe("mnemoshelf");
-    expect((await harness.mcp.client.listTools()).tools).toHaveLength(7);
+    expect((await harness.mcp.client.listTools()).tools).toHaveLength(8);
 
     const result = await harness.mcp.client.callTool({ name: "list_roots", arguments: {} });
     expect(result.isError).toBe(true);
     expect(textOf(result)).toContain("UnauthorizedError");
     expect(textOf(result)).not.toContain("wrong-token-value");
+    const update = await harness.mcp.client.callTool({
+      name: "update_memory", arguments: { id: 1, content: "合成更正" },
+    });
+    expect(update.isError).toBe(true);
+    expect(textOf(update)).toContain("UnauthorizedError（HTTP 401）");
   });
 
   it("REST 的錯誤名稱原樣轉發（未知 root 的 search 不會偽裝成功）", async () => {
@@ -1043,8 +1224,11 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
     expect(requests).toEqual([`${OLD_URL}/roots`, `${OLD_URL}/roots`]);
   });
 
-  it("remember 帶 force: true 連線失敗 → 不重試，回穩定代碼並請使用者先查詢", async () => {
-    const home = await makeTempDir("mnemoshelf-mcp-force-no-retry-");
+  it.each([
+    { name: "remember", args: { content: "合成強制新增", scope: "global", force: true }, route: "/memories" },
+    { name: "update_memory", args: { id: 7, content: "合成更正" }, route: "/memories/7/revisions" },
+  ])("$name 寫入連線失敗 → 不重試，回穩定代碼並請使用者先查詢", async ({ name, args, route }) => {
+    const home = await makeTempDir("mnemoshelf-mcp-write-no-retry-");
     dirs.push(home);
     const file = path.join(home, "runtime.json");
     const { readFileImpl, reads } = runtimeReader(file, [runtimeJson(OLD_URL, OLD_TOKEN)]);
@@ -1065,10 +1249,7 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
       log: logs,
     });
     try {
-      const result = await harness.client.callTool({
-        name: "remember",
-        arguments: { content: "force 寫入不重試", scope: "global", force: true },
-      });
+      const result = await harness.client.callTool({ name, arguments: args });
       expect(result.isError).toBe(true);
       const text = textOf(result);
       expect(text).toContain("connection-lost");
@@ -1082,7 +1263,7 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
     }
 
     // 只有第一次 REST 呼叫；沒有重讀 runtime 檔（重試才會），也沒有第二次請求。
-    expect(requests.filter((url) => url === `${OLD_URL}/memories`)).toHaveLength(1);
+    expect(requests.filter((url) => url === `${OLD_URL}${route}`)).toHaveLength(1);
     expect(reads()).toBe(1);
     // 原始錯誤只寫進 stderr 診斷輸出，且不含 token／路徑。
     const logText = logs.join("\n");
@@ -1316,7 +1497,7 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
     const client = new Client({ name: "io-client", version: "0.0.0" });
     await client.connect(new StdioServerTransport(serverToClient, clientToServer));
     try {
-      expect((await client.listTools()).tools).toHaveLength(7);
+      expect((await client.listTools()).tools).toHaveLength(8);
       const result = await client.callTool({ name: "list_roots", arguments: {} });
       expect(result.isError).toBeFalsy();
     } finally {

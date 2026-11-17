@@ -37,13 +37,20 @@ export interface MemoryOrganizationInput {
   organization?: MemoryOrganization;
 }
 export interface MemoryDedupeIdentity { scope: MemoryScope; project: string | null }
-/** 僅供備份復原；原請求維度與目前用途投影分開保存。 */
+/** 取原請求的去重維度，受信任的備份復原可明示原值。 */
 export function memoryDedupeIdentity(input: MemoryDedupeIdentity & { restoreDedupe?: MemoryDedupeIdentity }): MemoryDedupeIdentity {
   const identity = input.restoreDedupe ?? input;
   if (!["global", "project", "agent"].includes(identity.scope) ||
     (identity.project !== null && (typeof identity.project !== "string" || identity.project.length > 200 || identity.project.includes("\0")))) throw new TypeError("備份去重維度不合法");
   return { scope: identity.scope, project: identity.project };
 }
+
+/** 舊列缺少去重維度時，匯出和建立新版皆沿用該列的 scope／project。 */
+export function readMemoryDedupeIdentity(row: Record<string, unknown>): MemoryDedupeIdentity {
+  const project = row.dedupe_scope == null ? row.project : row.dedupe_project;
+  return { scope: String(row.dedupe_scope ?? row.scope) as MemoryScope, project: project == null ? null : String(project) };
+}
+
 export interface MemoryOrganizationItem extends MemoryOrganization { type: "source" | "memory"; id: number; agent: string }
 
 export class MemoryRecallConflictError extends Error {

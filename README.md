@@ -34,7 +34,7 @@ pnpm --filter @mnemoshelf/desktop dist
 | 檔案總管 | 自己挑選要納入的資料夾（root）；加入後先乾跑預覽統計（會納入什麼、會跳過什麼），確認後才開始索引。提供目錄樹、檔案預覽與圖片縮圖。 |
 | 語意搜尋 | 文字、圖片與支援的 WAV 音訊落在同一個向量空間；音訊需手動開啟，可用文字查詢並定位時間片段。三種模式 `vector`（預設）、`keyword`、`hybrid`。 |
 | 共用記憶 | 完整記憶庫分頁與專案／寫入者篩選；來源、整理歸屬與召回用途分開保存。可設定專案、寫入者或組合規則，預設只影響新資料；支援單筆例外與 NDJSON 備份（[記憶整理與召回規則](docs/memory-organization.md)）。 |
-| Agent 整合 | MCP 七個工具 `search`、`remember`、`recall`、`forget`、`list_roots`、`search_memories`、`read_memory_source`（[docs/operations.md](docs/operations.md)）；OpenCode／OpenChamber 外掛在模型請求前檢查，於 session 的第一則 prompt 或訊息含明示線索時召回（預設 `first-turn+explicit`；[docs/opencode-plugin.md](docs/opencode-plugin.md)）；dsh 外掛在每個回合第一步召回，回合結束保存原文來源（[docs/agent-integration.md](docs/agent-integration.md)）。 |
+| Agent 整合 | MCP 工具 `search`、`remember`、`update_memory`、`recall`、`forget`、`list_roots`、`search_memories`、`read_memory_source`（[docs/operations.md](docs/operations.md)）；OpenCode／OpenChamber 外掛在模型請求前檢查，於 session 的第一則 prompt 或訊息含明示線索時召回（預設 `first-turn+explicit`；[docs/opencode-plugin.md](docs/opencode-plugin.md)）；dsh 外掛在每個回合第一步召回，回合結束保存原文來源（[docs/agent-integration.md](docs/agent-integration.md)）。 |
 | 連接 Agent | 四種 harness 的接入指引、狀態偵測與可複製片段；只讀使用者層設定，不寫入、不執行安裝（[docs/agent-integration.md](docs/agent-integration.md)、[docs/opencode-plugin.md](docs/opencode-plugin.md)）。 |
 | 原文記憶 | 保存宿主提供的可見使用者／助理文字，以程式切塊及既有 embedding 召回；不需要摘要模型。App 可選擇記憶遮罩，預設開啟；來源可分頁續讀，見 [docs/raw-memory.md](docs/raw-memory.md)。 |
 | 隱私與信任模型 | 預設不掃任何目錄；服務只綁 `127.0.0.1` 並以 token 保護；記憶預設在寫入與讀取時遮罩，使用者可在 App 關閉；檔案索引仍遮罩。現行是**本機單一 owner 全權**：`agent` 只是來源標記、不是身分驗證，`scope=agent` 不是安全邊界（[docs/roots-and-privacy.md](docs/roots-and-privacy.md)）。 |

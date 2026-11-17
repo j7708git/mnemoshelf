@@ -60,7 +60,8 @@ session 最長 15 分鐘、每服務最多 128 個、每個最多 4 條活動串
 | `POST /memory-sources` | 完整原文回合寫入；8 MiB 上限，事件重送去重 |
 | `GET /memory-sources/:id` | 帶範圍與政策版本的來源分頁續讀 |
 | `PATCH /memory-sources/:id` / `DELETE /memory-sources/:id` | 整回合範圍更新／軟硬刪除 |
-| `GET /memories` / `POST /memories` | 列出／寫入（列表可用 `kind`／`scope`／`project`／`agent`／`limit` 篩選） |
+| `GET /memories` / `POST /memories` | 列出／寫入。編輯時可用 `supersedes` 指定有效短記憶 ID。列表可用 `kind`／`scope`／`project`／`agent`／`limit` 篩選 |
+| `POST /memories/:id/revisions` | 用 `{content}` 更正有效短記憶，回 `201` 與新版。ID 不存在回 `404`，已被取代、軟刪除或屬於原文回合回 `409` |
 | `PATCH /memories/:id` | 改 `scope`／`project`（共享開關） |
 | `DELETE /memories/:id?hard=true` | 軟刪除／硬刪除。`hard` **只接受** `true`／`1`，其他值（含 `false`、`yes`）一律 `400`（刻意嚴格防誤觸） |
 | `POST /memories/:id/pin` | 釘選 |
@@ -85,18 +86,22 @@ App 內更新後可用這個欄位確認實際執行的是新版本的建置（�
 ## MCP 工具
 
 MCP 入口是 local stdio 程式，**只把請求轉發給本機 REST，不直接開資料庫**；授權與參數驗證
-都由 REST 決定。共有七個工具：
+都由 REST 決定。
 
 | 工具 | 說明 |
 |---|---|
 | `search` | 搜尋已索引的檔案片段與記憶（`mode`：`vector` 預設／`keyword`／`hybrid`）；**預設 `agentOnly: true`，只搜尋使用者勾選「允許 Agent 搜尋」的資料夾**；要搜全部需明確帶 `agentOnly: false` |
 | `remember` | 寫入一筆記憶；預設以「目前專案」為範圍，重複內容回既有記憶並標 `duplicate` |
+| `update_memory` | 傳入 `{id, content}` 更正短記憶，回傳新的 `id` 與指向舊版的 `supersedes` |
 | `recall` | **跨專案**列出未刪除的記憶（由新到舊，可用 `project`／`scope` 篩選，**不套用**預設專案解析） |
 | `forget` | 依 id 軟刪除；若為原文片段，刪除整個來源回合 |
 | `list_roots` | 列出已加入的 roots（路徑、模式、模態、是否允許 Agent 搜尋）與 `sharedRootsCount`；沒有分享的資料夾時另帶 `hint` |
 | `search_memories` | 用自然語言搜尋記憶（語意優先，預設範圍＝目前專案＋全域共享） |
 | `read_memory_source` | 按來源 ID 與範圍分頁讀取原文角色、時間及上下文 |
 
+- `update_memory` 沿用原本的類別、來源、歸屬、召回用途與釘選。舊版軟刪除，之後請用新版
+  `id` 更正或 `forget`。找不到或無法更正時，先用 `recall` 或 `search_memories` 確認目前版本。
+  原文回合的更正請另行記錄。發生 `connection-lost` 時先召回確認結果，再決定是否重試。
 - **沒有備份用的 MCP 工具**：匯出／匯入只存在 REST（原因與範圍見 `docs/storage-ports.md`
   §記憶的匯出／匯入）。
 - `remember`／`search_memories` 預設以「目前專案」為範圍；專案解析順序＝工具參數 `project`

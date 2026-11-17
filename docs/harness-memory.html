@@ -875,9 +875,9 @@
   <p><strong>什麼時候會自動動作：</strong>OpenCode 外掛在<strong>每次模型請求前</strong>判斷要不要查；dsh 外掛在<strong>每個回合的第一步</strong>查、
     <strong>回合結束</strong>寫；MCP-only 則完全由呼叫端決定時機，沒有背景動作。實際的六個步驟見第 4 章。</p>
 
-  <p><strong>MCP</strong> 是一個讓 agent 用固定介面呼叫外部工具的規格。Mnemoshelf 的 MCP 入口是七個工具：
-    <code>search</code>、<code>remember</code>、<code>recall</code>、<code>search_memories</code>、<code>forget</code>、<code>list_roots</code>、<code>read_memory_source</code>。
-    這七個工具都只是把請求轉給本機服務，入口程式自己不開資料庫。</p>
+  <p><strong>MCP</strong> 是一個讓 agent 用固定介面呼叫外部工具的規格。Mnemoshelf 的 MCP 工具包含
+    <code>search</code>、<code>remember</code>、<code>update_memory</code>、<code>recall</code>、<code>search_memories</code>、<code>forget</code>、<code>list_roots</code>、<code>read_memory_source</code>。
+    所有工具都將請求轉給本機服務。</p>
 
   <p>也可以使用宿主的 <strong>Hook</strong>：Codex 的 <code>UserPromptSubmit</code> 在送出提示時召回，
     <code>Stop</code> 可保存當輪可見原文；Antigravity Adapter 以 <code>PreInvocation</code> 與
@@ -1335,7 +1335,7 @@
     </li>
     <li>
       <a href="https://github.com/j7708git/mnemoshelf/blob/main/docs/operations.md">docs/operations.md（GitHub 上的文件）</a>
-      <span>REST 端點速查、七個 MCP 工具、環境變數總表。</span>
+      <span>REST 端點速查、MCP 工具、環境變數總表。</span>
     </li>
     <li>
       <a href="https://github.com/j7708git/mnemoshelf/blob/main/docs/roots-and-privacy.md">docs/roots-and-privacy.md（GitHub 上的文件）</a>
