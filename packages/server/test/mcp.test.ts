@@ -363,6 +363,9 @@ describe("MCP stdio 入口", () => {
       originProject: "original-project", assignedProject: "current-project",
       recallPolicy: "project", recallPolicySource: "override",
     });
+    expect(await instance.store.listMemoriesForExport()).toMatchObject([{
+      id: revision.id, dedupeScope: "project", dedupeProject: "original-project",
+    }]);
     expect(await instance.store.getMemory(original.id)).toMatchObject({ deletedAt: expect.any(String) });
     const staleEdit = await api(instance, "POST", "/memories", {
       body: { supersedes: original.id, content: "合成過期編輯", agent: "web" },
@@ -377,6 +380,77 @@ describe("MCP stdio 入口", () => {
     expect(jsonOf(forgotten)).toEqual({ id: revision.id, deleted: true });
     expect(await instance.store.getMemory(revision.id)).toMatchObject({ content, deletedAt: expect.any(String) });
     expect(jsonOf(await recall())).toMatchObject({ memories: [] });
+  });
+
+  it.each([
+    { request: { scope: "project", project: "original-project" }, policy: "global", projectedScope: "global" },
+    { request: { scope: "global", project: null }, policy: "disabled", projectedScope: "agent" },
+  ])("update_memory 保留 $request.scope 寫入的去重維度（目前用途 $policy）", async ({ request, policy, projectedScope }) => {
+    const homeDir = path.resolve("synthetic-home");
+    const harness = await startMcp(TEST_TOKEN, { cwd: homeDir, homeDir });
+    rest = harness.rest;
+    mcp = harness.mcp;
+    const { instance } = rest;
+    const client = mcp.client;
+    const { scope, project } = request;
+    const remember = (content: string) => client.callTool({
+      name: "remember", arguments: { content, scope, ...(project === null ? {} : { project }) },
+    });
+
+    const saved = await remember("合成去重測試舊內容");
+    expect(saved.isError).toBeFalsy();
+    const original = jsonOf<{ id: number }>(saved);
+    expect(original).toMatchObject({ scope, project, assignedProject: project });
+    expect(await api(instance, "PATCH", `/memory-library/memory/${original.id}/organization`, {
+      body: { recallPolicy: policy },
+    })).toMatchObject({ status: 200 });
+
+    const content = "合成去重測試新版內容";
+    const updated = await client.callTool({ name: "update_memory", arguments: { id: original.id, content } });
+    expect(updated.isError).toBeFalsy();
+    const revision = jsonOf<{ id: number }>(updated);
+    expect(revision).toMatchObject({ scope: projectedScope, project: null, recallPolicy: policy });
+
+    const backup = await fetch(`${instance.url}/memories/export`, { headers: { authorization: `Bearer ${TEST_TOKEN}` } });
+    expect(backup.status).toBe(200);
+    const rows = (await backup.text()).trim().split("\n").map((line) => JSON.parse(line) as unknown);
+    expect(rows).toContainEqual(expect.objectContaining({
+      schemaVersion: 3, type: "memory", memory: expect.objectContaining({ content }), dedupe: { scope, project },
+    }));
+
+    const replay = await remember(content);
+    expect(replay.isError).toBeFalsy();
+    expect(jsonOf(replay)).toMatchObject({ id: revision.id, duplicate: true });
+    expect((await instance.store.listMemoriesForExport()).map(({ id }) => id)).toEqual([revision.id]);
+  });
+
+  it("REST supersedes 編輯會沿用原始去重維度及目前歸屬", async () => {
+    const harness = await startMcp();
+    rest = harness.rest;
+    mcp = harness.mcp;
+    const { instance } = rest;
+    const saved = await mcp.client.callTool({
+      name: "remember", arguments: { content: "合成網頁編輯舊內容", project: "original-project" },
+    });
+    expect(saved.isError).toBeFalsy();
+    const original = jsonOf<{ id: number }>(saved);
+    expect(await api(instance, "PATCH", `/memory-library/memory/${original.id}/organization`, {
+      body: { assignedProject: "current-project", recallPolicy: "global" },
+    })).toMatchObject({ status: 200 });
+
+    const content = "合成網頁編輯新內容";
+    const edited = await api(instance, "POST", "/memories", {
+      body: { content, agent: "web", scope: "global", supersedes: original.id },
+    });
+    expect(edited.status).toBe(201);
+    const revision = edited.body as { id: number };
+    expect(await instance.store.listMemoriesForExport()).toMatchObject([{
+      id: revision.id, assignedProject: "current-project", dedupeScope: "project", dedupeProject: "original-project",
+    }]);
+    expect(await api(instance, "POST", "/memories", { body: {
+      content, agent: "test-client", scope: "project", project: "original-project", assignedProject: "current-project",
+    } })).toMatchObject({ status: 200, body: { id: revision.id, duplicate: true } });
+    expect((await instance.store.listMemoriesForExport()).map(({ id }) => id)).toEqual([revision.id]);
   });
 
   it("拒絕更新無效 id、非法內容與原文片段", async () => {

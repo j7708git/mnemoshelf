@@ -81,7 +81,7 @@ loopback、並對連線來源再做 `requireLoopback` 檢查。需要更嚴格�
 | `GET /roots/:id/file?path=<相對路徑>` | 文字預覽（JSON：`{kind:"text",path,size,truncated,content}`，上限 256 KB、超過截斷並以 `truncated` 標明）或圖片原始位元組（帶正確 `Content-Type`） |
 | `GET /roots/:id/thumb?path=<相對路徑>` | 圖片縮圖（`sharp` 產生、寬度上限 320px、輸出 PNG；**記憶體內快取**，不寫磁碟） |
 | `POST /search` | `{query, mode?, rootIds?, k?, agentOnly?}`；`mode` 為 `keyword`／`hybrid`／`vector`（預設），`k` 上限 100；`agentOnly: true` 只搜已勾選「允許 Agent 搜尋」的 roots（預設 `false`；與 `rootIds` 同時給取交集，不影響記憶召回） |
-| `POST /memories` | `{content, kind?, scope?, project?, agent, supersedes?}`（`agent` 必填＝寫入者標識；`supersedes` 為被取代的記憶 id，帶了會把舊版軟刪除＝編輯流程） |
+| `POST /memories` | `{content, kind?, scope?, project?, agent, supersedes?}`（`agent` 必填，為寫入者標識）。可帶 `supersedes` 指定有效短記憶 ID，建立新版並軟刪除舊版。ID 不存在回 `404`，已被取代、已軟刪除或屬於原文回合片段回 `409` |
 | `POST /memories/:id/revisions` | `{content}`（更正短記憶並繼承原本的中繼資料，回新版記憶） |
 | `GET /memories` | 列出未刪除的記憶（由新到舊）；每筆帶 `pinned`；query：`kind`、`scope`、`project`、`agent`、`limit`（預設 100、上限 500） |
 | `POST /memories/:id/pin` | 設定／取消釘選：`{pinned?: boolean}`（省略＝`true`）；冪等；未知 id → `404`；回傳更新後的記憶 |
@@ -108,9 +108,9 @@ loopback、並對連線來源再做 `requireLoopback` 檢查。需要更嚴格�
 
 ### 記憶的編輯與釘選（M3）
 
-- **編輯＝supersedes**：`POST /memories` 帶 `supersedes: <舊記憶 id>` 會建立新版本，並把舊版標記
-  軟刪除（`deletedAt`）。`GET /memories` 只列未刪除者，因此編輯後只看到新版本；新版本的回應帶
-  `supersedes` 指回舊版，UI 即以此呈現新舊關係。**不直接改寫既有記憶列**。
+- **編輯＝supersedes** 使用 `POST /memories` 並帶 `supersedes: <有效短記憶 ID>` 會建立新版本，並將
+  舊版標為軟刪除（`deletedAt`）。目標 ID 不存在回 `404`，目標已被取代、已軟刪除或屬於原文回合片段
+  回 `409`。編輯後 `GET /memories` 只會列出新版，回應中的 `supersedes` 指回舊版，供 UI 呈現版本關係。
 - **釘選**：`POST /memories/:id/pin` 設定／取消 `pinned`（冪等）；`GET /memories` 的每筆記憶都帶
   `pinned`。後端契約（`docs/storage-ports.md` §記憶的釘選）刻意**不**把釘選併入排序——釘選優先的
   排序由 UI 自行處理。

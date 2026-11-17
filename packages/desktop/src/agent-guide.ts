@@ -1135,7 +1135,7 @@ export function buildInstallCard(harness: AgentGuideHarnessTab, input: AgentGuid
       lines.push(
         "# 把 Mnemoshelf 接到 codex（給 agent 的安裝卡）",
         "",
-        "你是協助使用者安裝 Mnemoshelf 的 agent。照下面做完，codex 會多出 Mnemoshelf 的七個 MCP 工具。",
+        "你是協助使用者安裝 Mnemoshelf 的 agent。照下面做完，codex 就能使用 Mnemoshelf 的 MCP 工具。",
         "",
         ...runtimeStep(input),
         "## 2. 把 MCP 片段貼進 `~/.codex/config.toml`",
@@ -1200,7 +1200,7 @@ export function buildInstallCard(harness: AgentGuideHarnessTab, input: AgentGuid
       lines.push(
         "# 把 Mnemoshelf 接到其他 MCP client（給 agent 的安裝卡）",
         "",
-        "你是協助使用者安裝 Mnemoshelf 的 agent。照下面做完，client 的工具清單會出現 Mnemoshelf 的七個 MCP 工具。",
+        "你是協助使用者安裝 Mnemoshelf 的 agent。照下面做完，client 的工具清單會出現 Mnemoshelf 的 MCP 工具。",
         "",
         ...runtimeStep(input),
         "## 2. 把片段貼進 client 的 MCP 設定",

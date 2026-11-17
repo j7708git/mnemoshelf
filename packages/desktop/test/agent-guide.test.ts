@@ -333,6 +333,7 @@ describe("buildInstallCard：卡片與片段同源", () => {
     expect(card).toContain("codex mcp list");
     expect(card).toContain("docs/codex-recall.md");
     expect(card).toContain("/hooks");
+    expect(card).not.toContain("七個");
   });
 
   it("dsh 卡優先給 dsh plugin add 絕對路徑，並含兩段手動片段與 install", () => {
@@ -355,6 +356,7 @@ describe("buildInstallCard：卡片與片段同源", () => {
     expect(card).toContain("update_memory");
     expect(card).toContain("search_memories");
     expect(card).toContain("read_memory_source");
+    expect(card).not.toContain("七個");
   });
 });
 

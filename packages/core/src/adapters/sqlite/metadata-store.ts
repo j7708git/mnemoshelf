@@ -1,7 +1,7 @@
 import { SqliteMemoryOrganizationStore } from "./memory-organization.js";
 import {
-  memoryDedupeIdentity, MEMORY_ORGANIZATION_COLUMNS, readMemoryOrganization, legacyMemoryOrganizationPatch,
-  type MemoryOrganizationPatch, type MemoryRecallRule, type MemoryRecallRuleWriteOptions,
+  memoryDedupeIdentity, readMemoryDedupeIdentity, MEMORY_ORGANIZATION_COLUMNS, readMemoryOrganization, legacyMemoryOrganizationPatch,
+  type MemoryDedupeIdentity, type MemoryOrganizationPatch, type MemoryRecallRule, type MemoryRecallRuleWriteOptions,
 } from "../../memory/organization.js";
 import { DuplicateRootError } from "../../errors.js";
 import { memoryContentHash } from "../../memory/content-normalize.js";
@@ -630,11 +630,20 @@ export class SqliteMetadataStore implements MetadataStore {
     );
   }
 
+  private dedupeForWrite(m: NewMemory): MemoryDedupeIdentity {
+    if (m.supersedes !== null && m.restoreDedupe === undefined) {
+      const previous = selectRow(this.db,
+        "select dedupe_scope, dedupe_project, scope, project from memories where id = ? and source_id is null", m.supersedes);
+      if (previous !== undefined) return readMemoryDedupeIdentity(previous);
+    }
+    return memoryDedupeIdentity(m);
+  }
+
   async addMemory(m: NewMemory, { pinned = false } = {}): Promise<Memory> {
-    const dedupe = memoryDedupeIdentity(m);
     const createdAt = new Date().toISOString();
     const insert = this.db.transaction((): number => {
       const organization = this.organization.forWrite(m);
+      const dedupe = this.dedupeForWrite(m);
       if (m.supersedes !== null) {
         this.markSuperseded(m.supersedes, createdAt);
       }
@@ -672,7 +681,7 @@ export class SqliteMetadataStore implements MetadataStore {
   /**
    * 原子 insert-or-return-existing（見 `MetadataStore.addMemoryUnlessDuplicate`）。
    *
-   * 去重 key＝（內容 hash, `scope`, `project`, `agent`），以 `project is ?` 做 null-safe 比較；
+   * 去重 key 包含內容 hash、原請求範圍與專案、agent 及目前歸屬，空值以 `is ?` 比較；
    * **檢查與新增在同一句 `insert … select … where not exists`**：SQLite 的單一寫入者＋同步交易下，
    * 不會出現「檢查後、插入前被別人插隊」的視窗。
    *
@@ -683,10 +692,10 @@ export class SqliteMetadataStore implements MetadataStore {
   async addMemoryUnlessDuplicate(m: NewMemory): Promise<{ memory: Memory; duplicate: boolean }> {
     const createdAt = new Date().toISOString();
     const contentHash = memoryContentHash(m.content);
-    const dedupe = memoryDedupeIdentity(m);
 
     const attempt = this.db.transaction((): { id: number; duplicate: boolean } => {
       const organization = this.organization.forWrite(m);
+      const dedupe = this.dedupeForWrite(m);
       if (m.supersedes !== null) {
         this.markSuperseded(m.supersedes, createdAt);
       }
@@ -1063,7 +1072,10 @@ export class SqliteMetadataStore implements MetadataStore {
     return selectRows(
       this.db,
       `select ${MEMORY_COLUMNS}, dedupe_scope, dedupe_project from memories where deleted_at is null order by created_at asc, id asc`,
-    ).map((row) => ({ ...rowToMemory(row), dedupeScope: String(row.dedupe_scope ?? row.scope) as MemoryScope, dedupeProject: row.dedupe_scope == null ? (row.project == null ? null : String(row.project)) : (row.dedupe_project == null ? null : String(row.dedupe_project)) }));
+    ).map((row) => {
+      const dedupe = readMemoryDedupeIdentity(row);
+      return { ...rowToMemory(row), dedupeScope: dedupe.scope, dedupeProject: dedupe.project };
+    });
   }
 
   /**
