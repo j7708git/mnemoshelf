@@ -2,7 +2,7 @@
 
 本機桌面應用程式：把自己挑選的資料夾變成可語意搜尋的知識庫，並讓多個 AI agent 共用同一份記憶。
 
-> **狀態**：最新釋出 **v0.9.2**（[GitHub Releases](https://github.com/j7708git/mnemoshelf/releases)）。本版修復記憶清單分頁與篩選一致性，新增保留來源與歸屬的專案／寫入者召回規則，並提供 Codex Stop 原文保存、Antigravity Adapter 與共用 Hook 接入。資料庫會向前升級，既有內容與用途保留；更新前請先備份，升級與回滾方式見 [docs/updates.md](docs/updates.md)。**App 內更新已在 Linux AppImage 實證到 0.5.2**；較新版本的更新流程尚未實機驗證。macOS 只檢查並開啟下載頁（ad-hoc 簽章、未公證），Windows NSIS 未簽章。完整本版說明見 [v0.9.2 發版說明](docs/releases/v0.9.2.md)。授權 [MIT](LICENSE)。
+> **狀態**：最新釋出 **v0.9.3**（[GitHub Releases](https://github.com/j7708git/mnemoshelf/releases)）。本版修復 Antigravity Hook 重複注入與原文 XML／過場句污染，新增精煉記憶優先分層召回、專案級自動注入開關（停用自動注入仍保留 MCP 主動搜尋）與 MCP 短記憶更正工具 `update_memory`。資料庫會向前升級，既有內容與規則保留；更新前請先備份，升級與回滾方式見 [docs/updates.md](docs/updates.md)。**App 內更新已在 Linux AppImage 實證到 0.5.2**；較新版本的更新流程尚未實機驗證。macOS 只檢查並開啟下載頁（ad-hoc 簽章、未公證），Windows NSIS 未簽章。完整本版說明見 [v0.9.3 發版說明](docs/releases/v0.9.3.md)。授權 [MIT](LICENSE)。
 
 ## 這是什麼
 
