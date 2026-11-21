@@ -49,6 +49,24 @@ Mnemoshelf 桌面版會從本專案的 GitHub Release 檢查新版本。**Linux 
 更新後版本 `0.5.1 → 0.5.2`；版本、資料庫檔位元組、roots、token 與更新前備份都保留。
 0.5.2 是依賴安全修補，行為與 0.5.1 相同。同樣是 Linux x64 的實證，不代表其他平台已驗證。
 
+### v0.9.3 的變更與升級注意
+
+2026-11-21 的 v0.9.3 修復 Antigravity Hook 同回合重複注入與原文 XML／過場步驟混入問題，
+新增精煉記憶優先分層召回（語意 `+0.08` 軟加權、外掛改為先裝精煉記憶再補原文）、專案級自動注入開關
+（`all`／`refined-only`／`off`，停用自動注入仍保留 MCP `search_memories`／`recall` 主動查詢），
+並補上 MCP 短記憶更正工具 `update_memory` 與 Stage 3 Token A/B 評測指標。
+
+- **既有資料保留**：首次啟動會套用 migration `0011_memory_auto_inject`，新增
+  `memory_auto_inject_settings` 表並初始化為 `defaultMode: "all"`；既有記憶內容、ID、向量、
+  召回規則與組織快照原樣保留，不自動改變既有的召回行為。
+- **先備份再升級**：手動更換 App 前先完全結束服務並複製資料目錄；PostgreSQL 使用者先建立資料庫備份。
+  回滾時請同時換回舊版 App 與升級前的資料庫備份。
+- **接入端同步**：完整啟用新版 Antigravity／Codex Hook 去重清洗、低資訊短句略過與專案級自動注入開關，
+  請同步重新建置並更新 Hook 腳本、OpenCode 與 dsh 外掛；升級 App 不會自動修改宿主設定檔。
+
+詳細契約見 [記憶整理與召回規則](memory-organization.md) 與 [Hook 接入指引](hook-integration.md)，
+本版重點與驗證界線見 [v0.9.3 發版說明](releases/v0.9.3.md)。
+
 ### v0.9.2 的變更與升級注意
 
 2026-11-14 的 v0.9.2 修復記憶管理的完整分頁與精確篩選，將來源專案、整理歸屬與召回用途
