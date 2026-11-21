@@ -32,6 +32,7 @@ export type { MetadataStore } from "./ports/metadata-store.js";
 export { buildMemoryLibrarySql, normalizeMemoryLibraryFilter, readMemoryLibraryRows } from "./memory/library.js";
 export type { MemoryLibraryEntry, MemoryLibraryFilter, MemoryLibraryPage } from "./memory/library.js";
 export * from "./memory/organization.js";
+export * from "./memory/auto-inject.js";
 export { memoryContentHash, normalizeMemoryContentForHash } from "./memory/content-normalize.js";
 export {
   assertMemorySourceChunks,
@@ -65,6 +66,7 @@ export {
   MEMORY_LIST_MAX_LIMIT,
   MEMORY_SCOPES,
   MEMORY_SEARCH_MAX_K,
+  MEMORY_SEARCH_SOURCE_KINDS,
   normalizeMemoryLimit,
   normalizeChunkMedia,
   normalizeRootMaxFileBytes,
@@ -89,6 +91,7 @@ export type {
   MemoryKeywordHit,
   MemorySearchBucket,
   MemorySearchFilter,
+  MemorySearchSourceKind,
   MemoryVectorHit,
   NormalizedMemorySearchBucket,
   NormalizedMemorySearchFilter,

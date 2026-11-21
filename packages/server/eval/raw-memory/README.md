@@ -32,7 +32,7 @@ RAW_MEMORY_PRODUCT=1 RAW_MEMORY_BACKEND=real RAW_MEMORY_SPLIT=tune pnpm --filter
 
 - `unseen-fixture.ts`：獨立種子（`482913`）與 10 個全新合成專案，共 40 題未見題庫（30 題可答、10 題無答案拒答），不與 `tune`／`holdout` 共用題型或詞表。
 - `naive-rag.ts`：純原始對話切片基線（`User: ...\nAssistant: ...`，512 Unicode code points / 重疊 64、純向量 cosine top-4 `minScore=0`、同一 900 字元裝箱預算）。
-- `stage3-reader.ts` 與 `stage3-e2e.test.ts`：預設跳過；執行實測：
+- `stage3-reader.ts` 與 `stage3-e2e.test.ts`：預設跳過，對照 `no-memory`（無記憶對照組）、`antigravity-hook`、`dsh-plugin`、`opencode-plugin` 與 `naive-rag-chunk512` 五種系統；執行實測：
 
 ```bash
 STAGE3_EVAL=1 RAW_MEMORY_BACKEND=real pnpm --filter @mnemoshelf/server exec vitest \
@@ -45,4 +45,12 @@ STAGE3_EVAL=1 RAW_MEMORY_BACKEND=real pnpm --filter @mnemoshelf/server exec vite
 - `STAGE3_READER_MODEL`
 - `STAGE3_READER_API_KEY`（選填）
 
-未設定 `STAGE3_READER_*` 時，報告僅產出檢索裝箱對照指標，Reader 欄位明確標記 `NOT_RUN`。
+Reader 呼叫會記錄 OpenAI `usage` 的 `prompt_tokens` 與 `completion_tokens`，並在摘要中彙總 `readerTotalPromptTokens`、`readerAvgPromptTokens` 與 `readerTotalCompletionTokens`（Markdown 報告列出 `總 prompt tokens`、`平均 prompt tokens` 與 `相較 no-memory 增量`）。未設定 `STAGE3_READER_*` 時，報告僅產出檢索裝箱對照指標，Reader 欄位明確標記 `NOT_RUN`。
+
+## 精煉記憶優先分層評測（`TIERED_EVAL=1`）
+
+`tiered-recall.test.ts` 使用可控 embedder 與合成資料（同時包含精煉記憶與長篇雜訊 `raw-turn`），對比 `flat`（`preferRefined: false`）、`tiered`（`preferRefined: true`）、`refined-only` 與 `off` 四種策略的精煉 Top-4 命中率、平均注入字元與 10 步累積字元：
+
+```bash
+TIERED_EVAL=1 pnpm --filter @mnemoshelf/server exec vitest run -c eval/raw-memory/vitest.config.ts eval/raw-memory/tiered-recall.test.ts
+```

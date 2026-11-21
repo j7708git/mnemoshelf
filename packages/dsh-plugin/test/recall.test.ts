@@ -128,6 +128,7 @@ describe("searchMemories", () => {
     const body = JSON.parse(String(calls[0]?.init?.body));
     expect(body).toEqual({
       agent: "dsh/turn",
+      channel: "auto",
       query: "召回 timeout 是多少",
       project: "mnemoshelf",
       k: 8,
@@ -150,7 +151,7 @@ describe("searchMemories", () => {
       project: null,
       fetchImpl,
     });
-    expect(body).toMatchObject({ query: "x", scope: "global", k: 8, minScore: 0.65 });
+    expect(body).toMatchObject({ channel: "auto", query: "x", scope: "global", k: 8, minScore: 0.65 });
     expect(body).not.toHaveProperty("project");
   });
 
@@ -301,7 +302,7 @@ describe("原文片段與政策", () => {
     expect(result.block).not.toContain("舊短記憶");
     expect(result.block).not.toContain("相鄰重複不送");
     expect(result.chars).toBeLessThanOrEqual(900);
-    const small = buildMemoryBlock({ hits, project: null, now: new Date(), maxChars: 250 });
+    const small = buildMemoryBlock({ hits: hits.slice(1), project: null, now: new Date(), maxChars: 250 });
     expect(small.block).toContain("中段錨點🧭");
     expect(small.block).toContain("…");
     expect(small.chars).toBeLessThanOrEqual(250);
@@ -381,4 +382,86 @@ it("召回政策在查詢後改變，遮罩版本相同也不能注入舊結果"
     : jsonResponse({ policyVersion: 1, recallVersion: 1, degraded: false, hits: [hit("禁止注入的過期政策結果")] });
   const result = await recallForMessages({ messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "之前討論的召回政策" }] }], connection: CONNECTION, project: "alpha", fetchImpl });
   expect(result).toMatchObject({ block: "", skip: "policy-changed" });
+});
+
+describe("精煉記憶與原文混合裝箱（Issue #22 P2）", () => {
+  it("緊縮 900 字元預算下先保留精煉記憶，剩餘空間才由長篇 raw-turn 補位且不超預算", () => {
+    const longRaw = "背景日誌".repeat(60) + "關鍵錨點KESTREL-9" + "後續雜訊".repeat(120);
+    const hits: RecallHitLike[] = [
+      hit(longRaw, {
+        id: 10,
+        sourceType: "raw-turn",
+        sourceId: 88,
+        role: "assistant",
+        source: "keyword",
+        snippetAnchor: 240,
+      }),
+      hit("精煉決策：資料庫連線池上限固定為 16。", { id: 1, kind: "decision" }),
+      hit("精煉踩坑：逾時重試必須帶幂等鍵。", { id: 2, kind: "pitfall" }),
+    ];
+    const built = buildMemoryBlock({
+      hits,
+      project: "mnemoshelf",
+      now: new Date("2026-10-28T10:00:00.000Z"),
+      maxChars: 900,
+      query: "關鍵錨點KESTREL-9",
+    });
+
+    expect(built.chars).toBeLessThanOrEqual(900);
+    expect([...built.block].length).toBeLessThanOrEqual(900);
+    expect(built.block.trimEnd().endsWith("</memory-context>")).toBe(true);
+    expect(built.block).toContain("精煉決策：資料庫連線池上限固定為 16。");
+    expect(built.block).toContain("精煉踩坑：逾時重試必須帶幂等鍵。");
+    expect(built.block).toContain("[source id=88]");
+    expect(built.block).toContain("關鍵錨點KESTREL-9");
+    expect(built.block.indexOf("精煉決策")).toBeLessThan(built.block.indexOf("[source id=88]"));
+  });
+
+  it("精煉記憶已幾乎用滿緊縮預算時不硬塞 raw-turn，不超預算且不留半截圍籬", () => {
+    const hits: RecallHitLike[] = [
+      hit("A".repeat(140), { id: 1, kind: "decision" }),
+      hit("長篇原文內容".repeat(100), {
+        id: 2,
+        sourceType: "raw-turn",
+        sourceId: 99,
+        role: "user",
+        source: "keyword",
+      }),
+    ];
+    const built = buildMemoryBlock({
+      hits,
+      project: "mnemoshelf",
+      now: new Date("2026-10-28T10:00:00.000Z"),
+      maxChars: 335,
+    });
+    expect(built.chars).toBeLessThanOrEqual(335);
+    expect(built.block).toContain("A".repeat(140));
+    expect(built.block).not.toContain("[source id=99]");
+    expect(built.block).toContain(BLOCK_INTRO);
+    expect(built.block.endsWith("</memory-context>")).toBe(true);
+  });
+
+  it("recallForMessages 自動召回送出 channel: 'auto'", async () => {
+    let searchBody: Record<string, unknown> | undefined;
+    const fetchImpl: typeof fetch = async (url, init) => {
+      if (String(url).endsWith("/memory-policy")) {
+        return jsonResponse({ maskSecrets: true, version: 1, recallVersion: 1 });
+      }
+      searchBody = JSON.parse(String(init?.body ?? "{}"));
+      return jsonResponse({
+        policyVersion: 1,
+        recallVersion: 1,
+        degraded: false,
+        hits: [hit("精煉記憶")],
+      });
+    };
+    const result = await recallForMessages({
+      messages: [{ role: "user", source: { kind: "user" }, content: [{ type: "text", text: "之前設定是什麼？" }] }],
+      connection: CONNECTION,
+      project: "mnemoshelf",
+      fetchImpl,
+    });
+    expect(result.skip).toBeNull();
+    expect(searchBody?.channel).toBe("auto");
+  });
 });

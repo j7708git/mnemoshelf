@@ -89,6 +89,7 @@ describe("Codex 自動召回", () => {
       project: "project-a",
       k: 4,
       minScore: 0.65,
+      channel: "auto",
     });
     expect(output).toEqual({ hookSpecificOutput: {
       hookEventName: "UserPromptSubmit",
@@ -113,7 +114,7 @@ describe("Codex 自動召回", () => {
         env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, homeDir, fetchImpl,
       });
       expect(JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body))).toEqual({
-        query: hookEvent.prompt, scope: "global", agent: "codex/turn", k: 4, minScore: 0.65,
+        query: hookEvent.prompt, scope: "global", agent: "codex/turn", k: 4, minScore: 0.65, channel: "auto",
       });
       expect(output?.hookSpecificOutput.additionalContext).toContain(globalHit.content);
       expect(output?.hookSpecificOutput.additionalContext).not.toContain("其他專案");

@@ -281,5 +281,76 @@ export function runMemoryOrganizationContract(name: string, factory: () => Memor
       expect((await store.listMemorySourceChunks(source.result.source.id)).every((chunk) => chunk.recallPolicy === "project")).toBe(true);
       expect(await store.searchMemoriesByVector(new Float32Array([1, 0]), "model", {}, 1)).toEqual([{ id: short.id, score: 1 }]);
     });
+
+    it("自動注入設定：預設值、合併更新、清除覆寫與逐專案鍵 trim", async () => {
+      expect(await store.getMemoryAutoInjectSettings()).toEqual({ revision: 1, defaultMode: "all", projects: {} });
+      const first = await store.updateMemoryAutoInjectSettings({ expectedRevision: 1, projects: { " alpha ": "refined-only", beta: "off" } });
+      expect(first).toEqual({ revision: 2, defaultMode: "all", projects: { alpha: "refined-only", beta: "off" } });
+      // 只更動 patch 列出的專案鍵；未列出的 beta 維持不變。
+      const second = await store.updateMemoryAutoInjectSettings({ expectedRevision: 2, defaultMode: "refined-only", projects: { alpha: "all", gamma: "off" } });
+      expect(second).toEqual({ revision: 3, defaultMode: "refined-only", projects: { alpha: "all", beta: "off", gamma: "off" } });
+      // 只改預設模式時不動任何專案覆寫。
+      expect(await store.updateMemoryAutoInjectSettings({ expectedRevision: 3, defaultMode: "off" }))
+        .toEqual({ revision: 4, defaultMode: "off", projects: { alpha: "all", beta: "off", gamma: "off" } });
+      // null 表示刪除該專案覆寫；刪除不存在的鍵不報錯。
+      expect(await store.updateMemoryAutoInjectSettings({ expectedRevision: 4, projects: { beta: null, missing: null } }))
+        .toEqual({ revision: 5, defaultMode: "off", projects: { alpha: "all", gamma: "off" } });
+      expect(await store.getMemoryAutoInjectSettings()).toEqual({ revision: 5, defaultMode: "off", projects: { alpha: "all", gamma: "off" } });
+    });
+
+    it("自動注入設定：expectedRevision 不符拋 MemoryRecallConflictError 且不寫入；非法 patch 拋 TypeError", async () => {
+      await store.updateMemoryAutoInjectSettings({ expectedRevision: 1, defaultMode: "refined-only" });
+      await expect(store.updateMemoryAutoInjectSettings({ expectedRevision: 1, defaultMode: "off" })).rejects.toBeInstanceOf(MemoryRecallConflictError);
+      await expect(store.updateMemoryAutoInjectSettings({ expectedRevision: 99, projects: { alpha: "off" } })).rejects.toBeInstanceOf(MemoryRecallConflictError);
+      const invalid = [
+        { expectedRevision: 2 },
+        { expectedRevision: 2, projects: {} },
+        { expectedRevision: 0, defaultMode: "off" },
+        { expectedRevision: 1.5, defaultMode: "off" },
+        { expectedRevision: 2, defaultMode: "bogus" },
+        { expectedRevision: 2, projects: { alpha: "bogus" } },
+        { expectedRevision: 2, projects: { "  ": "off" } },
+        { expectedRevision: 2, projects: { a: "off", " a ": "all" } },
+        { expectedRevision: 2, projects: { ["x".repeat(201)]: "off" } },
+        { expectedRevision: 2, projects: { "a\0b": "off" } },
+      ];
+      for (const patch of invalid) {
+        await expect(store.updateMemoryAutoInjectSettings(patch as never)).rejects.toBeInstanceOf(TypeError);
+      }
+      expect(await store.getMemoryAutoInjectSettings()).toEqual({ revision: 2, defaultMode: "refined-only", projects: {} });
+    });
+
+    it("sourceKind：向量與關鍵字檢索先過濾來源類型再排名（memory／raw-turn／all）", async () => {
+      const embedderId = "contract-source-kind@1";
+      const memory = await store.addMemory(input({ content: "kindneedle 精煉記憶" }));
+      const chunkIds: number[] = [];
+      for (const turn of ["t1", "t2", "t3"]) {
+        const source = await raw(turn, { messages: [{ sourceMessage: "m0", role: "user", content: `kindneedle 原始對話 ${turn}`, occurredAt: null }] });
+        for (const chunk of await store.listMemorySourceChunks(source.result.source.id)) chunkIds.push(chunk.id);
+      }
+      expect(chunkIds.length).toBeGreaterThanOrEqual(3);
+      // 原始 chunk 的向量與查詢完全一致（排名最前）；精煉記憶較遠，仍須在 k=1 時被 memory 過濾選中。
+      await store.markMemoryEmbedded(memory.id, embedderId, new Float32Array([0.5, 0.5]));
+      for (const id of chunkIds) await store.markMemoryEmbedded(id, embedderId, new Float32Array([1, 0]));
+      const query = new Float32Array([1, 0]);
+      const vec = async (sourceKind: "all" | "memory" | "raw-turn" | undefined, k: number) =>
+        (await store.searchMemoriesByVector(query, embedderId, sourceKind === undefined ? {} : { sourceKind }, k)).map((hit) => hit.id);
+      expect(await vec("memory", 1)).toEqual([memory.id]);
+      expect((await vec("raw-turn", 10)).slice().sort((a, b) => a - b)).toEqual(chunkIds.slice().sort((a, b) => a - b));
+      expect(await vec("raw-turn", 1)).toHaveLength(1);
+      expect(chunkIds).toContain((await vec("raw-turn", 1))[0]);
+      expect((await vec("all", 10)).slice().sort((a, b) => a - b)).toEqual([memory.id, ...chunkIds].sort((a, b) => a - b));
+      expect((await vec(undefined, 10)).length).toBe(1 + chunkIds.length);
+
+      const key = async (sourceKind: "all" | "memory" | "raw-turn" | undefined, k: number) =>
+        (await store.searchMemoriesKeyword("kindneedle", sourceKind === undefined ? {} : { sourceKind }, k)).map((hit) => hit.id);
+      expect(await key("memory", 1)).toEqual([memory.id]);
+      expect((await key("raw-turn", 10)).slice().sort((a, b) => a - b)).toEqual(chunkIds.slice().sort((a, b) => a - b));
+      expect((await key("all", 10)).slice().sort((a, b) => a - b)).toEqual([memory.id, ...chunkIds].sort((a, b) => a - b));
+      expect((await key(undefined, 10)).length).toBe(1 + chunkIds.length);
+
+      await expect(store.searchMemoriesByVector(query, embedderId, { sourceKind: "bogus" as never }, 1)).rejects.toBeInstanceOf(TypeError);
+      await expect(store.searchMemoriesKeyword("kindneedle", { sourceKind: "bogus" as never }, 1)).rejects.toBeInstanceOf(TypeError);
+    });
   });
 }

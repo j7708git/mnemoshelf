@@ -1,6 +1,8 @@
 import { PgMemoryOrganizationStore } from "./memory-organization.js";
 import {
   DuplicateRootError,
+  applyAutoInjectPatch, readMemoryAutoInjectSettings, MemoryRecallConflictError,
+  type MemoryAutoInjectPatch, type MemoryAutoInjectSettings,
   memoryDedupeIdentity, readMemoryDedupeIdentity, MEMORY_ORGANIZATION_COLUMNS, readMemoryOrganization, legacyMemoryOrganizationPatch,
   type MemoryDedupeIdentity, type MemoryOrganizationPatch, type MemoryRecallRule, type MemoryRecallRuleWriteOptions,
 
@@ -205,6 +207,9 @@ function buildPgMemorySearchWhere(filter: NormalizedMemorySearchFilter, firstPar
   }
 
   if (filter.writer !== undefined) { conditions.push(`m.agent = ${placeholder()}`); params.push(filter.writer); }
+  // 來源類型：精煉記憶沒有 source_id；原始對話 chunk 有。必須與其他條件一起在排名前過濾。
+  if (filter.sourceKind === "memory") conditions.push("m.source_id is null");
+  else if (filter.sourceKind === "raw-turn") conditions.push("m.source_id is not null");
   const buckets = filter.buckets;
   if (buckets !== undefined) {
     const parts: string[] = [];
@@ -249,7 +254,16 @@ function metadataSchemaSql(schema: string): string {
   const sources = qualified(schema, "memory_sources");
   const deletedSources = qualified(schema, "deleted_memory_sources");
   const policy = qualified(schema, "memory_policy");
+  const autoInject = qualified(schema, "memory_auto_inject_settings");
   return `
+    -- 自動注入設定（單列）：全域預設模式與逐專案覆寫；冪等。
+    create table if not exists ${autoInject} (
+      id integer primary key check (id = 1),
+      revision integer not null,
+      default_mode text not null,
+      projects_json text not null
+    );
+    insert into ${autoInject} (id, revision, default_mode, projects_json) values (1, 1, 'all', '{}') on conflict (id) do nothing;
     create table if not exists ${roots} (
       id integer generated always as identity primary key,
       path text not null unique,
@@ -368,6 +382,7 @@ export class PgMetadataStore implements MetadataStore {
   private readonly sources: string;
   private readonly deletedSources: string;
   private readonly policy: string;
+  private readonly autoInject: string;
   private readonly organization: PgMemoryOrganizationStore;
 
   constructor(pool: Pool, options: PgMetadataStoreOptions = {}) {
@@ -379,6 +394,7 @@ export class PgMetadataStore implements MetadataStore {
     this.sources = qualified(this.schema, "memory_sources");
     this.deletedSources = qualified(this.schema, "deleted_memory_sources");
     this.policy = qualified(this.schema, "memory_policy");
+    this.autoInject = qualified(this.schema, "memory_auto_inject_settings");
     this.organization = new PgMemoryOrganizationStore(pool, this.schema);
   }
 
@@ -400,6 +416,24 @@ export class PgMetadataStore implements MetadataStore {
   }
 
   async getMemoryRecallSettings() { return this.organization.settings(); }
+  async getMemoryAutoInjectSettings(): Promise<MemoryAutoInjectSettings> {
+    const result = await this.pool.query(`select * from ${this.autoInject} where id = 1`);
+    return readMemoryAutoInjectSettings(result.rows[0]!);
+  }
+  async updateMemoryAutoInjectSettings(patch: MemoryAutoInjectPatch): Promise<MemoryAutoInjectSettings> {
+    return withTransaction(this.pool, async (client) => {
+      const locked = await client.query(`select * from ${this.autoInject} where id = 1 for update`);
+      const current = readMemoryAutoInjectSettings(locked.rows[0]!);
+      // 先驗證 patch 形狀（TypeError），再比對 revision（衝突）。
+      const next = applyAutoInjectPatch(current, patch);
+      if (patch.expectedRevision !== current.revision) throw new MemoryRecallConflictError();
+      const updated = await client.query(
+        `update ${this.autoInject} set revision = revision + 1, default_mode = $1, projects_json = $2 where id = 1 returning *`,
+        [next.defaultMode, JSON.stringify(next.projects)],
+      );
+      return readMemoryAutoInjectSettings(updated.rows[0]!);
+    });
+  }
   async previewMemoryRecallRule(rule: MemoryRecallRule) { return this.organization.preview(rule); }
   async upsertMemoryRecallRule(rule: MemoryRecallRule, options: MemoryRecallRuleWriteOptions) { return this.organization.upsert(rule, options); }
   async deleteMemoryRecallRule(id: string, expectedRevision: number) { return this.organization.delete(id, expectedRevision); }

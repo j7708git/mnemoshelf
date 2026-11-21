@@ -1,6 +1,11 @@
 import { SqliteMemoryOrganizationStore } from "./memory-organization.js";
 import {
+  applyAutoInjectPatch, readMemoryAutoInjectSettings,
+  type MemoryAutoInjectPatch, type MemoryAutoInjectSettings,
+} from "../../memory/auto-inject.js";
+import {
   memoryDedupeIdentity, readMemoryDedupeIdentity, MEMORY_ORGANIZATION_COLUMNS, readMemoryOrganization, legacyMemoryOrganizationPatch,
+  MemoryRecallConflictError,
   type MemoryDedupeIdentity, type MemoryOrganizationPatch, type MemoryRecallRule, type MemoryRecallRuleWriteOptions,
 } from "../../memory/organization.js";
 import { DuplicateRootError } from "../../errors.js";
@@ -205,6 +210,9 @@ function buildMemorySearchWhere(filter: NormalizedMemorySearchFilter): MemorySea
   }
 
   if (filter.writer !== undefined) { conditions.push("m.agent = ?"); params.push(filter.writer); }
+  // 來源類型：精煉記憶沒有 source_id；原始對話 chunk 有。必須與其他條件一起在排名前過濾。
+  if (filter.sourceKind === "memory") conditions.push("m.source_id is null");
+  else if (filter.sourceKind === "raw-turn") conditions.push("m.source_id is not null");
   const buckets = filter.buckets;
   if (buckets !== undefined) {
     const parts: string[] = [];
@@ -269,6 +277,26 @@ export class SqliteMetadataStore implements MetadataStore {
     const where = buildMemorySearchWhere(normalizeMemorySearchFilter(filter));
     return selectRows(this.db, `select m.* from memories m where ${where.clause} order by m.created_at desc, m.id desc limit ?`,
       ...where.params, normalizeMemoryLimit(filter.limit)).map(rowToMemory);
+  }
+
+  async getMemoryAutoInjectSettings(): Promise<MemoryAutoInjectSettings> {
+    return this.readAutoInjectSettings();
+  }
+
+  async updateMemoryAutoInjectSettings(patch: MemoryAutoInjectPatch): Promise<MemoryAutoInjectSettings> {
+    return this.db.transaction(() => {
+      const current = this.readAutoInjectSettings();
+      // 先驗證 patch 形狀（TypeError），再比對 revision（衝突）。
+      const next = applyAutoInjectPatch(current, patch);
+      if (patch.expectedRevision !== current.revision) throw new MemoryRecallConflictError();
+      this.db.prepare("update memory_auto_inject_settings set revision = revision + 1, default_mode = ?, projects_json = ? where id = 1")
+        .run(next.defaultMode, JSON.stringify(next.projects));
+      return this.readAutoInjectSettings();
+    }).immediate();
+  }
+
+  private readAutoInjectSettings(): MemoryAutoInjectSettings {
+    return readMemoryAutoInjectSettings(selectRow(this.db, "select * from memory_auto_inject_settings where id = 1")!);
   }
 
   async getMemoryPolicy(): Promise<MemoryPolicy> {

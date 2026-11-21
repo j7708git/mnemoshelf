@@ -216,6 +216,7 @@ describe("context hook 召回", () => {
     expect(harness.searchCalls()[0].url).toBe("http://127.0.0.1:43117/memories/search");
     expect(harness.searchCalls()[0].body).toEqual({
       agent: "opencode-plugin/raw-turn",
+      channel: "auto",
       query: FIRST_QUERY,
       project: "mnemoshelf",
       k: 8,
@@ -240,6 +241,7 @@ describe("context hook 召回", () => {
     expect(harness.searchCalls()).toHaveLength(1);
     expect(harness.searchCalls()[0].body).toEqual({
       agent: "opencode-plugin/raw-turn",
+      channel: "auto",
       query: FIRST_QUERY,
       scope: "global",
       k: 8,
@@ -622,16 +624,17 @@ describe("最近回合紀錄召回", () => {
     expect(lists[0].authorization).toBe("Bearer test-token-value");
     expect(lists[0].body).toEqual({});
 
-    // 回合紀錄（舊→新）先，語意命中後。
+    // 精煉記憶先，回合紀錄（舊→新）補位。
     const text = latestText(event);
+    const semantic = text.indexOf("記憶向量改存");
     const first = text.indexOf("第一回合：結論 A。");
     const second = text.indexOf("第二回合：結論 B。");
     const third = text.indexOf("第三回合：結論 C，下一步 D。");
-    const semantic = text.indexOf("記憶向量改存");
+    expect(semantic).toBeGreaterThan(-1);
     expect(first).toBeGreaterThan(-1);
+    expect(semantic).toBeLessThan(first);
     expect(first).toBeLessThan(second);
     expect(second).toBeLessThan(third);
-    expect(third).toBeLessThan(semantic);
     expect(text).toContain("- [turn][2026-10-22][最近]");
     expect(text).toContain("回合紀錄與背景資料");
   });
@@ -784,21 +787,24 @@ describe("最近回合紀錄召回", () => {
     expect(status).not.toContain("仍注入");
   });
 
-  it("同一 id 已以回合紀錄注入時，語意命中不重複注入", async () => {
+  it("同一 id 已以精煉記憶注入時，舊版回合紀錄不重複注入", async () => {
     const harness = await setup({}, async (_input, init) => {
       if (init?.method !== "GET") return jsonResponse(memoryHits());
       return jsonResponse({
-        memories: [{ id: 1, content: "回合紀錄版本", createdAt: "2026-10-22T01:00:00.000Z" }],
+        memories: [
+          { id: 1, content: "回合紀錄版本", createdAt: "2026-10-22T01:00:00.000Z" },
+          { id: 202, content: "不重疊的回合紀錄", createdAt: "2026-10-22T02:00:00.000Z" },
+        ],
       });
     });
     const event = userEvent(FIRST_QUERY);
     await harness.handler(event);
 
     const text = latestText(event);
-    expect(text).toContain("回合紀錄版本");
-    expect(text.match(/回合紀錄版本/g)).toHaveLength(1);
-    expect(text).not.toContain("記憶向量改存");
-    // 其他語意命中照常。
+    expect(text).toContain("記憶向量改存");
+    expect(text.match(/記憶向量改存/g)).toHaveLength(1);
+    expect(text).not.toContain("回合紀錄版本");
+    expect(text).toContain("不重疊的回合紀錄");
     expect(text).toContain("舊索引要重跑");
   });
 });
@@ -1093,15 +1099,38 @@ describe("指令", () => {
     expect(harness.searchCalls()).toHaveLength(1);
     expect(harness.searchCalls()[0].body).toEqual({
       agent: "opencode-plugin/raw-turn",
+      channel: "manual",
       query: "向量表 決定",
       includeAllProjects: true,
       k: 8,
       minScore: 0.65,
     });
+    expect(harness.searchCalls()[0].body.channel).not.toBe("auto");
     expect(harness.searchCalls()[0].body).not.toHaveProperty("project");
     const output = harness.synthetic.at(-1)?.text ?? "";
     expect(output.startsWith(STATUS_SENTINEL)).toBe(true);
     expect(output).toContain("跨專案查詢");
+    expect(output).toContain("記憶向量改存");
+  });
+
+  it("專案自動注入關閉時（channel=auto 被 server 擋下），/memory-all 仍帶 channel=manual 正常查詢", async () => {
+    const harness = await setup({ recentTurns: 0 }, async (_input, init) => {
+      const parsed = JSON.parse(String(init?.body ?? "{}")) as { channel?: unknown };
+      if (parsed.channel === "auto") {
+        return jsonResponse({ ...memoryHits(), hits: [], autoInjectSuppressed: true });
+      }
+      return jsonResponse(memoryHits());
+    });
+
+    const event = userEvent(FIRST_QUERY);
+    await harness.handler(event);
+    expect(latestText(event)).toBe(FIRST_QUERY);
+
+    await harness.commands.get("memory-all")?.execute({ sessionID: "session-1", prompt: { text: "向量表" } });
+    expect(harness.searchCalls()).toHaveLength(2);
+    expect(harness.searchCalls()[0].body.channel).toBe("auto");
+    expect(harness.searchCalls()[1].body.channel).toBe("manual");
+    const output = harness.synthetic.at(-1)?.text ?? "";
     expect(output).toContain("記憶向量改存");
   });
 

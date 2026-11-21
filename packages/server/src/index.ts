@@ -674,6 +674,8 @@ export {
   buildMemorySearchBuckets,
   MEMORY_SEARCH_DEFAULT_K,
   MEMORY_SEARCH_MAX_K,
+  REFINED_KEYWORD_RANK_FACTOR,
+  REFINED_SEMANTIC_BOOST,
   searchMemories,
 } from "./memory-search.js";
 export type {

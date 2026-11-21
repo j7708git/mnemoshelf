@@ -68,6 +68,14 @@ MetadataStore 新增政策讀寫、來源新增／查重／讀取／列舉／範
 > `chunks.media_json` 內（SQLite／PostgreSQL 相同），不需要新 migration。同節記錄跨軌 `seq`
 > 排序規則與共用 helper，以及掃描／預覽的影片語意（`.mp4` 白名單、`videoMaxFileBytes`、
 > 跳過原因分組）。兩個後端跑同一組契約測試；PostgreSQL 仍需 `MNEMOSHELF_PG=1` 才是實跑。
+>
+> 2026-11-21（Issue #22 P2）新增自動注入設定與精煉記憶優先分層召回：SQLite migration
+> `0011_memory_auto_inject` 與 PostgreSQL `memory_auto_inject_settings` 同步；`MetadataStore`
+> 新增 `getMemoryAutoInjectSettings()`／`updateMemoryAutoInjectSettings()`，`MemorySearchFilter`
+> 新增 `sourceKind`（`"all" | "memory" | "raw-turn"`，先過濾再排名），兩者皆納入 SQLite／PG
+> 共用契約測試。伺服器層 `memory-search.ts` 新增精煉記憶優先分層排序
+> （`REFINED_SEMANTIC_BOOST = 0.08`、`REFINED_KEYWORD_RANK_FACTOR = 0.7`），回傳 `score`
+> 仍維持原始 cosine／`1/rank`，`pinned` 仍不影響排序。
 
 | 介面 | 職責 | 預設實作 | 預計的替代實作 |
 |---|---|---|---|
@@ -684,6 +692,8 @@ export interface MemorySearchBucket {
 export interface MemorySearchFilter {
   buckets?: MemorySearchBucket[];  // OR；未提供＝不限制 scope；空陣列＝沒有結果
   kind?: MemoryKind;
+  writer?: string;
+  sourceKind?: MemorySearchSourceKind; // "all" | "memory" | "raw-turn"
 }
 ```
 
@@ -697,6 +707,9 @@ export interface MemorySearchFilter {
 - **「所有專案」的介面表示**＝`project` scope **不帶名稱**；呼叫端不需要（也不應該）列舉專案名
   再組多個 bucket。
 - `kind` 精確比對；所有查詢永遠排除 `deleted_at is not null`。
+- `sourceKind`（`"all" | "memory" | "raw-turn"`）：`"memory"` 僅取精煉記憶（`source_id is null`）、
+  `"raw-turn"` 僅取原始對話片段（`source_id is not null`）、`"all"` 或省略不篩選；於
+  `normalizeMemorySearchFilter` 驗證（非法值拋 `TypeError`），兩後端皆**先過濾再排名**，並納入共用契約測試。
 - 非法 bucket（scope 不合法、`global` 帶 `project`／`agent`、`agent` 缺 `agent` 或空白、
   `project` 非字串）→ 拋 `TypeError`；兩後端以 `normalizeMemorySearchFilter` 共用同一套驗證。
 - `filter.buckets` 未提供＝不限制 scope；**空陣列＝沒有可見範圍**（回空清單，不是「不過濾」）。
@@ -754,7 +767,33 @@ searchMemoriesKeyword(query: string, filter: MemorySearchFilter, k: number): Pro
 - 命中回傳完整記憶欄位（與 `GET /memories` 一致）＋`rank`／`score`／`source`（`semantic`／`keyword`；
   關鍵字以 `1/rank` 當排序輔助分數）。`k` 預設 10；**大於 100 會靜默夾到 100**（不是 `400`；
   REST／MCP；store 層上限 500）。
+- **精煉記憶優先分層排序（2026-11-21）**：`preferRefined` 預設 `true`（設為 `false` 維持原本排序）。
+  語意路徑對精煉記憶（`sourceId == null`）套用內部排序加權 `REFINED_SEMANTIC_BOOST = 0.08`；
+  關鍵字路徑套用名次折扣 `REFINED_KEYWORD_RANK_FACTOR = 0.7`（`effectiveRank = rank * 0.7`），
+  同鍵值時精煉先於原文。**回傳的 `score` 仍維持原始 cosine／`1/rank`，`pinned` 仍不影響排序**。
+- **自動注入通道控制（2026-11-21）**：`channel` 為 `"manual"`（預設）或 `"auto"`。僅當
+  `channel === "auto"` 時依 `getMemoryAutoInjectSettings()` 解析當下專案模式：`off` 在
+  `embedQuery` 前短路並標記 `autoInjectSuppressed: true`；`refined-only` 將有效 `sourceKind`
+  限縮為 `"memory"`（若呼叫端明確要求 `sourceKind: "raw-turn"` 則同樣短路並標記
+  `autoInjectSuppressed: true`）。
 - 不變更 `/search`、`VectorIndex`、檔案索引管線與記憶寫入路徑。
+
+### 自動注入設定（2026-11-21）
+
+`MetadataStore` 新增全域與逐專案自動注入模式讀寫（預設單列 `id = 1`、`revision = 1`、`defaultMode = "all"`、`projects = {}`）：
+
+```ts
+getMemoryAutoInjectSettings(): Promise<MemoryAutoInjectSettings>;
+updateMemoryAutoInjectSettings(patch: MemoryAutoInjectPatch): Promise<MemoryAutoInjectSettings>;
+```
+
+- **SQLite（預設）**：migration `0011_memory_auto_inject` 建立 `memory_auto_inject_settings`
+  （`id integer primary key check (id = 1)`、`revision`、`default_mode`、`projects_json`）並冪等插入預設列；
+  更新於交易內比對 `expectedRevision`。
+- **PostgreSQL**：`schema.ts` 同步建立並初始化 `memory_auto_inject_settings`；`updateMemoryAutoInjectSettings`
+  以 `SELECT ... FOR UPDATE` 鎖定單列後驗證 `expectedRevision`。
+- **CAS 與驗證**：`expectedRevision` 不符時拋 `MemoryRecallConflictError`（REST 回 `409`）；`projects`
+  採合併語意（值為 `null` 時清除該專案覆寫，非法鍵或模式拋 `TypeError`）；通過 SQLite／PG 共用契約測試。
 
 ## 全文檢索與中文
 

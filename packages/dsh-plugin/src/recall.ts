@@ -92,7 +92,7 @@ export async function searchMemories(input: {
         accept: "application/json",
         authorization: `Bearer ${input.connection.token}`,
       },
-      body: JSON.stringify({ ...body, agent: TURN_AGENT }),
+      body: JSON.stringify({ ...body, agent: TURN_AGENT, channel: "auto" }),
       redirect: "error",
       signal: controller.signal,
     });
@@ -164,17 +164,11 @@ export function buildMemoryBlock(input: {
 
   const lines: string[] = [];
   let kept = 0;
+  let sourcesKept = 0;
+  let refinedChars = 0;
+  const baseUsed = framingChars + charLength(BLOCK_INTRO);
 
-  const raw = packRawSources({
-    hits: input.hits, maxSources: MAX_RECALL_SOURCES, maxChars: maxChars - framingChars - charLength(RAW_RECALL_INTRO),
-    measure: charLength, query: input.query,
-  });
-  lines.push(...raw.groups);
-  const intro = raw.groups.length > 0 ? RAW_RECALL_INTRO : BLOCK_INTRO;
-  let used = framingChars + charLength(intro) + raw.chars;
-  kept += raw.kept.length;
-  let sourcesKept = raw.groups.length;
-
+  // 先裝精煉記憶（依 server 回傳順序），避免高密度記憶被長篇 raw-turn 擠出預算。
   for (const hit of input.hits) {
     if (sourcesKept >= MAX_RECALL_SOURCES) break;
     if (hit === null || typeof hit !== "object" || hit.sourceType === "raw-turn") continue;
@@ -182,11 +176,11 @@ export function buildMemoryBlock(input: {
     if (content === "") continue;
     const prefix = `- [${hitKind(hit)}][${hitDate(hit)}] `;
 
-    const remaining = maxChars - used - 1; // 1 = 這一行的換行
+    const remaining = maxChars - (baseUsed + refinedChars) - 1; // 1 = 這一行的換行
     const candidate = `${prefix}${content}`;
     if (charLength(candidate) <= remaining) {
       lines.push(candidate);
-      used += 1 + charLength(candidate);
+      refinedChars += 1 + charLength(candidate);
       kept += 1;
       sourcesKept += 1;
       continue;
@@ -198,12 +192,29 @@ export function buildMemoryBlock(input: {
       if (available >= 8) {
         const truncated = `${prefix}${truncateChars(content, available)}`;
         lines.push(truncated);
-        used += 1 + charLength(truncated);
+        refinedChars += 1 + charLength(truncated);
         kept = 1;
+        sourcesKept += 1;
       }
     }
     break;
   }
+
+  // 再將剩餘名額與剩餘預算交給 raw-turn 補位（扣除 RAW_RECALL_INTRO 差額以保嚴格不超預算）。
+  const rawMaxChars = maxChars - framingChars - charLength(RAW_RECALL_INTRO) - refinedChars;
+  const raw =
+    sourcesKept < MAX_RECALL_SOURCES
+      ? packRawSources({
+          hits: input.hits,
+          maxSources: MAX_RECALL_SOURCES - sourcesKept,
+          maxChars: rawMaxChars,
+          measure: charLength,
+          query: input.query,
+        })
+      : { groups: [], kept: [], chars: 0 };
+  lines.push(...raw.groups);
+  kept += raw.kept.length;
+  const intro = raw.groups.length > 0 ? RAW_RECALL_INTRO : BLOCK_INTRO;
 
   if (lines.length === 0) return { block: "", kept: 0, chars: 0 };
 

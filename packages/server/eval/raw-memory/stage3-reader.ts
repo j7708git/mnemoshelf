@@ -66,6 +66,8 @@ export interface QuestionEvalRow {
     answer: string;
     latencyMs: number;
     score: ReaderScore;
+    promptTokens?: number;
+    completionTokens?: number;
   };
 }
 
@@ -97,6 +99,9 @@ export interface SystemEvalSummary {
   readerFalseAbstentionRate: number | null;
   readerForbiddenLeakRate: number | null;
   readerLatencyMs: { p50: number | null; p95: number | null };
+  readerTotalPromptTokens: number | null;
+  readerAvgPromptTokens: number | null;
+  readerTotalCompletionTokens: number | null;
   byCategory: Record<UnseenCategory, CategoryBreakdown>;
 }
 
@@ -309,6 +314,26 @@ export function aggregateStage3Scores(input: {
 
   const hasReader = rows.length > 0 && rows.every((row) => row.reader !== undefined);
   const latencies = hasReader ? rows.map((row) => row.reader!.latencyMs) : [];
+  const promptTokenValues = hasReader
+    ? rows
+        .map((row) => row.reader!.promptTokens)
+        .filter((value): value is number => typeof value === "number" && Number.isFinite(value))
+    : [];
+  const completionTokenValues = hasReader
+    ? rows
+        .map((row) => row.reader!.completionTokens)
+        .filter((value): value is number => typeof value === "number" && Number.isFinite(value))
+    : [];
+  const readerTotalPromptTokens =
+    promptTokenValues.length > 0
+      ? promptTokenValues.reduce((sum, value) => sum + value, 0)
+      : null;
+  const readerAvgPromptTokens =
+    readerTotalPromptTokens !== null ? readerTotalPromptTokens / promptTokenValues.length : null;
+  const readerTotalCompletionTokens =
+    completionTokenValues.length > 0
+      ? completionTokenValues.reduce((sum, value) => sum + value, 0)
+      : null;
 
   const byCategory = {} as Record<UnseenCategory, CategoryBreakdown>;
   for (const category of ALL_CATEGORIES) {
@@ -366,6 +391,9 @@ export function aggregateStage3Scores(input: {
       ? rate(rows.filter((row) => row.reader!.score.forbiddenMatched.length > 0).length, rows.length)
       : null,
     readerLatencyMs: hasReader ? quantiles(latencies) : { p50: null, p95: null },
+    readerTotalPromptTokens,
+    readerAvgPromptTokens,
+    readerTotalCompletionTokens,
     byCategory,
   };
 }

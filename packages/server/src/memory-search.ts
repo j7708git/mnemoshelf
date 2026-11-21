@@ -23,8 +23,10 @@ import type {
   MemoryScope,
   MemorySearchBucket,
   MemorySearchFilter,
+  MemorySearchSourceKind,
   MetadataStore,
 } from "@mnemoshelf/core";
+import { resolveAutoInjectMode } from "@mnemoshelf/core";
 import { MemoryPolicyChangedError } from "./memory-source.js";
 import { ValidationError } from "./errors.js";
 import {
@@ -40,6 +42,14 @@ import { isMemoryVisible } from "./memory-source.js";
 export const MEMORY_SEARCH_DEFAULT_K = 10;
 /** REST／MCP 介面的 `k` 上限（store 層另有 `MEMORY_SEARCH_MAX_K`＝500）。 */
 export const MEMORY_SEARCH_MAX_K = 100;
+
+/**
+ * 精煉記憶（`sourceId == null`）在語意排序中的加權（僅用於內部排序鍵；
+ * 回傳的 `score` 一律維持原始 cosine similarity）。
+ */
+export const REFINED_SEMANTIC_BOOST = 0.08;
+/** 關鍵字路徑中精煉記憶的名次折扣（`effectiveRank = rank * 0.7`）。 */
+export const REFINED_KEYWORD_RANK_FACTOR = 0.7;
 
 /** 語意不可用時的原因（回應的 `degradedReason`）。 */
 export type MemoryRecallDegradedReason = "no-embeddings" | "embedder-unavailable";
@@ -78,6 +88,15 @@ export interface MemoryRecallInput {
   k?: number;
   /** 只過濾語意結果，0..1（呼叫端已驗證）。 */
   minScore?: number;
+  /**
+   * 召回通道：`manual`（預設；使用者／MCP 主動查詢）或 `auto`（Hook／外掛自動注入）。
+   * 只有 `auto` 會受「自動注入模式」設定（off／refined-only）約束。
+   */
+  channel?: "manual" | "auto";
+  /** 來源種類篩選：`memory`＝精煉記憶、`raw-turn`＝原文片段、`all`／未提供＝不篩選。 */
+  sourceKind?: MemorySearchSourceKind;
+  /** 精煉記憶優先分層排序（預設 `true`；`false` 完全維持原本排序）。 */
+  preferRefined?: boolean;
 }
 
 /** 召回結果（REST 回應主體；MCP 原樣轉發）。 */
@@ -91,6 +110,8 @@ export interface MemoryRecallResponseBody {
   /** 記憶語意化統計（與 `GET /diagnostics` 的 `memories` 相同來源）。 */
   memoryEmbedding: MemoryEmbeddingStats;
   hits: MemoryRecallHit[];
+  /** 僅在自動注入被規則（off／refined-only）壓制時為 `true`（additive 欄位）。 */
+  autoInjectSuppressed?: boolean;
 }
 
 /** 執行召回所需的依賴。 */
@@ -152,8 +173,10 @@ type RankedMemory = { id: number; score: number; source: MemoryRecallSource };
 type RankedMemoryCandidate = { memory: Memory; item: RankedMemory };
 
 /** 讓較高順位的來源補入另一則訊息，至多取代一筆較低順位來源的重複名額。 */
+type MemoryReader = Pick<MetadataStore, "getMemory">;
+
 async function fillSourceComplement(
-  store: MetadataStore,
+  store: MemoryReader,
   remainder: readonly RankedMemory[],
   selected: RankedMemoryCandidate[],
   laneStart: number,
@@ -196,7 +219,7 @@ async function fillSourceComplement(
 }
 
 async function selectHits(
-  store: MetadataStore,
+  store: MemoryReader,
   ordered: RankedMemory[],
   buckets: MemorySearchBucket[],
   k: number,
@@ -237,6 +260,25 @@ async function selectHits(
   return selected;
 }
 
+/** 把候選記憶依「精煉優先」鍵重排：鍵相同（含同分）時精煉先於原文，再維持原始順序。 */
+function tierOrder<T extends { id: number }>(
+  items: readonly T[],
+  memories: ReadonlyMap<number, Memory | null>,
+  key: (item: T, refined: boolean) => number,
+  direction: "desc" | "asc",
+): T[] {
+  const decorated = items.map((item, index) => {
+    const refined = memories.get(item.id)?.sourceId == null && memories.get(item.id) !== null;
+    return { item, index, refined, key: key(item, refined) };
+  });
+  decorated.sort((a, b) => {
+    if (a.key !== b.key) return direction === "desc" ? b.key - a.key : a.key - b.key;
+    if (a.refined !== b.refined) return a.refined ? -1 : 1;
+    return a.index - b.index;
+  });
+  return decorated.map(({ item }) => item);
+}
+
 /**
  * 執行記憶召回（語言無關的核心；REST／MCP 都走這裡）。
  *
@@ -249,8 +291,23 @@ export async function prepareMemoryRecall(
   const recallVersion = (await deps.store.getMemoryRecallSettings()).dataRevision;
   const buckets = buildMemorySearchBuckets(input);
   const k = input.k ?? MEMORY_SEARCH_DEFAULT_K;
+
+  // 自動注入規則：必須在 embedQuery 之前短路（off／refined-only 的 raw-turn 不得觸發任何檢索）。
+  let effectiveSourceKind = input.sourceKind;
+  let suppressed = false;
+  if (input.channel === "auto") {
+    const mode = resolveAutoInjectMode(await deps.store.getMemoryAutoInjectSettings(), input.project);
+    if (mode === "off") suppressed = true;
+    else if (mode === "refined-only") {
+      if (input.sourceKind === "raw-turn") suppressed = true;
+      else effectiveSourceKind = "memory";
+    }
+  }
+  const preferRefined = input.preferRefined !== false;
+
   const filter: MemorySearchFilter = {
     buckets,
+    ...(effectiveSourceKind === undefined || effectiveSourceKind === "all" ? {} : { sourceKind: effectiveSourceKind }),
     ...(input.writer === undefined ? {} : { writer: input.writer }),
     ...(input.kind === undefined ? {} : { kind: input.kind }),
   };
@@ -267,7 +324,9 @@ export async function prepareMemoryRecall(
   // 多取候選，避免同一個長來源的相鄰片段擠掉其他來源。
   const candidateLimit = Math.min(500, Math.max(k * 4, 40));
 
-  if (usableReady <= 0) {
+  if (suppressed) {
+    // 自動注入被壓制：不載入模型、不檢索，回傳空結果。
+  } else if (usableReady <= 0) {
     // 沒有可用的就緒向量：連模型都不必載入，直接關鍵字。
     degraded = true;
     degradedReason = "no-embeddings";
@@ -289,11 +348,46 @@ export async function prepareMemoryRecall(
     }
   }
 
-  const selected = await selectHits(deps.store, semantic, buckets, k);
-  if (selected.length < k) {
-    const keyword = await deps.store.searchMemoriesKeyword(input.query, filter, candidateLimit);
-    await selectHits(deps.store, keyword.map(({ id, rank }) => ({ id, score: 1 / rank, source: "keyword" })),
-      buckets, k, selected);
+  // 同一次召回內共用 getMemory 快取，避免分層排序與選取各查一次。
+  const memoryCache = new Map<number, Memory | null>();
+  const reader: MemoryReader = {
+    getMemory: async (id) => {
+      if (!memoryCache.has(id)) memoryCache.set(id, await deps.store.getMemory(id));
+      return memoryCache.get(id) ?? null;
+    },
+  };
+  const preload = async (ids: readonly number[]) => {
+    for (const id of ids) await reader.getMemory(id);
+  };
+
+  let selected: RankedMemoryCandidate[] = [];
+  if (!suppressed) {
+    let orderedSemantic = semantic;
+    if (preferRefined && semantic.length > 1) {
+      await preload(semantic.map(({ id }) => id));
+      orderedSemantic = tierOrder(
+        semantic,
+        memoryCache,
+        (item, refined) => (refined ? item.score + REFINED_SEMANTIC_BOOST : item.score),
+        "desc",
+      );
+    }
+    selected = await selectHits(reader, orderedSemantic, buckets, k);
+    if (selected.length < k) {
+      const keyword = await deps.store.searchMemoriesKeyword(input.query, filter, candidateLimit);
+      let orderedKeyword = keyword;
+      if (preferRefined && keyword.length > 1) {
+        await preload(keyword.map(({ id }) => id));
+        orderedKeyword = tierOrder(
+          keyword,
+          memoryCache,
+          (item, refined) => (refined ? item.rank * REFINED_KEYWORD_RANK_FACTOR : item.rank),
+          "asc",
+        );
+      }
+      await selectHits(reader, orderedKeyword.map(({ id, rank }) => ({ id, score: 1 / rank, source: "keyword" as const })),
+        buckets, k, selected);
+    }
   }
 
   const ranks = new Map(selected.map(({ memory, item }) => [memory.id, item]));
@@ -321,6 +415,7 @@ export async function prepareMemoryRecall(
         degradedReason,
         memoryEmbedding,
         hits,
+        ...(suppressed ? { autoInjectSuppressed: true } : {}),
       };
     };
   };
