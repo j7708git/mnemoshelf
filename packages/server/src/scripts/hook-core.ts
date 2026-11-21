@@ -107,12 +107,18 @@ export async function readHookInput(
   }
 }
 
-/** 剝除已知的宿主與召回區塊；缺少收尾標籤時一律丟到字串尾端。 */
+const SYSTEM_MESSAGE_LEAD_RE =
+  /The following is a <SYSTEM_MESSAGE> not actually sent by the user\.[^\n]*\r?\n*/gi;
+const QUERY_STRIP_BLOCK_RE =
+  /<\s*(memory-context|system-reminder|system_message|additional_metadata|user_settings_change|file|attached-file|attachment|tool_use|tool_result|reasoning|thinking)\b[^>]*>[\s\S]*?(?:<\s*\/\s*\1\s*>|$)/gi;
+const QUERY_UNWRAP_TAG_RE = /<\s*\/?\s*user_request\b[^>]*>/gi;
+
+/** 剝除已知的宿主與召回區塊（保留 `<USER_REQUEST>` 內文）；缺少收尾標籤時一律丟到字串尾端。 */
 export function queryFromPrompt(prompt: string): string {
-  const stripped = prompt.replace(
-    /<\s*(memory-context|system-reminder|file|attached-file|attachment|tool_use|tool_result|reasoning|thinking)\b[^>]*>[\s\S]*?(?:<\s*\/\s*\1\s*>|$)/gi,
-    " ",
-  );
+  const stripped = prompt
+    .replace(SYSTEM_MESSAGE_LEAD_RE, " ")
+    .replace(QUERY_STRIP_BLOCK_RE, " ")
+    .replace(QUERY_UNWRAP_TAG_RE, " ");
   return maskSecrets(stripped)
     .text
     .trim()

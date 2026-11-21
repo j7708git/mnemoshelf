@@ -63,8 +63,8 @@ pnpm --filter '@mnemoshelf/server...' build
 }
 ```
 
-- `PreInvocation` 預設採 `first-turn+explicit`：每個新使用者提問自動召回一次，同一回合的多步工具迴圈內不重複注入；若需每步都召回，可設 `MNEMOSHELF_RECALL_MODE=every-turn`。
-- `Stop` 在回合正常結束時解析 `transcript.jsonl`（排除 `thinking`、`tool_calls`、工具輸出與系統注入），並透過 `POST /memory-sources` 等冪保存對話原文。
+- `PreInvocation` 預設採 `per-turn`：每個新使用者提問自動召回一次，並以回合步數（`initialNumSteps`）、正規化提示雜湊與注入內容雜湊防止同一回合的多步工具迴圈重複注入（即使提問含記憶關鍵字亦不重複注入）；若需每次模型呼叫都召回，可設 `MNEMOSHELF_RECALL_MODE=every-turn`。
+- `Stop` 在回合正常結束時解析 `transcript.jsonl`：解包 `<USER_REQUEST>` 並剝除 `<ADDITIONAL_METADATA>`、`<USER_SETTINGS_CHANGE>`、`<SYSTEM_MESSAGE>`、`<memory-context>` 等宿主注入標籤，排除 `thinking`、工具輸出、系統步驟與伴隨 `tool_calls` 的過場步驟（僅保留無 `tool_calls` 的實質回覆），透過 `POST /memory-sources` 等冪保存對話原文。
 
 #### B. Codex（自動召回＋可選 Stop 原文保存）
 
@@ -134,7 +134,7 @@ pnpm --filter '@mnemoshelf/server...' build
 
 | Harness | Preset (`--preset`) | 召回事件 | 提示欄位 (`--prompt-field`) | 工作目錄欄位 (`--cwd-field`) | 輸出模式 (`--output-mode`) | 原文保存 (`Stop`) |
 | --- | --- | --- | --- | --- | --- | --- |
-| Antigravity | `antigravity`（或專用 `antigravity-hook.js`） | `PreInvocation` | `lastUserInput` | `workspacePaths.0` | `injectSteps` | 支援（`antigravity-hook.js stop`） |
+| Antigravity | 專用 `antigravity-hook.js`（`generic-hook.js --preset antigravity` 不含多步去重狀態） | `PreInvocation` | `lastUserInput` | `workspacePaths.0` | `injectSteps` | 支援（`antigravity-hook.js stop`） |
 | Codex | `codex`（或專用 `codex-recall.js`） | `UserPromptSubmit` | `prompt` | `cwd` | `hookSpecificOutput` | 支援（`codex-capture.js`；`0.167.0-alpha.4.1` 的 CLI 與 macOS 桌面一般聊天均已實測） |
 | Claude Code | `claude-code` | `UserPromptSubmit` | `prompt` | `cwd` | `hookSpecificOutput` | 視宿主設定 |
 | Gemini CLI | `gemini-cli` | `BeforeAgent` | `prompt` | `cwd` | `hookSpecificOutput` | 視宿主設定 |

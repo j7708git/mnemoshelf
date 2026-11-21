@@ -21,9 +21,11 @@ import {
 const HOOK_TIMEOUT_MS = 3500;
 const MAX_TRANSCRIPT_BYTES = 16 * 1024 * 1024;
 const MAX_FULL_TRANSCRIPT_BYTES = 32 * 1024 * 1024;
-const EXPLICIT_MEMORY_HINT_RE =
-  /記得|上次|之前|過去|回憶|記憶|remember|recall|previous|earlier|last\s+time/iu;
 const SKIP_STOP_REASONS = new Set(["ERROR", "USER_CANCELED", "TERMINAL_CUSTOM_HOOK"]);
+const SYSTEM_MESSAGE_LEAD_RE =
+  /The following is a <SYSTEM_MESSAGE> not actually sent by the user\.[^\n]*\r?\n*/gi;
+const ANTIGRAVITY_TAG_RE =
+  /<\s*(\/?)\s*(user_request|additional_metadata|user_settings_change|system_message|memory-context|system-reminder|system|developer|environment_context|thinking|reasoning|tool_use|tool_result|tool_call|tool_output|attachment|attached-file|file)\b[^>]*>/gi;
 
 export interface PreInvocationOutput {
   injectSteps?: Array<{ systemMessage: { systemMessage: string } }>;
@@ -33,7 +35,9 @@ export interface PreInvocationOutput {
 export type StopOutput = Record<string, never>;
 
 interface ConversationState {
+  lastInitialNumSteps?: number;
   lastPromptHash?: string;
+  lastInjectedBlockHash?: string;
   lastCapturedUserStepIndex?: number;
 }
 
@@ -45,6 +49,7 @@ interface ParsedStep {
   createdAt: string | null;
   content: string;
   contentTruncated: boolean;
+  hasToolCalls: boolean;
 }
 
 interface ParsedTurn {
@@ -59,11 +64,54 @@ export interface AntigravityHookOptions {
   stateDir?: string;
 }
 
+function parseNonNegativeInt(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * 清洗 Antigravity 對話可見文字：
+ * - 剝除宿主系統前置提示與系統／元資料／記憶注入區塊（連同內文）；
+ * - 僅移除 `<USER_REQUEST>` 外殼標籤並保留使用者提問本文；
+ * - 缺少收尾標籤的待剝除區塊一律捨棄至字串尾端，不外洩未閉合注入內容。
+ */
+export function sanitizeAntigravityText(text: string): string {
+  const withoutLead = text.replace(SYSTEM_MESSAGE_LEAD_RE, "");
+  const stack: string[] = [];
+  let end = 0;
+  let output = "";
+
+  for (const match of withoutLead.matchAll(ANTIGRAVITY_TAG_RE)) {
+    const index = match.index!;
+    if (stack.length === 0) output += withoutLead.slice(end, index);
+
+    const isClose = match[1] === "/";
+    const name = match[2]!.toLowerCase();
+    const isSelfClosing = /\/\s*>$/.test(match[0]);
+
+    if (name === "user_request") {
+      // 只拆外殼標籤，不影響堆疊深度，保留內部使用者提問本文
+    } else if (isClose) {
+      if (stack[stack.length - 1] === name) stack.pop();
+    } else if (!isSelfClosing) {
+      stack.push(name);
+    }
+
+    end = index + match[0].length;
+  }
+
+  if (stack.length === 0) output += withoutLead.slice(end);
+  return output.trim();
+}
+
 function resolveWorkspaceCwd(input: Record<string, unknown>): string | undefined {
   const paths = input.workspacePaths;
-  if (!Array.isArray(paths)) return undefined;
-  for (const item of paths) {
-    if (typeof item === "string" && path.isAbsolute(item)) return item;
+  if (Array.isArray(paths)) {
+    for (const item of paths) {
+      if (typeof item === "string" && path.isAbsolute(item)) return item;
+    }
+  }
+  if (typeof input.cwd === "string" && path.isAbsolute(input.cwd)) {
+    return input.cwd;
   }
   return undefined;
 }
@@ -85,7 +133,10 @@ async function readState(file: string): Promise<ConversationState> {
     const parsed = asRecord(JSON.parse(raw));
     if (parsed === null) return {};
     return {
+      lastInitialNumSteps: parseNonNegativeInt(parsed.lastInitialNumSteps),
       lastPromptHash: typeof parsed.lastPromptHash === "string" ? parsed.lastPromptHash : undefined,
+      lastInjectedBlockHash:
+        typeof parsed.lastInjectedBlockHash === "string" ? parsed.lastInjectedBlockHash : undefined,
       lastCapturedUserStepIndex:
         typeof parsed.lastCapturedUserStepIndex === "number" &&
         Number.isSafeInteger(parsed.lastCapturedUserStepIndex)
@@ -119,23 +170,40 @@ export async function runAntigravityPreInvocation(
     const input = await readHookInput(stdin);
     if (input === null) return {};
 
-    const prompt = typeof input.lastUserInput === "string" ? input.lastUserInput.trim() : "";
+    const rawPrompt = typeof input.lastUserInput === "string" ? input.lastUserInput : "";
+    const prompt = sanitizeAntigravityText(rawPrompt);
     if (prompt === "") return {};
 
     const conversationId = typeof input.conversationId === "string" ? input.conversationId.trim() : "";
-    const recallMode = env.MNEMOSHELF_RECALL_MODE?.trim() || "first-turn+explicit";
+    const recallMode = env.MNEMOSHELF_RECALL_MODE?.trim() || "per-turn";
     const stateFile = conversationId !== "" ? resolveStateFile(conversationId, options) : null;
-    const state = stateFile !== null ? await readState(stateFile) : {};
+    let state = stateFile !== null ? await readState(stateFile) : {};
+    const initialNumSteps = parseNonNegativeInt(input.initialNumSteps);
     const promptHash = createHash("sha256").update(prompt).digest("hex");
 
     if (recallMode !== "every-turn" && stateFile !== null) {
-      const isNewPrompt = state.lastPromptHash !== promptHash;
-      const hasExplicitHint = EXPLICIT_MEMORY_HINT_RE.test(prompt);
-      if (!isNewPrompt && !hasExplicitHint) return {};
+      const sameTurnBySteps =
+        initialNumSteps !== undefined &&
+        state.lastInitialNumSteps !== undefined &&
+        state.lastInitialNumSteps === initialNumSteps;
+      const samePromptWithoutSteps =
+        (initialNumSteps === undefined || state.lastInitialNumSteps === undefined) &&
+        state.lastPromptHash === promptHash;
+      if (sameTurnBySteps || samePromptWithoutSteps) return {};
     }
 
-    if (stateFile !== null && state.lastPromptHash !== promptHash) {
-      await writeState(stateFile, { ...state, lastPromptHash: promptHash });
+    const previousPromptHash = state.lastPromptHash;
+    const previousInjectedBlockHash = state.lastInjectedBlockHash;
+    const stateChanged =
+      state.lastPromptHash !== promptHash ||
+      (initialNumSteps !== undefined && state.lastInitialNumSteps !== initialNumSteps);
+    if (stateFile !== null && stateChanged) {
+      state = {
+        ...state,
+        lastPromptHash: promptHash,
+        ...(initialNumSteps === undefined ? {} : { lastInitialNumSteps: initialNumSteps }),
+      };
+      await writeState(stateFile, state);
     }
 
     const cwd = resolveWorkspaceCwd(input);
@@ -148,6 +216,21 @@ export async function runAntigravityPreInvocation(
       fetchImpl: options.fetchImpl,
     });
     if (context === null) return {};
+
+    const blockHash = createHash("sha256").update(context).digest("hex");
+    if (
+      recallMode !== "every-turn" &&
+      stateFile !== null &&
+      previousPromptHash === promptHash &&
+      previousInjectedBlockHash === blockHash
+    ) {
+      return {};
+    }
+
+    if (stateFile !== null && state.lastInjectedBlockHash !== blockHash) {
+      state = { ...state, lastInjectedBlockHash: blockHash };
+      await writeState(stateFile, state);
+    }
 
     return {
       injectSteps: [{ systemMessage: { systemMessage: context } }],
@@ -174,13 +257,14 @@ function parseTranscriptLine(line: string): ParsedStep | null {
   if (type !== "USER_INPUT" && type !== "PLANNER_RESPONSE") return null;
 
   const source = typeof obj.source === "string" ? obj.source : "";
-  if (source === "SYSTEM") return null;
+  if (source === "SYSTEM" || source.startsWith("SYSTEM_")) return null;
 
   const status = typeof obj.status === "string" ? obj.status : "DONE";
   const createdAt = typeof obj.created_at === "string" ? obj.created_at : null;
   const content = typeof obj.content === "string" ? obj.content : "";
   const truncatedFields = Array.isArray(obj.truncated_fields) ? obj.truncated_fields : [];
   const contentTruncated = truncatedFields.includes("content");
+  const hasToolCalls = Array.isArray(obj.tool_calls) && obj.tool_calls.length > 0;
 
   return {
     stepIndex: obj.step_index,
@@ -190,6 +274,7 @@ function parseTranscriptLine(line: string): ParsedStep | null {
     createdAt,
     content,
     contentTruncated,
+    hasToolCalls,
   };
 }
 
@@ -243,14 +328,20 @@ export async function parseAntigravityTurns(transcriptPath: string): Promise<Par
   let current: ParsedTurn | null = null;
 
   for (const step of steps) {
-    const text = step.content.trim();
     if (step.type === "USER_INPUT") {
-      if (text === "") continue;
-      current = { userStep: step, assistantSteps: [] };
+      const cleaned = sanitizeAntigravityText(step.content);
+      if (cleaned === "") {
+        current = null;
+        continue;
+      }
+      current = { userStep: { ...step, content: cleaned }, assistantSteps: [] };
       turns.push(current);
     } else if (step.type === "PLANNER_RESPONSE" && current !== null) {
-      if (text === "") continue;
-      current.assistantSteps.push(step);
+      // 排除伴隨工具呼叫的過場步驟，僅保留面向使用者的實質回覆
+      if (step.hasToolCalls) continue;
+      const cleaned = sanitizeAntigravityText(step.content);
+      if (cleaned === "") continue;
+      current.assistantSteps.push({ ...step, content: cleaned });
     }
   }
 
