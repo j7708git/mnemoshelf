@@ -55,7 +55,12 @@ import {
   type IndexRootOptions,
   type IndexRootResult,
   type IndexTimingEvent,
+  AUTO_INJECT_MODES,
+  type AutoInjectMode,
   MEMORY_SCOPES,
+  MEMORY_SEARCH_SOURCE_KINDS,
+  type MemorySearchSourceKind,
+  type MemoryAutoInjectPatch,
   type Memory,
   type MemoryKind,
   type MemoryLibraryFilter,
@@ -225,6 +230,7 @@ export const API_PATH_PREFIXES: readonly string[] = [
   "memory-library",
   "memory-recall-rules",
   "memory-policy",
+  "memory-auto-inject",
   "memory-sources",
   "diagnostics",
 ];
@@ -2420,10 +2426,29 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       minScore = body.minScore;
     }
 
+    let channel: "manual" | "auto" | undefined;
+    if (body.channel !== undefined) {
+      if (body.channel !== "manual" && body.channel !== "auto") {
+        throw new ValidationError("channel", "必須是 manual 或 auto");
+      }
+      channel = body.channel;
+    }
+    let sourceKind: MemorySearchSourceKind | undefined;
+    if (body.sourceKind !== undefined) {
+      if (typeof body.sourceKind !== "string" || !(MEMORY_SEARCH_SOURCE_KINDS as readonly string[]).includes(body.sourceKind)) {
+        throw new ValidationError("sourceKind", `必須是 ${MEMORY_SEARCH_SOURCE_KINDS.join(" / ")} 之一`);
+      }
+      sourceKind = body.sourceKind as MemorySearchSourceKind;
+    }
+    const preferRefined = optionalBoolean(body.preferRefined, "preferRefined");
+
     const prepare = await prepareMemoryRecall(
       { store: deps.store, embedder: deps.embedder },
       {
         query,
+        ...(channel === undefined ? {} : { channel }),
+        ...(sourceKind === undefined ? {} : { sourceKind }),
+        ...(preferRefined === undefined ? {} : { preferRefined }),
         ...(projectValue === undefined ? {} : { project: projectValue }),
         ...(includeAllProjects === undefined ? {} : { includeAllProjects }),
         ...(scope === undefined ? {} : { scope }),
@@ -2621,6 +2646,56 @@ export function createRestApp(deps: RestAppDeps): RestApp {
     const maskSecrets = body.maskSecrets;
     const policy = await serializeMemoryWrite(() => deps.store.setMemoryPolicy(maskSecrets));
     return { status: 200, body: policy };
+  };
+
+  /** `GET／PATCH /memory-auto-inject`：自動注入模式（全域預設＋逐專案覆寫，樂觀並發）。 */
+  const routeMemoryAutoInject = async (
+    request: IncomingMessage,
+    method: string,
+    segments: string[],
+  ): Promise<RouteResult> => {
+    if (segments.length !== 1) throw new NotFoundError("路徑");
+    if (method === "GET") return { status: 200, body: await deps.store.getMemoryAutoInjectSettings() };
+    if (method !== "PATCH") throw new MethodNotAllowedError(method, ["GET", "PATCH"]);
+    const body = await readJsonBody(request);
+    if (Object.keys(body).some((key) => !["expectedRevision", "defaultMode", "projects"].includes(key))) {
+      throw new ValidationError("body", "含有不支援的欄位");
+    }
+    const expectedRevision = revisionNumber(body.expectedRevision, "expectedRevision");
+    let defaultMode: AutoInjectMode | undefined;
+    if (body.defaultMode !== undefined) {
+      if (typeof body.defaultMode !== "string" || !(AUTO_INJECT_MODES as readonly string[]).includes(body.defaultMode)) {
+        throw new ValidationError("defaultMode", `必須是 ${AUTO_INJECT_MODES.join(" / ")} 之一`);
+      }
+      defaultMode = body.defaultMode as AutoInjectMode;
+    }
+    let projects: Record<string, AutoInjectMode | null> | undefined;
+    if (body.projects !== undefined) {
+      if (typeof body.projects !== "object" || body.projects === null || Array.isArray(body.projects)) {
+        throw new ValidationError("projects", "必須是物件");
+      }
+      projects = {};
+      for (const [name, mode] of Object.entries(body.projects as Record<string, unknown>)) {
+        if (mode !== null && (typeof mode !== "string" || !(AUTO_INJECT_MODES as readonly string[]).includes(mode))) {
+          throw new ValidationError("projects", `專案 ${name} 的模式必須是 ${AUTO_INJECT_MODES.join(" / ")} 或 null`);
+        }
+        projects[name] = mode as AutoInjectMode | null;
+      }
+    }
+    const patch: MemoryAutoInjectPatch = {
+      expectedRevision,
+      ...(defaultMode === undefined ? {} : { defaultMode }),
+      ...(projects === undefined ? {} : { projects }),
+    };
+    try {
+      return await serializeMemoryWrite(async () => ({
+        status: 200,
+        body: await deps.store.updateMemoryAutoInjectSettings(patch),
+      }));
+    } catch (error) {
+      if (error instanceof TypeError) throw new ValidationError("body", error.message);
+      throw error;
+    }
   };
 
   const addMemorySource = async (request: IncomingMessage): Promise<RouteResult> => {
@@ -2891,6 +2966,9 @@ export function createRestApp(deps: RestAppDeps): RestApp {
       case "memory-policy":
         result = await routeMemoryPolicy(request, method, segments);
         break;
+      case "memory-auto-inject":
+        result = await routeMemoryAutoInject(request, method, segments);
+        break;
       case "memory-sources":
         result = await routeMemorySources(request, method, segments, url);
         break;
@@ -2947,7 +3025,7 @@ export function createRestApp(deps: RestAppDeps): RestApp {
         }
         const { url, segments } = parseRequestTarget(request);
         if (isApiPath(segments)) {
-          memoryRequest = ["memories", "memory-library", "memory-recall-rules", "memory-policy", "memory-sources", "search"].includes(segments[0]!);
+          memoryRequest = ["memories", "memory-library", "memory-recall-rules", "memory-policy", "memory-auto-inject", "memory-sources", "search"].includes(segments[0]!);
           await dispatch(request, response, url, segments);
         } else {
           await serveWeb(request, response, url);

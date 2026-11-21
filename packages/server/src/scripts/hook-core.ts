@@ -256,12 +256,35 @@ export function formatRecallBlock(
   return [...lines, BLOCK_END].join("\n");
 }
 
+/** 記憶線索詞：短提示若明確在問「記不記得」，仍值得自動召回。 */
+const RECALL_CUE_PATTERN = /(記得|還記得|上次|之前|先前|以前|剛剛|remember|recall|previously|last time)/i;
+/** 低於此 Unicode code point 數的提示視為寒暄／確認，不自動召回。 */
+const MIN_AUTO_RECALL_PROMPT_CODE_POINTS = 6;
+
+/**
+ * 判斷提示是否不值得自動召回（省下 HTTP 往返與無意義注入）。
+ *
+ * - 空白、純 slash 指令（如 `/compact`；`/plan 後續內容` 不算）→ 略過；
+ * - 少於 6 個 Unicode code points 且沒有記憶線索詞（如 `OK`、`好`、`繼續`）→ 略過。
+ */
+export function shouldSkipAutoRecallPrompt(prompt: string): boolean {
+  const trimmed = prompt.trim();
+  if (trimmed === "") return true;
+  if (/^\/[^\s]+$/.test(trimmed)) return true;
+  if (Array.from(trimmed).length < MIN_AUTO_RECALL_PROMPT_CODE_POINTS && !RECALL_CUE_PATTERN.test(trimmed)) return true;
+  return false;
+}
+
 /** 依提示執行自動語意召回，失敗或無命中時靜默回傳 null。 */
 export async function recallForPrompt(options: RecallOptions): Promise<string | null> {
   const query = queryFromPrompt(options.prompt);
   if (query === "") return null;
 
   const env = options.env ?? process.env;
+  // 環境層級的自動注入開關：off 完全不發 HTTP；refined-only 只搜精煉記憶。
+  const autoInjectMode = env.MNEMOSHELF_AUTO_INJECT?.trim().toLowerCase();
+  if (autoInjectMode === "off") return null;
+  if (shouldSkipAutoRecallPrompt(query)) return null;
   const project = resolveHookProject({ env, cwd: options.cwd, homeDir: options.homeDir });
   const config = await resolveHookConnection({
     env,
@@ -284,7 +307,15 @@ export async function recallForPrompt(options: RecallOptions): Promise<string | 
         "content-type": "application/json",
         accept: "application/json",
       },
-      body: JSON.stringify({ query, ...scope, ...(options.callerAgent === undefined ? {} : { agent: options.callerAgent }), k: limit, minScore }),
+      body: JSON.stringify({
+        query,
+        ...scope,
+        ...(options.callerAgent === undefined ? {} : { agent: options.callerAgent }),
+        k: limit,
+        minScore,
+        channel: "auto",
+        ...(autoInjectMode === "refined-only" ? { sourceKind: "memory" } : {}),
+      }),
       redirect: "error",
       signal: AbortSignal.timeout(options.searchTimeoutMs ?? DEFAULT_SEARCH_TIMEOUT_MS),
     });

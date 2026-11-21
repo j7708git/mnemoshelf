@@ -1428,6 +1428,90 @@ export async function updateMemoryOrganization(type: MemoryLibraryEntry["type"],
   }), "保存記憶歸屬與用途失敗");
 }
 
+/** 自動注入模式：精煉優先＋原文補位、僅自動注入精煉記憶、或停用自動注入。 */
+export type AutoInjectMode = "all" | "refined-only" | "off";
+
+/** `GET /memory-auto-inject` 與 `PATCH /memory-auto-inject` 回傳的自動注入設定。 */
+export interface MemoryAutoInjectSettings {
+  revision: number;
+  defaultMode: AutoInjectMode;
+  projects: Record<string, AutoInjectMode>;
+}
+
+/** `PATCH /memory-auto-inject` 請求內容；`projects` 值為 `null` 表示刪除該專案覆寫。 */
+export interface MemoryAutoInjectPatch {
+  expectedRevision: number;
+  defaultMode?: AutoInjectMode;
+  projects?: Record<string, AutoInjectMode | null>;
+}
+
+/** 舊版服務尚未支援 `/memory-auto-inject`（HTTP 404）時拋出。 */
+export class MemoryAutoInjectUnavailableError extends Error {
+  constructor() {
+    super("本機服務需要升級才能使用自動注入設定。");
+    this.name = "MemoryAutoInjectUnavailableError";
+  }
+}
+
+function isAutoInjectMode(value: unknown): value is AutoInjectMode {
+  return value === "all" || value === "refined-only" || value === "off";
+}
+
+function parseMemoryAutoInjectSettings(value: unknown): MemoryAutoInjectSettings {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("本機服務回傳的自動注入設定格式不正確。");
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.revision !== "number" ||
+    !Number.isSafeInteger(record.revision) ||
+    record.revision < 1 ||
+    !isAutoInjectMode(record.defaultMode) ||
+    typeof record.projects !== "object" ||
+    record.projects === null ||
+    Array.isArray(record.projects)
+  ) {
+    throw new Error("本機服務回傳的自動注入設定格式不正確。");
+  }
+  const projects: Record<string, AutoInjectMode> = {};
+  for (const [project, mode] of Object.entries(record.projects)) {
+    if (project.trim() === "" || !isAutoInjectMode(mode)) {
+      throw new Error("本機服務回傳的自動注入設定格式不正確。");
+    }
+    projects[project] = mode;
+  }
+  return {
+    revision: record.revision,
+    defaultMode: record.defaultMode,
+    projects,
+  };
+}
+
+async function requestMemoryAutoInject(init: RequestInit, fallback: string): Promise<MemoryAutoInjectSettings> {
+  const headers = new Headers(init.headers);
+  headers.set("accept", "application/json");
+  const response = await apiFetch("/memory-auto-inject", { ...init, headers, cache: "no-store" });
+  if (response.status === 404) throw new MemoryAutoInjectUnavailableError();
+  if (response.status === 409) throw new MemoryRecallConflictError();
+  if (!response.ok) throw new Error(await readErrorMessage(response, fallback));
+  const body = (await response.json().catch(() => null)) as unknown;
+  return parseMemoryAutoInjectSettings(body);
+}
+
+/** 讀取全域與專案級自動注入設定。 */
+export async function getMemoryAutoInjectSettings(signal?: AbortSignal): Promise<MemoryAutoInjectSettings> {
+  return requestMemoryAutoInject({ signal }, "讀取自動注入設定失敗");
+}
+
+/** 更新全域預設或局部變更專案級自動注入覆寫（409 表示修訂衝突）。 */
+export async function updateMemoryAutoInjectSettings(patch: MemoryAutoInjectPatch): Promise<MemoryAutoInjectSettings> {
+  return requestMemoryAutoInject({
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(patch),
+  }, "更新自動注入設定失敗");
+}
+
 export interface MemoryLibraryQuery {
   project?: string;
   unassigned?: boolean;

@@ -69,7 +69,7 @@ describe("通用 Hook CLI 入口", () => {
 
     const claudeCfg = parseGenericHookArgs(["--preset", "claude-code"]);
     const claudeOut = await runGenericRecall(
-      Readable.from([JSON.stringify({ prompt: "請問架構？", cwd: workspaceDir })]),
+      Readable.from([JSON.stringify({ prompt: "請問架構是什麼？", cwd: workspaceDir })]),
       claudeCfg,
       { env, homeDir, fetchImpl },
     );
@@ -82,7 +82,7 @@ describe("通用 Hook CLI 入口", () => {
 
     const agCfg = parseGenericHookArgs(["--preset", "antigravity"]);
     const agOut = await runGenericRecall(
-      Readable.from([JSON.stringify({ lastUserInput: "請問架構？", workspacePaths: [workspaceDir] })]),
+      Readable.from([JSON.stringify({ lastUserInput: "請問架構是什麼？", workspacePaths: [workspaceDir] })]),
       agCfg,
       { env, homeDir, fetchImpl },
     );
@@ -93,7 +93,7 @@ describe("通用 Hook CLI 入口", () => {
 
     const cursorCfg = parseGenericHookArgs(["--preset", "cursor"]);
     const cursorOut = await runGenericRecall(
-      Readable.from([JSON.stringify({ prompt: "請問架構？", workspace_roots: [workspaceDir] })]),
+      Readable.from([JSON.stringify({ prompt: "請問架構是什麼？", workspace_roots: [workspaceDir] })]),
       cursorCfg,
       { env, homeDir, fetchImpl },
     );

@@ -105,6 +105,23 @@
 接入端以回應的 `recallVersion` 與目前 `dataRevision` 核對快取，遮罩修訂另行核對。
 這些檢查不能追回已交給模型的文字，也不構成同 token 之間的身分隔離。
 
+## 自動注入設定
+
+`GET /memory-auto-inject` 與 `PATCH /memory-auto-inject` 控制「自動召回（`channel: "auto"`）」的全域預設模式與逐專案覆寫，結構為 `{ revision, defaultMode, projects }`：
+
+- 三種模式：
+  - `all`（預設）：自動注入可帶入精煉記憶與原始對話片段。
+  - `refined-only`：自動注入僅帶入精煉記憶（相當於 `sourceKind: "memory"`），若呼叫端明確要求 `sourceKind: "raw-turn"` 則壓制為空結果並標記 `autoInjectSuppressed: true`。
+  - `off`：停用自動注入，在 embedding 查詢前直接短路並標記 `autoInjectSuppressed: true`。
+- 更新採用樂觀並發（CAS）：`PATCH /memory-auto-inject` 須帶 `{ expectedRevision, defaultMode?, projects? }`；`expectedRevision` 與目前 `revision` 不符時回 `409`。`projects` 採合併語意，只更新請求列出的專案鍵；將某專案值設為 `null` 會清除該專案覆寫，使其改回沿用 `defaultMode`。
+
+**與 `recallPolicy: "disabled"` 的區別**：
+
+- 自動注入設為 `off` **只停用 `channel: "auto"`**（Hook／外掛在對話前自動帶入背景記憶），**不影響** MCP `search_memories`／`recall` 工具與手動召回預覽。
+- `recallPolicy: "disabled"` 則是記憶本身的用途規則，會在所有自動與主動召回中完全排除該筆記憶。
+
+**建議實務**：若自動保存原文回合的寫入者（如 `antigravity/turn`、`codex/turn`）偶爾在未解析到專案時寫入，建議在召回規則中將這類寫入者設為 `project` 規則——無歸屬專案時會依規則落為 `disabled`，避免未解析專案的原文回合擴散至 `global`。
+
 ## 備份與相容
 
 預設 NDJSON 備份使用 schemaVersion 3，保存短記憶、原文來源、組織快照與召回規則。

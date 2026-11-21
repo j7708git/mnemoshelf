@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { MemoryAutoInjectPanel } from "./MemoryAutoInjectPanel";
 import {
   deleteMemoryRecallRule, getMemoryRecallRules, previewMemoryRecallRule, saveMemoryRecallRule, MemoryRecallConflictError,
   type MemoryRecallPolicy, type MemoryRecallRule, type MemoryRecallSettings, type MemoryRulePreview,
@@ -124,7 +125,8 @@ export function MemoryRecallRules({ projects, writers, revision, onChanged }: {
     (a.project !== undefined ? a.writer !== undefined ? 0 : 1 : 2) - (b.project !== undefined ? b.writer !== undefined ? 0 : 1 : 2));
 
   return (
-    <div className="grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
+    <div className="space-y-4">
+      <div className="grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)]">
       <div className="space-y-4 rounded-2xl border border-line bg-surface p-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-sm font-medium text-ink">{form.id === null ? "新增召回規則" : "編輯召回規則"}</h3>
@@ -187,6 +189,8 @@ export function MemoryRecallRules({ projects, writers, revision, onChanged }: {
         <p className="border-t border-line pt-3 text-[11px] leading-relaxed text-muted">用途只控制這份本機記憶庫的召回，不是公開發布，也不是多使用者的權限隔離。套用後的記憶會保留規則快照，供之後追查。</p>
       </aside>
       {remove !== null && <ConfirmDialog open title="刪除這條召回規則？" description={`${memoryRuleTargetLabel(remove)}\n\n之後寫入不再套用這條規則。既有記憶保留原用途與歷史規則快照，不會被重新分類。`} confirmLabel="刪除規則" busy={busy} onCancel={() => setRemove(null)} onConfirm={() => void confirmDelete()} />}
+      </div>
+      <MemoryAutoInjectPanel projects={projects} revision={revision} />
     </div>
   );
 }

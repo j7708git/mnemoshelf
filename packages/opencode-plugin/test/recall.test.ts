@@ -16,6 +16,7 @@ import {
   messageText,
   planRecall,
   scoreLabel,
+  searchMemories,
   skipReason,
   statusText,
   truncateChars,
@@ -590,7 +591,7 @@ describe("最近回合紀錄（recent turns）", () => {
     expect(badShape).toMatchObject({ ok: false, reason: "bad-response" });
   });
 
-  it("注入順序：回合紀錄（舊→新）先，語意命中後；同 id 只出現一次", () => {
+  it("注入順序：精煉記憶先，舊版回合紀錄（舊→新）後；同 id 只出現一次", () => {
     const result = planRecall({
       hits: [
         hit({ id: 102, content: "同一筆也在語意命中裡", score: 0.9 }),
@@ -608,23 +609,22 @@ describe("最近回合紀錄（recent turns）", () => {
       now,
     });
 
-    const oldest = result.block.indexOf("最舊回合");
-    const middle = result.block.indexOf("中間回合");
-    const newest = result.block.indexOf("最新回合");
     const semantic = result.block.indexOf("其他語意命中");
+    const oldest = result.block.indexOf("最舊回合");
+    const newest = result.block.indexOf("最新回合");
+    expect(semantic).toBeGreaterThan(-1);
     expect(oldest).toBeGreaterThan(-1);
-    expect(oldest).toBeLessThan(middle);
-    expect(middle).toBeLessThan(newest);
-    expect(newest).toBeLessThan(semantic);
-    expect(result.block.match(/中間回合/g)).toHaveLength(1);
-    expect(result.block).not.toContain("同一筆也在語意命中裡");
+    expect(semantic).toBeLessThan(oldest);
+    expect(oldest).toBeLessThan(newest);
+    expect(result.block.match(/同一筆也在語意命中裡/g)).toHaveLength(1);
+    expect(result.block).not.toContain("中間回合");
     expect(result.block).toContain("- [turn][2026-10-20][最近] 最舊回合");
     expect(result.block).toContain("回合紀錄與背景資料");
-    expect(result.stats.turns).toBe(3);
-    expect(result.injected.map((item) => item.id)).toEqual([103, 102, 101, 5]);
+    expect(result.stats.turns).toBe(2);
+    expect(result.injected.map((item) => item.id)).toEqual([102, 5, 103, 101]);
   });
 
-  it("回合紀錄優先保留：預算不足時先丟語意命中", () => {
+  it("精煉記憶優先保留：預算不足時先丟舊版回合紀錄", () => {
     const result = planRecall({
       hits: [hit({ id: 5, content: "語".repeat(200), score: 0.9 })],
       turns: [turnRecord(11, "第一回合內容"), turnRecord(12, "第二回合內容"), turnRecord(13, "第三回合內容")],
@@ -634,9 +634,9 @@ describe("最近回合紀錄（recent turns）", () => {
       turn: 1,
       now,
     });
-    expect(result.block).toContain("第三回合內容");
-    expect(result.block).not.toContain("語語語");
-    expect(result.stats.turns).toBe(3);
+    expect(result.block).toContain("語語語");
+    expect(result.block).not.toContain("第三回合內容");
+    expect(result.stats.turns).toBe(0);
   });
 
   it("沒有回合紀錄時 intro 維持原本句子", () => {
@@ -713,4 +713,97 @@ it.each([
   expect(content).toMatch(expected);
   expect(content.length).toBeLessThanOrEqual(bodyLimit);
   expect(content).not.toMatch(/[\uD800-\uDFFF]/u);
+});
+
+describe("精煉記憶優先裝箱與 channel 參數（Issue #22 P2）", () => {
+  it("緊縮 900 字元預算下先保留精煉記憶，剩餘空間才由長篇 raw-turn 與舊回合補位", () => {
+    const longRaw = "前置背景".repeat(80) + "核心錨點FALCON-7" + "尾段雜訊".repeat(120);
+    const result = planRecall({
+      hits: [
+        {
+          id: 20,
+          sourceId: 77,
+          sourceType: "raw-turn",
+          role: "assistant",
+          content: longRaw,
+          snippetAnchor: 320,
+          kind: "fact",
+          project: "mnemoshelf",
+          createdAt: "2026-10-20T00:00:00.000Z",
+          source: "keyword",
+          score: 1,
+        },
+        hit({ id: 1, kind: "decision", score: 0.91, content: "精煉決策：寫入前一律驗證路徑歸屬。" }),
+        hit({ id: 2, kind: "pitfall", score: 0.85, content: "精煉踩坑：不可直接傳遞未校驗的查詢字串。" }),
+      ],
+      turns: [{ id: 30, content: "舊版回合紀錄應在最後補位或被丟棄", createdAt: "2026-10-19T00:00:00.000Z" }],
+      query: "核心錨點FALCON-7",
+      settings: { ...DEFAULT_SETTINGS, softChars: 900, hardChars: 900 },
+      project: "mnemoshelf",
+      dedupe: new Map(),
+      turn: 1,
+      now: new Date("2026-10-28T10:00:00.000Z"),
+    });
+
+    expect(result.block.length).toBeLessThanOrEqual(900);
+    expect(result.block.endsWith("</memory-context>")).toBe(true);
+    expect(result.block).toContain("精煉決策：寫入前一律驗證路徑歸屬。");
+    expect(result.block).toContain("精煉踩坑：不可直接傳遞未校驗的查詢字串。");
+    expect(result.block).toContain("[source id=77]");
+    expect(result.block).toContain("核心錨點FALCON-7");
+    expect(result.block.indexOf("精煉決策")).toBeLessThan(result.block.indexOf("[source id=77]"));
+    expect(result.injected.map((item) => item.id)).toContain(1);
+    expect(result.injected.map((item) => item.id)).toContain(2);
+    expect(result.injected.map((item) => item.id)).toContain(20);
+  });
+
+  it("精煉記憶已佔滿 maxItems 時不再納入 raw-turn", () => {
+    const result = planRecall({
+      hits: [
+        {
+          id: 99,
+          sourceId: 55,
+          sourceType: "raw-turn",
+          role: "user",
+          content: "不應佔位的原文片段",
+          kind: "fact",
+          project: "mnemoshelf",
+          createdAt: "2026-10-20T00:00:00.000Z",
+          source: "keyword",
+          score: 1,
+        },
+        hit({ id: 1, content: "精煉一" }),
+        hit({ id: 2, content: "精煉二" }),
+        hit({ id: 3, content: "精煉三" }),
+        hit({ id: 4, content: "精煉四" }),
+      ],
+      settings: settings({ maxItems: 4 }),
+      project: "mnemoshelf",
+      dedupe: new Map(),
+      turn: 1,
+      now: new Date("2026-10-28T10:00:00.000Z"),
+    });
+    expect(result.injected.map((item) => item.id)).toEqual([1, 2, 3, 4]);
+    expect(result.block).not.toContain("[source id=55]");
+    expect(result.block).toContain("以下是本專案先前留下的背景資料");
+  });
+
+  it("searchMemories 依 channel 參數決定是否帶出 'auto' 或 'manual'", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    const fetchImpl: typeof fetch = async (_url, init) => {
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return new Response(JSON.stringify({ hits: [] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const connection = { baseUrl: "http://127.0.0.1:43117", token: "test-token", source: "env" as const };
+    await searchMemories({ connection, query: "q1", project: "mnemoshelf", settings: settings(), timeoutMs: 100, channel: "auto", fetchImpl });
+    await searchMemories({ connection, query: "q2", includeAllProjects: true, settings: settings(), timeoutMs: 100, channel: "manual", fetchImpl });
+    await searchMemories({ connection, query: "q3", project: "mnemoshelf", settings: settings(), timeoutMs: 100, fetchImpl });
+
+    expect(bodies[0]).toMatchObject({ query: "q1", channel: "auto" });
+    expect(bodies[1]).toMatchObject({ query: "q2", channel: "manual", includeAllProjects: true });
+    expect(bodies[2]).not.toHaveProperty("channel");
+  });
 });

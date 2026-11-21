@@ -1,4 +1,5 @@
 import type { MemoryLibraryFilter, MemoryLibraryPage } from "../memory/library.js";
+import type { MemoryAutoInjectPatch, MemoryAutoInjectSettings } from "../memory/auto-inject.js";
 import type { MemoryOrganizationPatch, MemoryRecallRule, MemoryRecallRulePreview, MemoryRecallSettings, MemoryRecallRuleWriteOptions, MemoryRecallRuleWriteResult } from "../memory/organization.js";
 import type {
   MemoryPolicy,
@@ -297,11 +298,18 @@ export interface MemorySearchBucket {
  *
  * - `buckets` 未提供＝不限制 scope（仍永遠排除軟刪除）；空陣列＝沒有可見範圍（回空清單）。
  * - `kind` 精確比對。
+ * - `sourceKind`：`memory` 只含精煉記憶（`source_id is null`）、`raw-turn` 只含原始對話 chunk
+ *   （`source_id is not null`）；`all`／未提供＝不過濾。過濾發生在排名之前。
  */
+export type MemorySearchSourceKind = "all" | "memory" | "raw-turn";
+
+export const MEMORY_SEARCH_SOURCE_KINDS: readonly MemorySearchSourceKind[] = ["all", "memory", "raw-turn"];
+
 export interface MemorySearchFilter {
   buckets?: MemorySearchBucket[];
   kind?: MemoryKind;
   writer?: string;
+  sourceKind?: MemorySearchSourceKind;
 }
 
 /** 驗證並正規化後的 bucket（`project` 省略＝所有專案）。 */
@@ -317,6 +325,7 @@ export interface NormalizedMemorySearchFilter {
   buckets: NormalizedMemorySearchBucket[] | undefined;
   kind: MemoryKind | undefined;
   writer: string | undefined;
+  sourceKind: MemorySearchSourceKind | undefined;
 }
 
 /**
@@ -334,7 +343,11 @@ export function normalizeMemorySearchFilter(filter: MemorySearchFilter = {}): No
   const writer = filter.writer;
   if (writer !== undefined && (typeof writer !== "string" || writer.trim() === "" || writer.length > 200 || writer.includes("\0"))) throw new TypeError("writer 必須是非空文字");
   const rawBuckets = filter.buckets;
-  if (rawBuckets === undefined) return { buckets: undefined, kind, writer };
+  const sourceKind = filter.sourceKind;
+  if (sourceKind !== undefined && (typeof sourceKind !== "string" || !(MEMORY_SEARCH_SOURCE_KINDS as readonly string[]).includes(sourceKind))) {
+    throw new TypeError(`sourceKind 不合法：${String(sourceKind)}`);
+  }
+  if (rawBuckets === undefined) return { buckets: undefined, kind, writer, sourceKind };
   if (!Array.isArray(rawBuckets)) throw new TypeError("MemorySearchFilter.buckets 必須是陣列");
 
   return {
@@ -370,6 +383,7 @@ export function normalizeMemorySearchFilter(filter: MemorySearchFilter = {}): No
     }),
     kind,
     writer,
+    sourceKind,
   };
 }
 
@@ -772,6 +786,13 @@ export interface MetadataStore {
   replaceMemoryRecallRules(rules: MemoryRecallRule[], options: { expectedRevision: number }): Promise<MemoryRecallSettings>;
   updateMemoryOrganization(type: "source" | "memory", id: number, patch: MemoryOrganizationPatch): Promise<Memory | MemorySource | null>;
   listMemoriesForRecall(filter?: MemorySearchFilter & { limit?: number }): Promise<Memory[]>;
+  /** 讀取自動注入設定（單列；migrate 後必存在，預設 `revision: 1, defaultMode: "all", projects: {}`）。 */
+  getMemoryAutoInjectSettings(): Promise<MemoryAutoInjectSettings>;
+  /**
+   * 以 CAS 更新自動注入設定：`expectedRevision` 與目前不符 → 拋 `MemoryRecallConflictError`；
+   * 非法 patch → 拋 `TypeError`；成功 `revision + 1`，只更動 patch 列出的欄位與專案鍵。
+   */
+  updateMemoryAutoInjectSettings(patch: MemoryAutoInjectPatch): Promise<MemoryAutoInjectSettings>;
 
   /**
    * 列出**全部未刪除**的記憶，供備份匯出使用（見 `docs/storage-ports.md` §記憶的匯出／匯入）。

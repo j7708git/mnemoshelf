@@ -19,6 +19,7 @@ import { planRecall } from "../../../opencode-plugin/src/recall.js";
 import { buildMemoryBlock } from "../../../dsh-plugin/src/recall.js";
 import type { RecallHitLike } from "../../../dsh-plugin/src/types.js";
 import { createServer, type MnemoshelfServer } from "../../src/index.js";
+import { formatRecallBlock } from "../../src/scripts/hook-core.js";
 import { NaiveRagBaseline } from "./naive-rag.js";
 import { backend, NOW, REPO } from "./runtime.js";
 import {
@@ -78,24 +79,50 @@ function formatMarkdownReport(input: {
     "",
     "## 總覽比較（900 Unicode code points 預算）",
     "",
-    "| 系統 | 可答 context recall | 可答乾淨上下文率 | 無答案空區塊率 | 無答案陷阱洩漏率 | 平均字元 | 最大字元 | Reader 總正確率 | Reader 可答正確率 | Reader 拒答正確率 |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| 系統 | 可答 context recall | 可答乾淨上下文率 | 無答案空區塊率 | 無答案陷阱洩漏率 | 平均字元 | 最大字元 | Reader 總正確率 | Reader 可答正確率 | Reader 拒答正確率 | 總 prompt tokens | 平均 prompt tokens | 相較 no-memory 增量 |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
   ];
 
   const pct = (value: number | null) => (value === null ? "NOT_RUN" : `${(value * 100).toFixed(1)}%`);
+  const noMemoryAvgPrompt =
+    input.summaries.find((s) => s.system === "no-memory")?.readerAvgPromptTokens ?? null;
   for (const s of input.summaries) {
+    const totalPromptText =
+      s.readerTotalPromptTokens === null
+        ? s.readerStatus === "NOT_RUN"
+          ? "NOT_RUN"
+          : "N/A"
+        : String(Math.round(s.readerTotalPromptTokens));
+    const avgPromptText =
+      s.readerAvgPromptTokens === null
+        ? s.readerStatus === "NOT_RUN"
+          ? "NOT_RUN"
+          : "N/A"
+        : s.readerAvgPromptTokens.toFixed(1);
+    let deltaText: string;
+    if (s.readerStatus === "NOT_RUN") {
+      deltaText = "NOT_RUN";
+    } else if (s.readerAvgPromptTokens === null || noMemoryAvgPrompt === null) {
+      deltaText = "N/A";
+    } else {
+      const delta = s.readerAvgPromptTokens - noMemoryAvgPrompt;
+      deltaText = `${delta >= 0 ? "+" : ""}${delta.toFixed(1)}/題`;
+    }
+
     lines.push(
       `| ${s.system} | ${pct(s.answerableContextRecall)} | ${pct(s.answerableCleanContextRate)} | ${pct(
         s.unanswerableEmptyBlockRate,
       )} | ${pct(s.unanswerableTrapLeakRate)} | ${s.avgContextChars.toFixed(1)} | ${s.maxContextChars} | ${pct(
         s.readerOverallAccuracy,
-      )} | ${pct(s.readerAnswerableAccuracy)} | ${pct(s.readerAbstentionAccuracy)} |`,
+      )} | ${pct(s.readerAnswerableAccuracy)} | ${pct(s.readerAbstentionAccuracy)} | ${totalPromptText} | ${avgPromptText} | ${deltaText} |`,
     );
   }
 
   lines.push("", "## 分類表現（contextClean / total；若有跑 Reader 附 readerCorrect）", "");
-  lines.push("| 類別 | dsh-plugin | opencode-plugin | naive-rag-chunk512 |");
-  lines.push("| --- | --- | --- | --- |");
+  const systemHeaders = input.summaries.map((s) => s.system).join(" | ");
+  const systemSeparators = input.summaries.map(() => "---").join(" | ");
+  lines.push(`| 類別 | ${systemHeaders} |`);
+  lines.push(`| --- | ${systemSeparators} |`);
 
   const categories = Object.keys(input.summaries[0]!.byCategory) as Array<keyof SystemEvalSummary["byCategory"]>;
   for (const cat of categories) {
@@ -174,6 +201,8 @@ describe("Stage 3：40 題未見題庫與 Naive RAG 對照評估", () => {
 
         naiveRag = await NaiveRagBaseline.create(runtimeBackend, turns);
 
+        const noMemoryRows: QuestionEvalRow[] = [];
+        const antigravityRows: QuestionEvalRow[] = [];
         const dshRows: QuestionEvalRow[] = [];
         const opencodeRows: QuestionEvalRow[] = [];
         const naiveRows: QuestionEvalRow[] = [];
@@ -214,11 +243,19 @@ describe("Stage 3：40 題未見題庫與 Naive RAG 對照評估", () => {
               answer: llmResult.answer,
               latencyMs: llmResult.latencyMs,
               score,
+              ...(llmResult.promptTokens === undefined
+                ? {}
+                : { promptTokens: llmResult.promptTokens }),
+              ...(llmResult.completionTokens === undefined
+                ? {}
+                : { completionTokens: llmResult.completionTokens }),
             },
           };
         };
 
         for (const question of questions) {
+          noMemoryRows.push(await evaluateSystemRow(question, 0, 0, ""));
+
           const searchRes = await fetch(`${server.url}/memories/search`, {
             method: "POST",
             headers,
@@ -231,6 +268,19 @@ describe("Stage 3：40 題未見題庫與 Naive RAG 對照評估", () => {
           });
           expect(searchRes.status).toBe(200);
           const searchBody = (await searchRes.json()) as SearchApiResponse;
+
+          const agFormatted = formatRecallBlock(searchBody, question.project, {
+            limit: 4,
+            maxBlockChars: STAGE3_BUDGET_CHARS,
+            minScore: 0.65,
+          });
+          const agBlock = agFormatted ?? "";
+          const agKeptCount = agBlock
+            .split("\n")
+            .filter((line) => line.startsWith("- [")).length;
+          antigravityRows.push(
+            await evaluateSystemRow(question, searchBody.hits.length, agKeptCount, agBlock),
+          );
 
           const dshBlock = buildMemoryBlock({
             hits: searchBody.hits,
@@ -272,6 +322,16 @@ describe("Stage 3：40 題未見題庫與 Naive RAG 對照評估", () => {
         }
 
         const readerModel = readerConfig?.model ?? null;
+        const noMemorySummary = aggregateStage3Scores({
+          system: "no-memory",
+          rows: noMemoryRows,
+          readerModel,
+        });
+        const antigravitySummary = aggregateStage3Scores({
+          system: "antigravity-hook",
+          rows: antigravityRows,
+          readerModel,
+        });
         const dshSummary = aggregateStage3Scores({
           system: "dsh-plugin",
           rows: dshRows,
@@ -287,7 +347,13 @@ describe("Stage 3：40 題未見題庫與 Naive RAG 對照評估", () => {
           rows: naiveRows,
           readerModel,
         });
-        const summaries = [dshSummary, opencodeSummary, naiveSummary] as const;
+        const summaries = [
+          noMemorySummary,
+          antigravitySummary,
+          dshSummary,
+          opencodeSummary,
+          naiveSummary,
+        ] as const;
 
         await mkdir(STAGE3_OUTPUT_DIR, { recursive: true });
         await writeFile(
@@ -307,6 +373,8 @@ describe("Stage 3：40 題未見題庫與 Naive RAG 對照評估", () => {
                 : null,
               summaries,
               details: {
+                "no-memory": noMemoryRows,
+                "antigravity-hook": antigravityRows,
                 "dsh-plugin": dshRows,
                 "opencode-plugin": opencodeRows,
                 "naive-rag-chunk512": naiveRows,
@@ -333,15 +401,13 @@ describe("Stage 3：40 題未見題庫與 Naive RAG 對照評估", () => {
           "utf8",
         );
 
-        expect(dshSummary.totalQuestions).toBe(40);
-        expect(opencodeSummary.totalQuestions).toBe(40);
-        expect(naiveSummary.totalQuestions).toBe(40);
-        if (readerConfig === null) {
-          expect(dshSummary.readerStatus).toBe("NOT_RUN");
-          expect(opencodeSummary.readerStatus).toBe("NOT_RUN");
-          expect(naiveSummary.readerStatus).toBe("NOT_RUN");
-        } else {
-          expect(dshSummary.readerStatus).toBe("COMPLETED");
+        for (const summary of summaries) {
+          expect(summary.totalQuestions).toBe(40);
+          if (readerConfig === null) {
+            expect(summary.readerStatus).toBe("NOT_RUN");
+          } else {
+            expect(summary.readerStatus).toBe("COMPLETED");
+          }
         }
       } finally {
         if (naiveRag !== null) naiveRag.close();

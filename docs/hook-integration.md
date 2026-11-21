@@ -158,3 +158,12 @@ node dist/scripts/generic-hook.js \
 2. **預算與過濾上限**：預設僅採語意命中（`minScore >= 0.65`）、限本專案＋全域記憶，最多 4 筆、總計不超過 900 字元（不切斷 UTF-16 surrogate pair）。
 3. **短 Timeout 與離線不阻塞**：健康檢查（500 ms）、搜尋（800 ms）、原文寫入（1500 ms）與外層 watchdog（2.5–3.5 秒）確保服務未啟動、冷啟動或異常時靜默降級回傳 `{}`（或無輸出），絕不阻塞宿主對話，也不將 token、連線資訊或對話原文印到 stderr。
 4. **Loopback 身分檢查與機密遮罩**：沿用 `runtime.json` 的 loopback 位址檢查、PID 檢查與免 token `/health`（`service === "mnemoshelf"`）驗證；查詢前與寫入前皆依政策執行 `maskSecrets` 遮罩。
+
+---
+
+## 自動注入控制與分層召回（P2）
+
+1. **環境變數開關（`MNEMOSHELF_AUTO_INJECT`）**：Hook 層支援 `MNEMOSHELF_AUTO_INJECT`（`off`／`refined-only`／`all`）。設為 `off` 時於客戶端直接略過自動召回，不發出 HTTP 請求；設為 `refined-only` 時於 `/memories/search` 帶入 `sourceKind: "memory"`，僅召回精煉記憶。
+2. **低資訊短句與純指令略過（`shouldSkipAutoRecallPrompt`）**：Hook 會在送出查詢前先過濾空白、純 slash 指令（例如 `/compact`；後方附帶查詢內容的 `/plan ...` 不算），以及少於 6 個 Unicode code points 且不含記憶線索詞（如 `記得`、`上次`、`remember`、`recall` 等）的寒暄或確認短句（如 `OK`、`繼續`），省下無效 HTTP 往返與注入雜訊。
+3. **自動注入通道標記（`channel: "auto"`）**：Hook 自動召回固定帶 `channel: "auto"`，使伺服器端可依 `GET / PATCH /memory-auto-inject` 的全域或專案模式（`all`／`refined-only`／`off`）決定是否壓制或限縮為精煉記憶；MCP `search_memories`／`recall` 屬主動查詢（`manual`），不受自動注入 `off` 影響。
+4. **精煉優先分層與建議召回規則**：伺服器召回預設啟用精煉記憶優先分層排序（`preferRefined: true`），在同分或相近分數時讓精煉記憶優先於長篇原文片段進入注入預算；另建議在召回規則將 `antigravity/turn`、`codex/turn` 設為 `project` 規則，避免未解析專案的原文回合擴散至 `global`。
