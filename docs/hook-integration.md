@@ -63,7 +63,7 @@ pnpm --filter '@mnemoshelf/server...' build
 }
 ```
 
-- `PreInvocation` 預設採 `per-turn`：每個新使用者提問自動召回一次，並以回合步數（`initialNumSteps`）、正規化提示雜湊與注入內容雜湊防止同一回合的多步工具迴圈重複注入（即使提問含記憶關鍵字亦不重複注入）；若需每次模型呼叫都召回，可設 `MNEMOSHELF_RECALL_MODE=every-turn`。
+- `PreInvocation` 預設採 `per-turn`。每個新使用者提問自動召回一次，並以回合步數（`initialNumSteps`）、正規化提示雜湊與注入內容雜湊防止工具迴圈重複注入。同一對話的新回合也會過濾近期注入過的記憶。設定 `MNEMOSHELF_RECALL_MODE=every-turn` 可在每次模型呼叫時召回，略過同回合和跨回合去重。
 - `Stop` 在回合正常結束時解析 `transcript.jsonl`：解包 `<USER_REQUEST>` 並剝除 `<ADDITIONAL_METADATA>`、`<USER_SETTINGS_CHANGE>`、`<SYSTEM_MESSAGE>`、`<memory-context>` 等宿主注入標籤，排除 `thinking`、工具輸出、系統步驟與伴隨 `tool_calls` 的過場步驟（僅保留無 `tool_calls` 的實質回覆），透過 `POST /memory-sources` 等冪保存對話原文。
 
 #### B. Codex（自動召回＋可選 Stop 原文保存）
@@ -128,13 +128,22 @@ pnpm --filter '@mnemoshelf/server...' build
 1. **專案隔離（`MNEMOSHELF_PROJECT`）**：Hook 預設以工作目錄資料夾名稱作為 `project`（排除家目錄與根目錄）；若有多個同名資料夾，請於命令前明確設定 `MNEMOSHELF_PROJECT=<專案名>`。
 2. **檔案搜尋分享開關（`allowAgentSearch`）**：MCP `search` 工具預設 `agentOnly: true`，只搜尋你在 Mnemoshelf UI 中勾選「允許 Agent 搜尋此資料夾」的 root；記憶召回不受此開關限制。
 
+### Antigravity 多資料夾工作區
+
+專用 Hook 的 `PreInvocation` 和 `Stop` 均優先採用 `MNEMOSHELF_PROJECT`。未設定時，以選中的資料夾名稱作為專案。只採用正規化後的絕對路徑，排除家目錄與檔案系統根目錄。
+
+1. 有可用的 `cwd` 時，選擇 `workspacePaths` 中與其相同或包含它的最深層目錄。找不到匹配項時直接使用 `cwd`。
+2. 沒有可用的 `cwd` 時，排除包含其他工作區的上層目錄。若只剩一個葉節點，直接選用。
+3. 有多個葉節點時，`PreInvocation` 可依提示選擇唯一被明確提及的資料夾。名稱至少兩個字元，比對時忽略大小寫並要求完整詞界。
+4. 若提示未命中、同時命中多個資料夾，或事件沒有可用提示（例如 `Stop`），採用原始清單中第一個合法項目。沒有合法目錄時，召回及保存使用全域範圍。
+
 ---
 
 ## 生命週期事件與欄位對照表
 
 | Harness | Preset (`--preset`) | 召回事件 | 提示欄位 (`--prompt-field`) | 工作目錄欄位 (`--cwd-field`) | 輸出模式 (`--output-mode`) | 原文保存 (`Stop`) |
 | --- | --- | --- | --- | --- | --- | --- |
-| Antigravity | 專用 `antigravity-hook.js`（`generic-hook.js --preset antigravity` 不含多步去重狀態） | `PreInvocation` | `lastUserInput` | `workspacePaths.0` | `injectSteps` | 支援（`antigravity-hook.js stop`） |
+| Antigravity | 專用 `antigravity-hook.js` 或通用 `antigravity` | `PreInvocation` | `lastUserInput` | 專用 Hook 採 `cwd` 與 `workspacePaths`。通用 preset 採 `workspacePaths.0` | `injectSteps` | 支援（`antigravity-hook.js stop`） |
 | Codex | `codex`（或專用 `codex-recall.js`） | `UserPromptSubmit` | `prompt` | `cwd` | `hookSpecificOutput` | 支援（`codex-capture.js`；`0.167.0-alpha.4.1` 的 CLI 與 macOS 桌面一般聊天均已實測） |
 | Claude Code | `claude-code` | `UserPromptSubmit` | `prompt` | `cwd` | `hookSpecificOutput` | 視宿主設定 |
 | Gemini CLI | `gemini-cli` | `BeforeAgent` | `prompt` | `cwd` | `hookSpecificOutput` | 視宿主設定 |
@@ -164,6 +173,14 @@ node dist/scripts/generic-hook.js \
 ## 自動注入控制與分層召回（P2）
 
 1. **環境變數開關（`MNEMOSHELF_AUTO_INJECT`）**：Hook 層支援 `MNEMOSHELF_AUTO_INJECT`（`off`／`refined-only`／`all`）。設為 `off` 時於客戶端直接略過自動召回，不發出 HTTP 請求；設為 `refined-only` 時於 `/memories/search` 帶入 `sourceKind: "memory"`，僅召回精煉記憶。
-2. **低資訊短句與純指令略過（`shouldSkipAutoRecallPrompt`）**：Hook 會在送出查詢前先過濾空白、純 slash 指令（例如 `/compact`；後方附帶查詢內容的 `/plan ...` 不算），以及少於 6 個 Unicode code points 且不含記憶線索詞（如 `記得`、`上次`、`remember`、`recall` 等）的寒暄或確認短句（如 `OK`、`繼續`），省下無效 HTTP 往返與注入雜訊。
+2. **低資訊提示過濾**。Hook 先移除 `@[Quote]` 引用標記（忽略大小寫），再略過空白、純 slash 指令，以及少於 6 個 Unicode 碼點且無記憶線索的短句。圍欄程式碼占提示 60% 以上，或提示至少 10 行且平均每行少於 20 字元時，也會略過。略過的提示不發 HTTP 請求。`@[Quote] 好` 會略過，`@[Quote] 請幫我確認上次建置指令` 會以清除標記後的文字查詢。`Stop` 保存原文時仍保留 `@[Quote]`。
 3. **自動注入通道標記（`channel: "auto"`）**：Hook 自動召回固定帶 `channel: "auto"`，使伺服器端可依 `GET / PATCH /memory-auto-inject` 的全域或專案模式（`all`／`refined-only`／`off`）決定是否壓制或限縮為精煉記憶；MCP `search_memories`／`recall` 屬主動查詢（`manual`），不受自動注入 `off` 影響。
 4. **精煉優先分層與建議召回規則**：伺服器召回預設啟用精煉記憶優先分層排序（`preferRefined: true`），在同分或相近分數時讓精煉記憶優先於長篇原文片段進入注入預算；另建議在召回規則將 `antigravity/turn`、`codex/turn` 設為 `project` 規則，避免未解析專案的原文回合擴散至 `global`。
+
+## 同一對話的跨回合去重
+
+Antigravity 專用 Hook 依 `conversationId` 記錄已注入的記憶。Codex 專用 Hook 依序採用第一個非空白的 `session_id`、`conversation_id` 或 `thread_id`。通用 CLI 與未帶對話識別的事件採無狀態召回。
+
+`MNEMOSHELF_RECALL_DEDUPE_TTL` 指定同一記憶至少相隔幾個回合才能再次注入。預設為 8，無效值沿用預設，設為 0 關閉跨回合去重。回合差達門檻後，釘選項目、`decision`、`pitfall` 與 `raw-turn` 原文片段可以再次注入。一般事實與偏好在該對話的去重紀錄仍保留時只注入一次。
+
+每個對話的狀態檔最多保留最近注入的 256 筆記憶識別與去重所需欄位。全部命中都被過濾時，這一輪會直接略過注入。

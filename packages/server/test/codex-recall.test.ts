@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -139,6 +139,106 @@ describe("Codex 自動召回", () => {
     expect(context.length).toBeLessThanOrEqual(900);
     expect(context).toMatch(/🪴…\n<\/memory-context>$/u);
     expect(context).not.toContain(globalHit.content);
+  });
+
+  it("依序使用 session_id、conversation_id、thread_id，各工作階段獨立去重", async () => {
+    const fetchImpl = fakeService();
+    const stateDir = path.join(temp, "state");
+    const opts = { env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, homeDir, fetchImpl, stateDir };
+    const run = (session: Record<string, unknown>) => runCodexRecall(
+      Readable.from([JSON.stringify({ ...hookEvent, ...session })]), opts,
+    );
+
+    expect(await run({ session_id: "primary", conversation_id: "secondary", thread_id: "tertiary" })).not.toBeNull();
+    expect(await run({ session_id: "primary", conversation_id: "different" })).toBeNull();
+    expect(await run({ session_id: "  ", conversation_id: "secondary", thread_id: "tertiary" })).not.toBeNull();
+    expect(await run({ session_id: 17, conversation_id: "secondary" })).toBeNull();
+    expect(await run({ conversation_id: "", thread_id: "tertiary" })).not.toBeNull();
+    expect(await run({ thread_id: "tertiary" })).toBeNull();
+    expect(await readdir(stateDir)).toHaveLength(3);
+
+    expect(await run({ session_id: "  " })).not.toBeNull();
+    expect(await run({})).not.toBeNull();
+    expect(await readdir(stateDir)).toHaveLength(3);
+  });
+
+  it("Codex 依環境變數調整 TTL，無命中回合也計入輪次", async () => {
+    const stateDir = path.join(temp, "codex-recall-state");
+    const env = { MNEMOSHELF_RUNTIME_FILE: runtimeFile, MNEMOSHELF_HOOK_STATE_DIR: stateDir, MNEMOSHELF_RECALL_DEDUPE_TTL: "2" };
+    const fetchImpl = fakeService({ degraded: false, hits: [{ ...globalHit, id: 8, kind: "decision" }] });
+    const run = (prompt: string, extraEnv: NodeJS.ProcessEnv = {}) => runCodexRecall(
+      Readable.from([JSON.stringify({ ...hookEvent, prompt, session_id: "synthetic-session" })]),
+      { env: { ...env, ...extraEnv }, fetchImpl },
+    );
+    expect(await run(hookEvent.prompt)).not.toBeNull();
+    expect(await run("@[Quote] 好")).toBeNull();
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    expect(await run("進一步確認這項決策")).not.toBeNull();
+    expect(await run("立即追問同一項決策")).toBeNull();
+    expect(await run("停用去重後再次確認", { MNEMOSHELF_RECALL_DEDUPE_TTL: "0" })).not.toBeNull();
+    expect(await run("再測一次停用去重", { MNEMOSHELF_RECALL_DEDUPE_TTL: "0" })).not.toBeNull();
+
+    const files = await readdir(stateDir);
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/^[0-9a-f]{64}\.json$/);
+    const stateFile = path.join(stateDir, files[0]!);
+    const raw = await readFile(stateFile, "utf8");
+    expect(JSON.parse(raw)).toEqual({
+      turnCount: 4, injected: { "id:8": { turn: 3, kind: "decision", pinned: false, sourceType: "memory" } },
+    });
+    expect(raw).not.toContain(globalHit.content);
+    if (process.platform !== "win32") expect((await stat(stateFile)).mode & 0o777).toBe(0o600);
+  });
+
+  it.skipIf(process.platform === "win32")("狀態檔若為 symlink，召回不讀取或覆寫連結目標", async () => {
+    const stateDir = path.join(temp, "state");
+    const fetchImpl = fakeService();
+    const opts = { env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, fetchImpl, stateDir };
+    const sessionId = path.join("..", "synthetic-session");
+    const run = () => runCodexRecall(
+      Readable.from([JSON.stringify({ ...hookEvent, session_id: sessionId })]), opts,
+    );
+    expect(await run()).not.toBeNull();
+    const [name] = await readdir(stateDir);
+    const file = path.join(stateDir, name!);
+    const target = path.join(temp, "another-state.json");
+    const contents = await readFile(file, "utf8");
+    await writeFile(target, contents);
+    await rm(file);
+    await symlink(target, file);
+    expect(await run()).not.toBeNull();
+    expect(await readFile(target, "utf8")).toBe(contents);
+    expect(await readdir(stateDir)).toEqual([name]);
+    expect(await run()).toBeNull();
+  });
+
+  it("自動注入關閉或缺少有效連線檔時，不寫入工作階段狀態檔", async () => {
+    const stateDir = path.join(temp, "inactive-state");
+    const fetchImpl = fakeService();
+    const input = () => Readable.from([JSON.stringify({ ...hookEvent, session_id: "session-inactive" })]);
+    expect(await runCodexRecall(input(), {
+      env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile, MNEMOSHELF_AUTO_INJECT: "off" },
+      fetchImpl,
+      stateDir,
+    })).toBeNull();
+    expect(await runCodexRecall(input(), {
+      env: { MNEMOSHELF_RUNTIME_FILE: "relative.json" },
+      fetchImpl,
+      stateDir,
+    })).toBeNull();
+    expect(fetchImpl).not.toHaveBeenCalled();
+    await expect(readdir(stateDir)).rejects.toThrow();
+  });
+
+  it("狀態目錄無法寫入時仍可召回", async () => {
+    const fileInPlaceOfDir = path.join(temp, "state-file");
+    await writeFile(fileInPlaceOfDir, "合成資料");
+    const output = await runCodexRecall(
+      Readable.from([JSON.stringify({ ...hookEvent, session_id: "session" })]),
+      { env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, fetchImpl: fakeService(), stateDir: fileInPlaceOfDir },
+    );
+    expect(output?.hookSpecificOutput.additionalContext).toContain(globalHit.content);
+    expect(await readFile(fileInPlaceOfDir, "utf8")).toBe("合成資料");
   });
 
   it("原文命中標記角色、原對話日期及續讀來源，沿用伺服器的政策視圖", async () => {

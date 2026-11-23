@@ -54,7 +54,17 @@
 
 每次提交提示最多注入四筆語意命中，整段最多 900 字元。查詢透過本機服務執行，命中的記憶會成為 Codex 的參考上下文，也會傳給該工作階段使用的模型。注入一律包在不受信任的 `<memory-context>` 區塊中。
 
-`codex-recall.js` 只查詢；原文保存由另外啟用的 `codex-capture.js` 執行。原文命中是片段，可用 MCP `read_memory_source` 依來源 ID 續讀，遮罩由服務的有效政策決定。
+`codex-recall.js` 負責召回。原文保存由另外啟用的 `codex-capture.js` 執行。原文命中是片段，可用 MCP `read_memory_source` 依來源 ID 續讀，遮罩由服務的有效政策決定。
+
+召回會先移除 `@[Quote]` 引用標記。純程式碼、符合短行門檻的堆疊追蹤，以及清理後只剩 `好` 之類的短句會直接略過 HTTP 查詢。完整門檻見 [Hook 接入指南](hook-integration.md#自動注入控制與分層召回p2)。
+
+## 召回的跨回合去重
+
+有多個工作階段識別欄位時，依序採用第一個非空白的 `session_id`、`conversation_id` 或 `thread_id`。缺少識別時沿用無狀態召回。專案仍依 `MNEMOSHELF_PROJECT` 或事件的 `cwd` 解析。
+
+`MNEMOSHELF_RECALL_DEDUPE_TTL` 預設為 8 回合，設定為 0 可停用。相隔達門檻後，釘選、`decision`、`pitfall` 與 `raw-turn` 可再次注入。每個工作階段最多保留最近注入的 256 筆去重紀錄。完整規則見 [同一對話的跨回合去重](hook-integration.md#同一對話的跨回合去重)。
+
+召回狀態以工作階段識別的雜湊作為檔名，保存在作業系統暫存目錄下的 `mnemoshelf-codex-hooks`。可用 `MNEMOSHELF_HOOK_STATE_DIR` 指定目錄。檔案以原子方式更新，POSIX 權限為 `0600`，內容只有回合計數、已注入記憶的識別與類型等去重欄位。
 
 ## Stop 保存的範圍與去重
 
