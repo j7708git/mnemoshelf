@@ -7,15 +7,23 @@
  */
 import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import {
   asRecord,
   captureTurn,
+  hookStateFile,
   isDirectEntry,
+  parseHookDedupeState,
   readHookInput,
-  recallForPrompt,
+  readHookState,
+  recallForPromptWithMeta,
+  recordHookInjections,
+  resolveHookDedupeTTL,
+  resolveWorkspaceCwd,
+  writeHookState,
   type CaptureMessageInput,
+  type HookDedupeState,
 } from "./hook-core.js";
 
 const HOOK_TIMEOUT_MS = 3500;
@@ -34,7 +42,7 @@ export interface PreInvocationOutput {
 
 export type StopOutput = Record<string, never>;
 
-interface ConversationState {
+interface ConversationState extends HookDedupeState {
   lastInitialNumSteps?: number;
   lastPromptHash?: string;
   lastInjectedBlockHash?: string;
@@ -103,19 +111,6 @@ export function sanitizeAntigravityText(text: string): string {
   return output.trim();
 }
 
-function resolveWorkspaceCwd(input: Record<string, unknown>): string | undefined {
-  const paths = input.workspacePaths;
-  if (Array.isArray(paths)) {
-    for (const item of paths) {
-      if (typeof item === "string" && path.isAbsolute(item)) return item;
-    }
-  }
-  if (typeof input.cwd === "string" && path.isAbsolute(input.cwd)) {
-    return input.cwd;
-  }
-  return undefined;
-}
-
 function resolveStateFile(conversationId: string, options: AntigravityHookOptions): string {
   const env = options.env ?? process.env;
   const baseDir =
@@ -123,41 +118,23 @@ function resolveStateFile(conversationId: string, options: AntigravityHookOption
     (env.PLUGIN_DATA?.trim()
       ? path.join(env.PLUGIN_DATA.trim(), "mnemoshelf-state")
       : path.join(tmpdir(), "mnemoshelf-antigravity-hooks"));
-  const hash = createHash("sha256").update(conversationId).digest("hex");
-  return path.join(baseDir, `${hash}.json`);
+  return hookStateFile(baseDir, conversationId);
 }
 
 async function readState(file: string): Promise<ConversationState> {
-  try {
-    const raw = await fs.readFile(file, "utf8");
-    const parsed = asRecord(JSON.parse(raw));
-    if (parsed === null) return {};
-    return {
-      lastInitialNumSteps: parseNonNegativeInt(parsed.lastInitialNumSteps),
-      lastPromptHash: typeof parsed.lastPromptHash === "string" ? parsed.lastPromptHash : undefined,
-      lastInjectedBlockHash:
-        typeof parsed.lastInjectedBlockHash === "string" ? parsed.lastInjectedBlockHash : undefined,
-      lastCapturedUserStepIndex:
-        typeof parsed.lastCapturedUserStepIndex === "number" &&
-        Number.isSafeInteger(parsed.lastCapturedUserStepIndex)
-          ? parsed.lastCapturedUserStepIndex
-          : undefined,
-    };
-  } catch {
-    return {};
-  }
-}
-
-async function writeState(file: string, state: ConversationState): Promise<void> {
-  try {
-    const dir = path.dirname(file);
-    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
-    const tmp = `${file}.${process.pid}.tmp`;
-    await fs.writeFile(tmp, JSON.stringify(state), { encoding: "utf8", mode: 0o600 });
-    await fs.rename(tmp, file);
-  } catch {
-    // 狀態檔寫入失敗不應影響主流程
-  }
+  const parsed = await readHookState(file);
+  return {
+    ...parseHookDedupeState(parsed),
+    lastInitialNumSteps: parseNonNegativeInt(parsed.lastInitialNumSteps),
+    lastPromptHash: typeof parsed.lastPromptHash === "string" ? parsed.lastPromptHash : undefined,
+    lastInjectedBlockHash:
+      typeof parsed.lastInjectedBlockHash === "string" ? parsed.lastInjectedBlockHash : undefined,
+    lastCapturedUserStepIndex:
+      typeof parsed.lastCapturedUserStepIndex === "number" &&
+      Number.isSafeInteger(parsed.lastCapturedUserStepIndex)
+        ? parsed.lastCapturedUserStepIndex
+        : undefined,
+  };
 }
 
 /** 處理 Antigravity `PreInvocation` 事件。 */
@@ -177,6 +154,7 @@ export async function runAntigravityPreInvocation(
     const conversationId = typeof input.conversationId === "string" ? input.conversationId.trim() : "";
     const recallMode = env.MNEMOSHELF_RECALL_MODE?.trim() || "per-turn";
     const stateFile = conversationId !== "" ? resolveStateFile(conversationId, options) : null;
+    const ttl = recallMode === "every-turn" ? 0 : resolveHookDedupeTTL(env);
     let state = stateFile !== null ? await readState(stateFile) : {};
     const initialNumSteps = parseNonNegativeInt(input.initialNumSteps);
     const promptHash = createHash("sha256").update(prompt).digest("hex");
@@ -197,26 +175,31 @@ export async function runAntigravityPreInvocation(
     const stateChanged =
       state.lastPromptHash !== promptHash ||
       (initialNumSteps !== undefined && state.lastInitialNumSteps !== initialNumSteps);
+    const turn = (state.turnCount ?? 0) + 1;
     if (stateFile !== null && stateChanged) {
       state = {
         ...state,
         lastPromptHash: promptHash,
+        turnCount: turn,
         ...(initialNumSteps === undefined ? {} : { lastInitialNumSteps: initialNumSteps }),
       };
-      await writeState(stateFile, state);
+      await writeHookState(stateFile, state);
     }
 
-    const cwd = resolveWorkspaceCwd(input);
-    const context = await recallForPrompt({
+    const homeDir = options.homeDir ?? homedir();
+    const cwd = resolveWorkspaceCwd(input, { homeDir, prompt });
+    const dedupe = stateFile !== null && ttl > 0 ? { turn, ttl, injected: state.injected } : undefined;
+    const result = await recallForPromptWithMeta({
       callerAgent: "antigravity/turn",
       prompt,
       cwd,
       env,
-      homeDir: options.homeDir,
+      homeDir,
       fetchImpl: options.fetchImpl,
-    });
-    if (context === null) return {};
+    }, dedupe);
+    if (result === null) return {};
 
+    const context = result.block;
     const blockHash = createHash("sha256").update(context).digest("hex");
     if (
       recallMode !== "every-turn" &&
@@ -227,9 +210,16 @@ export async function runAntigravityPreInvocation(
       return {};
     }
 
-    if (stateFile !== null && state.lastInjectedBlockHash !== blockHash) {
-      state = { ...state, lastInjectedBlockHash: blockHash };
-      await writeState(stateFile, state);
+    if (stateFile !== null && (dedupe !== undefined || state.lastInjectedBlockHash !== blockHash)) {
+      const latest = await readState(stateFile);
+      const latestTurn = latest.turnCount ?? 0;
+      const currentTurn = state.turnCount ?? 0;
+      await writeHookState(stateFile, {
+        ...latest,
+        turnCount: Math.max(latestTurn, currentTurn),
+        lastInjectedBlockHash: latestTurn <= currentTurn ? blockHash : latest.lastInjectedBlockHash,
+        injected: dedupe === undefined ? latest.injected : recordHookInjections(latest.injected, result.hits, turn),
+      } satisfies ConversationState);
     }
 
     return {
@@ -369,9 +359,9 @@ export async function runAntigravityStop(
     if (turns.length === 0) return {};
 
     const stateFile = resolveStateFile(conversationId, options);
-    let state = await readState(stateFile);
-    let lastCaptured = state.lastCapturedUserStepIndex ?? -1;
-    const cwd = resolveWorkspaceCwd(input);
+    let lastCaptured = (await readState(stateFile)).lastCapturedUserStepIndex ?? -1;
+    const homeDir = options.homeDir ?? homedir();
+    const cwd = resolveWorkspaceCwd(input, { homeDir });
 
     for (const turn of turns) {
       if (turn.userStep.stepIndex <= lastCaptured) continue;
@@ -400,15 +390,15 @@ export async function runAntigravityStop(
         cwd,
         messages,
         env,
-        homeDir: options.homeDir,
+        homeDir,
         fetchImpl: options.fetchImpl,
       });
 
       if (result.status === "offline") break;
       if (result.status === "saved" || result.status === "conflict") {
-        lastCaptured = turn.userStep.stepIndex;
-        state = { ...state, lastCapturedUserStepIndex: lastCaptured };
-        await writeState(stateFile, state);
+        const latest = await readState(stateFile);
+        lastCaptured = Math.max(latest.lastCapturedUserStepIndex ?? -1, turn.userStep.stepIndex);
+        await writeHookState(stateFile, { ...latest, lastCapturedUserStepIndex: lastCaptured });
       }
     }
 

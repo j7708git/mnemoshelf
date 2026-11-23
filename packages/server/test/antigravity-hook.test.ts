@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -9,12 +9,30 @@ import {
   runAntigravityStop,
   sanitizeAntigravityText,
 } from "../src/scripts/antigravity-hook.js";
-import { captureTurn, queryFromPrompt, recallForPrompt, sanitizeRawText } from "../src/scripts/hook-core.js";
+import {
+  captureTurn,
+  DEFAULT_HOOK_DEDUPE_TTL,
+  formatRecallBlock,
+  formatRecallBlockWithMeta,
+  hookStateFile,
+  memoryDedupeKey,
+  parseHookDedupeState,
+  queryFromPrompt,
+  recallForPrompt,
+  recordHookInjections,
+  resolveHookDedupeTTL,
+  resolveWorkspaceCwd,
+  sanitizeRawText,
+} from "../src/scripts/hook-core.js";
 
 const baseUrl = "http://127.0.0.1:4321";
 const credential = ["synthetic", "ag", "token"].join("-");
 const homeDir = path.join(path.parse(tmpdir()).root, "synthetic-home");
 const workspaceDir = path.join(homeDir, "work", "demo-app");
+const containerDir = path.dirname(workspaceDir);
+const siblingDir = path.join(containerDir, "other-app");
+const workspaces = [containerDir, workspaceDir, siblingDir];
+const globalHit = { id: 17, source: "semantic", scope: "global", kind: "fact", score: 0.9, content: "已注入的合成記憶" };
 
 let tempDir: string;
 let runtimeFile: string;
@@ -46,6 +64,111 @@ afterEach(async () => {
 });
 
 describe("Hook Core 與 Antigravity Adapter", () => {
+  it("工作區解析依最深祖先、葉節點和原順序選擇絕對路徑", () => {
+    const root = path.parse(homeDir).root;
+    const options = { homeDir };
+    const workspacePaths = ["relative", 12, root, homeDir, ...workspaces];
+    expect(resolveWorkspaceCwd({ workspacePaths, cwd: path.join(workspaceDir, "src") }, options)).toBe(workspaceDir);
+    expect(resolveWorkspaceCwd({ workspacePaths, cwd: siblingDir }, options)).toBe(siblingDir);
+    const outside = path.join(homeDir, "work-other");
+    expect(resolveWorkspaceCwd({ workspacePaths, cwd: outside }, options)).toBe(outside);
+    expect(resolveWorkspaceCwd({ workspacePaths, cwd: homeDir }, options)).toBe(containerDir);
+    expect(resolveWorkspaceCwd({ workspacePaths, cwd: root }, options)).toBe(containerDir);
+    expect(resolveWorkspaceCwd({
+      workspacePaths: [containerDir, workspaceDir, `${workspaceDir}${path.sep}.`],
+      cwd: "relative",
+    }, options)).toBe(workspaceDir);
+    expect(resolveWorkspaceCwd({ workspacePaths: [null, root, homeDir, "relative", `${workspaceDir}\0`] }, options))
+      .toBeUndefined();
+  });
+
+  it.each([
+    ["請確認（DEMO-APP）上次的建置指令", workspaceDir],
+    ["請幫我看demo-app的建置指令", workspaceDir],
+    ["@[Quote] 請確認other-app怎麼跑測試", siblingDir],
+    ["請確認 other-app 的建置指令", siblingDir],
+    ["請確認 my-demo-app、demo-app-v2 和 predemo-app2 的建置指令", containerDir],
+    ["請比較 demo-app 與 other-app 的建置指令", containerDir],
+    ["請比較demo-app與other-app的建置指令", containerDir],
+    ["目前工作區要怎麼建置？", containerDir],
+    [undefined, containerDir],
+  ])("只用明確且唯一的資料夾名稱判定工作區（%s）", (prompt, expected) => {
+    expect(resolveWorkspaceCwd({ workspacePaths: workspaces }, { homeDir, prompt })).toBe(expected);
+  });
+
+  it("同名葉節點有歧義，單字元名稱不參與提示比對", () => {
+    const otherWithSameName = path.join(siblingDir, path.basename(workspaceDir));
+    expect(resolveWorkspaceCwd({ workspacePaths: [containerDir, workspaceDir, otherWithSameName] }, {
+      homeDir, prompt: "請檢查 demo-app",
+    })).toBe(containerDir);
+    expect(resolveWorkspaceCwd({ workspacePaths: [containerDir, path.join(containerDir, "a"), siblingDir] }, {
+      homeDir, prompt: "請檢查 a",
+    })).toBe(containerDir);
+  });
+
+  it.each([
+    [{ cwd: path.join(siblingDir, "src"), lastUserInput: "請檢查 demo-app 的建置" }, {}, "other-app"],
+    [{ lastUserInput: "請檢查 DEMO-APP 的建置" }, {}, "demo-app"],
+    [{ cwd: workspaceDir, lastUserInput: "請檢查建置指令" }, { MNEMOSHELF_PROJECT: "override" }, "override"],
+  ])("PreInvocation 傳送解析後的專案", async (input, extraEnv, project) => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (url) =>
+      url === `${baseUrl}/health`
+        ? Response.json({ service: "mnemoshelf" })
+        : Response.json({ degraded: false, hits: [globalHit] }));
+    await runAntigravityPreInvocation(
+      Readable.from([JSON.stringify({ workspacePaths: workspaces, ...input })]),
+      { env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile, ...extraEnv }, fetchImpl, homeDir, stateDir },
+    );
+    expect(JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body))).toMatchObject({ project });
+  });
+
+  it.each([
+    [undefined, DEFAULT_HOOK_DEDUPE_TTL], ["", 8], ["-1", 8], ["2.5", 8],
+    ["2e1", 8], ["9007199254740992", 8], [" 0 ", 0], ["3", 3],
+  ])("解析回合去重門檻（%s → %s）", (raw, expected) => {
+    expect(resolveHookDedupeTTL({ MNEMOSHELF_RECALL_DEDUPE_TTL: raw })).toBe(expected);
+  });
+
+  it("記憶鍵以正整數 ID 為準，無 ID 時雜湊來源和正規化文字", () => {
+    const fallback = { sourceType: "raw-turn", sourceId: 7, kind: "fact", content: "片段\n Café" };
+    const key = memoryDedupeKey(fallback);
+    expect(key).toMatch(/^content:[a-f0-9]{16}$/);
+    expect(memoryDedupeKey({ ...fallback, id: 0, content: " 片段 Cafe\u0301 " })).toBe(key);
+    expect(memoryDedupeKey({ ...fallback, sourceId: 8 })).not.toBe(key);
+    expect(memoryDedupeKey({ ...fallback, kind: "pitfall" })).not.toBe(key);
+    expect(memoryDedupeKey({ ...fallback, sourceType: "memory" })).not.toBe(key);
+    expect(memoryDedupeKey({ ...fallback, id: 9 })).toBe("id:9");
+  });
+
+  it("格式化只回報實際納入區塊的命中，舊介面仍回傳相同文字", () => {
+    const result = { degraded: false, hits: [
+      { ...globalHit, id: 1, content: "字".repeat(1000) },
+      { ...globalHit, id: 2, content: "未納入的內容" },
+    ] };
+    const formatted = formatRecallBlockWithMeta(result, null);
+    expect(formatted?.block).toBe(formatRecallBlock(result, null));
+    expect(formatted?.block).toContain("…");
+    expect(formatted?.hits.map((hit) => hit.key)).toEqual(["id:1"]);
+    const injected = recordHookInjections(undefined, formatted!.hits, 1);
+    const next = formatRecallBlockWithMeta(result, null, { dedupe: { turn: 2, ttl: 8, injected } });
+    expect(next?.block).toContain("未納入的內容");
+    expect(next?.hits.map((hit) => hit.key)).toEqual(["id:2"]);
+  });
+
+  it("去重狀態只保留最近注入的 256 筆，忽略舊版和無效記錄", () => {
+    let injected = {};
+    for (let turn = 1; turn <= 257; turn += 1) {
+      injected = recordHookInjections(injected, [{ key: `id:${turn}`, kind: "fact", pinned: false, sourceType: "memory" }], turn);
+    }
+    expect(Object.keys(injected)).toHaveLength(256);
+    expect(injected).not.toHaveProperty("id:1");
+    expect(injected).toHaveProperty("id:2");
+    expect(parseHookDedupeState({ lastInitialNumSteps: 2 })).toEqual({});
+    expect(parseHookDedupeState({ turnCount: 257, injected: {
+      ...injected, invalid: { turn: 257 }, "id:258": { turn: 258 },
+    } })).toEqual({ turnCount: 257, injected });
+  });
+
   it("sanitizeRawText 會移除 NUL 與孤立 surrogate，保留合法 emoji", () => {
     const dirty = `abc\0def\uD800ghi\uDC00jkl🪴`;
     expect(sanitizeRawText(dirty)).toBe("abcdefghijkl🪴");
@@ -145,9 +268,10 @@ describe("Hook Core 與 Antigravity Adapter", () => {
   });
 
   it("PreInvocation 於新提問注入記憶，同一輪工具迴圈內不重複注入，換新問題再觸發", async () => {
-    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (url) => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (url, init) => {
       if (url === `${baseUrl}/health`) return Response.json({ service: "mnemoshelf" });
       if (url === `${baseUrl}/memories/search`) {
+        const { query } = JSON.parse(String(init?.body));
         return Response.json({
           degraded: false,
           policyVersion: 1,
@@ -158,7 +282,7 @@ describe("Hook Core 與 Antigravity Adapter", () => {
               project: "demo-app",
               kind: "decision",
               score: 0.91,
-              content: "專案預設使用 pnpm",
+              content: query === "那測試指令是什麼？" ? "測試指令為 pnpm test" : "專案預設使用 pnpm",
               createdAt: "2026-11-10T00:00:00Z",
             },
           ],
@@ -218,6 +342,7 @@ describe("Hook Core 與 Antigravity Adapter", () => {
       opts,
     );
     expect(third.injectSteps).toHaveLength(1);
+    expect(third.injectSteps?.[0]?.systemMessage.systemMessage).toContain("測試指令為 pnpm test");
     expect(fetchImpl).toHaveBeenCalledTimes(4);
   });
 
@@ -311,7 +436,7 @@ describe("Hook Core 與 Antigravity Adapter", () => {
           invocationNum: 1,
         }),
       ]),
-      opts,
+      { ...opts, env: { ...opts.env, MNEMOSHELF_RECALL_DEDUPE_TTL: "0" } },
     );
     expect(retrySameBlock).toEqual({});
     expect(fetchImpl).toHaveBeenCalledTimes(4);
@@ -352,13 +477,79 @@ describe("Hook Core 與 Antigravity Adapter", () => {
     expect(everyTurn.injectSteps).toHaveLength(1);
   });
 
+  it.each([
+    ["decision", { kind: "decision" }, true],
+    ["pitfall", { kind: "pitfall" }, true],
+    ["pinned", { pinned: true }, true],
+    ["raw-turn", { sourceType: "raw-turn", sourceId: 21, role: "assistant" }, true],
+    ["fact", {}, false],
+    ["preference", { kind: "preference" }, false],
+  ])("跨回合去重保留 %s 的到期規則", async (_kind, metadata, canRepeat) => {
+    let hits: Array<Record<string, unknown>> = [{ ...globalHit, ...metadata }];
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (url) =>
+      url === `${baseUrl}/health`
+        ? Response.json({ service: "mnemoshelf" })
+        : Response.json({ degraded: false, hits }));
+    const opts = { env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, fetchImpl, homeDir, stateDir };
+    const run = (initialNumSteps: number, extraEnv: NodeJS.ProcessEnv = {}) => runAntigravityPreInvocation(
+      Readable.from([JSON.stringify({
+        conversationId: "dedupe-session",
+        initialNumSteps,
+        lastUserInput: `請確認第 ${initialNumSteps} 輪的專案設定`,
+      })]),
+      { ...opts, env: { ...opts.env, ...extraEnv } },
+    );
+
+    expect((await run(1)).injectSteps?.[0]?.systemMessage.systemMessage).toContain(globalHit.content);
+    expect(await run(2)).toEqual({});
+    hits = [{ ...globalHit, ...metadata, score: 0.98, content: "同一筆記憶的更新文字" },
+      { ...globalHit, id: 18, content: "本輪新記憶" }];
+    const third = (await run(3)).injectSteps?.[0]?.systemMessage.systemMessage;
+    expect(third).toContain("本輪新記憶");
+    expect(third).not.toContain("同一筆記憶的更新文字");
+
+    hits = hits.slice(0, 1);
+    for (let turn = 4; turn <= DEFAULT_HOOK_DEDUPE_TTL; turn += 1) expect(await run(turn)).toEqual({});
+    const expired = await run(DEFAULT_HOOK_DEDUPE_TTL + 1);
+    if (canRepeat) expect(expired.injectSteps?.[0]?.systemMessage.systemMessage).toContain("同一筆記憶的更新文字");
+    else expect(expired).toEqual({});
+
+    const disabled = await run(DEFAULT_HOOK_DEDUPE_TTL + 2, { MNEMOSHELF_RECALL_DEDUPE_TTL: "0" });
+    expect(disabled.injectSteps).toHaveLength(1);
+    expect(await run(DEFAULT_HOOK_DEDUPE_TTL + 2, { MNEMOSHELF_RECALL_DEDUPE_TTL: "0" })).toEqual({});
+    const everyTurn = await run(DEFAULT_HOOK_DEDUPE_TTL + 2, { MNEMOSHELF_RECALL_MODE: "every-turn" });
+    expect(everyTurn.injectSteps).toHaveLength(1);
+  });
+
+  it("舊版狀態保留回合步數與擷取游標，下一輪開始記錄跨回合去重", async () => {
+    const conversationId = "legacy-state";
+    const file = hookStateFile(stateDir, conversationId);
+    await mkdir(stateDir, { mode: 0o700 });
+    await writeFile(file, JSON.stringify({ lastInitialNumSteps: 3, lastCapturedUserStepIndex: 2 }), { mode: 0o600 });
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (url) =>
+      url === `${baseUrl}/health`
+        ? Response.json({ service: "mnemoshelf" })
+        : Response.json({ degraded: false, hits: [globalHit] }));
+    const run = (initialNumSteps: number) => runAntigravityPreInvocation(
+      Readable.from([JSON.stringify({ conversationId, initialNumSteps, lastUserInput: "請確認專案設定" })]),
+      { env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, fetchImpl, homeDir, stateDir },
+    );
+    expect(await run(3)).toEqual({});
+    expect(fetchImpl).not.toHaveBeenCalled();
+    expect((await run(4)).injectSteps).toHaveLength(1);
+    expect(JSON.parse(await readFile(file, "utf8"))).toMatchObject({
+      lastCapturedUserStepIndex: 2, lastInitialNumSteps: 4, turnCount: 1,
+      injected: { "id:17": { turn: 1, kind: "fact", pinned: false } },
+    });
+  });
+
   it("Stop 解析 transcript.jsonl（含真實宿主標籤與過場步驟過濾）並維持游標去重", async () => {
     const transcriptFile = path.join(tempDir, "transcript.jsonl");
     const fullTranscriptFile = path.join(tempDir, "transcript_full.jsonl");
 
     const wrappedUserFull = [
       "<USER_REQUEST>",
-      "第一題完整提問內容",
+      "@[Quote] 第一題完整提問內容",
       "</USER_REQUEST>",
       "<ADDITIONAL_METADATA>",
       "The current local time is: 2026-11-21T19:00:00+08:00.",
@@ -454,7 +645,7 @@ describe("Hook Core 與 Antigravity Adapter", () => {
 
     const parsed = await parseAntigravityTurns(transcriptFile);
     expect(parsed).toHaveLength(1);
-    expect(parsed[0]?.userStep.content).toBe("第一題完整提問內容");
+    expect(parsed[0]?.userStep.content).toBe("@[Quote] 第一題完整提問內容");
     expect(parsed[0]?.assistantSteps).toHaveLength(1);
     expect(parsed[0]?.assistantSteps[0]?.content).toBe("第一題完整回答");
 
@@ -474,7 +665,8 @@ describe("Hook Core 與 Antigravity Adapter", () => {
 
     const stopPayload = JSON.stringify({
       conversationId: "conv-stop-1",
-      workspacePaths: [workspaceDir],
+      workspacePaths: workspaces,
+      cwd: path.join(workspaceDir, "src"),
       transcriptPath: transcriptFile,
       terminationReason: "NO_TOOL_CALL",
     });
@@ -492,8 +684,9 @@ describe("Hook Core 與 Antigravity Adapter", () => {
       agent: "antigravity/turn",
       sourceSession: "conv-stop-1",
       sourceTurn: "turn-0",
+      project: "demo-app",
       messages: [
-        { sourceMessage: "step-0", role: "user", content: "第一題完整提問內容" },
+        { sourceMessage: "step-0", role: "user", content: "@[Quote] 第一題完整提問內容" },
         { sourceMessage: "step-4", role: "assistant", content: "第一題完整回答" },
       ],
     });

@@ -4,6 +4,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { parseGenericHookArgs, readFieldPath, runGenericRecall } from "../src/scripts/generic-hook.js";
+import { isCodeHeavy, queryFromPrompt, shouldSkipAutoRecallPrompt } from "../src/scripts/hook-core.js";
 
 const baseUrl = "http://127.0.0.1:4322";
 const credential = ["synthetic", "gen", "token"].join("-");
@@ -57,6 +58,44 @@ function mockFetch() {
 }
 
 describe("通用 Hook CLI 入口", () => {
+  it("以 60% 圍欄占比及 10 行、平均行長小於 20 判定程式碼", () => {
+    expect(isCodeHeavy("12345\n```abc```")).toBe(true);
+    expect(isCodeHeavy("123456\n```abc```")).toBe(false);
+    expect(isCodeHeavy("~~~\nconst ok = true;\n~~~")).toBe(true);
+    expect(isCodeHeavy(Array(10).fill("x".repeat(19)).join("\r\n"))).toBe(true);
+    expect(isCodeHeavy(Array(10).fill("x".repeat(20)).join("\n"))).toBe(false);
+    expect(isCodeHeavy(Array(9).fill("at run()").join("\n"))).toBe(false);
+    expect(isCodeHeavy(" \n ")).toBe(false);
+  });
+
+  it.each(["@[qUoTe] 好", "@[Quote]", "```ts\nconst ok = true;\n```", Array(12).fill("at run()").join("\n")])(
+    "低資訊提示不發 HTTP（%j）",
+    async (prompt) => {
+      const fetchImpl = mockFetch();
+      expect(shouldSkipAutoRecallPrompt(prompt)).toBe(true);
+      expect(await runGenericRecall(
+        Readable.from([JSON.stringify({ prompt, cwd: workspaceDir })]),
+        parseGenericHookArgs(["--preset", "claude-code"]),
+        { env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, homeDir, fetchImpl },
+      )).toBeNull();
+      expect(fetchImpl).not.toHaveBeenCalled();
+    },
+  );
+
+  it("向量查詢剝除引用標記，保留明確的短提示與正常問題", async () => {
+    const fetchImpl = mockFetch();
+    const prompt = "@[qUoTe] 請幫我確認上次建置指令";
+    const query = "請幫我確認上次建置指令";
+    expect(queryFromPrompt(prompt)).toBe(query);
+    expect(shouldSkipAutoRecallPrompt("@[Quote] 上次呢")).toBe(false);
+    expect(await runGenericRecall(
+      Readable.from([JSON.stringify({ prompt, cwd: workspaceDir })]),
+      parseGenericHookArgs(["--preset", "claude-code"]),
+      { env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, homeDir, fetchImpl },
+    )).toMatchObject({ hookSpecificOutput: { additionalContext: expect.stringContaining("通用測試記憶") } });
+    expect(JSON.parse(String(fetchImpl.mock.calls[1]?.[1]?.body))).toMatchObject({ query });
+  });
+
   it("支援點號路徑讀取巢狀物件與陣列索引", () => {
     expect(readFieldPath({ workspacePaths: [workspaceDir] }, "workspacePaths.0")).toBe(workspaceDir);
     expect(readFieldPath({ a: { b: "ok" } }, "a.b")).toBe("ok");

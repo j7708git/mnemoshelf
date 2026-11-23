@@ -1,10 +1,18 @@
 /** Codex UserPromptSubmit 入口。失敗時不輸出、不阻擋使用者提示。 */
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
   DEFAULT_HEALTH_TIMEOUT_MS,
   DEFAULT_SEARCH_TIMEOUT_MS,
+  hookStateFile,
   isDirectEntry,
+  parseHookDedupeState,
   readHookInput,
-  recallForPrompt,
+  readHookState,
+  recallForPromptWithMeta,
+  recordHookInjections,
+  resolveHookDedupeTTL,
+  writeHookState,
 } from "./hook-core.js";
 
 const EVENT = "UserPromptSubmit";
@@ -17,27 +25,47 @@ interface HookOutput {
 /** 只讀取明確指定的本機連線資訊檔，再查詢本專案及全域記憶。 */
 export async function runCodexRecall(
   stdin: AsyncIterable<Uint8Array | string>,
-  options: { env?: NodeJS.ProcessEnv; homeDir?: string; fetchImpl?: typeof fetch } = {},
+  options: { env?: NodeJS.ProcessEnv; homeDir?: string; fetchImpl?: typeof fetch; stateDir?: string } = {},
 ): Promise<HookOutput | null> {
   try {
     const input = await readHookInput(stdin);
     if (input?.hook_event_name !== EVENT || typeof input.prompt !== "string") return null;
 
-    const context = await recallForPrompt({
+    const env = options.env ?? process.env;
+    if (env.MNEMOSHELF_AUTO_INJECT?.trim().toLowerCase() === "off") return null;
+    const runtimeFile = env.MNEMOSHELF_RUNTIME_FILE?.trim();
+    if (runtimeFile === undefined || !path.isAbsolute(runtimeFile)) return null;
+    const ttl = resolveHookDedupeTTL(env);
+    const sessionId = [input.session_id, input.conversation_id, input.thread_id]
+      .find((value): value is string => typeof value === "string" && value.trim() !== "")?.trim();
+    const stateDir = options.stateDir ?? (env.MNEMOSHELF_HOOK_STATE_DIR?.trim() ||
+      path.join(tmpdir(), "mnemoshelf-codex-hooks"));
+    const stateFile = sessionId !== undefined && ttl > 0 ? hookStateFile(stateDir, sessionId) : undefined;
+    const state = stateFile === undefined ? {} : parseHookDedupeState(await readHookState(stateFile));
+    const turn = (state.turnCount ?? 0) + 1;
+    if (stateFile !== undefined) await writeHookState(stateFile, { ...state, turnCount: turn });
+
+    const result = await recallForPromptWithMeta({
       callerAgent: "codex/turn",
       prompt: input.prompt,
       cwd: typeof input.cwd === "string" ? input.cwd : undefined,
-      env: options.env,
+      env,
       homeDir: options.homeDir,
       fetchImpl: options.fetchImpl,
       healthTimeoutMs: DEFAULT_HEALTH_TIMEOUT_MS,
       searchTimeoutMs: DEFAULT_SEARCH_TIMEOUT_MS,
       requireExplicitRuntimeFile: true,
-    });
+    }, stateFile === undefined ? undefined : { turn, ttl, injected: state.injected });
+    if (result === null) return null;
 
-    return context === null
-      ? null
-      : { hookSpecificOutput: { hookEventName: EVENT, additionalContext: context } };
+    if (stateFile !== undefined) {
+      const latest = parseHookDedupeState(await readHookState(stateFile));
+      await writeHookState(stateFile, {
+        turnCount: Math.max(latest.turnCount ?? 0, turn),
+        injected: recordHookInjections(latest.injected, result.hits, turn),
+      });
+    }
+    return { hookSpecificOutput: { hookEventName: EVENT, additionalContext: result.block } };
   } catch {
     // 不把連線資訊、提示或記憶原文寫到 stderr。
     return null;
