@@ -54,6 +54,58 @@ function normalizeBaseUrl(value: string | undefined): string | undefined {
   return trimmed.replace(/\/+$/, "");
 }
 
+/** 兩個路徑是否指向同一個位置（Windows 不分大小寫；POSIX 分大小寫）。 */
+function samePath(a: string, b: string): boolean {
+  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/** `resolveProjectName` 的結果。 */
+export interface ProjectResolution {
+  /** 解析出的專案名稱（trim 後非空）；解析不到為 `null`。 */
+  project: string | null;
+  /** 名稱來源（除錯與測試用）：工具參數／環境變數／cwd／解析不到。 */
+  source: "argument" | "env" | "cwd" | "none";
+}
+
+/** `resolveProjectName` 的輸入。 */
+export interface ResolveProjectOptions {
+  /** 工具參數 `project`（型別未知；只有 trim 後非空的字串才算數）。 */
+  argument?: unknown;
+  /** MCP 設定（`MNEMOSHELF_PROJECT`）解析出的專案名稱；空白視為未設定。 */
+  configProject?: string | undefined;
+  /** 行程 cwd；預設 `process.cwd()`（測試可注入）。 */
+  cwd?: string;
+  /** 家目錄；預設 `os.homedir()`（測試可注入）。 */
+  homeDir?: string;
+}
+
+/**
+ * 解析 `remember` 要用的專案名稱（卡 A §3 的優先序）：
+ *
+ * 1. 工具參數 `project`（trim 後非空）；
+ * 2. 環境變數 `MNEMOSHELF_PROJECT`（MCP 啟動時讀入 `McpConfig.project`；空白視為未設定）；
+ * 3. `process.cwd()` 的 basename——**但 cwd 等於家目錄時跳過**（家目錄的 basename 是使用者名稱，
+ *    不是專案，不得被寫進記憶）；
+ * 4. 解析不到 → `null`（呼叫端退回 `global`）。
+ *
+ * 只做純字串運算，不寫入任何路徑到記憶或磁碟；路徑比較用 `node:path`（不硬寫分隔符）。
+ */
+export function resolveProjectName(options: ResolveProjectOptions = {}): ProjectResolution {
+  const argument = typeof options.argument === "string" ? options.argument.trim() : "";
+  if (argument !== "") return { project: argument, source: "argument" };
+
+  const configProject = typeof options.configProject === "string" ? options.configProject.trim() : "";
+  if (configProject !== "") return { project: configProject, source: "env" };
+
+  const cwd = path.resolve(options.cwd ?? process.cwd());
+  const homeDir = path.resolve(options.homeDir ?? homedir());
+  if (!samePath(cwd, homeDir)) {
+    const project = path.basename(cwd).trim();
+    if (project !== "") return { project, source: "cwd" };
+  }
+  return { project: null, source: "none" };
+}
+
 /**
  * 網址是否為單純的本機 loopback 基底網址。
  *
@@ -88,6 +140,7 @@ function isLoopbackBaseUrl(value: string): boolean {
 interface HealthInfo {
   service?: unknown;
   appVersion?: unknown;
+  build?: unknown;
 }
 
 /** 連線來源的標記（給除錯與 `/memory` 顯示用）。 */
@@ -95,7 +148,7 @@ export type McpConnectionSource = "env" | "runtime";
 
 /** `GET /health` 的結果。 */
 export type HealthCheckResult =
-  | { ok: true; appVersion: string | null }
+  | { ok: true; appVersion: string | null; build?: string }
   | { ok: false; reason: "timeout" | "unreachable" | "not-json" | "wrong-service" | "http-error" };
 
 /** `/health` 的逾時（毫秒）。逾時算「暫時連不上」，與「確定不是 mnemoshelf」分開。 */
@@ -271,7 +324,12 @@ export async function checkServiceHealth(input: {
     if (typeof record.service !== "string" || record.service !== SERVICE_NAME) {
       return { ok: false, reason: "wrong-service" };
     }
-    return { ok: true, appVersion: typeof record.appVersion === "string" ? record.appVersion : null };
+    const build = typeof record.build === "string" ? readNonEmptyString(record.build) : undefined;
+    return {
+      ok: true,
+      appVersion: typeof record.appVersion === "string" ? record.appVersion : null,
+      ...(build === undefined ? {} : { build }),
+    };
   } catch {
     return { ok: false, reason: controller.signal.aborted ? "timeout" : "unreachable" };
   } finally {
@@ -288,6 +346,8 @@ export interface McpConnection {
   config: McpConfig;
   /** 憑證來自環境變數還是連線資訊檔。 */
   source: McpConnectionSource;
+  /** 從連線資訊檔連線時，沿用身分檢查取得的版本資料。 */
+  serverHealth?: { appVersion: string | null; build: string | null };
 }
 
 /** `resolveMcpConnection` 的輸入（測試可注入每個外部依賴）。 */
@@ -418,6 +478,7 @@ export async function resolveMcpConnection(options: ResolveMcpConnectionOptions 
         ...(projectSetting === undefined ? {} : { project: projectSetting }),
       },
       source: "runtime",
+      serverHealth: { appVersion: health.appVersion, build: health.build ?? null },
     };
   }
 }

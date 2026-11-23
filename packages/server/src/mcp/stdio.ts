@@ -19,16 +19,17 @@
  * 為了不新增宣告的依賴，工具定義改用原始 JSON Schema、參數由 REST 驗證（見回報）。
  */
 import type { Readable, Writable } from "node:stream";
-import { homedir } from "node:os";
-import path from "node:path";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema, type Tool } from "@modelcontextprotocol/sdk/types.js";
 import type { McpConfig } from "../config.js";
 import { McpConnectionError, McpConnectionLostError, ValidationError } from "../errors.js";
-import { APP_VERSION } from "../http/app.js";
+import { APP_VERSION, BUILD_COMMIT } from "../http/app.js";
 import { MAX_MEMORY_CHARS } from "../memory-export.js";
-import { resolveMcpConnection, type McpConnection, type McpConnectionSource } from "./runtime-connection.js";
+import { detectVersionDrift } from "../scripts/hook-core.js";
+import { resolveMcpConnection, resolveProjectName, type McpConnection, type McpConnectionSource } from "./runtime-connection.js";
+
+export { resolveProjectName, type ProjectResolution, type ResolveProjectOptions } from "./runtime-connection.js";
 
 /** 每個工具描述都會帶上的警語（任務卡要求）。 */
 export const UNTRUSTED_DATA_WARNING =
@@ -230,58 +231,6 @@ export const MCP_TOOLS: Tool[] = [
   },
 ];
 
-/** 兩個路徑是否指向同一個位置（Windows 不分大小寫；POSIX 分大小寫）。 */
-function samePath(a: string, b: string): boolean {
-  return process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
-}
-
-/** `resolveProjectName` 的結果。 */
-export interface ProjectResolution {
-  /** 解析出的專案名稱（trim 後非空）；解析不到為 `null`。 */
-  project: string | null;
-  /** 名稱來源（除錯與測試用）：工具參數／環境變數／cwd／解析不到。 */
-  source: "argument" | "env" | "cwd" | "none";
-}
-
-/** `resolveProjectName` 的輸入。 */
-export interface ResolveProjectOptions {
-  /** 工具參數 `project`（型別未知；只有 trim 後非空的字串才算數）。 */
-  argument?: unknown;
-  /** MCP 設定（`MNEMOSHELF_PROJECT`）解析出的專案名稱；空白視為未設定。 */
-  configProject?: string | undefined;
-  /** 行程 cwd；預設 `process.cwd()`（測試可注入）。 */
-  cwd?: string;
-  /** 家目錄；預設 `os.homedir()`（測試可注入）。 */
-  homeDir?: string;
-}
-
-/**
- * 解析 `remember` 要用的專案名稱（卡 A §3 的優先序）：
- *
- * 1. 工具參數 `project`（trim 後非空）；
- * 2. 環境變數 `MNEMOSHELF_PROJECT`（MCP 啟動時讀入 `McpConfig.project`；空白視為未設定）；
- * 3. `process.cwd()` 的 basename——**但 cwd 等於家目錄時跳過**（家目錄的 basename 是使用者名稱，
- *    不是專案，不得被寫進記憶）；
- * 4. 解析不到 → `null`（呼叫端退回 `global`）。
- *
- * 只做純字串運算，不寫入任何路徑到記憶或磁碟；路徑比較用 `node:path`（不硬寫分隔符）。
- */
-export function resolveProjectName(options: ResolveProjectOptions = {}): ProjectResolution {
-  const argument = typeof options.argument === "string" ? options.argument.trim() : "";
-  if (argument !== "") return { project: argument, source: "argument" };
-
-  const configProject = typeof options.configProject === "string" ? options.configProject.trim() : "";
-  if (configProject !== "") return { project: configProject, source: "env" };
-
-  const cwd = path.resolve(options.cwd ?? process.cwd());
-  const homeDir = path.resolve(options.homeDir ?? homedir());
-  if (!samePath(cwd, homeDir)) {
-    const project = path.basename(cwd).trim();
-    if (project !== "") return { project, source: "cwd" };
-  }
-  return { project: null, source: "none" };
-}
-
 /** REST 呼叫失敗（非 2xx）。`remoteName` 是 REST 回應的 `error.name`。 */
 export class RestCallError extends Error {
   readonly status: number;
@@ -331,6 +280,10 @@ export interface McpServerOptions {
   homeDir?: string;
   /** 測試注入用；預設全域 `fetch`。 */
   fetchImpl?: typeof fetch;
+  serverHealth?: McpConnection["serverHealth"];
+  clientVersion?: string;
+  clientBuild?: string;
+  env?: NodeJS.ProcessEnv;
   /**
    * 連線層失敗（fetch 拋錯／連線被拒）時重新解析連線；成功時回傳新設定。
    *
@@ -450,7 +403,20 @@ function toolError(error: unknown): { content: { type: "text"; text: string }[];
 export function createMcpServer(options: McpServerOptions): Server {
   const log = options.log ?? ((message: string) => console.error(message));
   // 連線狀態是可變的：重新解析成功後，後續呼叫要用新的網址與 token（服務重啟會換埠）。
-  const state = { url: options.url, token: options.token, project: options.project };
+  const state = { url: options.url, token: options.token, project: options.project, serverHealth: options.serverHealth };
+  const getVersionDrift = () => detectVersionDrift({
+    component: "MCP",
+    clientVersion: options.clientVersion ?? APP_VERSION,
+    clientBuild: options.clientBuild ?? BUILD_COMMIT,
+    serverVersion: state.serverHealth?.appVersion,
+    serverBuild: state.serverHealth?.build,
+    env: options.env ?? process.env,
+  });
+  const logVersionDrift = (): void => {
+    const drift = getVersionDrift();
+    if (drift !== null) log(`[mnemoshelf-mcp] [版本提醒] ${drift.message}`);
+  };
+  logVersionDrift();
 
   /**
    * 打一次 REST；依 `policy` 決定連線層失敗時要不要重新解析連線並重試。
@@ -486,9 +452,11 @@ export function createMcpServer(options: McpServerOptions): Server {
       const connection = await options.reconnect();
       state.url = connection.config.url;
       state.token = connection.config.token;
+      state.serverHealth = connection.serverHealth;
       if (connection.config.project !== undefined) state.project = connection.config.project;
       // 只記來源與動作，不含 token、不含路徑。
       log(`[mnemoshelf-mcp] 連線中斷，已重新解析連線（來源：${connection.source}）並重試一次`);
+      logVersionDrift();
       try {
         return await callRest({ ...options, url: state.url, token: state.token }, method, path, body);
       } catch (retryError) {
@@ -749,6 +717,8 @@ export function createMcpServer(options: McpServerOptions): Server {
 
         case "list_roots": {
           const { listing, roots, sharedRootsCount } = await loadRootsListing();
+          const drift = getVersionDrift();
+          const { pairKey: _pairKey, ...versionNotice } = drift ?? {};
           return toolText(
             JSON.stringify(
               {
@@ -756,6 +726,7 @@ export function createMcpServer(options: McpServerOptions): Server {
                 roots,
                 sharedRootsCount,
                 ...(sharedRootsCount === 0 ? { hint: AGENT_SHARED_ROOTS_HINT } : {}),
+                ...(drift === null ? {} : { versionNotice }),
               },
               null,
               2,
@@ -777,6 +748,8 @@ export function createMcpServer(options: McpServerOptions): Server {
 export interface RunStdioOptions {
   /** 環境變數來源；預設 `process.env`。 */
   env?: NodeJS.ProcessEnv;
+  clientVersion?: string;
+  clientBuild?: string;
   /** 覆寫 stdin（測試用；預設 `process.stdin`）。 */
   stdin?: Readable;
   /** 覆寫 stdout（測試用；預設 `process.stdout`）。 */
@@ -881,6 +854,10 @@ export async function runStdio(options: RunStdioOptions = {}): Promise<{ config:
   const server = createMcpServer({
     url: config.url,
     token: config.token,
+    env,
+    serverHealth: connection.serverHealth,
+    clientVersion: options.clientVersion,
+    clientBuild: options.clientBuild,
     ...(config.project === undefined ? {} : { project: config.project }),
     ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     ...(options.homeDir === undefined ? {} : { homeDir: options.homeDir }),

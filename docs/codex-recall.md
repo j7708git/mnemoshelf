@@ -64,7 +64,13 @@
 
 `MNEMOSHELF_RECALL_DEDUPE_TTL` 預設為 8 回合，設定為 0 可停用。相隔達門檻後，釘選、`decision`、`pitfall` 與 `raw-turn` 可再次注入。每個工作階段最多保留最近注入的 256 筆去重紀錄。完整規則見 [同一對話的跨回合去重](hook-integration.md#同一對話的跨回合去重)。
 
-召回狀態以工作階段識別的雜湊作為檔名，保存在作業系統暫存目錄下的 `mnemoshelf-codex-hooks`。可用 `MNEMOSHELF_HOOK_STATE_DIR` 指定目錄。檔案以原子方式更新，POSIX 權限為 `0600`，內容只有回合計數、已注入記憶的識別與類型等去重欄位。
+召回狀態以工作階段識別的雜湊作為檔名，保存在作業系統暫存目錄下的 `mnemoshelf-codex-hooks`。可用 `MNEMOSHELF_HOOK_STATE_DIR` 指定目錄。檔案以原子方式更新，POSIX 權限為 `0600`，只保存回合計數、已注入記憶的去重欄位與最近一次提醒的版本組合雜湊。
+
+## 版本漂移提醒
+
+每個工作階段遇到新的版本差異時，Codex 會在 `additionalContext` 收到一次提醒。有記憶時會附在召回區塊內。搜尋成功但無可注入記憶時，仍會收到單獨的版本提醒。`MNEMOSHELF_RECALL_DEDUPE_TTL=0` 只停用記憶跨回合去重。
+
+`MNEMOSHELF_HOOK_VERSION_CHECK` 預設為 `semver`，可設為 `strict` 檢查同版號的建置 commit，或設為 `off` 停用版本提醒。若提醒 Hook 版本較舊，請更新來源並重新建置，確認 Codex 指向更新後的腳本。若服務版本較舊，請升級並重啟 Mnemoshelf。完整條件見 [Hook 接入指南](hook-integration.md#版本漂移提醒)。
 
 ## Stop 保存的範圍與去重
 
@@ -88,7 +94,7 @@ Stop 觸發時 `task_complete` 尚未寫入；Adapter 以最後一則可見回�
 
 ## 降級、重試與排查
 
-召回遇到無命中、冷啟動、離線、查詢降級或逾時便略過注入。擷取遇到服務離線、錯誤回應、格式不符或逾時回 `{}`／無輸出並以退出碼 0 結束，不要求 Codex 繼續或阻擋停止。CLI watchdog 為 3.5 秒，外層 hook timeout 為 5 秒；stdin 上限 256 KiB、transcript 上限 32 MiB，超限整輪略過，不截短原文。
+召回遇到服務離線、逾時或回應格式不符時靜默結束。擷取遇到服務離線、錯誤回應、格式不符或逾時回 `{}`／無輸出並以退出碼 0 結束，不要求 Codex 繼續或阻擋停止。CLI watchdog 為 3.5 秒，外層 hook timeout 為 5 秒；stdin 上限 256 KiB、transcript 上限 32 MiB，超限整輪略過，不截短原文。
 
 擷取不建立離線 spool，也不在下一輪補抓歷史。失敗時不確認游標，同一 Stop 再次觸發才會重試；只對當次事件保存成功負責。服務回 409 時不改 ID、不覆寫，也不假稱已保存。若其他 Stop hook 讓同一 turn 繼續產生內容，已保存的事件不會被覆寫。
 

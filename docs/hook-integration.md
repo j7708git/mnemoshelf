@@ -63,7 +63,7 @@ pnpm --filter '@mnemoshelf/server...' build
 }
 ```
 
-- `PreInvocation` 預設採 `per-turn`。每個新使用者提問自動召回一次，並以回合步數（`initialNumSteps`）、正規化提示雜湊與注入內容雜湊防止工具迴圈重複注入。同一對話的新回合也會過濾近期注入過的記憶。設定 `MNEMOSHELF_RECALL_MODE=every-turn` 可在每次模型呼叫時召回，略過同回合和跨回合去重。
+- `PreInvocation` 預設採 `per-turn`。同一對話中，只要正規化提問或 `initialNumSteps` 與上次記錄相同，就略過本次召回，連健康檢查也省略。工具呼叫使步數遞增時，相同提問仍只召回一次。先問 A、再問 B、之後回到 A，第三輪會重新搜尋並過濾已注入的記憶。設定 `MNEMOSHELF_RECALL_MODE=every-turn` 可在每次模型呼叫時召回並略過記憶去重。
 - `Stop` 在回合正常結束時解析 `transcript.jsonl`：解包 `<USER_REQUEST>` 並剝除 `<ADDITIONAL_METADATA>`、`<USER_SETTINGS_CHANGE>`、`<SYSTEM_MESSAGE>`、`<memory-context>` 等宿主注入標籤，排除 `thinking`、工具輸出、系統步驟與伴隨 `tool_calls` 的過場步驟（僅保留無 `tool_calls` 的實質回覆），透過 `POST /memory-sources` 等冪保存對話原文。
 
 #### B. Codex（自動召回＋可選 Stop 原文保存）
@@ -183,4 +183,18 @@ Antigravity 專用 Hook 依 `conversationId` 記錄已注入的記憶。Codex �
 
 `MNEMOSHELF_RECALL_DEDUPE_TTL` 指定同一記憶至少相隔幾個回合才能再次注入。預設為 8，無效值沿用預設，設為 0 關閉跨回合去重。回合差達門檻後，釘選項目、`decision`、`pitfall` 與 `raw-turn` 原文片段可以再次注入。一般事實與偏好在該對話的去重紀錄仍保留時只注入一次。
 
-每個對話的狀態檔最多保留最近注入的 256 筆記憶識別與去重所需欄位。全部命中都被過濾時，這一輪會直接略過注入。
+每個對話的狀態檔最多保留最近注入的 256 筆記憶識別與去重所需欄位。全部命中都被過濾時，只有首次出現的版本差異會形成注入。
+
+## 版本漂移提醒
+
+Hook 沿用讀取 `runtime.json` 時既有的 `GET /health` 回應，比對其中的 `appVersion`、`build` 與腳本的版本。版本資料缺失、格式不符或任一端回報 `0.0.0` 時略過。直接設定 `MNEMOSHELF_URL` 和 `MNEMOSHELF_TOKEN` 的連線沿用原本的請求流程。
+
+| `MNEMOSHELF_HOOK_VERSION_CHECK` | 提醒條件 |
+| --- | --- |
+| `semver`（預設） | 版本的主要、次要或修訂編號不同，或預發行版本優先序不同。忽略前導 `v` 與 `+` 後的建置後綴。 |
+| `strict` | 包含 `semver` 的條件。同版號時，兩端的建置標記已知但不一致也會提醒，文字顯示兩端的七碼短雜湊。 |
+| `off` | 停用版本提醒。 |
+
+有記憶可注入時，`[版本提醒]` 放在記憶區塊的導言後，計入同一個字元預算。搜尋成功但沒有可注入的記憶時，Hook 會用 `form="notice"` 的 `<memory-context>` 區塊單獨輸出。環境變數 `MNEMOSHELF_AUTO_INJECT=off` 或低資訊提示會同時略過召回與版本提醒。
+
+Antigravity 與 Codex 專用 Hook 將最近一次提醒的版本組合存入對話狀態檔。同一對話只有在版本組合改變時才會再次提醒。通用 CLI 或缺少對話識別時使用無狀態召回。MCP 的診斷輸出與 `list_roots` 欄位見 [Agent 整合契約](agent-integration.md#版本漂移診斷)。版本排序依 [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html)。

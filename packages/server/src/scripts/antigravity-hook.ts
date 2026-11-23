@@ -45,7 +45,6 @@ export type StopOutput = Record<string, never>;
 interface ConversationState extends HookDedupeState {
   lastInitialNumSteps?: number;
   lastPromptHash?: string;
-  lastInjectedBlockHash?: string;
   lastCapturedUserStepIndex?: number;
 }
 
@@ -70,6 +69,8 @@ export interface AntigravityHookOptions {
   homeDir?: string;
   fetchImpl?: typeof fetch;
   stateDir?: string;
+  clientVersion?: string;
+  clientBuild?: string;
 }
 
 function parseNonNegativeInt(value: unknown): number | undefined {
@@ -127,8 +128,6 @@ async function readState(file: string): Promise<ConversationState> {
     ...parseHookDedupeState(parsed),
     lastInitialNumSteps: parseNonNegativeInt(parsed.lastInitialNumSteps),
     lastPromptHash: typeof parsed.lastPromptHash === "string" ? parsed.lastPromptHash : undefined,
-    lastInjectedBlockHash:
-      typeof parsed.lastInjectedBlockHash === "string" ? parsed.lastInjectedBlockHash : undefined,
     lastCapturedUserStepIndex:
       typeof parsed.lastCapturedUserStepIndex === "number" &&
       Number.isSafeInteger(parsed.lastCapturedUserStepIndex)
@@ -164,14 +163,10 @@ export async function runAntigravityPreInvocation(
         initialNumSteps !== undefined &&
         state.lastInitialNumSteps !== undefined &&
         state.lastInitialNumSteps === initialNumSteps;
-      const samePromptWithoutSteps =
-        (initialNumSteps === undefined || state.lastInitialNumSteps === undefined) &&
-        state.lastPromptHash === promptHash;
-      if (sameTurnBySteps || samePromptWithoutSteps) return {};
+      // 同一則使用者提問在工具迴圈內可能伴隨遞增的步數。
+      if (sameTurnBySteps || state.lastPromptHash === promptHash) return {};
     }
 
-    const previousPromptHash = state.lastPromptHash;
-    const previousInjectedBlockHash = state.lastInjectedBlockHash;
     const stateChanged =
       state.lastPromptHash !== promptHash ||
       (initialNumSteps !== undefined && state.lastInitialNumSteps !== initialNumSteps);
@@ -196,34 +191,27 @@ export async function runAntigravityPreInvocation(
       env,
       homeDir,
       fetchImpl: options.fetchImpl,
+      clientVersion: options.clientVersion,
+      clientBuild: options.clientBuild,
+      lastNoticedVersionPair: state.lastNoticedVersionPair,
     }, dedupe);
     if (result === null) return {};
 
-    const context = result.block;
-    const blockHash = createHash("sha256").update(context).digest("hex");
-    if (
-      recallMode !== "every-turn" &&
-      stateFile !== null &&
-      previousPromptHash === promptHash &&
-      previousInjectedBlockHash === blockHash
-    ) {
-      return {};
-    }
-
-    if (stateFile !== null && (dedupe !== undefined || state.lastInjectedBlockHash !== blockHash)) {
+    const hasNewInjections = dedupe !== undefined && result.hits.length > 0;
+    if (stateFile !== null && (hasNewInjections || result.noticedVersionPair !== undefined)) {
       const latest = await readState(stateFile);
       const latestTurn = latest.turnCount ?? 0;
       const currentTurn = state.turnCount ?? 0;
       await writeHookState(stateFile, {
         ...latest,
         turnCount: Math.max(latestTurn, currentTurn),
-        lastInjectedBlockHash: latestTurn <= currentTurn ? blockHash : latest.lastInjectedBlockHash,
-        injected: dedupe === undefined ? latest.injected : recordHookInjections(latest.injected, result.hits, turn),
+        lastNoticedVersionPair: result.noticedVersionPair ?? latest.lastNoticedVersionPair,
+        injected: hasNewInjections ? recordHookInjections(latest.injected, result.hits, turn) : latest.injected,
       } satisfies ConversationState);
     }
 
     return {
-      injectSteps: [{ systemMessage: { systemMessage: context } }],
+      injectSteps: [{ systemMessage: { systemMessage: result.block } }],
       terminationBehavior: "",
     };
   } catch {

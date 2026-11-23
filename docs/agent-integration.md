@@ -112,8 +112,8 @@ MNEMOSHELF_TOKEN=<token> MNEMOSHELF_AGENT_DISCOVERY=on \
 
 1. 讀 `runtime.json`，取出 `url` 與 `token`。
 2. 先打免 token 的 `GET /health`，確認回應的 `service` 是 `"mnemoshelf"`——降低把 token 送到
-   佔用同一個埠的無關程式的風險（這不是保證，界線見下面「MCP 設定片段」）。**入口只比對
-   `service`**；`appVersion` 供人工核對（下面的手動 script 會印出來），版本不同不會讓入口拒絕連線。
+   佔用同一個埠的無關程式的風險（這不是保證，界線見下面「MCP 設定片段」）。入口以
+   `service` 檢查服務身分，並沿用 `appVersion` 與 `build` 產生版本漂移診斷。
 3. 之後的請求帶 `Authorization: Bearer <token>`。
 
 以下用 Node 22（本專案的執行環境）讀檔，不依賴 `jq`：
@@ -194,6 +194,14 @@ MCP 入口的連線來源有兩條，**先環境變數、後連線資訊檔**：
 使用者看得懂的訊息。原始錯誤只寫進 stderr 的診斷輸出（不含 token、不含路徑）。
 HTTP 有回應但狀態碼是錯誤（401／404／400…）**不會**重試：那是服務端的答案，重試只會多打一次 API。
 重新驗證若失敗，工具回應會帶上對應的失敗代碼。
+
+### 版本漂移診斷
+
+由 `runtime.json` 連線時，MCP 入口沿用啟動及重連時既有的 `/health` 回應取得服務版本。偵測到漂移時，當次連線在 stderr 印出一則版本提醒。使用 `MNEMOSHELF_URL` 和 `MNEMOSHELF_TOKEN` 直接連線時，入口不做健康檢查。
+
+`list_roots` 在偵測到漂移時附帶 `versionNotice`。內容包含 `kind`（`client-behind`、`server-behind` 或 `build-mismatch`）、`message`、`clientVersion` 與 `serverVersion`。`strict` 模式也附上已取得的 `clientBuild` 或 `serverBuild`，自訂建置標記以雜湊表示。版本一致、停用檢查或缺少有效服務版本時省略該欄位。
+
+`MNEMOSHELF_HOOK_VERSION_CHECK` 對 MCP 與 Hook 都適用。`semver`（預設）比對版本優先序，`strict` 也比對同版號的建置 commit，`off` 停用提醒。Antigravity 與 Codex 專用 Hook 在每段對話中追蹤最近提醒的版本組合。設定方式及無命中時的輸出見 [Hook 版本漂移提醒](hook-integration.md#版本漂移提醒)。
 
 ### 檔案搜尋（roots）的分享開關（2026-11-12，行為變更）
 
