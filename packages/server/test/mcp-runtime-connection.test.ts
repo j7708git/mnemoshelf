@@ -203,6 +203,18 @@ describe("checkServiceHealth", () => {
     expect(result).toEqual({ ok: true, appVersion: "0.4.0" });
   });
 
+  it.each([
+    [" abcdef0 ", { build: "abcdef0" }],
+    ["", {}],
+    ["  ", {}],
+    [42, {}],
+  ])("只附帶非空的 build 字串（%j）", async (build, expected) => {
+    expect(await checkServiceHealth({
+      baseUrl: "http://127.0.0.1:1234",
+      fetchImpl: fakeFetch(200, { ...HEALTHY, build }),
+    })).toEqual({ ok: true, appVersion: "0.4.0", ...expected });
+  });
+
   it("服務名稱不符時判定為身分不符", async () => {
     const result = await checkServiceHealth({
       baseUrl: "http://127.0.0.1:1234",
@@ -331,32 +343,38 @@ describe("isProcessAlive", () => {
 });
 
 describe("resolveMcpConnection", () => {
-  it("環境變數齊全時直接使用，完全不讀檔", async () => {
-    const readFileImpl = readerFor({});
+  it("環境變數齊全時直接使用，不讀檔也不發健康檢查", async () => {
+    const { readFileImpl, reads } = trackingReader({});
+    const counter = { calls: 0 };
     const connection = await resolveMcpConnection({
       env: { MNEMOSHELF_URL: "http://127.0.0.1:1234", MNEMOSHELF_TOKEN: TOKEN },
       platform: "linux",
       home: HOME,
       readFileImpl,
+      fetchImpl: countingFetch(counter),
     });
     expect(connection.source).toBe("env");
     expect(connection.config.url).toBe("http://127.0.0.1:1234");
     expect(connection.config.token).toBe(TOKEN);
+    expect(connection).not.toHaveProperty("serverHealth");
+    expect(reads).toEqual([]);
+    expect(counter.calls).toBe(0);
   });
 
-  it("環境變數缺 token 時改讀連線資訊檔，並驗過服務身分", async () => {
+  it.each([undefined, "abcdef0"])("連線資訊檔附上健康檢查取得的版本（build：%s）", async (build) => {
     const file = `${HOME}/.config/Mnemoshelf/data/runtime.json`;
     const connection = await resolveMcpConnection({
       env: {},
       platform: "linux",
       home: HOME,
       readFileImpl: readerFor({ [file]: runtimeJson() }),
-      fetchImpl: fakeFetch(200, HEALTHY),
+      fetchImpl: fakeFetch(200, { ...HEALTHY, appVersion: "0.10.0", build }),
       killImpl: () => undefined,
     });
     expect(connection.source).toBe("runtime");
     expect(connection.config.url).toBe("http://127.0.0.1:53459");
     expect(connection.config.token).toBe(TOKEN);
+    expect(connection.serverHealth).toEqual({ appVersion: "0.10.0", build: build ?? null });
   });
 
   it("連線資訊檔可帶出預設專案", async () => {

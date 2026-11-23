@@ -190,6 +190,35 @@ describe("Codex 自動召回", () => {
     if (process.platform !== "win32") expect((await stat(stateFile)).mode & 0o777).toBe(0o600);
   });
 
+  it.each(["8", "0"])("版本提醒獨立輸出並依 session 去重（記憶 TTL %s）", async (ttl) => {
+    const stateDir = path.join(temp, "version-notice-state");
+    const env = { MNEMOSHELF_RUNTIME_FILE: runtimeFile, MNEMOSHELF_RECALL_DEDUPE_TTL: ttl };
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (url) =>
+      url === `${baseUrl}/health`
+        ? Response.json({ service: "mnemoshelf", appVersion: "0.10.0" })
+        : Response.json({ degraded: false, hits: [] }));
+    const run = (session_id: string, prompt = hookEvent.prompt, extraEnv: NodeJS.ProcessEnv = {}) => runCodexRecall(
+      Readable.from([JSON.stringify({ ...hookEvent, session_id, prompt })]),
+      { env: { ...env, ...extraEnv }, fetchImpl, stateDir, clientVersion: "0.9.3" },
+    );
+    expect(await run("session-a", "好")).toBeNull();
+    expect(await run("session-a", hookEvent.prompt, { MNEMOSHELF_AUTO_INJECT: "off" })).toBeNull();
+    expect(fetchImpl).not.toHaveBeenCalled();
+
+    const first = await run("session-a");
+    expect(first?.hookSpecificOutput.additionalContext).toMatch(
+      /^<memory-context source="mnemoshelf" trust="untrusted" form="notice">\n[^\n]*服務 0\.10\.0[^\n]*Hook 0\.9\.3[^\n]*\n<\/memory-context>$/,
+    );
+    expect(await run("session-a")).toBeNull();
+    const [file] = await readdir(stateDir);
+    const state = JSON.parse(await readFile(path.join(stateDir, file!), "utf8"));
+    expect(state.lastNoticedVersionPair).toMatch(/^[0-9a-f]{64}$/);
+    expect(state.injected).toEqual(ttl === "0" ? undefined : {});
+    expect((await run("session-b"))?.hookSpecificOutput.additionalContext)
+      .toBe(first?.hookSpecificOutput.additionalContext);
+    expect(fetchImpl).toHaveBeenCalledTimes(6);
+  });
+
   it.skipIf(process.platform === "win32")("狀態檔若為 symlink，召回不讀取或覆寫連結目標", async () => {
     const stateDir = path.join(temp, "state");
     const fetchImpl = fakeService();

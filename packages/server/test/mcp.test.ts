@@ -1063,6 +1063,8 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
     fetchImpl: typeof fetch;
     readFileImpl: (target: string) => Promise<string>;
     log?: string[];
+    clientVersion?: string;
+    clientBuild?: string;
   }): Promise<InjectedHarness> {
     const clientToServer = new PassThrough();
     const serverToClient = new PassThrough();
@@ -1076,6 +1078,8 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
       readFileImpl: input.readFileImpl,
       killImpl: () => undefined,
       fetchImpl: input.fetchImpl,
+      clientVersion: input.clientVersion,
+      clientBuild: input.clientBuild,
       ...(logs === undefined ? {} : { log: (message: string) => logs.push(message) }),
     });
     const client = new Client({ name: "retry-client", version: "0.0.0" });
@@ -1089,7 +1093,12 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
     };
   }
 
-  it("舊網址連線層失敗 → 重讀 runtime.json 並重做身分檢查 → 重試一次成功（用新 token）", async () => {
+  it.each([
+    { clientVersion: "0.4.0", startsWithNotice: false, reconnectsWithNotice: true },
+    { clientVersion: "0.10.0", startsWithNotice: true, reconnectsWithNotice: false },
+  ])("重連使用新 token 並更新版本提醒（啟動時有提醒：$startsWithNotice）", async ({
+    clientVersion, startsWithNotice, reconnectsWithNotice,
+  }) => {
     const home = await makeTempDir("mnemoshelf-mcp-retry-");
     dirs.push(home);
     const file = path.join(home, "runtime.json");
@@ -1106,7 +1115,8 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
         url,
         ...(headers.authorization === undefined ? {} : { authorization: headers.authorization }),
       });
-      if (url.endsWith("/health")) return jsonResponse(HEALTHY);
+      if (url === `${OLD_URL}/health`) return jsonResponse(HEALTHY);
+      if (url === `${NEW_URL}/health`) return jsonResponse({ ...HEALTHY, appVersion: "0.10.0" });
       // 舊服務已經結束（換埠重啟）→ 連線層失敗。
       if (url.startsWith(OLD_URL)) throw new TypeError("fetch failed");
       if (url.startsWith(NEW_URL)) return jsonResponse({ roots: [] });
@@ -1119,11 +1129,24 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
       fetchImpl,
       readFileImpl,
       log: logs,
+      clientVersion,
     });
     try {
+      expect(logs.filter((line) => line.includes("[版本提醒]"))).toHaveLength(startsWithNotice ? 1 : 0);
       const result = await harness.client.callTool({ name: "list_roots", arguments: {} });
       expect(result.isError).toBeFalsy();
-      expect(jsonOf<{ roots: unknown[] }>(result).roots).toEqual([]);
+      const listing = jsonOf<{ roots: unknown[] }>(result);
+      expect(listing.roots).toEqual([]);
+      if (reconnectsWithNotice) {
+        expect(listing).toMatchObject({ versionNotice: {
+          kind: "client-behind",
+          clientVersion: "0.4.0",
+          serverVersion: "0.10.0",
+          message: expect.stringContaining("MCP 0.4.0"),
+        } });
+      } else {
+        expect(listing).not.toHaveProperty("versionNotice");
+      }
     } finally {
       await harness.close();
     }
@@ -1145,9 +1168,63 @@ describe("MCP：連線層失敗時重解析並重試一次", () => {
 
     const logText = logs.join("\n");
     expect(logText).toContain("重試一次");
+    expect(logs.filter((line) => line.includes("[版本提醒]"))).toHaveLength(1);
     expect(logText).not.toContain(OLD_TOKEN);
     expect(logText).not.toContain(NEW_TOKEN);
     expect(logText).not.toContain(file);
+  });
+
+  it.each([
+    { mode: "strict", serverVersion: HEALTHY.appVersion, expectsNotice: true },
+    { mode: "semver", serverVersion: HEALTHY.appVersion, expectsNotice: false },
+    { mode: "off", serverVersion: "0.10.0", expectsNotice: false },
+  ])("MCP 的 $mode 模式使用服務版本 $serverVersion 產生診斷", async ({ mode, serverVersion, expectsNotice }) => {
+    const file = path.join(HOME, "runtime.json");
+    const clientBuild = "1234567".padEnd(40, "a");
+    const serverBuild = "abcdef0".padEnd(40, "b");
+    const logs: string[] = [];
+    const requests: string[] = [];
+    const fetchImpl: typeof fetch = async (input) => {
+      const url = String(input);
+      requests.push(url);
+      if (url === `${OLD_URL}/health`) return jsonResponse({ ...HEALTHY, appVersion: serverVersion, build: serverBuild });
+      return jsonResponse({ roots: [] });
+    };
+    const harness = await startInjected({
+      env: { MNEMOSHELF_RUNTIME_FILE: file, MNEMOSHELF_HOOK_VERSION_CHECK: mode },
+      clientVersion: HEALTHY.appVersion,
+      clientBuild,
+      fetchImpl,
+      readFileImpl: runtimeReader(file, [runtimeJson(OLD_URL, OLD_TOKEN)]).readFileImpl,
+      log: logs,
+    });
+
+    try {
+      const result = await harness.client.callTool({ name: "list_roots", arguments: {} });
+      const listing = jsonOf<{ versionNotice?: unknown }>(result);
+      const notices = logs.filter((line) => line.includes("[版本提醒]"));
+      if (expectsNotice) {
+        expect(listing.versionNotice).toEqual({
+          kind: "build-mismatch",
+          clientVersion: HEALTHY.appVersion,
+          serverVersion: HEALTHY.appVersion,
+          clientBuild,
+          serverBuild,
+          message: expect.stringContaining("服務 abcdef0、MCP 1234567"),
+        });
+        expect(notices).toHaveLength(1);
+        expect(notices[0]).toContain("服務 abcdef0、MCP 1234567");
+        expect(notices[0]).not.toContain(OLD_URL);
+        expect(notices[0]).not.toContain(OLD_TOKEN);
+        expect(notices[0]).not.toContain(file);
+      } else {
+        expect(listing).not.toHaveProperty("versionNotice");
+        expect(notices).toEqual([]);
+      }
+      expect(requests).toEqual([`${OLD_URL}/health`, `${OLD_URL}/roots`]);
+    } finally {
+      await harness.close();
+    }
   });
 
   it("重試仍連線層失敗 → 只重試一次（共兩次 REST 呼叫），工具回報穩定代碼", async () => {

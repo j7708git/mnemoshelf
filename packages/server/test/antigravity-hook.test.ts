@@ -10,8 +10,11 @@ import {
   sanitizeAntigravityText,
 } from "../src/scripts/antigravity-hook.js";
 import {
+  BLOCK_INTRO,
   captureTurn,
+  compareSemver,
   DEFAULT_HOOK_DEDUPE_TTL,
+  detectVersionDrift,
   formatRecallBlock,
   formatRecallBlockWithMeta,
   hookStateFile,
@@ -19,6 +22,7 @@ import {
   parseHookDedupeState,
   queryFromPrompt,
   recallForPrompt,
+  recallForPromptWithMeta,
   recordHookInjections,
   resolveHookDedupeTTL,
   resolveWorkspaceCwd,
@@ -167,6 +171,88 @@ describe("Hook Core 與 Antigravity Adapter", () => {
     expect(parseHookDedupeState({ turnCount: 257, injected: {
       ...injected, invalid: { turn: 257 }, "id:258": { turn: 258 },
     } })).toEqual({ turnCount: 257, injected });
+    expect(parseHookDedupeState({ lastNoticedVersionPair: "pair" })).toEqual({ lastNoticedVersionPair: "pair" });
+    for (const pair of ["", " ", 1, "a".repeat(65)]) {
+      expect(parseHookDedupeState({ turnCount: 1, lastNoticedVersionPair: pair })).toEqual({ turnCount: 1, injected: {} });
+    }
+  });
+
+  it.each([
+    ["0.10.0", "v0.9.3", 1],
+    ["1.0.0-rc.2", "1.0.0-rc.10", -1],
+    ["1.0.0-rc.10", "1.0.0-rc.beta", -1],
+    ["1.0.0-rc", "1.0.0-rc.1", -1],
+    ["1.0.0", "1.0.0-rc.1", 1],
+    ["v1.0.0+local", "1.0.0+remote", 0],
+    ["1.0.0-rc.01", "1.0.0", null],
+    ["01.0.0", "1.0.0", null],
+  ])("依 SemVer 優先序比較 %s 與 %s", (left, right, expected) => {
+    expect(compareSemver(left, right)).toBe(expected);
+  });
+
+  it("依模式判定版本漂移，無有效版本並不提示", () => {
+    const strict = { MNEMOSHELF_HOOK_VERSION_CHECK: "strict" };
+    const clientBuild = "1234567".padEnd(40, "a");
+    const serverBuild = "abcdef0".padEnd(40, "b");
+    const versions = { clientVersion: "0.9.3", serverVersion: "0.10.0" };
+    const behind = detectVersionDrift({ ...versions, clientBuild, serverBuild });
+    expect(behind).toMatchObject({ kind: "client-behind", ...versions });
+    expect(behind?.message).toContain("Hook 0.9.3");
+    expect(behind?.message).toContain("服務 0.10.0");
+    expect(behind).not.toHaveProperty("serverBuild");
+    expect(detectVersionDrift({ ...versions, serverVersion: "v0.10.0+local", serverBuild })?.pairKey)
+      .toBe(behind?.pairKey);
+    expect(detectVersionDrift({ ...versions, clientVersion: "0.11.0", component: "MCP" }))
+      .toMatchObject({ kind: "server-behind", message: expect.stringContaining("MCP 0.11.0") });
+    expect(detectVersionDrift({ ...versions, env: { MNEMOSHELF_HOOK_VERSION_CHECK: "off" } })).toBeNull();
+
+    const same = { ...versions, serverVersion: versions.clientVersion, clientBuild, serverBuild };
+    expect(detectVersionDrift(same)).toBeNull();
+    const mismatch = detectVersionDrift({ ...same, env: strict });
+    expect(mismatch).toMatchObject({ kind: "build-mismatch", clientBuild, serverBuild });
+    expect(mismatch?.message).toContain("服務 abcdef0、Hook 1234567");
+    expect(mismatch?.message).not.toContain(serverBuild);
+    expect(detectVersionDrift({ ...same, env: strict, serverBuild: clientBuild })).toBeNull();
+    expect(detectVersionDrift({ ...same, env: strict, serverBuild: "unknown" })).toBeNull();
+    const customBuild = detectVersionDrift({ ...same, env: strict, serverBuild: baseUrl });
+    expect(customBuild).toMatchObject({ kind: "build-mismatch", serverBuild: expect.stringMatching(/^[0-9a-f]{64}$/) });
+    expect(customBuild?.message).not.toContain(baseUrl);
+    for (const serverVersion of [undefined, null, "v0.0.0", "bad", `1.0.0-${baseUrl}`]) {
+      expect(detectVersionDrift({ ...versions, serverVersion })).toBeNull();
+    }
+    expect(detectVersionDrift({ ...versions, clientVersion: "0.0.0" })).toBeNull();
+  });
+
+  it("版本提醒佔用同一區塊預算，過濾所有命中後仍可獨立輸出", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (url) =>
+      url === `${baseUrl}/health`
+        ? Response.json({ service: "mnemoshelf", appVersion: "0.10.0" })
+        : Response.json({ degraded: false, hits: [{ ...globalHit, content: "記".repeat(900) }] }));
+    const options = {
+      prompt: "請確認版本與專案設定",
+      env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile },
+      clientVersion: "0.9.3",
+      fetchImpl,
+      maxBlockChars: 240,
+    };
+    const result = await recallForPromptWithMeta(options);
+    expect(result?.block.length).toBe(240);
+    expect(result?.block.split("\n")[1]).toBe(BLOCK_INTRO);
+    expect(result?.block.split("\n")[2]).toMatch(/^\[版本提醒\]/);
+    expect(result?.block).toMatch(/…\n<\/memory-context>$/);
+    expect(result?.hits.map((hit) => hit.key)).toEqual(["id:17"]);
+    expect(result?.noticedVersionPair).toMatch(/^[0-9a-f]{64}$/);
+
+    const dedupe = { turn: 2, ttl: 8, injected: recordHookInjections(undefined, result!.hits, 1) };
+    const noticeOnly = await recallForPromptWithMeta(options, dedupe);
+    expect(noticeOnly).toMatchObject({ hits: [], noticedVersionPair: result?.noticedVersionPair });
+    expect(noticeOnly?.block).toMatch(/^<memory-context source="mnemoshelf" trust="untrusted" form="notice">\n[^\n]+\n<\/memory-context>$/);
+    expect(await recallForPromptWithMeta({ ...options, lastNoticedVersionPair: noticeOnly?.noticedVersionPair }, dedupe))
+      .toBeNull();
+    expect(await recallForPromptWithMeta({ ...options, maxBlockChars: 60 }, dedupe)).toBeNull();
+    expect(fetchImpl.mock.calls.map(([url]) => url)).toEqual(
+      Array.from({ length: 4 }, () => [`${baseUrl}/health`, `${baseUrl}/memories/search`]).flat(),
+    );
   });
 
   it("sanitizeRawText 會移除 NUL 與孤立 surrogate，保留合法 emoji", () => {
@@ -384,7 +470,7 @@ describe("Hook Core 與 Antigravity Adapter", () => {
           conversationId: "conv-explicit-loop",
           workspacePaths: [workspaceDir],
           lastUserInput: "你記得上次我們討論的建置指令嗎？",
-          initialNumSteps: 0,
+          initialNumSteps: 200,
           invocationNum: 1,
         }),
       ]),
@@ -400,7 +486,7 @@ describe("Hook Core 與 Antigravity Adapter", () => {
           conversationId: "conv-explicit-loop",
           workspacePaths: [workspaceDir],
           lastUserInput: "你記得上次我們討論的建置指令嗎？",
-          initialNumSteps: 0,
+          initialNumSteps: 200,
           invocationNum: 2,
         }),
       ]),
@@ -425,21 +511,22 @@ describe("Hook Core 與 Antigravity Adapter", () => {
     expect(step3NoSteps).toEqual({});
     expect(fetchImpl).toHaveBeenCalledTimes(2);
 
-    // 若同提問在新的 initialNumSteps 重送且召回區塊完全相同 -> lastInjectedBlockHash 擋下重複注入
-    const retrySameBlock = await runAntigravityPreInvocation(
+    // 工具呼叫使步數遞增，同一則提問仍不進行第二次搜尋。
+    hitText = "低順位的第二批記憶";
+    const stepAfterTool = await runAntigravityPreInvocation(
       Readable.from([
         JSON.stringify({
           conversationId: "conv-explicit-loop",
           workspacePaths: [workspaceDir],
           lastUserInput: "你記得上次我們討論的建置指令嗎？",
-          initialNumSteps: 4,
-          invocationNum: 1,
+          initialNumSteps: 205,
+          invocationNum: 4,
         }),
       ]),
-      { ...opts, env: { ...opts.env, MNEMOSHELF_RECALL_DEDUPE_TTL: "0" } },
+      opts,
     );
-    expect(retrySameBlock).toEqual({});
-    expect(fetchImpl).toHaveBeenCalledTimes(4);
+    expect(stepAfterTool).toEqual({});
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
 
     // 若新回合是不同問題（同樣含記憶關鍵字）-> 再次注入
     hitText = "測試指令為 pnpm test";
@@ -449,7 +536,7 @@ describe("Hook Core 與 Antigravity Adapter", () => {
           conversationId: "conv-explicit-loop",
           workspacePaths: [workspaceDir],
           lastUserInput: "那上次的測試指令是什麼？",
-          initialNumSteps: 8,
+          initialNumSteps: 210,
           invocationNum: 1,
         }),
       ]),
@@ -465,7 +552,7 @@ describe("Hook Core 與 Antigravity Adapter", () => {
           conversationId: "conv-explicit-loop",
           workspacePaths: [workspaceDir],
           lastUserInput: "那上次的測試指令是什麼？",
-          initialNumSteps: 8,
+          initialNumSteps: 210,
           invocationNum: 2,
         }),
       ]),
@@ -475,6 +562,66 @@ describe("Hook Core 與 Antigravity Adapter", () => {
       },
     );
     expect(everyTurn.injectSteps).toHaveLength(1);
+  });
+
+  it("提問 A → B → A 依序召回，第三輪過濾 A 已注入的記憶", async () => {
+    const promptA = "請確認上次的建置指令";
+    const promptB = "那上次的測試指令是什麼？";
+    const hitB = { ...globalHit, id: 18, content: "測試指令的記憶" };
+    const newHitA = { ...globalHit, id: 19, content: "建置指令的補充記憶" };
+    let hits = [globalHit];
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (url) =>
+      url === `${baseUrl}/health`
+        ? Response.json({ service: "mnemoshelf" })
+        : Response.json({ degraded: false, hits }));
+    const conversationId = "prompt-cycle";
+    const run = async (lastUserInput: string, initialNumSteps: number) =>
+      (await runAntigravityPreInvocation(
+        Readable.from([JSON.stringify({ conversationId, lastUserInput, initialNumSteps })]),
+        { env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, fetchImpl, stateDir, homeDir },
+      )).injectSteps?.[0]?.systemMessage.systemMessage;
+
+    expect(await run(promptA, 200)).toContain(globalHit.content);
+    hits = [hitB];
+    expect(await run(promptB, 210)).toContain(hitB.content);
+    hits = [globalHit, newHitA];
+    const third = await run(promptA, 220);
+    expect(third).toContain(newHitA.content);
+    expect(third).not.toContain(globalHit.content);
+    expect(fetchImpl).toHaveBeenCalledTimes(6);
+    expect(JSON.parse(await readFile(hookStateFile(stateDir, conversationId), "utf8"))).toMatchObject({ turnCount: 3 });
+  });
+
+  it("同一對話只注入一次相同版本提醒，服務版本變更後再次提醒", async () => {
+    let appVersion = "0.10.0";
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async (url) =>
+      url === `${baseUrl}/health`
+        ? Response.json({ service: "mnemoshelf", appVersion })
+        : Response.json({ degraded: false, hits: [globalHit] }));
+    const conversationId = "version-notices";
+    const run = (step: number) => runAntigravityPreInvocation(
+      Readable.from([JSON.stringify({
+        conversationId,
+        initialNumSteps: step,
+        lastUserInput: `請確認第 ${step} 輪的版本設定`,
+      })]),
+      { env: { MNEMOSHELF_RUNTIME_FILE: runtimeFile }, fetchImpl, stateDir, homeDir, clientVersion: "0.9.3" },
+    );
+    const first = (await run(1)).injectSteps?.[0]?.systemMessage.systemMessage;
+    expect(first).toContain("[版本提醒]");
+    expect(first).toContain(globalHit.content);
+    expect(await run(2)).toEqual({});
+    appVersion = "0.11.0";
+    const third = (await run(3)).injectSteps?.[0]?.systemMessage.systemMessage;
+    expect(third).toContain('form="notice"');
+    expect(third).toContain("0.11.0");
+    expect(await run(4)).toEqual({});
+    expect(fetchImpl).toHaveBeenCalledTimes(8);
+    expect(JSON.parse(await readFile(hookStateFile(stateDir, conversationId), "utf8"))).toMatchObject({
+      turnCount: 4,
+      injected: { "id:17": { turn: 1 } },
+      lastNoticedVersionPair: expect.stringMatching(/^[0-9a-f]{64}$/),
+    });
   });
 
   it.each([
